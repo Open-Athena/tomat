@@ -27,7 +27,7 @@ from click import argument, command, option
 
 from tomato.data.classify import classify_elements
 from tomato.data.mp import load_chgcar, list_mp_ids
-from tomato.tokenizers import CutoffTokenizer, DensityTokenizer, DirectTokenizer, FourierTokenizer
+from tomato.tokenizers import CutoffEncoded, CutoffTokenizer, DensityTokenizer, DirectTokenizer, FourierTokenizer
 
 err = partial(print, file=sys.stderr)
 
@@ -84,13 +84,18 @@ def main(n_samples: int, output_csv: Path | None, split: str, mp_ids: tuple[str,
         err(f"\n{mp_id} [{category}]: grid {density.shape}, sum ρ = {density.sum():.3e}, loaded in {load_s:.1f}s")
         for cfg in configs:
             t0 = time.perf_counter()
-            recon = cfg.tokenizer.roundtrip(chgcar)
+            encoded = cfg.tokenizer.encode(chgcar)
+            recon = cfg.tokenizer.decode(encoded)
             elapsed = time.perf_counter() - t0
             val = nmae(density, recon)
-            err(f"  {cfg.label:>24s}  NMAE={val:.4e}  ({elapsed:.2f}s)")
-            rows.append(
-                dict(mp_id=mp_id, category=category, config=cfg.label, nmae=val, seconds=elapsed, grid=str(density.shape)),
-            )
+            row = dict(mp_id=mp_id, category=category, config=cfg.label, nmae=val, seconds=elapsed, grid=str(density.shape))
+            if isinstance(encoded, CutoffEncoded):
+                row["mass_captured"] = encoded.mass_captured
+                row["effective_threshold"] = encoded.effective_threshold
+                err(f"  {cfg.label:>24s}  NMAE={val:.4e}  mass={encoded.mass_captured:.3f}  thresh={encoded.effective_threshold:.3e}  ({elapsed:.2f}s)")
+            else:
+                err(f"  {cfg.label:>24s}  NMAE={val:.4e}  ({elapsed:.2f}s)")
+            rows.append(row)
 
     print()
     print(f"{'config':>24s}  {'mean NMAE':>12s}  {'median NMAE':>12s}  n")
@@ -103,7 +108,11 @@ def main(n_samples: int, output_csv: Path | None, split: str, mp_ids: tuple[str,
 
     if output_csv is not None:
         with output_csv.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["mp_id", "category", "config", "nmae", "seconds", "grid"])
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["mp_id", "category", "config", "nmae", "seconds", "grid", "mass_captured", "effective_threshold"],
+                extrasaction="ignore",
+            )
             writer.writeheader()
             writer.writerows(rows)
         err(f"Wrote {len(rows)} rows to {output_csv}")

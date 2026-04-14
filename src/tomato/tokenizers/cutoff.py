@@ -33,6 +33,8 @@ class CutoffEncoded:
     grid_shape: tuple[int, int, int]
     flat_indices: np.ndarray
     values: np.ndarray
+    mass_captured: float
+    effective_threshold: float
 
 
 class CutoffTokenizer(DensityTokenizer):
@@ -66,10 +68,14 @@ class CutoffTokenizer(DensityTokenizer):
             idx = np.argpartition(flat, -k)[-k:]
         else:
             idx = np.flatnonzero(flat >= self.threshold)
+        values = flat[idx]
+        total_mass = float(np.abs(flat).sum())
         return CutoffEncoded(
             grid_shape=density.shape,
             flat_indices=idx.astype(np.int64),
-            values=flat[idx],
+            values=values,
+            mass_captured=float(np.abs(values).sum() / total_mass) if total_mass else 0.0,
+            effective_threshold=float(values.min()) if values.size else float("nan"),
         )
 
     def decode(self, encoded: CutoffEncoded) -> np.ndarray:

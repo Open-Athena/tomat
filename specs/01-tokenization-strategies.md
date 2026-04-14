@@ -51,6 +51,18 @@ i.e. most materials have ~80% of voxels below 0.5 e/Å³, so a density cutoff co
 - **Pros:** Human-readable grammar. Doesn't waste context on empty voxels. Reasonable context length.
 - **Cons:** Loses low-density information (generally less interesting but still matters). Cutoff must be low enough to capture bonding chemistry (not just nuclear-adjacent voxels, which are trivially predicted from atomic positions). Sparsity varies a lot by material type (intermetallics have almost no sparse voxels), so a single threshold may not generalize.
 
+**Three ways to pick what "cutoff" means:**
+
+| variant | knob | seq length | NMAE floor | best for |
+|---|---|---|---|---|
+| `top_k` / `top_fraction` | fraction of voxels kept | **fixed** per structure | varies per structure | tokenizer (matches fixed context windows) |
+| `threshold` | absolute e/Å³ cutoff | varies per structure | varies per structure | characterization / chemistry intuition |
+| `mass_cap` (not yet implemented) | fraction of total integrated ρ to retain | varies per structure | **fixed** per structure at `1 − mass` | a knob that directly pins the NMAE floor, at the cost of variable seq length |
+
+The `mass_cap` variant is interesting because it decouples fidelity from voxel-count: setting `mass=0.99` guarantees NMAE ≤ 1% regardless of structure. But variable sequence length re-introduces batching complexity. Probably not the primary tokenizer, but would be useful as an analysis tool for the question "how many voxels does each structure need to hit NMAE budget X?" — the distribution of required token counts per material class.
+
+**COO storage break-even** (from doc comment discussion): a dense 128³ f16 grid is 16 bits/voxel; COO representation `(x, y, z, ρ_f16)` is 3×7+16 = 37 bits/voxel. Sparse pays off only when ≥ (1 − 16/37) = 57% of voxels are dropped. Per the sparsity table that corresponds to a density cutoff above ~0.1 e/Å³. At smaller fractions kept (top-5% → 95% dropped), COO is cleanly the right format.
+
 ### 4. Deformation density prediction
 
 Predict Δρ = ρ_DFT − ρ_PADS (superposition of isolated atomic densities) instead of absolute ρ. Input = crystal structure; output = deformation density. At inference, add the cheaply-computed PADS to the predicted Δρ.

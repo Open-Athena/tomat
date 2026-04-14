@@ -46,12 +46,14 @@ def main(csv_path: Path, output: Path | None):
     lines.append("### Overall NMAE over all samples\n")
     total_samples = len({r["mp_id"] for r in rows})
     lines.append(f"n={total_samples} MP structures, grid=128³.\n")
-    lines.append("| config | mean NMAE | median | min | max |")
-    lines.append("|---|---:|---:|---:|---:|")
+    lines.append("| config | mean NMAE | median | min | max | mean mass captured |")
+    lines.append("|---|---:|---:|---:|---:|---:|")
     for cfg in configs:
         vals = np.array(by_config[cfg])
+        mass_vals = [float(r["mass_captured"]) for r in rows if r["config"] == cfg and r.get("mass_captured")]
+        mass_cell = f"{np.mean(mass_vals):.3f}" if mass_vals else "—"
         lines.append(
-            f"| `{cfg}` | {vals.mean():.2e} | {np.median(vals):.2e} | {vals.min():.2e} | {vals.max():.2e} |"
+            f"| `{cfg}` | {vals.mean():.2e} | {np.median(vals):.2e} | {vals.min():.2e} | {vals.max():.2e} | {mass_cell} |"
         )
     lines.append("")
 

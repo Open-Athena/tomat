@@ -72,17 +72,19 @@ just NMAE — TODO.
 
 ### Overall (n=50 MP structures, 128³ grid)
 
-| config | mean NMAE | median | min | max |
-|---|---:|---:|---:|---:|
-| `direct` | 2.15e-08 | 2.14e-08 | 2.10e-08 | 2.20e-08 |
-| `cutoff-top-1pct` | 8.04e-01 | 8.29e-01 | 6.57e-01 | 9.29e-01 |
-| `cutoff-top-5pct` | 5.01e-01 | 5.27e-01 | 2.78e-01 | 8.16e-01 |
-| `cutoff-top-25pct` | 1.77e-01 | 1.75e-01 | 3.12e-02 | 4.55e-01 |
-| `cutoff-top-100pct` | 2.15e-08 | 2.14e-08 | 2.10e-08 | 2.20e-08 |
-| `fourier-lowg-1pct` | 4.78e-02 | **9.05e-03** | 2.68e-04 | 5.15e-01 |
-| `fourier-lowg-5pct` | 9.16e-03 | **9.61e-04** | 9.17e-05 | 1.74e-01 |
-| `fourier-lowg-25pct` | 9.08e-04 | **2.60e-04** | 3.47e-05 | 1.20e-02 |
-| `fourier-lowg-100pct` | 5.40e-08 | 5.20e-08 | 2.95e-08 | 9.23e-08 |
+| config | mean NMAE | median | min | max | mean mass captured |
+|---|---:|---:|---:|---:|---:|
+| `direct` | 2.15e-08 | 2.14e-08 | 2.10e-08 | 2.20e-08 | — |
+| `cutoff-top-1pct` | 8.04e-01 | 8.29e-01 | 6.57e-01 | 9.29e-01 | 0.196 |
+| `cutoff-top-5pct` | 5.01e-01 | 5.27e-01 | 2.78e-01 | 8.16e-01 | 0.499 |
+| `cutoff-top-25pct` | 1.77e-01 | 1.75e-01 | 3.12e-02 | 4.55e-01 | 0.823 |
+| `cutoff-top-100pct` | 2.15e-08 | 2.14e-08 | 2.10e-08 | 2.20e-08 | 1.000 |
+| `fourier-lowg-1pct` | 4.78e-02 | **9.05e-03** | 2.68e-04 | 5.15e-01 | — |
+| `fourier-lowg-5pct` | 9.16e-03 | **9.61e-04** | 9.17e-05 | 1.74e-01 | — |
+| `fourier-lowg-25pct` | 9.08e-04 | **2.60e-04** | 3.47e-05 | 1.20e-02 | — |
+| `fourier-lowg-100pct` | 5.40e-08 | 5.20e-08 | 2.95e-08 | 9.23e-08 | — |
+
+Cutoff NMAE matches `1 − mass_captured` exactly by construction — dropped voxels contribute their full density to the error. So $\mathrm{NMAE}_\mathrm{floor}(\text{cutoff-top-}X) = 1 − \text{mass}_\text{top-}X$, and for this dataset the top 5% of voxels carries only ~50% of total integrated density. The remaining ~50% lives in the long mid/low-$ρ$ tail — which is why top-$K$ cutoff can't be competitive on NMAE without keeping nearly all voxels.
 
 ### By material category (mean NMAE)
 
