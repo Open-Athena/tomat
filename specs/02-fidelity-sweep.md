@@ -11,12 +11,20 @@ transformer can never beat 1% NMAE even with perfect prediction*).
 
 The transformer's total NMAE is `reconstruction_floor + prediction_error`
 where the floor is what `encode → decode` alone loses before any model
-runs. To *beat* electrai's achieved ~2.6% (their end-to-end loss, not a
-floor), tomato's floor has to be well below 2.6% — leaving headroom for
-the transformer to add some prediction error on top. A scheme whose
-reconstruction floor approaches or exceeds 2.6% is an automatic
-non-starter; one whose floor is comfortably below it is a *prerequisite*
-to being competitive, not an achievement on its own.
+runs. The MP reference point is electrAI (a.k.a. RHOAR-Net) at **2.60%
+validation NMAE** (Jan 2026 monthly review, 100-epoch run) — OA's own
+ResNet, not a published SotA (Li et al 2024 reports only on molecular
+datasets, no MP number). For tomato to beat it, our floor needs to be
+well below 2.6%, leaving headroom for transformer prediction error. A
+scheme whose floor approaches or exceeds 2.6% is disqualified; a floor
+well below it is a *prerequisite* to competing, not an achievement.
+
+One more caveat on NMAE as a target: Yael's investigation in the same
+Jan 2026 review shows the metric is dominated by high-density (near-
+nucleus) voxels, so a scheme can score well on NMAE while being wrong
+about the chemically interesting bonding regions. Reporting additional
+metrics (Chi-Squared, Jensen-Shannon, Hellinger, Weighted MAE — all
+already explored in the electrAI repo) alongside NMAE is a TODO.
 
 [`00-project-context.md`]: ./00-project-context.md
 [`01-tokenization-strategies.md`]: ./01-tokenization-strategies.md

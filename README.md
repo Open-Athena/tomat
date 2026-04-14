@@ -28,16 +28,39 @@ choice, no RI-fitting step) are implemented so far.
 (`s3://openathena/electrai/mp/chg_datasets/dataset_4/label/`), 128³
 voxel grids. `label/` = DFT-converged ρ (the thing we want to tokenize).
 
-**Metric:** NMAE = `sum(|ρ_reconstructed − ρ_original|) / sum(|ρ_original|)`.
+**Metric:** NMAE = `sum(|ρ_reconstructed − ρ_original|) / sum(|ρ_original|)`
+— the same metric electrAI uses, for apples-to-apples comparison.
 
 What the sweep measures is the tokenizer's **reconstruction floor** — the
-NMAE you get from `encode → decode` alone, with no model in the loop.
-The transformer's total error on the same metric will be
-`floor + prediction_error`, and electrAI reports ~2.6% achieved NMAE
-(not a floor — that's their best end-to-end loss). So for tomato to
-*beat* electrai, the floor needs to be well below 2.6%, leaving headroom
-for the transformer to be imperfect. A floor above ~2.6% is an automatic
-non-starter for the scheme (no amount of prediction accuracy recovers).
+NMAE from `encode → decode` alone, with no model in the loop. The
+transformer's total error on the same metric will be `floor +
+prediction_error`.
+
+**Reference points.** electrAI (recently rebranded RHOAR-Net; "Rho
+Augmented Resolution Network") is OA's in-house 3D ResUNet. On the same
+MP subset used here, electrAI's best reported validation NMAE is
+**2.60%** (Jan 2026 monthly review, 100-epoch run; 50-epoch runs cluster
+around 2.7–3.1% and were "still learning"). There is **no published MP
+SotA** for density prediction to benchmark against — Li et al 2024 (the
+paper electrAI replicates) reports only molecular datasets, best 0.14%
+on QM9. So tomato's target on MP is beating OA's own ResNet, not a
+paper number.
+
+For tomato to *beat* electrAI on NMAE, the tokenizer floor needs to be
+well below 2.6%, leaving headroom for the transformer to add some
+prediction error. A floor approaching 2.6% is disqualifying; a floor
+well below is a *prerequisite* to competing, not an achievement.
+
+**Caveat on the metric itself.** electrAI's own Jan 2026 review surfaces
+a concern (Yael's investigation) that MAE/NMAE is dominated by
+high-density regions — voxels near nuclei where ρ is ~e+02 — while
+chemically interesting signal (bonds, charge transfer) lives at much
+lower density. Across loss functions, the ratio of low- to
+high-density error contribution varies from ~0.005 (MAE) to ~15
+(Chi-Squared). So a scheme that "beats 2.6% NMAE" while discarding
+low-density information may be winning the metric but losing the science.
+This argues for reporting our fidelity sweep in several metrics, not
+just NMAE — TODO.
 
 **Schemes:**
 
