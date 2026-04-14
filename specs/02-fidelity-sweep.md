@@ -9,9 +9,14 @@ early*) and [`01-tokenization-strategies.md`] (additional question 5:
 *tokenization fidelity — if scheme X loses 1% NMAE in reconstruction, the
 transformer can never beat 1% NMAE even with perfect prediction*).
 
-The transformer's achievable NMAE is bounded below by `tokenize → detokenize`
-NMAE; electrAI sits at ~2.6–3.1% on MP. A scheme whose reconstruction floor
-is above that is a non-starter.
+The transformer's total NMAE is `reconstruction_floor + prediction_error`
+where the floor is what `encode → decode` alone loses before any model
+runs. To *beat* electrai's achieved ~2.6% (their end-to-end loss, not a
+floor), tomato's floor has to be well below 2.6% — leaving headroom for
+the transformer to add some prediction error on top. A scheme whose
+reconstruction floor approaches or exceeds 2.6% is an automatic
+non-starter; one whose floor is comfortably below it is a *prerequisite*
+to being competitive, not an achievement on its own.
 
 [`00-project-context.md`]: ./00-project-context.md
 [`01-tokenization-strategies.md`]: ./01-tokenization-strategies.md
@@ -71,23 +76,25 @@ level.
 
 Key take-aways from this round:
 
-1. **Scheme 5 (Fourier) is the clear winner among the easy three.** At 1%
-   of coefficients the median NMAE is 0.9% — already under electrai's
-   ~2.6%. At 5% it's 0.1%.
-2. **Scheme 3 (voxel cutoff) is a standalone dead end.** At 25% of
-   voxels it's still at 18% NMAE. The "top-density voxels" ranking picks
-   up nuclear-cusp voxels, which are easy to predict from atomic
-   positions alone — the expensive bonding information lives between
-   atoms and gets dropped.
+1. **Scheme 5 (Fourier) is the only candidate of the three that clears
+   the prerequisite.** At 5% coefs the median floor is 0.1%, leaving
+   ~2.5% budget for the model. Mean is noisier (0.9%) because of the
+   oxide tail — oxide mean floor alone is 2.4%, leaving only ~0.2%
+   model budget, so oxides are the threshold case.
+2. **Scheme 3 (voxel cutoff) is disqualified.** At 25% of voxels it's
+   still at 18% NMAE — already 7× over electrai's achieved loss before
+   any model runs. The "top-density voxels" ranking is backwards for
+   this task: those voxels are near nuclei and are trivially
+   reconstructible from atomic positions, so the scheme is keeping the
+   easy part and throwing away the hard part.
 3. **Category matters a lot for Fourier.** Oxides are 10–50× worse than
    every other category at each sparsity level. This is a concrete
    argument for pursuing scheme 4 (Δρ) next — subtracting the PADS
    removes the atomic-core structure that presumably drives this gap.
 4. **Dataset skew.** The first 50 mp-ids in electrai's curated 2,885 set
-   (alphabetical) contain no halides or oxyhalides — which per the
-   design doc's sparsity table are the *sparsest* material class and the
-   one cutoff was motivated by. The cutoff-vs-Fourier comparison may
-   tilt if we re-run on a stratified sample. Worth doing.
+   (alphabetical) contain no halides or oxyhalides. Stratified re-run
+   is queued; doesn't change the headline (cutoff is disqualified
+   regardless).
 
 ## Follow-ups (separate PRs)
 

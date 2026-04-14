@@ -1,9 +1,7 @@
-# tomato
+# tomato 🍅
+**to**kenized **ma**terials; LLM/transformer-based approach to predicting DFT-converged electron density for periodic crystals.
 
-**to**kenized **ma**terials. The LLM/transformer analogue of [electrAI]:
-predict DFT-converged electron density for periodic crystals using a
-sequence model over a tokenized representation of ρ, instead of a 3D
-ResUNet over voxel grids.
+Uses a sequence model over a tokenized representation of $ρ$ (contrast with [electrAI]'s 3D ResUNet over voxel grids).
 
 Sibling to [tomol] (**to**kenized **mo**lecules, Will Held's OMol25 S2EF
 work). See [`specs/00-project-context.md`](./specs/00-project-context.md)
@@ -31,7 +29,15 @@ choice, no RI-fitting step) are implemented so far.
 voxel grids. `label/` = DFT-converged ρ (the thing we want to tokenize).
 
 **Metric:** NMAE = `sum(|ρ_reconstructed − ρ_original|) / sum(|ρ_original|)`.
-ElectrAI reports ~0.026 on the same data.
+
+What the sweep measures is the tokenizer's **reconstruction floor** — the
+NMAE you get from `encode → decode` alone, with no model in the loop.
+The transformer's total error on the same metric will be
+`floor + prediction_error`, and electrAI reports ~2.6% achieved NMAE
+(not a floor — that's their best end-to-end loss). So for tomato to
+*beat* electrai, the floor needs to be well below 2.6%, leaving headroom
+for the transformer to be imperfect. A floor above ~2.6% is an automatic
+non-starter for the scheme (no amount of prediction accuracy recovers).
 
 **Schemes:**
 
@@ -68,27 +74,37 @@ ElectrAI reports ~0.026 on the same data.
 
 ### Observations (n=50, preliminary)
 
+**Budget framing.** We want `floor + prediction_error < 0.026`. The floor
+is what the sweep measures; prediction error is the work the transformer
+has to do. Lower floor = more budget for the model to be imperfect.
+
 * **Fourier dominates voxel-cutoff at every sparsity level by ~2 orders
   of magnitude.** The chemically-interesting information lives in the
   low-spatial-frequency modes, not in the top-density voxels (which are
   concentrated near nuclei and don't carry bond/charge-transfer signal).
-* **Oxides are the worst case for Fourier**, by ~10–50× vs. every other
-  category. Most likely the compact O core has non-negligible power at
-  high \|G\|, so the lowpass leaves a residual the other categories
-  don't see. Worth confirming by looking at spectra per category, and is
-  a **concrete argument for scheme 4 (Δρ)**: subtracting PADS removes the
-  atomic-core structure and should flatten this category gap.
-* **Electrai's ~2.6% NMAE floor is already below what Fourier-1% achieves
-  on median** (0.9%). Even at **1% of coefficients, Fourier is
-  competitive**; at 5% it's an order of magnitude better (median 0.096%).
-* **Cutoff (scheme 3) is probably a dead end as a standalone.** At 25% of
-  voxels it's still at 18% NMAE — 6× above electrai. Might still be
-  interesting as a *residual* scheme layered on Fourier or Δρ-Fourier.
+* **Cutoff (scheme 3) is a non-starter as-is.** At 25% of voxels it's
+  still at 18% NMAE — already 7× over electrai's achieved loss before
+  any model is trained. The rank-by-density criterion is backwards for
+  this task: top-density voxels are near nuclei and trivially
+  reconstructible from atomic positions, so the scheme is keeping the
+  easy part and throwing away the hard part.
+* **Fourier's budget at 5% coefs is comfortable in the median case
+  (~2.5% budget) but tight in mean** (1.7% budget) — and is already
+  *negative* for oxides in the mean (floor 2.4% vs target 2.6%, leaving
+  ~0.2% budget for the transformer). Oxides at 1% coefs blow the budget
+  outright (floor 11.3%).
+* **Oxides are the worst case for Fourier**, 10–50× worse than every
+  other category. Most likely the compact O core has non-negligible
+  power at high \|G\|, so the lowpass leaves a residual. This is a
+  concrete argument for **scheme 4 (Δρ)** next: subtracting PADS removes
+  the atomic-core contribution and should flatten the category gap.
 * **Dataset skew caveat:** the electrai-curated 2,885-subset has no
   halides or oxyhalides in the first n=50 (alphabetical by mp-id).
-  Per the design doc's sparsity table, halides are the sparsest
-  class and the one cutoff was originally motivated by — so cutoff may
-  look relatively better if we re-run on a stratified sample.
+  Per the design doc's sparsity table, halides are the sparsest class
+  and the one cutoff was originally motivated by — so cutoff may look
+  relatively better if we re-run on a stratified sample. Doesn't change
+  the headline (cutoff 18% at 25% kept is catastrophic), but worth
+  confirming.
 
 Raw CSV in [`results/sweep-n50.csv`](./results/sweep-n50.csv); regenerate
 tables with `uv run scripts/summarize_sweep.py results/sweep-n50.csv`. See
