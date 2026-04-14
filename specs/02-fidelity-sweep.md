@@ -82,6 +82,17 @@ See [`../README.md`](../README.md) for the full table. Headline: Fourier
 truncation beats voxel-cutoff by ~2 orders of magnitude at every sparsity
 level.
 
+Δρ (scheme 4) has been scaffolded on top of Fourier with a crude Gaussian
+promolecule-density baseline (`tomato.pads.GaussianPADS`, σ=0.4 Å). It
+doesn't yet act as a physically faithful atomic-density model — real
+atoms have core cusps (high-|G| content) that a Gaussian doesn't
+reproduce, and our VASP CHGCARs use pseudopotentials that don't have
+all-electron cores anyway. So the current Δρ variants bound "what the
+pipeline does with an obviously-too-smooth PADS," not "the real Δρ
+scheme's performance." Upgrading PADS to a Clementi-Raimondi
+Slater-multi-shell or (better) pseudopotential-matched valence density
+is the concrete next deliverable.
+
 Key take-aways from this round:
 
 1. **Scheme 5 (Fourier) is the only candidate of the three that clears

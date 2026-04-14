@@ -1,11 +1,13 @@
 """Roundtrip tests that don't require pymatgen IO — we stub a Chgcar-like object."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
 
-from tomato.tokenizers import CutoffTokenizer, DirectTokenizer, FourierTokenizer
+from tomato.pads import GaussianPADS, SlaterPADS
+from tomato.tokenizers import CutoffTokenizer, DeltaDensityTokenizer, DirectTokenizer, FourierTokenizer
 
 
 def make_density(shape: tuple[int, int, int] = (16, 18, 20), seed: int = 0) -> np.ndarray:
@@ -102,3 +104,56 @@ def test_cutoff_rejects_bad_args(kwargs):
 def test_fourier_rejects_bad_args(kwargs):
     with pytest.raises(ValueError):
         FourierTokenizer(**kwargs)
+
+
+def fake_chgcar_with_structure(density: np.ndarray) -> SimpleNamespace:
+    """Structure with two fake atoms in a small cubic cell for Δρ tests."""
+    lattice = Mock()
+    lattice.matrix = np.eye(3) * 4.0  # 4 Å cube
+    structure = Mock()
+    structure.lattice = lattice
+    structure.volume = 64.0
+    site_a = Mock()
+    site_a.specie = Mock(Z=6)
+    site_a.frac_coords = np.array([0.25, 0.25, 0.25])
+    site_b = Mock()
+    site_b.specie = Mock(Z=8)
+    site_b.frac_coords = np.array([0.75, 0.75, 0.75])
+    structure.__iter__ = lambda self: iter([site_a, site_b])
+    return SimpleNamespace(data={"total": density}, structure=structure)
+
+
+def test_delta_fourier_full_basis_is_lossless():
+    density = make_density()
+    chg = fake_chgcar_with_structure(density)
+    # At 100% coefs, Fourier is lossless, and PADS cancels exactly on decode.
+    wrapped = DeltaDensityTokenizer(FourierTokenizer(coefficient_fraction=1.0), pads=GaussianPADS())
+    recon = wrapped.roundtrip(chg)
+    # FourierEncoded stores coefs as complex64, so 1e-5 is the float32 roundoff floor.
+    assert nmae(density, recon) < 1e-4
+
+
+def test_delta_preserves_sum_within_noise():
+    """At full Fourier basis the roundtrip should preserve total mass; PADS is a
+    deterministic add/subtract so it can't introduce net mass."""
+    density = make_density()
+    chg = fake_chgcar_with_structure(density)
+    wrapped = DeltaDensityTokenizer(FourierTokenizer(coefficient_fraction=1.0), pads=SlaterPADS())
+    recon = wrapped.roundtrip(chg)
+    # Float32 roundoff in FourierEncoded; SlaterPADS's sharp core amplifies it.
+    assert abs(density.sum() - recon.sum()) < 1e-4 * abs(density.sum())
+
+
+def test_pads_sums_match_total_electrons_under_integration():
+    """∫ ρ_PADS dV should equal Σ Z over atoms (for both PADS variants)."""
+    density = make_density()
+    chg = fake_chgcar_with_structure(density)
+    voxel_volume = 64.0 / density.size  # cell volume / N_voxels
+    expected_electrons = 6 + 8  # C + O
+
+    for pads in (GaussianPADS(sigma_angstrom=0.3), SlaterPADS()):
+        grid = pads.compute(chg)
+        total = grid.sum() * voxel_volume
+        # Periodic-image truncation + coarse grid means this isn't exact,
+        # but should be within a few percent for reasonable σ/α.
+        assert abs(total - expected_electrons) / expected_electrons < 0.1

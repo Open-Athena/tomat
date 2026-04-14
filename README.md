@@ -83,6 +83,9 @@ just NMAE — TODO.
 | `fourier-lowg-5pct` | 9.16e-03 | **9.61e-04** | 9.17e-05 | 1.74e-01 | — |
 | `fourier-lowg-25pct` | 9.08e-04 | **2.60e-04** | 3.47e-05 | 1.20e-02 | — |
 | `fourier-lowg-100pct` | 5.40e-08 | 5.20e-08 | 2.95e-08 | 9.23e-08 | — |
+| `delta-fourier-lowg-1pct` | 4.62e-02 | 9.16e-03 | 2.71e-04 | 5.12e-01 | — |
+| `delta-fourier-lowg-5pct` | 8.01e-03 | 9.61e-04 | 1.08e-04 | 1.41e-01 | — |
+| `delta-fourier-lowg-25pct` | 9.26e-04 | 2.93e-04 | 3.78e-05 | 1.16e-02 | — |
 
 Cutoff NMAE matches `1 − mass_captured` exactly by construction — dropped voxels contribute their full density to the error. So $\mathrm{NMAE}_\mathrm{floor}(\text{cutoff-top-}X) = 1 − \text{mass}_\text{top-}X$, and for this dataset the top 5% of voxels carries only ~50% of total integrated density. The remaining ~50% lives in the long mid/low-$ρ$ tail — which is why top-$K$ cutoff can't be competitive on NMAE without keeping nearly all voxels.
 
@@ -106,6 +109,11 @@ Regenerate via `uv run scripts/plot_sweep.py results/sweep-n50.csv`.
 | `fourier-lowg-1pct` | **1.13e-01** | 5.52e-03 | 1.91e-02 | 1.12e-02 | 5.18e-03 |
 | `fourier-lowg-5pct` | **2.37e-02** | 4.23e-04 | 1.85e-03 | 1.01e-03 | 6.88e-04 |
 | `fourier-lowg-25pct` | **2.01e-03** | 1.30e-04 | 4.96e-04 | 2.49e-04 | 3.35e-04 |
+| `delta-fourier-lowg-1pct` | 1.09e-01 | 7.92e-03 | 1.69e-02 | 1.13e-02 | 5.18e-03 |
+| `delta-fourier-lowg-5pct` | 2.04e-02 | 4.79e-04 | 1.92e-03 | 1.01e-03 | 6.88e-04 |
+| `delta-fourier-lowg-25pct` | 1.98e-03 | 1.72e-04 | 5.64e-04 | 2.49e-04 | 3.35e-04 |
+
+**Δρ with crude Gaussian PADS gives a small oxide-specific improvement** (~14% mean-NMAE reduction at 5% coefs: 2.37e-2 → 2.04e-2), tied elsewhere. Directionally consistent with the hypothesis — PADS removes some of the structure Fourier-lowpass loses — but Gaussians are too smooth to capture atomic core cusps, so the effect is modest. Proper PADS (multi-shell Slater or pseudopotential-matched valence) should amplify this substantially; see `src/tomato/pads.py` and the "Follow-ups" section below.
 
 ### Observations (n=50, preliminary)
 

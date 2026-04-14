@@ -27,8 +27,9 @@ plt.rcParams["figure.dpi"] = 120
 plt.rcParams["savefig.bbox"] = "tight"
 plt.rcParams["font.size"] = 10
 
-CUTOFF_RE = re.compile(r"cutoff-top-(\d+(?:\.\d+)?)pct")
-FOURIER_RE = re.compile(r"fourier-lowg-(\d+(?:\.\d+)?)pct")
+CUTOFF_RE = re.compile(r"^cutoff-top-(\d+(?:\.\d+)?)pct$")
+FOURIER_RE = re.compile(r"^fourier-lowg-(\d+(?:\.\d+)?)pct$")
+DELTA_FOURIER_RE = re.compile(r"^delta-fourier-lowg-(\d+(?:\.\d+)?)pct$")
 
 
 def load(csv_path: Path) -> list[dict]:
@@ -45,16 +46,22 @@ def load(csv_path: Path) -> list[dict]:
 def plot_nmae_vs_fraction(rows: list[dict], out: Path):
     """Log-log NMAE vs fraction kept, cutoff vs fourier overlay."""
     # (scheme_label, fraction) → list of nmae
-    curves: dict[str, dict[float, list[float]]] = {"cutoff": defaultdict(list), "fourier": defaultdict(list)}
+    curves: dict[str, dict[float, list[float]]] = {
+        "cutoff": defaultdict(list),
+        "fourier": defaultdict(list),
+        "delta-fourier": defaultdict(list),
+    }
     for r in rows:
-        for scheme, regex in (("cutoff", CUTOFF_RE), ("fourier", FOURIER_RE)):
+        for scheme, regex in (("cutoff", CUTOFF_RE), ("fourier", FOURIER_RE), ("delta-fourier", DELTA_FOURIER_RE)):
             if m := regex.match(r["config"]):
                 curves[scheme][float(m.group(1)) / 100].append(r["nmae"])
                 break
 
     fig, ax = plt.subplots(figsize=(6, 4.5))
-    colors = {"cutoff": "#c44", "fourier": "#4480e0"}
+    colors = {"cutoff": "#c44", "fourier": "#4480e0", "delta-fourier": "#2a8c2a"}
     for scheme, data in curves.items():
+        if not data:
+            continue
         fractions = sorted(data.keys())
         medians = [np.median(data[f]) for f in fractions]
         mins = [min(data[f]) for f in fractions]

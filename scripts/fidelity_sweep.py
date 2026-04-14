@@ -27,7 +27,14 @@ from click import argument, command, option
 
 from tomato.data.classify import classify_elements
 from tomato.data.mp import load_chgcar, list_mp_ids
-from tomato.tokenizers import CutoffEncoded, CutoffTokenizer, DensityTokenizer, DirectTokenizer, FourierTokenizer
+from tomato.tokenizers import (
+    CutoffEncoded,
+    CutoffTokenizer,
+    DeltaDensityTokenizer,
+    DensityTokenizer,
+    DirectTokenizer,
+    FourierTokenizer,
+)
 
 err = partial(print, file=sys.stderr)
 
@@ -53,6 +60,16 @@ def default_configs() -> list[SweepConfig]:
         cfgs.append(SweepConfig(f"cutoff-top-{frac * 100:g}pct", CutoffTokenizer(top_fraction=frac)))
     for frac in (0.01, 0.05, 0.25, 1.0):
         cfgs.append(SweepConfig(f"fourier-lowg-{frac * 100:g}pct", FourierTokenizer(coefficient_fraction=frac)))
+    # Δρ-Fourier variants — scheme 4 + scheme 5 composed.
+    # PADS is crude Gaussian (see `src/tomato/pads.py` caveat); results
+    # bound the "Δρ with a very approximate promolecule density" scenario.
+    for frac in (0.01, 0.05, 0.25):
+        cfgs.append(
+            SweepConfig(
+                f"delta-fourier-lowg-{frac * 100:g}pct",
+                DeltaDensityTokenizer(FourierTokenizer(coefficient_fraction=frac)),
+            )
+        )
     return cfgs
 
 
