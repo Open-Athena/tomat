@@ -57,10 +57,37 @@ schemes 1/3/5.
 uv sync
 uv run scripts/fidelity_sweep.py -n 5                   # quick smoke test
 uv run scripts/fidelity_sweep.py -n 50 -o tmp/sweep.csv # first real data point
+uv run scripts/summarize_sweep.py tmp/sweep.csv         # markdown tables
 ```
 
 Each CHGCAR is ~76 MB on S3, so `-n 50` downloads ~3.8 GB into
 `data/mp-cache/` the first run. Subsequent runs are local.
+
+## First-pass results (n=50, 128³ grid)
+
+See [`../README.md`](../README.md) for the full table. Headline: Fourier
+truncation beats voxel-cutoff by ~2 orders of magnitude at every sparsity
+level.
+
+Key take-aways from this round:
+
+1. **Scheme 5 (Fourier) is the clear winner among the easy three.** At 1%
+   of coefficients the median NMAE is 0.9% — already under electrai's
+   ~2.6%. At 5% it's 0.1%.
+2. **Scheme 3 (voxel cutoff) is a standalone dead end.** At 25% of
+   voxels it's still at 18% NMAE. The "top-density voxels" ranking picks
+   up nuclear-cusp voxels, which are easy to predict from atomic
+   positions alone — the expensive bonding information lives between
+   atoms and gets dropped.
+3. **Category matters a lot for Fourier.** Oxides are 10–50× worse than
+   every other category at each sparsity level. This is a concrete
+   argument for pursuing scheme 4 (Δρ) next — subtracting the PADS
+   removes the atomic-core structure that presumably drives this gap.
+4. **Dataset skew.** The first 50 mp-ids in electrai's curated 2,885 set
+   (alphabetical) contain no halides or oxyhalides — which per the
+   design doc's sparsity table are the *sparsest* material class and the
+   one cutoff was motivated by. The cutoff-vs-Fourier comparison may
+   tilt if we re-run on a stratified sample. Worth doing.
 
 ## Follow-ups (separate PRs)
 

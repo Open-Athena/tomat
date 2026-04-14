@@ -25,6 +25,7 @@ import click
 import numpy as np
 from click import argument, command, option
 
+from tomato.data.classify import classify_elements
 from tomato.data.mp import load_chgcar, list_mp_ids
 from tomato.tokenizers import CutoffTokenizer, DensityTokenizer, DirectTokenizer, FourierTokenizer
 
@@ -78,29 +79,31 @@ def main(n_samples: int, output_csv: Path | None, split: str, mp_ids: tuple[str,
         t0 = time.perf_counter()
         chgcar = load_chgcar(mp_id, split=split)
         density = np.asarray(chgcar.data["total"], dtype=np.float64)
+        category = classify_elements(el.symbol for el in chgcar.structure.composition.elements)
         load_s = time.perf_counter() - t0
-        err(f"\n{mp_id}: grid {density.shape}, sum ρ = {density.sum():.3e}, loaded in {load_s:.1f}s")
+        err(f"\n{mp_id} [{category}]: grid {density.shape}, sum ρ = {density.sum():.3e}, loaded in {load_s:.1f}s")
         for cfg in configs:
             t0 = time.perf_counter()
             recon = cfg.tokenizer.roundtrip(chgcar)
             elapsed = time.perf_counter() - t0
-            err(f"  {cfg.label:>20s}  NMAE={nmae(density, recon):.4e}  ({elapsed:.2f}s)")
+            val = nmae(density, recon)
+            err(f"  {cfg.label:>24s}  NMAE={val:.4e}  ({elapsed:.2f}s)")
             rows.append(
-                dict(mp_id=mp_id, config=cfg.label, nmae=nmae(density, recon), seconds=elapsed, grid=str(density.shape)),
+                dict(mp_id=mp_id, category=category, config=cfg.label, nmae=val, seconds=elapsed, grid=str(density.shape)),
             )
 
     print()
-    print(f"{'config':>22s}  {'mean NMAE':>12s}  {'median NMAE':>12s}")
+    print(f"{'config':>24s}  {'mean NMAE':>12s}  {'median NMAE':>12s}  n")
     by_config: dict[str, list[float]] = {}
     for row in rows:
         by_config.setdefault(row["config"], []).append(row["nmae"])
     for label, vals in by_config.items():
         arr = np.array(vals)
-        print(f"{label:>22s}  {arr.mean():.4e}  {np.median(arr):.4e}")
+        print(f"{label:>24s}  {arr.mean():.4e}   {np.median(arr):.4e}   {len(arr)}")
 
     if output_csv is not None:
         with output_csv.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["mp_id", "config", "nmae", "seconds", "grid"])
+            writer = csv.DictWriter(f, fieldnames=["mp_id", "category", "config", "nmae", "seconds", "grid"])
             writer.writeheader()
             writer.writerows(rows)
         err(f"Wrote {len(rows)} rows to {output_csv}")
