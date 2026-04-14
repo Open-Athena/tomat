@@ -86,6 +86,16 @@ just NMAE — TODO.
 
 Cutoff NMAE matches `1 − mass_captured` exactly by construction — dropped voxels contribute their full density to the error. So $\mathrm{NMAE}_\mathrm{floor}(\text{cutoff-top-}X) = 1 − \text{mass}_\text{top-}X$, and for this dataset the top 5% of voxels carries only ~50% of total integrated density. The remaining ~50% lives in the long mid/low-$ρ$ tail — which is why top-$K$ cutoff can't be competitive on NMAE without keeping nearly all voxels.
 
+### Plots
+
+![NMAE vs fraction kept](./results/plots/nmae-vs-fraction.png)
+
+![NMAE by material category at 5% kept](./results/plots/nmae-by-category.png)
+
+![Cutoff NMAE = 1 − mass captured](./results/plots/mass-captured-cutoff.png)
+
+Regenerate via `uv run scripts/plot_sweep.py results/sweep-n50.csv`.
+
 ### By material category (mean NMAE)
 
 | config | oxide (n=18) | other (n=14) | intermetallic (n=11) | oxychalcogenide (n=4) | chalcogenide (n=3) |
