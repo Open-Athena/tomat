@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tomato"
+version = "0.1.0"
+description = "Tokenized Materials: LLM analogue of electrAI — predict DFT electron density for periodic crystals via a sequence model."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "click",
+    "numpy",
+    "pymatgen",
+]
+
+# The marin stack isn't on PyPI — marin-experiments/tiny-tpu ships a local
+# ./vendor/ wheel index populated via `uv build` from a marin checkout. Those
+# deps (marin, marin-levanter, marin-iris, marin-zephyr, marin-rigging, and
+# jax[tpu]/torch/torchvision pins) are deferred to PR 2 (training), when
+# we'll either vendor the wheels here or switch to git sources, mirroring
+# tiny-tpu's setup.
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-xdist",
+]
+
+[tool.uv]
+fork-strategy = "fewest"
+# Mirrored from submodules/marin/pyproject.toml; omitting these makes uv
+# resolution fail in the same way it does for marin itself.
+override-dependencies = [
+    "omegaconf>=2.4.0.dev4",
+    "antlr4-python3-runtime==4.11",
+    "python-multipart>=0.0.22",
+    "wheel>=0.46.2",
+    "datasets>=3.1.0,<4.0.0",
+    "equinox>=0.11.10",
+]
+find-links = [
+    "https://github.com/marin-community/marin/releases/expanded_assets/dupekit-0.1.0-40ac799",
+    "https://github.com/marin-community/kitoken/releases/expanded_assets/kitoken-0.10.2-a3012f4",
+]
+
+# marin depends on resiliparse>=0.17.2 which only exists on this custom index.
+# Mirrored from submodules/marin/lib/marin/pyproject.toml. Without it, uv
+# resolves resiliparse from PyPI which caps at 0.16.0 and resolution fails.
+[[tool.uv.index]]
+name = "marin-resiliparse"
+url = "https://marin-community.github.io/chatnoir-resiliparse/simple"
+
+[tool.uv.sources]
+resiliparse = { index = "marin-resiliparse" }
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tomato"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
