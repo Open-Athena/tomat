@@ -58,12 +58,12 @@ def default_configs() -> list[SweepConfig]:
     cfgs: list[SweepConfig] = [SweepConfig("direct", DirectTokenizer())]
     for frac in (0.01, 0.05, 0.25, 1.0):
         cfgs.append(SweepConfig(f"cutoff-top-{frac * 100:g}pct", CutoffTokenizer(top_fraction=frac)))
-    for frac in (0.01, 0.05, 0.25, 1.0):
+    for frac in (0.0025, 0.005, 0.01, 0.05, 0.25, 1.0):
         cfgs.append(SweepConfig(f"fourier-lowg-{frac * 100:g}pct", FourierTokenizer(coefficient_fraction=frac)))
     # Δρ-Fourier variants — scheme 4 + scheme 5 composed.
     # PADS is crude Gaussian (see `src/tomato/pads.py` caveat); results
     # bound the "Δρ with a very approximate promolecule density" scenario.
-    for frac in (0.01, 0.05, 0.25):
+    for frac in (0.0025, 0.005, 0.01, 0.05, 0.25):
         cfgs.append(
             SweepConfig(
                 f"delta-fourier-lowg-{frac * 100:g}pct",

@@ -79,10 +79,14 @@ just NMAE — TODO.
 | `cutoff-top-5pct` | 5.01e-01 | 5.27e-01 | 2.78e-01 | 8.16e-01 | 0.499 |
 | `cutoff-top-25pct` | 1.77e-01 | 1.75e-01 | 3.12e-02 | 4.55e-01 | 0.823 |
 | `cutoff-top-100pct` | 2.15e-08 | 2.14e-08 | 2.10e-08 | 2.20e-08 | 1.000 |
+| `fourier-lowg-0.25pct` | 1.68e-01 | 8.87e-02 | 1.66e-03 | 7.34e-01 | — |
+| `fourier-lowg-0.5pct` | 9.08e-02 | 2.17e-02 | 4.76e-04 | 7.14e-01 | — |
 | `fourier-lowg-1pct` | 4.78e-02 | **9.05e-03** | 2.68e-04 | 5.15e-01 | — |
 | `fourier-lowg-5pct` | 9.16e-03 | **9.61e-04** | 9.17e-05 | 1.74e-01 | — |
 | `fourier-lowg-25pct` | 9.08e-04 | **2.60e-04** | 3.47e-05 | 1.20e-02 | — |
 | `fourier-lowg-100pct` | 5.40e-08 | 5.20e-08 | 2.95e-08 | 9.23e-08 | — |
+| `delta-fourier-lowg-0.25pct` | 1.72e-01 | 8.52e-02 | 1.71e-03 | 8.34e-01 | — |
+| `delta-fourier-lowg-0.5pct` | 8.82e-02 | 2.32e-02 | 7.50e-04 | 7.07e-01 | — |
 | `delta-fourier-lowg-1pct` | 4.62e-02 | 9.16e-03 | 2.71e-04 | 5.12e-01 | — |
 | `delta-fourier-lowg-5pct` | 8.01e-03 | 9.61e-04 | 1.08e-04 | 1.41e-01 | — |
 | `delta-fourier-lowg-25pct` | 9.26e-04 | 2.93e-04 | 3.78e-05 | 1.16e-02 | — |
@@ -120,6 +124,22 @@ Regenerate via `uv run scripts/plot_sweep.py results/sweep-n50.csv`.
 **Budget framing.** We want `floor + prediction_error < 0.026`. The floor
 is what the sweep measures; prediction error is the work the transformer
 has to do. Lower floor = more budget for the model to be imperfect.
+
+**Context-length feasibility.** With tomol-style SE/M0/M1 float encoding
+(3 tokens per real value, 6 tokens per complex Fourier coef), Marin's
+standard 4k/16k context windows fit:
+
+| target seq len | Fourier fraction (direct float encoding) | median NMAE | viable? |
+|---|:---:|:---:|:---:|
+| 4k | ≤ 0.06% | — (not measured; worse than 0.25%) | no |
+| 16k | ≤ 0.25% | 8.9% | **no** — already ~3× over electrAI budget |
+| 64k | ≤ 1% | 0.9% | yes on median; oxide tail (mean 4.8%) tight |
+| 256k+ | 5% | 0.10% | yes, comfortable; expensive |
+
+**Direct-float Fourier encoding needs ≥64k context to be in budget**, and
+even then oxides are borderline. For the usual 4–16k regime, **VQ or
+patching is required**, not optional — this rules out naive
+tokenize-and-train.
 
 * **Fourier dominates voxel-cutoff at every sparsity level by ~2 orders
   of magnitude.** The chemically-interesting information lives in the
