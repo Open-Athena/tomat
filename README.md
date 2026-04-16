@@ -70,7 +70,16 @@ just NMAE — TODO.
 | 3 — voxel cutoff | `CutoffTokenizer` | top-K% voxels ranked by density value | all other voxels are zeroed |
 | 5 — Fourier lowpass | `FourierTokenizer` | lowest-K% FFT coefficients by \|G\| | high-frequency modes |
 
-### Overall (n=50 MP structures, 128³ grid)
+### Tables
+
+Auto-regenerated via [`mdcmd`][mdcmd] from [`results/sweep-n50.csv`](./results/sweep-n50.csv).
+
+<!-- `uv run scripts/summarize_sweep.py results/sweep-n50.csv --html` -->
+<details open><summary>Fidelity-sweep tables</summary>
+
+### Overall NMAE over all samples
+
+n=50 MP structures, grid=128³.
 
 | config | mean NMAE | median | min | max | mean mass captured |
 |---|---:|---:|---:|---:|---:|
@@ -81,9 +90,9 @@ just NMAE — TODO.
 | `cutoff-top-100pct` | 2.15e-08 | 2.14e-08 | 2.10e-08 | 2.20e-08 | 1.000 |
 | `fourier-lowg-0.25pct` | 1.68e-01 | 8.87e-02 | 1.66e-03 | 7.34e-01 | — |
 | `fourier-lowg-0.5pct` | 9.08e-02 | 2.17e-02 | 4.76e-04 | 7.14e-01 | — |
-| `fourier-lowg-1pct` | 4.78e-02 | **9.05e-03** | 2.68e-04 | 5.15e-01 | — |
-| `fourier-lowg-5pct` | 9.16e-03 | **9.61e-04** | 9.17e-05 | 1.74e-01 | — |
-| `fourier-lowg-25pct` | 9.08e-04 | **2.60e-04** | 3.47e-05 | 1.20e-02 | — |
+| `fourier-lowg-1pct` | 4.78e-02 | 9.05e-03 | 2.68e-04 | 5.15e-01 | — |
+| `fourier-lowg-5pct` | 9.16e-03 | 9.61e-04 | 9.17e-05 | 1.74e-01 | — |
+| `fourier-lowg-25pct` | 9.08e-04 | 2.60e-04 | 3.47e-05 | 1.20e-02 | — |
 | `fourier-lowg-100pct` | 5.40e-08 | 5.20e-08 | 2.95e-08 | 9.23e-08 | — |
 | `delta-fourier-lowg-0.25pct` | 1.72e-01 | 8.52e-02 | 1.71e-03 | 8.34e-01 | — |
 | `delta-fourier-lowg-0.5pct` | 8.82e-02 | 2.32e-02 | 7.50e-04 | 7.07e-01 | — |
@@ -91,7 +100,36 @@ just NMAE — TODO.
 | `delta-fourier-lowg-5pct` | 8.01e-03 | 9.61e-04 | 1.08e-04 | 1.41e-01 | — |
 | `delta-fourier-lowg-25pct` | 9.26e-04 | 2.93e-04 | 3.78e-05 | 1.16e-02 | — |
 
+### NMAE by material category (mean)
+
+| config | oxide (n=18) | other (n=14) | intermetallic (n=11) | oxychalcogenide (n=4) | chalcogenide (n=3) |
+|---|:---:|:---:|:---:|:---:|:---:|
+| `direct` | 2.15e-08 | 2.15e-08 | 2.12e-08 | 2.15e-08 | 2.17e-08 |
+| `cutoff-top-1pct` | 8.31e-01 | 8.26e-01 | 7.14e-01 | 8.48e-01 | 8.03e-01 |
+| `cutoff-top-5pct` | 5.24e-01 | 5.53e-01 | 3.68e-01 | 5.50e-01 | 5.52e-01 |
+| `cutoff-top-25pct` | 1.50e-01 | 2.03e-01 | 1.93e-01 | 1.62e-01 | 1.77e-01 |
+| `cutoff-top-100pct` | 2.15e-08 | 2.15e-08 | 2.12e-08 | 2.15e-08 | 2.17e-08 |
+| `fourier-lowg-0.25pct` | 2.96e-01 | 4.46e-02 | 1.80e-01 | 8.56e-02 | 4.90e-02 |
+| `fourier-lowg-0.5pct` | 1.89e-01 | 1.56e-02 | 6.85e-02 | 3.07e-02 | 1.65e-02 |
+| `fourier-lowg-1pct` | 1.13e-01 | 5.52e-03 | 1.91e-02 | 1.12e-02 | 5.18e-03 |
+| `fourier-lowg-5pct` | 2.37e-02 | 4.23e-04 | 1.85e-03 | 1.01e-03 | 6.88e-04 |
+| `fourier-lowg-25pct` | 2.01e-03 | 1.30e-04 | 4.96e-04 | 2.49e-04 | 3.35e-04 |
+| `fourier-lowg-100pct` | 4.81e-08 | 5.07e-08 | 7.12e-08 | 4.96e-08 | 4.85e-08 |
+| `delta-fourier-lowg-0.25pct` | 2.79e-01 | 9.99e-02 | 1.52e-01 | 9.07e-02 | 5.49e-02 |
+| `delta-fourier-lowg-0.5pct` | 1.75e-01 | 3.02e-02 | 5.98e-02 | 3.15e-02 | 1.69e-02 |
+| `delta-fourier-lowg-1pct` | 1.09e-01 | 7.92e-03 | 1.69e-02 | 1.13e-02 | 5.18e-03 |
+| `delta-fourier-lowg-5pct` | 2.04e-02 | 4.79e-04 | 1.92e-03 | 1.01e-03 | 6.88e-04 |
+| `delta-fourier-lowg-25pct` | 1.98e-03 | 1.72e-04 | 5.64e-04 | 2.49e-04 | 3.35e-04 |
+
+</details>
+
+[mdcmd]: https://pypi.org/project/mdcmd/
+
+### Commentary
+
 Cutoff NMAE matches `1 − mass_captured` exactly by construction — dropped voxels contribute their full density to the error. So $\mathrm{NMAE}_\mathrm{floor}(\text{cutoff-top-}X) = 1 − \text{mass}_\text{top-}X$, and for this dataset the top 5% of voxels carries only ~50% of total integrated density. The remaining ~50% lives in the long mid/low-$ρ$ tail — which is why top-$K$ cutoff can't be competitive on NMAE without keeping nearly all voxels.
+
+**Δρ with crude Gaussian PADS gives a small oxide-specific improvement** (~14% mean-NMAE reduction at 5% coefs: 2.37e-2 → 2.04e-2), tied elsewhere. Directionally consistent with the hypothesis — PADS removes some of the structure Fourier-lowpass loses — but Gaussians are too smooth to capture atomic core cusps, so the effect is modest. Proper PADS (multi-shell Slater or pseudopotential-matched valence) should amplify this substantially; see `src/tomato/pads.py` and the "Follow-ups" section below.
 
 ### Plots
 
@@ -101,23 +139,8 @@ Cutoff NMAE matches `1 − mass_captured` exactly by construction — dropped vo
 
 ![Cutoff NMAE = 1 − mass captured](./results/plots/mass-captured-cutoff.png)
 
-Regenerate via `uv run scripts/plot_sweep.py results/sweep-n50.csv`.
-
-### By material category (mean NMAE)
-
-| config | oxide (n=18) | other (n=14) | intermetallic (n=11) | oxychalcogenide (n=4) | chalcogenide (n=3) |
-|---|:---:|:---:|:---:|:---:|:---:|
-| `cutoff-top-1pct` | 8.31e-01 | 8.26e-01 | 7.14e-01 | 8.48e-01 | 8.03e-01 |
-| `cutoff-top-5pct` | 5.24e-01 | 5.53e-01 | 3.68e-01 | 5.50e-01 | 5.52e-01 |
-| `cutoff-top-25pct` | 1.50e-01 | 2.03e-01 | 1.93e-01 | 1.62e-01 | 1.77e-01 |
-| `fourier-lowg-1pct` | **1.13e-01** | 5.52e-03 | 1.91e-02 | 1.12e-02 | 5.18e-03 |
-| `fourier-lowg-5pct` | **2.37e-02** | 4.23e-04 | 1.85e-03 | 1.01e-03 | 6.88e-04 |
-| `fourier-lowg-25pct` | **2.01e-03** | 1.30e-04 | 4.96e-04 | 2.49e-04 | 3.35e-04 |
-| `delta-fourier-lowg-1pct` | 1.09e-01 | 7.92e-03 | 1.69e-02 | 1.13e-02 | 5.18e-03 |
-| `delta-fourier-lowg-5pct` | 2.04e-02 | 4.79e-04 | 1.92e-03 | 1.01e-03 | 6.88e-04 |
-| `delta-fourier-lowg-25pct` | 1.98e-03 | 1.72e-04 | 5.64e-04 | 2.49e-04 | 3.35e-04 |
-
-**Δρ with crude Gaussian PADS gives a small oxide-specific improvement** (~14% mean-NMAE reduction at 5% coefs: 2.37e-2 → 2.04e-2), tied elsewhere. Directionally consistent with the hypothesis — PADS removes some of the structure Fourier-lowpass loses — but Gaussians are too smooth to capture atomic core cusps, so the effect is modest. Proper PADS (multi-shell Slater or pseudopotential-matched valence) should amplify this substantially; see `src/tomato/pads.py` and the "Follow-ups" section below.
+Regenerate via `uv run scripts/plot_sweep.py results/sweep-n50.csv` (or
+`dvx run` for the full provenance chain).
 
 ### Observations (n=50, preliminary)
 

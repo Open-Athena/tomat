@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync
+      - run: uv run pytest tests/
+
+  readme:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+        continue-on-error: true
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync
+      # Pull the DVX-tracked CSV (tables are derived from it)
+      - run: uv run dvx pull results/sweep-n50.csv.dvc || echo "DVX pull failed — check AWS_ROLE_ARN secret; proceeding without"
+      # Re-run mdcmd and fail if there's a diff against the committed README
+      - run: uv run mdcmd -i README.md
+      - name: Check README is up to date
+        run: |
+          if ! git diff --exit-code README.md; then
+            echo "::error::README.md is stale. Run 'uv run mdcmd -i README.md' locally and commit."
+            exit 1
+          fi

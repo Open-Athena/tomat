@@ -21,8 +21,9 @@ from click import argument, command, option
 
 @command()
 @argument("csv_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@option("-H", "--html", is_flag=True, help="Wrap output in a <details> block (for mdcmd embedding in README)")
 @option("-o", "--output", type=click.Path(dir_okay=False, path_type=Path), help="Write markdown to this path instead of stdout")
-def main(csv_path: Path, output: Path | None):
+def main(csv_path: Path, html: bool, output: Path | None):
     rows = list(csv.DictReader(csv_path.open()))
     configs: list[str] = []
     seen = set()
@@ -74,6 +75,8 @@ def main(csv_path: Path, output: Path | None):
     lines.append("")
 
     text = "\n".join(lines)
+    if html:
+        text = "<details open><summary>Fidelity-sweep tables</summary>\n\n" + text + "\n</details>"
     if output is not None:
         output.write_text(text)
         print(f"Wrote {output}", file=sys.stderr)
