@@ -2,9 +2,9 @@
 
 Project context, positioning, and background on predecessor / sibling efforts.
 
-## What is Tomato?
+## What is Tomat?
 
-**tomato** = **to**kenized **ma**terials (with **to** intentionally echoing `tomol` = **to**kenized **mo**lecules).
+**tomat** = **to**kenized **mat**erials (with **to** intentionally echoing `tomol` = **to**kenized **mo**lecules).
 
 The LLM/transformer analogue of [electrAI]: predict DFT-converged electron density for periodic crystals using a sequence model over a tokenized representation of ρ (and/or structure), instead of electrAI's 3D ResUNet doing super-resolution on voxel grids.
 
@@ -35,7 +35,7 @@ This repository is currently a clean slate (empty git repo on `main`, no commits
 
 [#63]: https://github.com/Quantum-Accelerators/electrai/pull/63
 
-**Takeaway for tomato:** electrAI treats the problem as _image super-resolution in 3D_. The hypothesis behind tomato is that the same material → property mapping can be learned by a sequence model over discrete tokens, the way tomol does for molecules.
+**Takeaway for tomat:** electrAI treats the problem as _image super-resolution in 3D_. The hypothesis behind tomat is that the same material → property mapping can be learned by a sequence model over discrete tokens, the way tomol does for molecules.
 
 ### tomol (a.k.a. moltok)
 
@@ -80,7 +80,7 @@ This repository is currently a clean slate (empty git repo on `main`, no commits
 
 Net: tomol is a useful reference for arch, training setup (Marin + Levanter + Qwen3 on v5p-8 TPU), and S2EF task framing, but the eval pipeline is not runnable end-to-end without recovering the missing codebook from Will / Isaac, or re-tokenizing the data from scratch with a known encoder.
 
-## Positioning: why tomato?
+## Positioning: why tomat?
 
 Same problem as electrAI — predict ρ_DFT for periodic crystals, evaluated against the same benchmarks (QM9, Materials Project, ELF coming). Different architectural bet: a sequence model over discrete tokens instead of a 3D ResUNet over voxel grids.
 
@@ -98,7 +98,7 @@ The case against:
 
 Materials vs molecules changes the problem meaningfully:
 
-| Axis | tomol (molecules) | tomato (materials) |
+| Axis | tomol (molecules) | tomat (materials) |
 |---|---|---|
 | **Geometry** | Finite clusters, vacuum BCs | Periodic crystals, PBC |
 | **Input representation** | Atoms + positions | Atoms + positions + **lattice vectors** |
@@ -106,11 +106,11 @@ Materials vs molecules changes the problem meaningfully:
 | **Why this is harder to tokenize** | Just ~3·N_atoms float coords + scalars | A dense 3D scalar field (~10⁵–10⁶ voxels per structure) |
 | **Dataset** | OMol25 (~4M) | Materials Project (~2.9k curated, 198k+ on S3) |
 
-So tomato inherits tomol's _infra_ (Marin + Levanter + Qwen3 on TPU) and _encoding tricks_ (SE/mantissa float-to-token schemes for continuous quantities), but the central design question — how to tokenize a 3D density field — has no tomol analog.
+So tomat inherits tomol's _infra_ (Marin + Levanter + Qwen3 on TPU) and _encoding tricks_ (SE/mantissa float-to-token schemes for continuous quantities), but the central design question — how to tokenize a 3D density field — has no tomol analog.
 
 ## Technical approach (strawman)
 
-- **Stack:** reuse Marin + Levanter + Qwen3 from tomol. Will's `experiments/tatt/` in the `will/tomol` branch of `marin-community/marin` has working v5p-8 configs at 30M, 600M, and 1B scales, plus parallel `protein_docs_*` experiments that show the same scaffolding generalizing to a different token stream. A tomato experiment file (`experiments/tatt/tomato_density_30m.py` or similar) is the minimum viable first step once a tokenized dataset exists.
+- **Stack:** reuse Marin + Levanter + Qwen3 from tomol. Will's `experiments/tatt/` in the `will/tomol` branch of `marin-community/marin` has working v5p-8 configs at 30M, 600M, and 1B scales, plus parallel `protein_docs_*` experiments that show the same scaffolding generalizing to a different token stream. A tomat experiment file (`experiments/tatt/tomat_density_30m.py` or similar) is the minimum viable first step once a tokenized dataset exists.
 - **Tokenizer:** pick from [the seven candidates](./01-tokenization-strategies.md). My initial lean (not a decision): scheme 3 (high-density voxels with cutoff) on Δρ (scheme 4), combined — keeps tokens interpretable, compresses well per the sparsity analysis, and the deformation-density trick removes the "model learns that ρ is big near nuclei" overhead.
 - **Data:** electrAI's existing MP pipeline (`s3://materialsproject-parsed/chgcars/`, 198k+ GGA CHGCARs) is the natural source — identical supervision, directly comparable metrics. Start with the ~2.9k curated subset electrAI is training on now for fastest iteration / apples-to-apples comparison; scale up if needed.
 - **Eval:** NMAE on the same MP validation split electrAI uses, so results are directly comparable. Stretch: downstream DFT convergence speedup if we get strong NMAE.
@@ -119,9 +119,9 @@ So tomato inherits tomol's _infra_ (Marin + Levanter + Qwen3 on TPU) and _encodi
 
 1. **Which tokenization?** The design doc is explicit that it's not a decision doc. We need to pick one (or a short list to prototype). See `01-tokenization-strategies.md`.
 2. **Absolute ρ or Δρ?** Orthogonal to tokenization; the doc argues Δρ is strictly easier. Probably yes unless we see a specific reason otherwise.
-3. **Relationship to electrAI:** "test other architectures" language in the doc implies tomato is a _sibling bet_, not a replacement — both efforts continue, with tomato judged on whether transformers can match/beat ResUNet at comparable compute. Worth confirming with Betsy / Hananeh / Rosen.
+3. **Relationship to electrAI:** "test other architectures" language in the doc implies tomat is a _sibling bet_, not a replacement — both efforts continue, with tomat judged on whether transformers can match/beat ResUNet at comparable compute. Worth confirming with Betsy / Hananeh / Rosen.
 4. **Tokenization fidelity floor:** before investing in modeling, characterize reconstruction error for each candidate scheme. This is a small-scale empirical question (tokenize → detokenize → measure NMAE vs original) that could knock out schemes early.
-5. **Tomol dependency:** tomol's per-axis SE/mantissa float encoding is reusable for continuous-valued tokens (density magnitudes, Fourier coefs, SH coefs). Salvaging the actual tomol tokenizer isn't necessary for tomato, but we can copy the encoding pattern.
+5. **Tomol dependency:** tomol's per-axis SE/mantissa float encoding is reusable for continuous-valued tokens (density magnitudes, Fourier coefs, SH coefs). Salvaging the actual tomol tokenizer isn't necessary for tomat, but we can copy the encoding pattern.
 6. **Dataset scope:** start with MP (matches electrAI), or push immediately into QM9 (simpler, molecule-only, matches prior-art replication benchmark)? QM9 first might be the fastest way to prove tokens-for-ρ is viable at all, before tackling periodic materials.
 
 ## Key references & links

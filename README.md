@@ -1,5 +1,5 @@
-# tomato 🍅
-**to**kenized **ma**terials; LLM/transformer-based approach to predicting DFT-converged electron density for periodic crystals.
+# tomat 🍅
+**to**kenized **mat**erials; LLM/transformer-based approach to predicting DFT-converged electron density for periodic crystals.
 
 Uses a sequence model over a tokenized representation of $ρ$ (contrast with [electrAI]'s 3D ResUNet over voxel grids).
 
@@ -43,10 +43,10 @@ MP subset used here, electrAI's best reported validation NMAE is
 around 2.7–3.1% and were "still learning"). There is **no published MP
 SotA** for density prediction to benchmark against — Li et al 2024 (the
 paper electrAI replicates) reports only molecular datasets, best 0.14%
-on QM9. So tomato's target on MP is beating OA's own ResNet, not a
+on QM9. So tomat's target on MP is beating OA's own ResNet, not a
 paper number.
 
-For tomato to *beat* electrAI on NMAE, the tokenizer floor needs to be
+For tomat to *beat* electrAI on NMAE, the tokenizer floor needs to be
 well below 2.6%, leaving headroom for the transformer to add some
 prediction error. A floor approaching 2.6% is disqualifying; a floor
 well below is a *prerequisite* to competing, not an achievement.
@@ -129,7 +129,7 @@ n=50 MP structures, grid=128³.
 
 Cutoff NMAE matches `1 − mass_captured` exactly by construction — dropped voxels contribute their full density to the error. So $\mathrm{NMAE}_\mathrm{floor}(\text{cutoff-top-}X) = 1 − \text{mass}_\text{top-}X$, and for this dataset the top 5% of voxels carries only ~50% of total integrated density. The remaining ~50% lives in the long mid/low-$ρ$ tail — which is why top-$K$ cutoff can't be competitive on NMAE without keeping nearly all voxels.
 
-**Δρ with crude Gaussian PADS gives a small oxide-specific improvement** (~14% mean-NMAE reduction at 5% coefs: 2.37e-2 → 2.04e-2), tied elsewhere. Directionally consistent with the hypothesis — PADS removes some of the structure Fourier-lowpass loses — but Gaussians are too smooth to capture atomic core cusps, so the effect is modest. Proper PADS (multi-shell Slater or pseudopotential-matched valence) should amplify this substantially; see `src/tomato/pads.py` and the "Follow-ups" section below.
+**Δρ with crude Gaussian PADS gives a small oxide-specific improvement** (~14% mean-NMAE reduction at 5% coefs: 2.37e-2 → 2.04e-2), tied elsewhere. Directionally consistent with the hypothesis — PADS removes some of the structure Fourier-lowpass loses — but Gaussians are too smooth to capture atomic core cusps, so the effect is modest. Proper PADS (multi-shell Slater or pseudopotential-matched valence) should amplify this substantially; see `src/tomat/pads.py` and the "Follow-ups" section below.
 
 ### Plots
 
@@ -214,7 +214,7 @@ from S3 to `data/mp-cache/`; subsequent runs are local.
 
 ```
 pyproject.toml            # deps: pymatgen, numpy, click (marin stack deferred to PR 2)
-src/tomato/
+src/tomat/
   tokenizers/
     base.py               # DensityTokenizer ABC (encode → decode → roundtrip)
     direct.py             # scheme 1

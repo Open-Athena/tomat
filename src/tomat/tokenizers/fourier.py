@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from tomato.tokenizers.base import DensityTokenizer
+from tomat.tokenizers.base import DensityTokenizer
 
 if TYPE_CHECKING:
     from pymatgen.io.vasp.outputs import Chgcar

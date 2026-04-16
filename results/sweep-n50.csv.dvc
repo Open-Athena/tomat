@@ -10,14 +10,14 @@ meta:
     cmd: uv run scripts/fidelity_sweep.py -n 50 -o results/sweep-n50.csv
     deps:
       scripts/fidelity_sweep.py: 660a6aae0797c5a10fe63e49c5b65c36
-      src/tomato/__init__.py: 27981171591a0aadf280de3bf137da1b
-      src/tomato/data/__init__.py: d41d8cd98f00b204e9800998ecf8427e
-      src/tomato/data/classify.py: 344930021c37abc4c9087a1ba5f51454
-      src/tomato/data/mp.py: 4743bd23ea6f102f4bc3f24d659f57cc
-      src/tomato/pads.py: 619671c4b6d30ea18582ebf3050a11a9
-      src/tomato/tokenizers/__init__.py: 5d07cddd745fc861553807821f67c384
-      src/tomato/tokenizers/base.py: 977ec46447c05e502f9dd6d6767b7e6f
-      src/tomato/tokenizers/cutoff.py: 7dadd59260f3d6e94e7ed696263182b1
-      src/tomato/tokenizers/delta.py: 46857c0583b93f8ae6e7add13d5dc65a
-      src/tomato/tokenizers/direct.py: 570d87c258817928ea69741580fa847d
-      src/tomato/tokenizers/fourier.py: c6bc8549b00f81eb47740b7e1751d98d
+      src/tomat/__init__.py: 27981171591a0aadf280de3bf137da1b
+      src/tomat/data/__init__.py: d41d8cd98f00b204e9800998ecf8427e
+      src/tomat/data/classify.py: 344930021c37abc4c9087a1ba5f51454
+      src/tomat/data/mp.py: 4743bd23ea6f102f4bc3f24d659f57cc
+      src/tomat/pads.py: 619671c4b6d30ea18582ebf3050a11a9
+      src/tomat/tokenizers/__init__.py: 5d07cddd745fc861553807821f67c384
+      src/tomat/tokenizers/base.py: 977ec46447c05e502f9dd6d6767b7e6f
+      src/tomat/tokenizers/cutoff.py: 7dadd59260f3d6e94e7ed696263182b1
+      src/tomat/tokenizers/delta.py: 46857c0583b93f8ae6e7add13d5dc65a
+      src/tomat/tokenizers/direct.py: 570d87c258817928ea69741580fa847d
+      src/tomat/tokenizers/fourier.py: c6bc8549b00f81eb47740b7e1751d98d

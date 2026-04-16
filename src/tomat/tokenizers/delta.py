@@ -9,7 +9,7 @@ The motivation (per the design doc): Δρ has smaller dynamic range, no
 nuclear cusps, centered on zero, and concentrates chemically
 interesting signal (bonds, charge transfer). Expected win depends on
 how well the PADS captures the core-electron contribution the base
-tokenizer would otherwise fail to represent; see ``tomato.pads``.
+tokenizer would otherwise fail to represent; see ``tomat.pads``.
 """
 
 from dataclasses import dataclass
@@ -18,8 +18,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from tomato.pads import GaussianPADS, SlaterPADS
-from tomato.tokenizers.base import DensityTokenizer
+from tomat.pads import GaussianPADS, SlaterPADS
+from tomat.tokenizers.base import DensityTokenizer
 
 if TYPE_CHECKING:
     from pymatgen.io.vasp.outputs import Chgcar

@@ -1,6 +1,6 @@
 # Tokenizer fidelity sweep
 
-First empirical step for the tomato project: characterize the reconstruction
+First empirical step for the tomat project: characterize the reconstruction
 error floor each candidate tokenization scheme imposes, before investing in
 modeling. The motivation is called out in both [`00-project-context.md`]
 (open question 4: *characterize reconstruction error for each candidate
@@ -14,7 +14,7 @@ where the floor is what `encode → decode` alone loses before any model
 runs. The MP reference point is electrAI (a.k.a. RHOAR-Net) at **2.60%
 validation NMAE** (Jan 2026 monthly review, 100-epoch run) — OA's own
 ResNet, not a published SotA (Li et al 2024 reports only on molecular
-datasets, no MP number). For tomato to beat it, our floor needs to be
+datasets, no MP number). For tomat to beat it, our floor needs to be
 well below 2.6%, leaving headroom for transformer prediction error. A
 scheme whose floor approaches or exceeds 2.6% is disqualified; a floor
 well below it is a *prerequisite* to competing, not an achievement.
@@ -55,10 +55,10 @@ schemes 1/3/5.
   `marin{,-levanter,-iris,-zephyr,-rigging}` dependencies plus `pymatgen`
   and `numpy`. No training code yet; the fidelity sweep deliberately
   doesn't import marin so it can run on CPU without pulling JAX/TPU deps.
-* `src/tomato/tokenizers/` — ABC plus the three schemes; roundtrip-tested
+* `src/tomat/tokenizers/` — ABC plus the three schemes; roundtrip-tested
   against synthetic Gaussian-lump densities in `tests/test_tokenizers.py`
   (no CHGCAR IO required).
-* `src/tomato/data/mp.py` — fetches CHGCARs from
+* `src/tomat/data/mp.py` — fetches CHGCARs from
   `s3://openathena/electrai/mp/chg_datasets/dataset_4/` (same 2,885-entry
   curated MP subset electrAI trains on), caches under `data/mp-cache/`.
 * `scripts/fidelity_sweep.py` — CLI that tokenizes→detokenizes→measures
@@ -83,7 +83,7 @@ truncation beats voxel-cutoff by ~2 orders of magnitude at every sparsity
 level.
 
 Δρ (scheme 4) has been scaffolded on top of Fourier with a crude Gaussian
-promolecule-density baseline (`tomato.pads.GaussianPADS`, σ=0.4 Å). It
+promolecule-density baseline (`tomat.pads.GaussianPADS`, σ=0.4 Å). It
 doesn't yet act as a physically faithful atomic-density model — real
 atoms have core cusps (high-|G| content) that a Gaussian doesn't
 reproduce, and our VASP CHGCARs use pseudopotentials that don't have

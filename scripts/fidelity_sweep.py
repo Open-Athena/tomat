@@ -25,9 +25,9 @@ import click
 import numpy as np
 from click import argument, command, option
 
-from tomato.data.classify import classify_elements
-from tomato.data.mp import load_chgcar, list_mp_ids
-from tomato.tokenizers import (
+from tomat.data.classify import classify_elements
+from tomat.data.mp import load_chgcar, list_mp_ids
+from tomat.tokenizers import (
     CutoffEncoded,
     CutoffTokenizer,
     DeltaDensityTokenizer,
@@ -61,7 +61,7 @@ def default_configs() -> list[SweepConfig]:
     for frac in (0.0025, 0.005, 0.01, 0.05, 0.25, 1.0):
         cfgs.append(SweepConfig(f"fourier-lowg-{frac * 100:g}pct", FourierTokenizer(coefficient_fraction=frac)))
     # Δρ-Fourier variants — scheme 4 + scheme 5 composed.
-    # PADS is crude Gaussian (see `src/tomato/pads.py` caveat); results
+    # PADS is crude Gaussian (see `src/tomat/pads.py` caveat); results
     # bound the "Δρ with a very approximate promolecule density" scenario.
     for frac in (0.0025, 0.005, 0.01, 0.05, 0.25):
         cfgs.append(

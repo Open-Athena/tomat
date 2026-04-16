@@ -6,8 +6,8 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
-from tomato.pads import GaussianPADS, SlaterPADS
-from tomato.tokenizers import CutoffTokenizer, DeltaDensityTokenizer, DirectTokenizer, FourierTokenizer
+from tomat.pads import GaussianPADS, SlaterPADS
+from tomat.tokenizers import CutoffTokenizer, DeltaDensityTokenizer, DirectTokenizer, FourierTokenizer
 
 
 def make_density(shape: tuple[int, int, int] = (16, 18, 20), seed: int = 0) -> np.ndarray:

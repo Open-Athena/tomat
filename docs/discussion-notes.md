@@ -6,7 +6,7 @@ own section. For implementation specs see `specs/`; for code see `src/`.
 
 ## Project frame
 
-**tomato** = tokenized materials. The transformer/LLM analogue of
+**tomat** = tokenized materials. The transformer/LLM analogue of
 **electrAI** (recently renamed **RHOAR-Net**, "Rho Augmented Resolution
 Network") — predict DFT-converged electron density $\rho(r)$ for periodic
 crystals, but via a sequence model over a tokenized representation rather
@@ -27,7 +27,7 @@ validation NMAE on Materials Project**, from a 100-epoch internal run
   only molecular benchmarks (best 0.14% on QM9). No MP number in that paper.
 - Materials Project density prediction was an OA extension to the ResNet
   approach. There's no published MP-density SotA to benchmark against.
-- electrAI's own ratchet is the relevant target. tomato beating it at
+- electrAI's own ratchet is the relevant target. tomat beating it at
   comparable compute would justify the architectural bet.
 
 [arXiv:2402.12335]: https://arxiv.org/abs/2402.12335
@@ -40,7 +40,7 @@ in the loop. Measured by our fidelity sweep.
 **Achieved loss** = total error of the trained pipeline = `floor +
 prediction_error`. What electrAI's 2.6% is.
 
-For tomato to beat electrAI: floor must be **well below 2.6%**, leaving
+For tomat to beat electrAI: floor must be **well below 2.6%**, leaving
 budget for the transformer to be imperfect. A floor approaching 2.6% is
 disqualifying. A floor at 0.1% is a *prerequisite* to competing, not an
 achievement. (Easy to confuse — I did, see git history.)
@@ -96,7 +96,7 @@ Detailed table in `README.md`; key points:
 
 ## Δρ (scheme 4) status
 
-Pipeline scaffolded (`src/tomato/pads.py`, `src/tomato/tokenizers/delta.py`).
+Pipeline scaffolded (`src/tomat/pads.py`, `src/tomat/tokenizers/delta.py`).
 Two PADS implementations:
 
 - `GaussianPADS` — one isotropic Gaussian per atom. Smooth, no cusps. Crude
@@ -327,7 +327,7 @@ by chaos.
 
 ## Tool lineage and the VASP dependency
 
-tomato's data pipeline inherits electrAI's, which inherits Materials
+tomat's data pipeline inherits electrAI's, which inherits Materials
 Project's, which is VASP-computed. This chain creates a soft lock-in on
 proprietary tooling worth being explicit about.
 
@@ -404,7 +404,7 @@ Why none of them "won" — mostly path dependence:
 ### Interesting datapoint: Li et al are OSS already
 
 The paper electrAI replicates uses **pyscf + GTH pseudopotentials +
-GTH-TZV2P basis** for QM9 — entirely OSS. So an OSS-aligned tomato
+GTH-TZV2P basis** for QM9 — entirely OSS. So an OSS-aligned tomat
 isn't methodologically novel, just a fork from electrAI's choice of
 pre-computed VASP data. The molecular side of the literature has
 already moved this way; materials lag because of MP's dominance.
