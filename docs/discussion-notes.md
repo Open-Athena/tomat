@@ -325,6 +325,118 @@ by chaos.
 - **Multi-target sweep**: add ELF as a second target once
   electrAI's ELF dataset lands. Same arch, same sweep code.
 
+## Tool lineage and the VASP dependency
+
+tomato's data pipeline inherits electrAI's, which inherits Materials
+Project's, which is VASP-computed. This chain creates a soft lock-in on
+proprietary tooling worth being explicit about.
+
+### Three orthogonal axes (to keep straight when discussing QC codes)
+
+1. **System type — periodic vs molecular**: crystals/surfaces with PBCs
+   vs. isolated finite clusters. Codes tend to specialize; some do both.
+2. **Basis set — plane waves vs atomic orbitals**: periodic systems
+   naturally use plane waves ($e^{iG \cdot r}$); molecular systems
+   naturally use atom-centered Gaussians or Slaters. Orthogonal to (1)
+   but strongly correlated in practice.
+3. **Core treatment — all-electron vs pseudopotential**: compute the
+   deep 1s/2s cores explicitly, or absorb them into a smoothed
+   effective potential. Independent of (1) and (2).
+
+VASP sits at (periodic, plane-wave, PAW-pseudopotential). Our CHGCARs
+are shaped by all three choices; PADS approximations that don't account
+for them (especially the pseudopotential axis) produce systematic errors
+near nuclei.
+
+### Why VASP dominates materials QC
+
+- Started ~1991; network effects of three decades of papers.
+- PAW POTCAR library is genuinely high-quality across most of the
+  periodic table (50+ elements, multiple variants each).
+- MP picked it → everyone using MP data is downstream of VASP.
+- Fast, well-validated, responsive developer team (closed-source
+  funding model has kept pace with methodology advances).
+- Per-group license cost (~low-k€/yr academic) is small vs. compute.
+
+### OSS alternatives — realistic and their gaps
+
+| code | basis | pseudopotentials | vs VASP for our work |
+|---|---|---|---|
+| [Quantum ESPRESSO][qe] | plane-wave | NC + US + PAW | closest drop-in; multiple PP libraries (SSSP, PSlibrary, GBRV); widely validated |
+| [ABINIT][abinit] | plane-wave | NC + PAW | similar scope, stronger on excited states |
+| [GPAW][gpaw] | real-space + plane-wave | PAW | same PP family as VASP, Python+ASE-friendly, slower for large systems |
+| [CP2K][cp2k] | hybrid Gaussian + plane-wave | GTH | great for biomolecular; less common for crystals |
+| [pyscf][pyscf] | Gaussian (+ periodic add-ons) | GTH, ECP | molecular-first; what Li et al used for QM9 |
+
+[qe]: https://www.quantum-espresso.org/
+[abinit]: https://www.abinit.org/
+[gpaw]: https://gpaw.readthedocs.io/
+[cp2k]: https://www.cp2k.org/
+[pyscf]: https://pyscf.org/
+
+Why none of them "won" — mostly path dependence:
+
+- VASP papers beget VASP papers; reproducing published work is easier
+  in the originating code
+- POTCAR library quality/breadth is hard to match
+- MP's choice locks in a whole ecosystem of downstream users
+- Cost-to-switch greatly exceeds marginal benefit for most groups
+
+### What an OSS-only stance would cost us, concretely
+
+1. **Existing electrAI/MP CHGCARs become unusable as training data.**
+   They encode VASP-PAW-PBE conventions; predicting them with an OSS
+   code would still leave us downstream of VASP lineage.
+2. **Recompute the training set.** QE over MP structures at comparable
+   settings (PBE, similar k-mesh density). For the curated 2,885:
+   probably few-hundred CPU-days, tractable. For full MP 198k+:
+   hundreds of k CPU-days, real money.
+3. **Re-establish the electrAI baseline.** Their 2.6% NMAE is on
+   VASP-PAW data; if our training data shifts, we need to recompute
+   the baseline against the new data too.
+4. **Can't do POTCAR-matched PADS for existing data.** Would switch to
+   QE's PSP files for the recomputed dataset (they have parsers; it's
+   fine, just different).
+5. **Gain full reproducibility.** Anyone can rerun end-to-end with no
+   proprietary deps. Attractive for open science / Marin-community
+   alignment.
+
+### Interesting datapoint: Li et al are OSS already
+
+The paper electrAI replicates uses **pyscf + GTH pseudopotentials +
+GTH-TZV2P basis** for QM9 — entirely OSS. So an OSS-aligned tomato
+isn't methodologically novel, just a fork from electrAI's choice of
+pre-computed VASP data. The molecular side of the literature has
+already moved this way; materials lag because of MP's dominance.
+
+### The ML-centric observation
+
+Once a density-prediction model is trained, **it's code-agnostic at
+inference**: it predicts ρ given a structure, regardless of which DFT
+code "would have computed it." The training-data choice fixes what
+conventions the model emits (PAW vs all-electron cores, PBE vs other
+XC, etc.), but not architectural lock-in. So:
+
+- **Short-term pragma**: inherit electrAI's VASP-CHGCAR data for direct
+  apples-to-apples comparison against the ResNet baseline.
+- **Medium-term**: could recompute a held-out subset with QE for
+  cross-code validation (and as a hedge against VASP licensing
+  friction at scale).
+- **Long-term**: if publishing broadly or integrating with Marin's
+  open-science ethos, an OSS-data fork is a defensible reset.
+
+Not a decision right now; a flag for the team.
+
+### POTCAR availability summary
+
+- Proprietary, bundled with VASP license; **MP does not redistribute**.
+- MP metadata records *which* POTCAR variant was used (e.g. `O_s` vs
+  `O_GW` vs `O_h`), so reproduction is possible given a license.
+- `pymatgen.io.vasp.inputs.Potcar` can parse them **if we have them
+  locally** — doesn't help otherwise.
+- For POTCAR-matched PADS, we'd need OA to have a licensed VASP install
+  and the specific POTCAR versions MP used. Worth checking with Betsy.
+
 ## Glossary
 
 ### Quantum chemistry / DFT
