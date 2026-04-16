@@ -9,6 +9,7 @@ description = "Tokenized Materials: LLM analogue of electrAI — predict DFT ele
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "click",
+    "dvx",
     "matplotlib",
     "numpy",
     "pymatgen",

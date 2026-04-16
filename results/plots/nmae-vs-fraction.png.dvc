@@ -1,0 +1,13 @@
+outs:
+- md5: c24705024192c00136200f4096a5dffe
+  size: 96561
+  hash: md5
+  path: nmae-vs-fraction.png
+meta:
+  # Co-output of the same plot_sweep.py invocation; see sibling .dvc files
+  # for `nmae-by-category.png` and `mass-captured-cutoff.png`.
+  computation:
+    cmd: uv run scripts/plot_sweep.py results/sweep-n50.csv
+    deps:
+      scripts/plot_sweep.py: 7ba6d2fb57196311c0b165d97a23ed37
+      results/sweep-n50.csv: ca68074fe682d8d6fba16dd4bb08a3e6
