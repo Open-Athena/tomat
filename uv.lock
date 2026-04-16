@@ -1047,6 +1047,19 @@ wheels = [
 ]
 
 [[package]]
+name = "mdcmd"
+version = "0.7.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "utz" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ad/55/1249d494aafad376f249f189437c26001654901b8ad3801624bce8596ff4/mdcmd-0.7.4.tar.gz", hash = "sha256:4c4569aadde60903c143025917e195874e9b5001aff4f217bb529d64246ac783", size = 22281, upload-time = "2025-12-20T20:02:05.426Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/41/17/da5611c420f4dfea4d52159fb72243bfd291af76bc2be2d1c6a484ca0f95/mdcmd-0.7.4-py3-none-any.whl", hash = "sha256:a05b0761eb7cb75cc3cee014a8400ef83c8f0e63c69067a9cd2dd75eb1221262", size = 16758, upload-time = "2025-12-20T20:02:04.272Z" },
+]
+
+[[package]]
 name = "mdurl"
 version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1960,6 +1973,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "mdcmd" },
     { name = "pytest" },
     { name = "pytest-xdist" },
 ]
@@ -1975,6 +1989,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "mdcmd" },
     { name = "pytest" },
     { name = "pytest-xdist" },
 ]
