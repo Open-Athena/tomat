@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Plot, PlotlyProvider } from 'pltly/react'
-import plotly from 'plotly.js-basic-dist'
+
+const plotlyLoader = () =>
+  import('plotly.js-basic-dist') as unknown as Promise<typeof import('plotly.js')>
 import { METRIC_LABEL, type Metric, parseConfig, type SweepRow } from './types'
 import { useSweep } from './useSweep'
 
@@ -11,9 +13,15 @@ const SCHEME_COLORS: Record<string, string> = {
 }
 
 const SCHEME_LABEL: Record<string, string> = {
-  cutoff: 'cutoff-top (voxel value)',
-  fourier: 'fourier-lowg (low |G|)',
-  'delta-fourier': 'Δρ-fourier-lowg (PADS subtracted)',
+  cutoff: 'cutoff-top',
+  fourier: 'fourier-lowg',
+  'delta-fourier': 'Δρ-fourier-lowg',
+}
+
+const SCHEME_DESC: Record<string, string> = {
+  cutoff: 'voxel value',
+  fourier: 'low |G|',
+  'delta-fourier': 'PADS subtracted, low |G|',
 }
 
 const SCHEMES_WITH_FRACTION = ['cutoff-top', 'fourier-lowg', 'delta-fourier-lowg']
@@ -68,7 +76,7 @@ export function App() {
   const metricLabel = METRIC_LABEL[metric]
 
   return (
-    <PlotlyProvider plotly={plotly as unknown as typeof import('plotly.js')}>
+    <PlotlyProvider loader={plotlyLoader}>
       <header>
         <h1>tomat 🍅 — tokenizer fidelity</h1>
         <button
@@ -106,7 +114,7 @@ export function App() {
           min/max band
         </label>
         {Object.keys(SCHEME_COLORS).map(s => (
-          <label key={s}>
+          <label key={s} title={SCHEME_DESC[s]}>
             <input
               type="checkbox"
               checked={enabledSchemes.has(s)}
@@ -141,7 +149,7 @@ export function App() {
                     y: c.median,
                     type: 'scatter' as const,
                     mode: 'lines+markers' as const,
-                    name: `${SCHEME_LABEL[c.key]} (median)`,
+                    name: SCHEME_LABEL[c.key],
                     line: { color: SCHEME_COLORS[c.key], width: 2 },
                     marker: { size: 7 },
                   },
@@ -150,19 +158,23 @@ export function App() {
           )}
           layout={{
             autosize: true,
-            height: 460,
+            height: 500,
+            margin: { r: 20 },
             xaxis: { type: 'log', title: { text: 'Fraction of representation kept' } },
             yaxis: { type: logY ? 'log' : 'linear', title: { text: `Reconstruction ${metricLabel}` }, fixedrange: false },
+            legend: { orientation: 'h', y: -0.2, yanchor: 'top' },
             shapes: [{
               type: 'line',
               x0: 0.0001, x1: 1, y0: 0.026, y1: 0.026,
               line: { color: 'gray', dash: 'dash', width: 1 },
             }],
             annotations: [{
-              x: 0.5, y: 0.026,
-              text: 'electrAI achieved 2.6% (NMAE)',
+              x: Math.log10(0.01), y: Math.log10(0.026),
+              xref: 'x', yref: 'y',
+              text: 'electrAI best 2.6% NMAE',
               showarrow: false,
-              yshift: 10,
+              xanchor: 'left',
+              yshift: 8,
               font: { color: 'gray', size: 11 },
             }],
           }}
@@ -176,7 +188,7 @@ export function App() {
           data={byCategory.schemes
             .filter(s => enabledSchemes.has(s.key))
             .map(s => ({
-              x: byCategory.categories.map(c => `${c}\n(n=${byCategory.counts[c]})`),
+              x: byCategory.categories.map(c => `${c} (n=${byCategory.counts[c]})`),
               y: s.values,
               type: 'bar' as const,
               name: SCHEME_LABEL[s.key],
@@ -184,9 +196,11 @@ export function App() {
             }))}
           layout={{
             autosize: true,
-            height: 420,
+            height: 460,
+            margin: { r: 20 },
             barmode: 'group',
             yaxis: { type: logY ? 'log' : 'linear', title: { text: `Mean ${metricLabel}` }, fixedrange: false },
+            legend: { orientation: 'h', y: -0.2, yanchor: 'top' },
           }}
           style={{ width: '100%' }}
         />
