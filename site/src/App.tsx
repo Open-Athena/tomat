@@ -1,5 +1,6 @@
-import { useMemo, useState } from 'react'
-import Plot from 'react-plotly.js'
+import { useEffect, useMemo, useState } from 'react'
+import { Plot, PlotlyProvider } from 'pltly/react'
+import plotly from 'plotly.js-basic-dist'
 import { METRIC_LABEL, type Metric, parseConfig, type SweepRow } from './types'
 import { useSweep } from './useSweep'
 
@@ -15,15 +16,31 @@ const SCHEME_LABEL: Record<string, string> = {
   'delta-fourier': 'Δρ-fourier-lowg (PADS subtracted)',
 }
 
-// Only keep schemes that can be parameterized by a fraction.
 const SCHEMES_WITH_FRACTION = ['cutoff-top', 'fourier-lowg', 'delta-fourier-lowg']
 
-// Map parsed scheme label back to a color/legend key.
 function schemeKey(scheme: string): string {
   if (scheme === 'cutoff-top') return 'cutoff'
   if (scheme === 'fourier-lowg') return 'fourier'
   if (scheme === 'delta-fourier-lowg') return 'delta-fourier'
   return scheme
+}
+
+type ThemeMode = 'light' | 'dark' | 'auto'
+
+function useThemeToggle() {
+  const [mode, setMode] = useState<ThemeMode>(
+    () => (localStorage.getItem('theme') as ThemeMode | null) ?? 'auto',
+  )
+  useEffect(() => {
+    const html = document.documentElement
+    if (mode === 'auto') {
+      html.removeAttribute('data-theme')
+    } else {
+      html.setAttribute('data-theme', mode)
+    }
+    localStorage.setItem('theme', mode)
+  }, [mode])
+  return [mode, setMode] as const
 }
 
 export function App() {
@@ -34,6 +51,7 @@ export function App() {
   const [logY, setLogY] = useState(true)
   const [showMinMax, setShowMinMax] = useState(true)
   const [enabledSchemes, setEnabledSchemes] = useState(new Set(Object.keys(SCHEME_COLORS)))
+  const [theme, setTheme] = useThemeToggle()
   const toggleScheme = (s: string) => {
     const next = new Set(enabledSchemes)
     next.has(s) ? next.delete(s) : next.add(s)
@@ -50,8 +68,19 @@ export function App() {
   const metricLabel = METRIC_LABEL[metric]
 
   return (
-    <>
-      <h1>tomat 🍅 — tokenizer fidelity</h1>
+    <PlotlyProvider plotly={plotly as unknown as typeof import('plotly.js')}>
+      <header>
+        <h1>tomat 🍅 — tokenizer fidelity</h1>
+        <button
+          className="theme-toggle"
+          onClick={() => setTheme(theme === 'dark' ? 'light' : theme === 'light' ? 'auto' : 'dark')}
+          aria-label="theme"
+          title={`theme: ${theme}`}
+        >
+          {theme === 'dark' ? '🌙' : theme === 'light' ? '☀️' : '🖥️'}
+        </button>
+      </header>
+
       <p className="meta">
         Reconstruction-error floor per tokenization scheme on n={samples} Materials
         Project CHGCARs (128³ grid). Backed by live
@@ -98,10 +127,10 @@ export function App() {
                     ? [{
                         x: [...c.fractions, ...[...c.fractions].reverse()],
                         y: [...c.max, ...[...c.min].reverse()],
-                        fill: 'toself',
+                        fill: 'toself' as const,
                         fillcolor: hexToRgba(SCHEME_COLORS[c.key], 0.12),
                         line: { color: 'transparent' },
-                        hoverinfo: 'skip',
+                        hoverinfo: 'skip' as const,
                         name: `${c.key} (min-max)`,
                         showlegend: false,
                         type: 'scatter' as const,
@@ -122,10 +151,8 @@ export function App() {
           layout={{
             autosize: true,
             height: 460,
-            margin: { t: 10, r: 20, b: 50, l: 60 },
             xaxis: { type: 'log', title: { text: 'Fraction of representation kept' } },
-            yaxis: { type: logY ? 'log' : 'linear', title: { text: `Reconstruction ${metricLabel}` } },
-            legend: { orientation: 'h', y: -0.2 },
+            yaxis: { type: logY ? 'log' : 'linear', title: { text: `Reconstruction ${metricLabel}` }, fixedrange: false },
             shapes: [{
               type: 'line',
               x0: 0.0001, x1: 1, y0: 0.026, y1: 0.026,
@@ -140,8 +167,6 @@ export function App() {
             }],
           }}
           style={{ width: '100%' }}
-          useResizeHandler
-          config={{ displaylogo: false }}
         />
       </div>
 
@@ -160,14 +185,10 @@ export function App() {
           layout={{
             autosize: true,
             height: 420,
-            margin: { t: 10, r: 20, b: 80, l: 60 },
             barmode: 'group',
-            yaxis: { type: logY ? 'log' : 'linear', title: { text: `Mean ${metricLabel}` } },
-            legend: { orientation: 'h', y: -0.25 },
+            yaxis: { type: logY ? 'log' : 'linear', title: { text: `Mean ${metricLabel}` }, fixedrange: false },
           }}
           style={{ width: '100%' }}
-          useResizeHandler
-          config={{ displaylogo: false }}
         />
       </div>
 
@@ -176,7 +197,7 @@ export function App() {
         tracked in <code>results/sweep-n50.csv.dvc</code> (<code>dvx status</code>).
         Plots built from the committed CSV — no server needed.
       </div>
-    </>
+    </PlotlyProvider>
   )
 }
 
@@ -265,8 +286,8 @@ function mean(xs: number[]): number {
 
 function hexToRgba(hex: string, alpha: number): string {
   const h = hex.replace('#', '')
-  const r = parseInt(h.substr(0, 2), 16)
-  const g = parseInt(h.substr(2, 2), 16)
-  const b = parseInt(h.substr(4, 2), 16)
+  const r = parseInt(h.substring(0, 2), 16)
+  const g = parseInt(h.substring(2, 4), 16)
+  const b = parseInt(h.substring(4, 6), 16)
   return `rgba(${r},${g},${b},${alpha})`
 }
