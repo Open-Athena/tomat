@@ -57,10 +57,15 @@ high-density regions — voxels near nuclei where ρ is ~e+02 — while
 chemically interesting signal (bonds, charge transfer) lives at much
 lower density. Across loss functions, the ratio of low- to
 high-density error contribution varies from ~0.005 (MAE) to ~15
-(Chi-Squared). So a scheme that "beats 2.6% NMAE" while discarding
+(Chi-Squared). A scheme that "beats 2.6% NMAE" while discarding
 low-density information may be winning the metric but losing the science.
-This argues for reporting our fidelity sweep in several metrics, not
-just NMAE — TODO.
+
+The fidelity sweep now reports NMAE, χ² (low-ρ-weighted), Hellinger,
+JSD, and Weighted MAE in each row of [`results/sweep-n50.csv`](./results/sweep-n50.csv);
+the tables below show NMAE + χ² side-by-side so the divergence between
+"whole-density error" and "low-density-weighted error" is visible at a
+glance. Full breakdowns available via
+`uv run scripts/summarize_sweep.py results/sweep-n50.csv`.
 
 **Schemes:**
 
@@ -74,31 +79,29 @@ just NMAE — TODO.
 
 Auto-regenerated via [`mdcmd`][mdcmd] from [`results/sweep-n50.csv`](./results/sweep-n50.csv).
 
-<!-- `uv run scripts/summarize_sweep.py results/sweep-n50.csv --html` -->
+<!-- `uv run scripts/summarize_sweep.py results/sweep-n50.csv -m nmae -m chi_sq --html` -->
 <details open><summary>Fidelity-sweep tables</summary>
 
-### Overall NMAE over all samples
+### Overall (n=50, 128³ grid)
 
-n=50 MP structures, grid=128³.
-
-| config | mean NMAE | median | min | max | mean mass captured |
-|---|---:|---:|---:|---:|---:|
-| `direct` | 2.15e-08 | 2.14e-08 | 2.10e-08 | 2.20e-08 | — |
-| `cutoff-top-1pct` | 8.04e-01 | 8.29e-01 | 6.57e-01 | 9.29e-01 | 0.196 |
-| `cutoff-top-5pct` | 5.01e-01 | 5.27e-01 | 2.78e-01 | 8.16e-01 | 0.499 |
-| `cutoff-top-25pct` | 1.77e-01 | 1.75e-01 | 3.12e-02 | 4.55e-01 | 0.823 |
-| `cutoff-top-100pct` | 2.15e-08 | 2.14e-08 | 2.10e-08 | 2.20e-08 | 1.000 |
-| `fourier-lowg-0.25pct` | 1.68e-01 | 8.87e-02 | 1.66e-03 | 7.34e-01 | — |
-| `fourier-lowg-0.5pct` | 9.08e-02 | 2.17e-02 | 4.76e-04 | 7.14e-01 | — |
-| `fourier-lowg-1pct` | 4.78e-02 | 9.05e-03 | 2.68e-04 | 5.15e-01 | — |
-| `fourier-lowg-5pct` | 9.16e-03 | 9.61e-04 | 9.17e-05 | 1.74e-01 | — |
-| `fourier-lowg-25pct` | 9.08e-04 | 2.60e-04 | 3.47e-05 | 1.20e-02 | — |
-| `fourier-lowg-100pct` | 5.40e-08 | 5.20e-08 | 2.95e-08 | 9.23e-08 | — |
-| `delta-fourier-lowg-0.25pct` | 1.72e-01 | 8.52e-02 | 1.71e-03 | 8.34e-01 | — |
-| `delta-fourier-lowg-0.5pct` | 8.82e-02 | 2.32e-02 | 7.50e-04 | 7.07e-01 | — |
-| `delta-fourier-lowg-1pct` | 4.62e-02 | 9.16e-03 | 2.71e-04 | 5.12e-01 | — |
-| `delta-fourier-lowg-5pct` | 8.01e-03 | 9.61e-04 | 1.08e-04 | 1.41e-01 | — |
-| `delta-fourier-lowg-25pct` | 9.26e-04 | 2.93e-04 | 3.78e-05 | 1.16e-02 | — |
+| config | mean NMAE | mean χ² | mean mass captured |
+|---|---:|---:|---:|
+| `direct` | 2.15e-08 | 6.38e-16 | — |
+| `cutoff-top-1pct` | 8.04e-01 | 8.04e-01 | 0.196 |
+| `cutoff-top-5pct` | 5.01e-01 | 5.01e-01 | 0.499 |
+| `cutoff-top-25pct` | 1.77e-01 | 1.77e-01 | 0.823 |
+| `cutoff-top-100pct` | 2.15e-08 | 6.38e-16 | 1.000 |
+| `fourier-lowg-0.25pct` | 1.68e-01 | 2.06e+01 | — |
+| `fourier-lowg-0.5pct` | 9.08e-02 | 8.30e+00 | — |
+| `fourier-lowg-1pct` | 4.78e-02 | 8.21e-01 | — |
+| `fourier-lowg-5pct` | 9.16e-03 | 1.25e-02 | — |
+| `fourier-lowg-25pct` | 9.08e-04 | 5.90e-05 | — |
+| `fourier-lowg-100pct` | 5.40e-08 | 1.08e-12 | — |
+| `delta-fourier-lowg-0.25pct` | 1.13e-01 | 3.66e-01 | — |
+| `delta-fourier-lowg-0.5pct` | 6.44e-02 | 3.62e-01 | — |
+| `delta-fourier-lowg-1pct` | 4.20e-02 | 2.43e-01 | — |
+| `delta-fourier-lowg-5pct` | 1.47e-02 | 1.49e-01 | — |
+| `delta-fourier-lowg-25pct` | 3.85e-03 | 3.10e-02 | — |
 
 ### NMAE by material category (mean)
 
@@ -115,11 +118,32 @@ n=50 MP structures, grid=128³.
 | `fourier-lowg-5pct` | 2.37e-02 | 4.23e-04 | 1.85e-03 | 1.01e-03 | 6.88e-04 |
 | `fourier-lowg-25pct` | 2.01e-03 | 1.30e-04 | 4.96e-04 | 2.49e-04 | 3.35e-04 |
 | `fourier-lowg-100pct` | 4.81e-08 | 5.07e-08 | 7.12e-08 | 4.96e-08 | 4.85e-08 |
-| `delta-fourier-lowg-0.25pct` | 2.79e-01 | 9.99e-02 | 1.52e-01 | 9.07e-02 | 5.49e-02 |
-| `delta-fourier-lowg-0.5pct` | 1.75e-01 | 3.02e-02 | 5.98e-02 | 3.15e-02 | 1.69e-02 |
-| `delta-fourier-lowg-1pct` | 1.09e-01 | 7.92e-03 | 1.69e-02 | 1.13e-02 | 5.18e-03 |
-| `delta-fourier-lowg-5pct` | 2.04e-02 | 4.79e-04 | 1.92e-03 | 1.01e-03 | 6.88e-04 |
-| `delta-fourier-lowg-25pct` | 1.98e-03 | 1.72e-04 | 5.64e-04 | 2.49e-04 | 3.35e-04 |
+| `delta-fourier-lowg-0.25pct` | 1.47e-01 | 4.23e-02 | 1.80e-01 | 6.86e-02 | 4.73e-02 |
+| `delta-fourier-lowg-0.5pct` | 1.07e-01 | 1.77e-02 | 6.89e-02 | 5.63e-02 | 2.23e-02 |
+| `delta-fourier-lowg-1pct` | 8.57e-02 | 9.50e-03 | 1.99e-02 | 4.32e-02 | 1.10e-02 |
+| `delta-fourier-lowg-5pct` | 3.41e-02 | 2.24e-03 | 2.89e-03 | 1.26e-02 | 1.84e-03 |
+| `delta-fourier-lowg-25pct` | 9.01e-03 | 5.86e-04 | 1.29e-03 | 1.58e-03 | 4.59e-04 |
+
+### χ² by material category (mean)
+
+| config | oxide (n=18) | other (n=14) | intermetallic (n=11) | oxychalcogenide (n=4) | chalcogenide (n=3) |
+|---|:---:|:---:|:---:|:---:|:---:|
+| `direct` | 6.41e-16 | 6.42e-16 | 6.24e-16 | 6.40e-16 | 6.54e-16 |
+| `cutoff-top-1pct` | 8.31e-01 | 8.26e-01 | 7.14e-01 | 8.48e-01 | 8.03e-01 |
+| `cutoff-top-5pct` | 5.24e-01 | 5.53e-01 | 3.68e-01 | 5.50e-01 | 5.52e-01 |
+| `cutoff-top-25pct` | 1.50e-01 | 2.03e-01 | 1.93e-01 | 1.62e-01 | 1.77e-01 |
+| `cutoff-top-100pct` | 6.41e-16 | 6.42e-16 | 6.24e-16 | 6.40e-16 | 6.54e-16 |
+| `fourier-lowg-0.25pct` | 5.70e+01 | 4.40e-02 | 2.15e-01 | 8.63e-02 | 1.70e-02 |
+| `fourier-lowg-0.5pct` | 2.30e+01 | 1.61e-02 | 4.72e-02 | 1.36e-02 | 2.26e-03 |
+| `fourier-lowg-1pct` | 2.27e+00 | 2.56e-03 | 6.36e-03 | 1.23e-03 | 2.34e-04 |
+| `fourier-lowg-5pct` | 3.47e-02 | 2.01e-06 | 3.83e-05 | 1.56e-05 | 2.89e-06 |
+| `fourier-lowg-25pct` | 1.63e-04 | 1.21e-07 | 1.52e-06 | 2.12e-07 | 5.79e-07 |
+| `fourier-lowg-100pct` | 2.84e-12 | 1.53e-13 | 3.00e-14 | 3.45e-14 | 2.25e-14 |
+| `delta-fourier-lowg-0.25pct` | 8.59e-01 | 2.29e-02 | 2.15e-01 | 2.09e-02 | 1.57e-02 |
+| `delta-fourier-lowg-0.5pct` | 9.64e-01 | 8.74e-03 | 4.71e-02 | 1.71e-02 | 3.29e-03 |
+| `delta-fourier-lowg-1pct` | 6.65e-01 | 3.61e-03 | 6.44e-03 | 1.14e-02 | 8.32e-04 |
+| `delta-fourier-lowg-5pct` | 4.13e-01 | 2.90e-04 | 8.15e-05 | 1.89e-03 | 2.61e-05 |
+| `delta-fourier-lowg-25pct` | 8.60e-02 | 8.46e-06 | 1.47e-05 | 5.19e-05 | 1.27e-06 |
 
 </details>
 
@@ -129,7 +153,31 @@ n=50 MP structures, grid=128³.
 
 Cutoff NMAE matches `1 − mass_captured` exactly by construction — dropped voxels contribute their full density to the error. So $\mathrm{NMAE}_\mathrm{floor}(\text{cutoff-top-}X) = 1 − \text{mass}_\text{top-}X$, and for this dataset the top 5% of voxels carries only ~50% of total integrated density. The remaining ~50% lives in the long mid/low-$ρ$ tail — which is why top-$K$ cutoff can't be competitive on NMAE without keeping nearly all voxels.
 
-**Δρ with crude Gaussian PADS gives a small oxide-specific improvement** (~14% mean-NMAE reduction at 5% coefs: 2.37e-2 → 2.04e-2), tied elsewhere. Directionally consistent with the hypothesis — PADS removes some of the structure Fourier-lowpass loses — but Gaussians are too smooth to capture atomic core cusps, so the effect is modest. Proper PADS (multi-shell Slater or pseudopotential-matched valence) should amplify this substantially; see `src/tomat/pads.py` and the "Follow-ups" section below.
+**Δρ with multi-shell Slater PADS** (the `MultiShellSlaterPADS` default
+as of the most recent sweep) behaves differently across metrics and
+sparsity regimes:
+
+* **At aggressive compression (≤ 1% coefs)**: Δρ helps modestly on NMAE
+  (1%: 4.78e-2 → 4.20e-2, ~12% better) and more strongly on χ² (1%:
+  8.21e-1 → 2.43e-1, **~70% better**). Δρ's win is larger on the
+  metric that rewards low-ρ accuracy — exactly Yael's point that
+  NMAE under-credits chemistry.
+* **At high fidelity (5–25% coefs)**: Δρ *loses* on both metrics
+  (5% NMAE: 9.16e-3 → 1.47e-2; 5% χ²: 1.25e-2 → 1.49e-1). Our PADS
+  doesn't perfectly match VASP's pseudopotential valence density, so
+  residual PADS error dominates when the Fourier compression is no
+  longer the bottleneck.
+* **Oxide-specific picture**: at 1% NMAE we see 11.3% → 8.6% (~24%
+  better); χ² goes from 2.27 (oxide) → 0.67 (Δρ). Directional
+  confirmation that removing the atomic-core content helps oxides
+  most — but our PADS is still an all-electron Slater approximation,
+  not POTCAR-matched.
+
+**Implication**: Δρ's fundamental value depends on PADS accuracy. A
+POTCAR-derived pseudo-valence PADS would likely amplify both the
+aggressive-compression win and the high-fidelity regression, since the
+PADS would match the data's conventions exactly. That's the clear
+next step for `scheme 4`.
 
 ### Plots
 

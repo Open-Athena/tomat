@@ -80,6 +80,51 @@ def nmae(reference: np.ndarray, reconstruction: np.ndarray) -> float:
     return float(np.abs(reference - reconstruction).sum() / denom)
 
 
+def compute_metrics(reference: np.ndarray, reconstruction: np.ndarray) -> dict[str, float]:
+    """Return a dict of reconstruction-error metrics.
+
+    Addresses Yael's Jan 2026 observation that NMAE is dominated by
+    high-density (near-nucleus) regions, under-weighting the chemically
+    interesting low-density bonding signal. Reporting multiple metrics
+    with different ρ-weighting behaviors gives a fuller picture.
+
+    All metrics are scalar; lower is better; 0 = perfect reconstruction.
+
+    * ``nmae``: standard — sum|Δ| / sum|ρ|. High-ρ dominated.
+    * ``chi_sq``: Σ Δ² / max(|ρ|, ε). Amplifies errors at low-ρ voxels.
+    * ``hellinger``: sqrt(½ Σ (√|ρ| − √|ρ̂|)²) / sqrt(sum|ρ|). Mid-weighted.
+    * ``jsd``: Jensen-Shannon divergence between normalized |ρ|, |ρ̂|
+      treated as probability distributions.
+    * ``weighted_mae``: Σ |Δ|/max(|ρ|,ε) / N. Low-ρ emphasized.
+    """
+    ref = np.abs(reference).astype(np.float64).ravel()
+    rec = np.abs(reconstruction).astype(np.float64).ravel()
+    diff = ref - rec
+    eps = max(float(ref.max()) * 1e-8, 1e-12)
+
+    total = ref.sum()
+    metrics: dict[str, float] = {
+        "nmae": float(np.abs(reference - reconstruction).sum() / total),
+        "chi_sq": float((diff * diff / np.maximum(ref, eps)).sum() / total),
+        "hellinger": float(
+            np.sqrt(0.5 * ((np.sqrt(ref) - np.sqrt(rec)) ** 2).sum()) / np.sqrt(total)
+        ),
+        "weighted_mae": float(
+            (np.abs(diff) / np.maximum(ref, eps)).sum() / ref.size
+        ),
+    }
+
+    # Jensen-Shannon over normalized distributions.
+    from scipy.spatial.distance import jensenshannon
+    if total > 0 and rec.sum() > 0:
+        # scipy returns sqrt(JSD); square to get JSD itself, range [0, ln(2)].
+        metrics["jsd"] = float(jensenshannon(ref / total, rec / rec.sum()) ** 2)
+    else:
+        metrics["jsd"] = 0.0
+
+    return metrics
+
+
 @command()
 @option("-n", "--n-samples", type=int, default=5, help="Number of MP entries to evaluate")
 @option("-o", "--output-csv", type=click.Path(dir_okay=False, path_type=Path), help="Write per-(sample, config) rows to CSV")
@@ -104,14 +149,27 @@ def main(n_samples: int, output_csv: Path | None, split: str, mp_ids: tuple[str,
             encoded = cfg.tokenizer.encode(chgcar)
             recon = cfg.tokenizer.decode(encoded)
             elapsed = time.perf_counter() - t0
-            val = nmae(density, recon)
-            row = dict(mp_id=mp_id, category=category, config=cfg.label, nmae=val, seconds=elapsed, grid=str(density.shape))
+            metrics = compute_metrics(density, recon)
+            row = dict(
+                mp_id=mp_id,
+                category=category,
+                config=cfg.label,
+                seconds=elapsed,
+                grid=str(density.shape),
+                **metrics,
+            )
             if isinstance(encoded, CutoffEncoded):
                 row["mass_captured"] = encoded.mass_captured
                 row["effective_threshold"] = encoded.effective_threshold
-                err(f"  {cfg.label:>24s}  NMAE={val:.4e}  mass={encoded.mass_captured:.3f}  thresh={encoded.effective_threshold:.3e}  ({elapsed:.2f}s)")
+                err(
+                    f"  {cfg.label:>26s}  NMAE={metrics['nmae']:.3e}  χ²={metrics['chi_sq']:.3e}  "
+                    f"H={metrics['hellinger']:.3e}  mass={encoded.mass_captured:.3f}  ({elapsed:.2f}s)"
+                )
             else:
-                err(f"  {cfg.label:>24s}  NMAE={val:.4e}  ({elapsed:.2f}s)")
+                err(
+                    f"  {cfg.label:>26s}  NMAE={metrics['nmae']:.3e}  χ²={metrics['chi_sq']:.3e}  "
+                    f"H={metrics['hellinger']:.3e}  ({elapsed:.2f}s)"
+                )
             rows.append(row)
 
     print()
@@ -124,12 +182,13 @@ def main(n_samples: int, output_csv: Path | None, split: str, mp_ids: tuple[str,
         print(f"{label:>24s}  {arr.mean():.4e}   {np.median(arr):.4e}   {len(arr)}")
 
     if output_csv is not None:
+        fieldnames = [
+            "mp_id", "category", "config",
+            "nmae", "chi_sq", "hellinger", "jsd", "weighted_mae",
+            "seconds", "grid", "mass_captured", "effective_threshold",
+        ]
         with output_csv.open("w", newline="") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=["mp_id", "category", "config", "nmae", "seconds", "grid", "mass_captured", "effective_threshold"],
-                extrasaction="ignore",
-            )
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
         err(f"Wrote {len(rows)} rows to {output_csv}")

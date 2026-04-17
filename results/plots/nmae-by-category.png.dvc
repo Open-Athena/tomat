@@ -8,4 +8,4 @@ meta:
     cmd: uv run scripts/plot_sweep.py results/sweep-n50.csv
     deps:
       scripts/plot_sweep.py: 7ba6d2fb57196311c0b165d97a23ed37
-      results/sweep-n50.csv: ca68074fe682d8d6fba16dd4bb08a3e6
+      results/sweep-n50.csv: 04ee1814f2e06809a298fc5374878751

@@ -18,8 +18,10 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from tomat.pads import GaussianPADS, SlaterPADS
+from tomat.pads import GaussianPADS, MultiShellSlaterPADS, SlaterPADS
 from tomat.tokenizers.base import DensityTokenizer
+
+PADSImpl = GaussianPADS | SlaterPADS | MultiShellSlaterPADS
 
 if TYPE_CHECKING:
     from pymatgen.io.vasp.outputs import Chgcar
@@ -39,9 +41,9 @@ class DeltaDensityTokenizer(DensityTokenizer):
     ρ units — typically a factor of 0.05–0.1 for well-formed PADS.
     """
 
-    def __init__(self, base: DensityTokenizer, pads: GaussianPADS | SlaterPADS | None = None):
+    def __init__(self, base: DensityTokenizer, pads: PADSImpl | None = None):
         self.base = base
-        self.pads = pads or GaussianPADS()
+        self.pads = pads or MultiShellSlaterPADS()
         self.name = f"delta-{base.name}"
 
     def encode(self, chgcar: "Chgcar") -> DeltaEncoded:
