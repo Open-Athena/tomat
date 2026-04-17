@@ -7,6 +7,8 @@ Sibling to [tomol] (**to**kenized **mo**lecules, Will Held's OMol25 S2EF
 work). See [`specs/00-project-context.md`](./specs/00-project-context.md)
 for positioning and the tomol/electrAI relationship.
 
+**Interactive plots:** [open-athena.github.io/tomat](https://open-athena.github.io/tomat/) ([source](./site/)).
+
 [electrAI]: https://github.com/Quantum-Accelerators/electrai
 [tomol]: https://huggingface.co/ihxds/ToMol-marin-1B
 
