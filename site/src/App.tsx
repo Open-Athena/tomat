@@ -1,13 +1,18 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Plot, PlotlyProvider } from 'pltly/react'
+import { Plot, PlotlyProvider, useTheme } from 'pltly/react'
 
 const plotlyLoader = () =>
   import('plotly.js-basic-dist') as unknown as Promise<typeof import('plotly.js')>
+
+/** Link opening in a new tab with sensible rel attrs. */
+function ExtLink({ href, children }: { href: string; children: React.ReactNode }) {
+  return <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>
+}
 import { METRIC_LABEL, type Metric, parseConfig, type SweepRow } from './types'
 import { useSweep } from './useSweep'
 
 const SCHEME_COLORS: Record<string, string> = {
-  cutoff: '#c44',
+  cutoff: '#cc4444',
   fourier: '#4480e0',
   'delta-fourier': '#2a8c2a',
 }
@@ -60,11 +65,26 @@ export function App() {
   const [showMinMax, setShowMinMax] = useState(true)
   const [enabledSchemes, setEnabledSchemes] = useState(new Set(Object.keys(SCHEME_COLORS)))
   const [theme, setTheme] = useThemeToggle()
+  const { isDark } = useTheme()
   const toggleScheme = (s: string) => {
     const next = new Set(enabledSchemes)
     next.has(s) ? next.delete(s) : next.add(s)
     setEnabledSchemes(next)
   }
+
+  // Plotly's default hoverlabel uses a pale bg + dark text — invisible in dark
+  // mode. Mirror CSS vars so the tooltip matches the card chrome in both themes.
+  const hoverlabel = isDark
+    ? {
+        bgcolor: '#1d2125',
+        bordercolor: '#2f343a',
+        font: { color: '#e4e4e4' as const },
+      }
+    : {
+        bgcolor: '#ffffff',
+        bordercolor: '#d5d5d5',
+        font: { color: '#222' as const },
+      }
 
   const fractionCurves = useMemo(() => buildFractionCurves(rows ?? [], metric), [rows, metric])
   const byCategory = useMemo(() => buildByCategory(rows ?? [], metric), [rows, metric])
@@ -92,8 +112,8 @@ export function App() {
       <p className="meta">
         Reconstruction-error floor per tokenization scheme on n={samples} Materials
         Project CHGCARs (128³ grid). Backed by live
-        {' '}<a href="https://github.com/Open-Athena/tomat/blob/main/results/sweep-n50.csv">sweep CSV</a>{' '}
-        · <a href="https://github.com/Open-Athena/tomat">Open-Athena/tomat</a>
+        {' '}<ExtLink href="https://github.com/Open-Athena/tomat/blob/main/results/sweep-n50.csv">sweep CSV</ExtLink>{' '}
+        · <ExtLink href="https://github.com/Open-Athena/tomat">Open-Athena/tomat</ExtLink>
       </p>
 
       <div className="controls">
@@ -152,24 +172,40 @@ export function App() {
                     name: SCHEME_LABEL[c.key],
                     line: { color: SCHEME_COLORS[c.key], width: 2 },
                     marker: { size: 7 },
+                    hovertemplate: '%{y:.3~%}<extra></extra>',
                   },
                 ]
               : [],
           )}
           layout={{
             autosize: true,
-            height: 500,
-            margin: { r: 20 },
-            xaxis: { type: 'log', title: { text: 'Fraction of representation kept' } },
-            yaxis: { type: logY ? 'log' : 'linear', title: { text: `Reconstruction ${metricLabel}` }, fixedrange: false },
-            legend: { orientation: 'h', y: -0.2, yanchor: 'top' },
+            height: 560,
+            margin: { t: 10, r: 40, b: 50, l: 60 },
+            hovermode: 'x unified',
+            hoverlabel,
+            xaxis: {
+              type: 'log',
+              title: { text: 'Fraction of representation kept' },
+              range: [Math.log10(0.002), Math.log10(1.3)],
+              dtick: 1,  // one decade per major tick: 0.1%, 1%, 10%, 100%
+              tickformat: '.2~%',
+              hoverformat: '.3~%',
+            },
+            yaxis: {
+              type: logY ? 'log' : 'linear',
+              title: { text: `Reconstruction ${metricLabel}` },
+              fixedrange: false,
+              tickformat: '.1~e',  // 1e-1, 1e-2, ...; percent format loses precision at small values
+              hoverformat: '.3~%',
+            },
+            legend: { orientation: 'h', x: 0.5, xanchor: 'center', y: -0.12, yanchor: 'top' },
             shapes: [{
               type: 'line',
-              x0: 0.0001, x1: 1, y0: 0.026, y1: 0.026,
+              x0: 0.001, x1: 1.5, y0: 0.026, y1: 0.026,
               line: { color: 'gray', dash: 'dash', width: 1 },
             }],
             annotations: [{
-              x: Math.log10(0.01), y: Math.log10(0.026),
+              x: Math.log10(0.005), y: Math.log10(0.026),
               xref: 'x', yref: 'y',
               text: 'electrAI best 2.6% NMAE',
               showarrow: false,
@@ -193,23 +229,38 @@ export function App() {
               type: 'bar' as const,
               name: SCHEME_LABEL[s.key],
               marker: { color: SCHEME_COLORS[s.key] },
+              hovertemplate: '%{y:.3~%}<extra></extra>',
             }))}
           layout={{
             autosize: true,
-            height: 460,
-            margin: { r: 20 },
+            height: 500,
+            margin: { t: 10, r: 40, b: 50, l: 60 },
+            hovermode: 'x unified',
+            hoverlabel,
             barmode: 'group',
-            yaxis: { type: logY ? 'log' : 'linear', title: { text: `Mean ${metricLabel}` }, fixedrange: false },
-            legend: { orientation: 'h', y: -0.2, yanchor: 'top' },
+            yaxis: {
+              type: logY ? 'log' : 'linear',
+              title: { text: `Mean ${metricLabel}` },
+              fixedrange: false,
+              tickformat: '.2~%',
+              hoverformat: '.3~%',
+            },
+            legend: { orientation: 'h', x: 0.5, xanchor: 'center', y: -0.15, yanchor: 'top' },
           }}
           style={{ width: '100%' }}
         />
       </div>
 
       <div className="footer">
-        Data regenerated via <code>uv run scripts/fidelity_sweep.py -n 50</code>; provenance
-        tracked in <code>results/sweep-n50.csv.dvc</code> (<code>dvx status</code>).
-        Plots built from the committed CSV — no server needed.
+        Data regenerated via{' '}
+        <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/scripts/fidelity_sweep.py">
+          <code>uv run scripts/fidelity_sweep.py -n 50</code>
+        </ExtLink>
+        ; provenance tracked in{' '}
+        <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/results/sweep-n50.csv.dvc">
+          <code>results/sweep-n50.csv.dvc</code>
+        </ExtLink>{' '}
+        (<code>dvx status</code>). Plots built from the committed CSV — no server needed.
       </div>
     </PlotlyProvider>
   )
@@ -299,7 +350,8 @@ function mean(xs: number[]): number {
 }
 
 function hexToRgba(hex: string, alpha: number): string {
-  const h = hex.replace('#', '')
+  let h = hex.replace('#', '')
+  if (h.length === 3) h = h.split('').map(c => c + c).join('')  // '#c44' → '#cc4444'
   const r = parseInt(h.substring(0, 2), 16)
   const g = parseInt(h.substring(2, 4), 16)
   const b = parseInt(h.substring(4, 6), 16)
