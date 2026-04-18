@@ -3,6 +3,7 @@ import { Plot, useTheme } from 'pltly/react'
 import { METRIC_LABEL, type Metric, parseConfig, type SweepRow } from './types'
 import { useSweep } from './useSweep'
 import { FractionPlot, SCHEME_COLORS, SCHEME_LABEL } from './FractionPlot'
+import { ParetoPlot } from './ParetoPlot'
 import { ThemeToggle, themedHoverlabel } from './theme'
 
 function ExtLink({ href, children }: { href: string; children: React.ReactNode }) {
@@ -98,6 +99,20 @@ export function HomePage() {
           rows={rows}
           metric={metric}
           logY={logY}
+          showMinMax={showMinMax}
+          enabledSchemes={enabledSchemes}
+        />
+      </div>
+
+      <h2>{metricLabel} vs tokens per structure (Pareto)</h2>
+      <p className="meta">
+        Coded variants assume FP16 codec fidelity end-to-end (3 tokens per real value,
+        6 per complex). Vertical lines mark typical transformer context lengths.
+      </p>
+      <div className="plot-card">
+        <ParetoPlot
+          rows={rows}
+          metric={metric}
           showMinMax={showMinMax}
           enabledSchemes={enabledSchemes}
         />

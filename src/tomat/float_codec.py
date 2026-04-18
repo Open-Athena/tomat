@@ -145,10 +145,18 @@ class FP16Codec:
     # ---- persistence -----------------------------------------------------
 
     @classmethod
-    def from_json(cls, path: str | Path) -> "FP16Codec":
+    def from_json(cls, path: str | Path, *, channel: str | None = None) -> "FP16Codec":
+        """Load ``(log_min, log_max)``. If the JSON has a ``channels`` key,
+        ``channel`` picks one; otherwise the top-level entry is used."""
         import json
         with open(path) as f:
             cfg = json.load(f)
+        if "channels" in cfg:
+            if channel is None:
+                raise ValueError(
+                    f"{path} has channels {list(cfg['channels'])!r}; pass channel=..."
+                )
+            cfg = cfg["channels"][channel]
         return cls(log_min=float(cfg["log_min"]), log_max=float(cfg["log_max"]))
 
     def to_json(self, path: str | Path) -> None:

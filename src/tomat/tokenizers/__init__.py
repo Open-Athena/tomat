@@ -4,6 +4,7 @@ from tomat.tokenizers.delta import DeltaDensityTokenizer, DeltaEncoded
 from tomat.tokenizers.direct import DirectEncoded, DirectTokenizer
 from tomat.tokenizers.direct_coded import DirectCodedEncoded, DirectCodedTokenizer
 from tomat.tokenizers.fourier import FourierEncoded, FourierTokenizer
+from tomat.tokenizers.fourier_coded import FourierCodedEncoded, FourierCodedTokenizer
 
 __all__ = [
     "CutoffEncoded",
@@ -15,6 +16,8 @@ __all__ = [
     "DirectCodedTokenizer",
     "DirectEncoded",
     "DirectTokenizer",
+    "FourierCodedEncoded",
+    "FourierCodedTokenizer",
     "FourierEncoded",
     "FourierTokenizer",
 ]

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from tomat.pads import GaussianPADS, MultiShellSlaterPADS, SlaterPADS
+from tomat.token_count import delta_overhead
 from tomat.tokenizers.base import DensityTokenizer
 
 PADSImpl = GaussianPADS | SlaterPADS | MultiShellSlaterPADS
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
 class DeltaEncoded:
     base_encoded: Any
     pads: np.ndarray
+    n_atoms: int
 
 
 class DeltaDensityTokenizer(DensityTokenizer):
@@ -53,8 +55,15 @@ class DeltaDensityTokenizer(DensityTokenizer):
         pads = self.pads.compute(chgcar) * float(chgcar.structure.volume)
         delta = rho - pads
         fake = SimpleNamespace(data={"total": delta}, structure=chgcar.structure)
-        return DeltaEncoded(base_encoded=self.base.encode(fake), pads=pads)
+        return DeltaEncoded(
+            base_encoded=self.base.encode(fake),
+            pads=pads,
+            n_atoms=len(chgcar.structure),
+        )
 
     def decode(self, encoded: DeltaEncoded) -> np.ndarray:
         delta_recon = self.base.decode(encoded.base_encoded)
         return encoded.pads + delta_recon
+
+    def token_count(self, encoded: DeltaEncoded) -> int:
+        return self.base.token_count(encoded.base_encoded) + delta_overhead(encoded.n_atoms)

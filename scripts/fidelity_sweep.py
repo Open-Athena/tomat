@@ -35,10 +35,11 @@ from tomat.tokenizers import (
     DensityTokenizer,
     DirectCodedTokenizer,
     DirectTokenizer,
+    FourierCodedTokenizer,
     FourierTokenizer,
 )
 
-DEFAULT_CODEC_CONFIG = Path("configs/density-fp16.json")
+DEFAULT_CODEC_CONFIG = Path("configs/fp16-channels.json")
 
 err = partial(print, file=sys.stderr)
 
@@ -60,19 +61,25 @@ def default_configs(codec_config: Path = DEFAULT_CODEC_CONFIG) -> list[SweepConf
     Both sort by the scheme's natural ranking, but the ranking criterion differs.
     """
     cfgs: list[SweepConfig] = [SweepConfig("direct", DirectTokenizer())]
+    density_codec: FP16Codec | None = None
+    fourier_codec: FP16Codec | None = None
     if codec_config.exists():
-        codec = FP16Codec.from_json(codec_config)
-        cfgs.append(SweepConfig("direct-coded", DirectCodedTokenizer(codec=codec)))
+        density_codec = FP16Codec.from_json(codec_config, channel="density")
+        fourier_codec = FP16Codec.from_json(codec_config, channel="fourier")
+        cfgs.append(SweepConfig("direct-coded", DirectCodedTokenizer(codec=density_codec)))
     else:
-        err(f"[warn] {codec_config} missing; skipping direct-coded. "
+        err(f"[warn] {codec_config} missing; skipping coded variants. "
             "Run scripts/fit_density_codec.py to generate it.")
     for frac in (0.01, 0.05, 0.25, 1.0):
         cfgs.append(SweepConfig(f"cutoff-top-{frac * 100:g}pct", CutoffTokenizer(top_fraction=frac)))
     for frac in (0.0025, 0.005, 0.01, 0.05, 0.25, 1.0):
         cfgs.append(SweepConfig(f"fourier-lowg-{frac * 100:g}pct", FourierTokenizer(coefficient_fraction=frac)))
+        if fourier_codec is not None:
+            cfgs.append(SweepConfig(
+                f"fourier-coded-lowg-{frac * 100:g}pct",
+                FourierCodedTokenizer(FourierTokenizer(coefficient_fraction=frac), codec=fourier_codec),
+            ))
     # Δρ-Fourier variants — scheme 4 + scheme 5 composed.
-    # PADS is crude Gaussian (see `src/tomat/pads.py` caveat); results
-    # bound the "Δρ with a very approximate promolecule density" scenario.
     for frac in (0.0025, 0.005, 0.01, 0.05, 0.25):
         cfgs.append(
             SweepConfig(
@@ -80,6 +87,13 @@ def default_configs(codec_config: Path = DEFAULT_CODEC_CONFIG) -> list[SweepConf
                 DeltaDensityTokenizer(FourierTokenizer(coefficient_fraction=frac)),
             )
         )
+        if fourier_codec is not None:
+            cfgs.append(SweepConfig(
+                f"delta-fourier-coded-lowg-{frac * 100:g}pct",
+                DeltaDensityTokenizer(
+                    FourierCodedTokenizer(FourierTokenizer(coefficient_fraction=frac), codec=fourier_codec),
+                ),
+            ))
     return cfgs
 
 
@@ -160,10 +174,12 @@ def main(n_samples: int, output_csv: Path | None, split: str, mp_ids: tuple[str,
             recon = cfg.tokenizer.decode(encoded)
             elapsed = time.perf_counter() - t0
             metrics = compute_metrics(density, recon)
+            tokens = cfg.tokenizer.token_count(encoded)
             row = dict(
                 mp_id=mp_id,
                 category=category,
                 config=cfg.label,
+                tokens=tokens,
                 seconds=elapsed,
                 grid=str(density.shape),
                 **metrics,
@@ -172,13 +188,13 @@ def main(n_samples: int, output_csv: Path | None, split: str, mp_ids: tuple[str,
                 row["mass_captured"] = encoded.mass_captured
                 row["effective_threshold"] = encoded.effective_threshold
                 err(
-                    f"  {cfg.label:>26s}  NMAE={metrics['nmae']:.3e}  χ²={metrics['chi_sq']:.3e}  "
-                    f"H={metrics['hellinger']:.3e}  mass={encoded.mass_captured:.3f}  ({elapsed:.2f}s)"
+                    f"  {cfg.label:>36s}  NMAE={metrics['nmae']:.3e}  χ²={metrics['chi_sq']:.3e}  "
+                    f"H={metrics['hellinger']:.3e}  tok={tokens:>10,d}  mass={encoded.mass_captured:.3f}  ({elapsed:.2f}s)"
                 )
             else:
                 err(
-                    f"  {cfg.label:>26s}  NMAE={metrics['nmae']:.3e}  χ²={metrics['chi_sq']:.3e}  "
-                    f"H={metrics['hellinger']:.3e}  ({elapsed:.2f}s)"
+                    f"  {cfg.label:>36s}  NMAE={metrics['nmae']:.3e}  χ²={metrics['chi_sq']:.3e}  "
+                    f"H={metrics['hellinger']:.3e}  tok={tokens:>10,d}  ({elapsed:.2f}s)"
                 )
             rows.append(row)
 
@@ -193,7 +209,7 @@ def main(n_samples: int, output_csv: Path | None, split: str, mp_ids: tuple[str,
 
     if output_csv is not None:
         fieldnames = [
-            "mp_id", "category", "config",
+            "mp_id", "category", "config", "tokens",
             "nmae", "chi_sq", "hellinger", "jsd", "weighted_mae",
             "seconds", "grid", "mass_captured", "effective_threshold",
         ]

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from tomat.float_codec import FP16Codec
+from tomat.token_count import direct_tokens
 from tomat.tokenizers.base import DensityTokenizer
 
 if TYPE_CHECKING:
@@ -46,3 +47,6 @@ class DirectCodedTokenizer(DensityTokenizer):
     def decode(self, encoded: DirectCodedEncoded) -> np.ndarray:
         flat = self.codec.decode_signed(encoded.components)
         return flat.reshape(encoded.shape)
+
+    def token_count(self, encoded: DirectCodedEncoded) -> int:
+        return direct_tokens(int(np.prod(encoded.shape)))

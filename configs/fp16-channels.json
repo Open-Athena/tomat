@@ -1,0 +1,17 @@
+{
+  "encoding_type": "fp16_like",
+  "n_samples_fitted": 50,
+  "percentile_low": 0.01,
+  "percentile_high": 99.99,
+  "padding_log_units": 1.0,
+  "channels": {
+    "density": {
+      "log_min": -4.126689678993868,
+      "log_max": 4.967006433531596
+    },
+    "fourier": {
+      "log_min": -11.685479287248814,
+      "log_max": 10.047559526234377
+    }
+  }
+}

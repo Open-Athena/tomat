@@ -2,6 +2,7 @@ export interface SweepRow {
   mp_id: string
   category: string
   config: string
+  tokens: number
   nmae: number
   chi_sq: number
   hellinger: number

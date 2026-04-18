@@ -1,5 +1,6 @@
 import type { SweepRow } from './types'
 import { FractionPlot } from './FractionPlot'
+import { ParetoPlot } from './ParetoPlot'
 
 export interface SlideCtx {
   rows: SweepRow[] | null
@@ -259,18 +260,17 @@ export const slides: Slide[] = [
     id: 'context-length',
     title: 'Context length reality',
     thumb: 'Context',
-    render: () => (
-      <>
-        <h2>Context length gate</h2>
-        <p>
-          Direct-float Fourier at 1% coefs on 128³ → ~<strong>60k tokens</strong>.
+    render: ({ rows }) => (
+      <div className="slide-plot">
+        <h2>NMAE floor vs. tokens per structure</h2>
+        {rows
+          ? <ParetoPlot rows={rows} metric="nmae" height={460} />
+          : <p className="note">Loading…</p>}
+        <p className="note">
+          Every scheme here assumes FP16 codec fidelity (3 tokens per real value,
+          6 per complex). Vertical lines = 4k / 16k / 64k / 256k / 1M context.
         </p>
-        <ul>
-          <li>Qwen3 4k context: <strong>impossible</strong>.</li>
-          <li>Qwen3 16k context: <strong>impossible</strong>.</li>
-          <li>Floor-only analysis is necessary but not sufficient — need a compression step (VQ-VAE or float codec) before the transformer sees anything.</li>
-        </ul>
-      </>
+      </div>
     ),
   },
   {

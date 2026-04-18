@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from tomat.token_count import cutoff_tokens
 from tomat.tokenizers.base import DensityTokenizer
 
 if TYPE_CHECKING:
@@ -82,3 +83,6 @@ class CutoffTokenizer(DensityTokenizer):
         out = np.zeros(int(np.prod(encoded.grid_shape)), dtype=np.float64)
         out[encoded.flat_indices] = encoded.values
         return out.reshape(encoded.grid_shape)
+
+    def token_count(self, encoded: CutoffEncoded) -> int:
+        return cutoff_tokens(int(encoded.values.size))

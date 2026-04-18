@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from tomat.token_count import fourier_tokens
 from tomat.tokenizers.base import DensityTokenizer
 
 if TYPE_CHECKING:
@@ -71,6 +72,9 @@ class FourierTokenizer(DensityTokenizer):
         flat[encoded.flat_indices] = encoded.coefficients
         axes = tuple(range(len(encoded.grid_shape)))
         return np.fft.irfftn(flat.reshape(rfft_shape), s=encoded.grid_shape, axes=axes)
+
+    def token_count(self, encoded: FourierEncoded) -> int:
+        return fourier_tokens(int(encoded.coefficients.size))
 
     @staticmethod
     def _g_squared_grid(grid_shape: tuple[int, ...], rfft_shape: tuple[int, ...]) -> np.ndarray:

@@ -17,6 +17,7 @@ export function useSweep(url: string) {
           mp_id: d.mp_id!,
           category: d.category!,
           config: d.config!,
+          tokens: Number(d.tokens),
           nmae: Number(d.nmae),
           chi_sq: Number(d.chi_sq),
           hellinger: Number(d.hellinger),

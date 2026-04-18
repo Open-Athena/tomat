@@ -35,5 +35,13 @@ class DensityTokenizer(ABC):
     def decode(self, encoded: Any) -> np.ndarray:
         """Reconstruct a density grid matching the original ``chgcar.data['total']`` shape."""
 
+    def token_count(self, encoded: Any) -> int:
+        """Tokens needed to transmit ``encoded`` under FP16 codec fidelity.
+
+        Default is 0 (scheme hasn't reported one). Subclasses override.
+        See :mod:`tomat.token_count` for the per-component constants.
+        """
+        return 0
+
     def roundtrip(self, chgcar: "Chgcar") -> np.ndarray:
         return self.decode(self.encode(chgcar))

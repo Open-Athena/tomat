@@ -1,6 +1,6 @@
 outs:
-- md5: 04ee1814f2e06809a298fc5374878751
-  size: 155056
+- md5: f246849e46fa8ae919c61b28b48bed8c
+  size: 280766
   hash: md5
   path: sweep-n50.csv
 meta:
@@ -9,15 +9,20 @@ meta:
   computation:
     cmd: uv run scripts/fidelity_sweep.py -n 50 -o results/sweep-n50.csv
     deps:
-      scripts/fidelity_sweep.py: 814d611f98f2e66e59d035ad05b32031
+      scripts/fidelity_sweep.py: 7a5e729b158046875c49ecab7375ab96
       src/tomat/__init__.py: 9cbf47fe9946ff90b5fb7c878130198d
       src/tomat/data/__init__.py: d41d8cd98f00b204e9800998ecf8427e
       src/tomat/data/classify.py: 344930021c37abc4c9087a1ba5f51454
       src/tomat/data/mp.py: 4743bd23ea6f102f4bc3f24d659f57cc
       src/tomat/pads.py: f9850f9572607f831a5fb8db55d04bd5
-      src/tomat/tokenizers/__init__.py: 34325b0be7585ca80e666be613e729b2
-      src/tomat/tokenizers/base.py: 977ec46447c05e502f9dd6d6767b7e6f
-      src/tomat/tokenizers/cutoff.py: b85d5a41f088872a578405e18ef47916
-      src/tomat/tokenizers/delta.py: 599b56091646ab5df6935148408fe8b7
-      src/tomat/tokenizers/direct.py: b8e285bc4dba452066b98d78e75d0a73
-      src/tomat/tokenizers/fourier.py: 29366b150676bf37b73005bec206129d
+      src/tomat/float_codec.py: cc357fde427098aa5fc999f503a37084
+      src/tomat/token_count.py: b20a83565696594affe7e78aeb6efd07
+      src/tomat/tokenizers/__init__.py: ff1a0d2fc4426235a5b5f65bbe50153a
+      src/tomat/tokenizers/base.py: d13e494c5310ac1ae3dfc727e3e283d3
+      src/tomat/tokenizers/cutoff.py: 227b96fe28fcd2b675fd1ef826eadda9
+      src/tomat/tokenizers/delta.py: 97b38059320ba8e7907d0bb938b48e19
+      src/tomat/tokenizers/direct.py: 045b2597d08ce070bd81f9a90a3d8683
+      src/tomat/tokenizers/direct_coded.py: c9d127b7527c0636ec6a8e4d8b053be8
+      src/tomat/tokenizers/fourier.py: 1d6da310da7731df741ec01e8ee5754b
+      src/tomat/tokenizers/fourier_coded.py: 22a823fd2a93412a465e062adef4154a
+      configs/fp16-channels.json: 85e147194129bc2bd2b93af85d38963c

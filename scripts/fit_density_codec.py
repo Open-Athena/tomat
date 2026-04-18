@@ -1,17 +1,21 @@
 #!/usr/bin/env python
-"""Fit ``(log_min, log_max)`` for the FP16-like density codec.
+"""Fit ``(log_min, log_max)`` for the FP16-like codec, per channel.
 
-Mirrors ``Open-Athena/tomol:build_fp16_config.py`` (Will's config fitter):
-takes per-voxel quantiles of ``log10(ρ)`` across a sample of CHGCARs,
-adds one log-unit of padding on each side, and writes a JSON config the
-codec loads with :meth:`FP16Codec.from_json`.
+Two channels:
 
-Usage:
+* ``density`` — per-voxel ρ values (signed in principle; CHGCARs carry
+  small negative regions from FFT aliasing).
+* ``fourier`` — real and imaginary parts of ``rfftn(ρ)`` coefficients,
+  fitted jointly. Fourier coefficients span a much wider dynamic range
+  than real-space density: DC ≈ sum(ρ) ~ 10³–10⁴ on one end, high-|G|
+  coefficients ~ 10⁻¹⁰ on the other.
 
-    scripts/fit_density_codec.py -n 50 -o configs/density-fp16.json
+Mirrors ``Open-Athena/tomol:build_fp16_config.py`` (one channel per
+dimension, same 0.01 / 99.99 percentile + 1-log-unit padding).
 
-The default 0.01 / 99.99 percentile pair matches Will's choice — robust
-to the extreme-value tail while still covering essentially all voxels.
+Usage::
+
+    scripts/fit_density_codec.py -n 50 -o configs/fp16-channels.json
 """
 
 import json
@@ -27,7 +31,7 @@ from tomat.data.mp import list_mp_ids, load_chgcar
 
 err = partial(print, file=sys.stderr)
 
-DEFAULT_OUTPUT = Path("configs/density-fp16.json")
+DEFAULT_OUTPUT = Path("configs/fp16-channels.json")
 
 
 def compute_log_range(
@@ -60,41 +64,49 @@ def main(n_samples: int, output: Path, padding: float, percentile_low: float, pe
     ids = list_mp_ids()[:n_samples]
     err(f"Sampling {len(ids)} CHGCARs…")
 
-    sample = []
+    density_samples: list[np.ndarray] = []
+    fourier_samples: list[np.ndarray] = []
     for i, mp_id in enumerate(ids, 1):
         chgcar = load_chgcar(mp_id)
-        vox = chgcar.data['total'].ravel()
-        # Density (ρ × V_cell in VASP units) is non-negative — but keep abs for
-        # safety in case this fitter is ever used on Δρ-like signed inputs.
-        sample.append(np.abs(vox).astype(np.float64))
-        err(f"  [{i}/{len(ids)}] {mp_id}: {vox.size:,} voxels, "
-            f"min={vox.min():.3e}, max={vox.max():.3e}")
+        rho = np.asarray(chgcar.data['total'], dtype=np.float64)
+        coefs = np.fft.rfftn(rho)
+        density_samples.append(rho.ravel())
+        # Fit real+imag jointly — they share a channel in the codec.
+        fourier_samples.append(np.concatenate([coefs.real.ravel(), coefs.imag.ravel()]))
+        err(f"  [{i}/{len(ids)}] {mp_id}: "
+            f"ρ ∈ [{rho.min():.2e}, {rho.max():.2e}]  "
+            f"|F| ∈ [{np.abs(coefs).min():.2e}, {np.abs(coefs).max():.2e}]")
 
-    all_vals = np.concatenate(sample)
-    nonzero = all_vals[all_vals > 0]
-    err(f"Total: {all_vals.size:,} voxels ({nonzero.size:,} non-zero)")
+    density_all = np.concatenate(density_samples)
+    fourier_all = np.concatenate(fourier_samples)
+    err(f"Density voxels: {density_all.size:,}")
+    err(f"Fourier components (real+imag): {fourier_all.size:,}")
 
-    log_min, log_max = compute_log_range(
-        all_vals,
-        percentile_low=percentile_low,
-        percentile_high=percentile_high,
-        padding=padding,
+    density_range = compute_log_range(
+        density_all, percentile_low=percentile_low, percentile_high=percentile_high, padding=padding,
     )
-    err(f"p{percentile_low}  → log10 = {np.log10(np.percentile(nonzero, percentile_low)):.3f}")
-    err(f"p{percentile_high} → log10 = {np.log10(np.percentile(nonzero, percentile_high)):.3f}")
-    err(f"padded: log_min={log_min:.3f}, log_max={log_max:.3f} "
-        f"({log_max - log_min:.2f} decades)")
+    # Fourier's DC component is a single huge value per structure (= sum ρ × V).
+    # p99.99 discards those outliers; clipping them injects a massive uniform
+    # spatial error on decode. Use the actual max on the high side.
+    fourier_range = compute_log_range(
+        fourier_all, percentile_low=percentile_low, percentile_high=100.0, padding=padding,
+    )
+    err(f"density: log_min={density_range[0]:.3f}, log_max={density_range[1]:.3f} "
+        f"({density_range[1] - density_range[0]:.2f} decades)")
+    err(f"fourier: log_min={fourier_range[0]:.3f}, log_max={fourier_range[1]:.3f} "
+        f"({fourier_range[1] - fourier_range[0]:.2f} decades)")
 
     output.parent.mkdir(parents=True, exist_ok=True)
     config = {
         "encoding_type": "fp16_like",
-        "channel": "density",
         "n_samples_fitted": len(ids),
         "percentile_low": percentile_low,
         "percentile_high": percentile_high,
         "padding_log_units": padding,
-        "log_min": log_min,
-        "log_max": log_max,
+        "channels": {
+            "density": {"log_min": density_range[0], "log_max": density_range[1]},
+            "fourier": {"log_min": fourier_range[0], "log_max": fourier_range[1]},
+        },
     }
     with output.open("w") as f:
         json.dump(config, f, indent=2)

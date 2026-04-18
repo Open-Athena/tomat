@@ -13,6 +13,7 @@ from tomat.tokenizers import (
     DeltaDensityTokenizer,
     DirectCodedTokenizer,
     DirectTokenizer,
+    FourierCodedTokenizer,
     FourierTokenizer,
 )
 
@@ -58,6 +59,17 @@ def test_direct_coded_roundtrip_hits_codec_precision():
     assert recon.shape == density.shape
     # 24-bit over 6 decades → ~1e-6 relative precision → NMAE ≲ 1e-6.
     assert nmae(density, recon) < 5e-6
+
+
+def test_fourier_coded_full_basis_approaches_codec_floor():
+    density = make_density() + 1e-3
+    # Fourier coefs span a wide range; widen log window accordingly.
+    codec = FP16Codec(log_min=-6.0, log_max=6.0)
+    tok = FourierCodedTokenizer(base=FourierTokenizer(coefficient_fraction=1.0), codec=codec)
+    recon = tok.roundtrip(fake_chgcar(density))
+    assert recon.shape == density.shape
+    # Full basis + codec only quantises; NMAE ≈ codec floor, well below bare Fourier truncation.
+    assert nmae(density, recon) < 1e-4
 
 
 def test_cutoff_top_fraction_one_is_lossless():
@@ -137,6 +149,7 @@ def fake_chgcar_with_structure(density: np.ndarray) -> SimpleNamespace:
     site_b.specie = Mock(Z=8)
     site_b.frac_coords = np.array([0.75, 0.75, 0.75])
     structure.__iter__ = lambda self: iter([site_a, site_b])
+    structure.__len__ = lambda self: 2
     return SimpleNamespace(data={"total": density}, structure=structure)
 
 

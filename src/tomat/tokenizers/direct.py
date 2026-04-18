@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from tomat.token_count import direct_tokens
 from tomat.tokenizers.base import DensityTokenizer
 
 if TYPE_CHECKING:
@@ -34,3 +35,6 @@ class DirectTokenizer(DensityTokenizer):
 
     def decode(self, encoded: DirectEncoded) -> np.ndarray:
         return encoded.density.astype(np.float64)
+
+    def token_count(self, encoded: DirectEncoded) -> int:
+        return direct_tokens(encoded.density.size)

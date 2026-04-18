@@ -86,63 +86,99 @@ Auto-regenerated via [`mdcmd`][mdcmd] from [`results/sweep-n50.csv`](./results/s
 | config | mean NMAE | mean χ² | mean mass captured |
 |---|---:|---:|---:|
 | `direct` | 2.15e-08 | 6.38e-16 | — |
+| `direct-coded` | 6.24e-07 | 1.60e-12 | — |
 | `cutoff-top-1pct` | 8.04e-01 | 8.04e-01 | 0.196 |
 | `cutoff-top-5pct` | 5.01e-01 | 5.01e-01 | 0.499 |
 | `cutoff-top-25pct` | 1.77e-01 | 1.77e-01 | 0.823 |
 | `cutoff-top-100pct` | 2.15e-08 | 6.38e-16 | 1.000 |
 | `fourier-lowg-0.25pct` | 1.68e-01 | 2.06e+01 | — |
+| `fourier-coded-lowg-0.25pct` | 1.68e-01 | 2.06e+01 | — |
 | `fourier-lowg-0.5pct` | 9.08e-02 | 8.30e+00 | — |
+| `fourier-coded-lowg-0.5pct` | 9.08e-02 | 8.30e+00 | — |
 | `fourier-lowg-1pct` | 4.78e-02 | 8.21e-01 | — |
+| `fourier-coded-lowg-1pct` | 4.78e-02 | 8.21e-01 | — |
 | `fourier-lowg-5pct` | 9.16e-03 | 1.25e-02 | — |
+| `fourier-coded-lowg-5pct` | 9.16e-03 | 1.25e-02 | — |
 | `fourier-lowg-25pct` | 9.08e-04 | 5.90e-05 | — |
+| `fourier-coded-lowg-25pct` | 9.08e-04 | 5.90e-05 | — |
 | `fourier-lowg-100pct` | 5.40e-08 | 1.08e-12 | — |
+| `fourier-coded-lowg-100pct` | 2.79e-06 | 8.39e-10 | — |
 | `delta-fourier-lowg-0.25pct` | 1.13e-01 | 3.66e-01 | — |
+| `delta-fourier-coded-lowg-0.25pct` | 1.13e-01 | 3.66e-01 | — |
 | `delta-fourier-lowg-0.5pct` | 6.44e-02 | 3.62e-01 | — |
+| `delta-fourier-coded-lowg-0.5pct` | 6.44e-02 | 3.62e-01 | — |
 | `delta-fourier-lowg-1pct` | 4.20e-02 | 2.43e-01 | — |
+| `delta-fourier-coded-lowg-1pct` | 4.20e-02 | 2.43e-01 | — |
 | `delta-fourier-lowg-5pct` | 1.47e-02 | 1.49e-01 | — |
+| `delta-fourier-coded-lowg-5pct` | 1.47e-02 | 1.49e-01 | — |
 | `delta-fourier-lowg-25pct` | 3.85e-03 | 3.10e-02 | — |
+| `delta-fourier-coded-lowg-25pct` | 3.85e-03 | 3.10e-02 | — |
 
 ### NMAE by material category (mean)
 
 | config | oxide (n=18) | other (n=14) | intermetallic (n=11) | oxychalcogenide (n=4) | chalcogenide (n=3) |
 |---|:---:|:---:|:---:|:---:|:---:|
 | `direct` | 2.15e-08 | 2.15e-08 | 2.12e-08 | 2.15e-08 | 2.17e-08 |
+| `direct-coded` | 6.24e-07 | 6.24e-07 | 6.24e-07 | 6.24e-07 | 6.22e-07 |
 | `cutoff-top-1pct` | 8.31e-01 | 8.26e-01 | 7.14e-01 | 8.48e-01 | 8.03e-01 |
 | `cutoff-top-5pct` | 5.24e-01 | 5.53e-01 | 3.68e-01 | 5.50e-01 | 5.52e-01 |
 | `cutoff-top-25pct` | 1.50e-01 | 2.03e-01 | 1.93e-01 | 1.62e-01 | 1.77e-01 |
 | `cutoff-top-100pct` | 2.15e-08 | 2.15e-08 | 2.12e-08 | 2.15e-08 | 2.17e-08 |
 | `fourier-lowg-0.25pct` | 2.96e-01 | 4.46e-02 | 1.80e-01 | 8.56e-02 | 4.90e-02 |
+| `fourier-coded-lowg-0.25pct` | 2.96e-01 | 4.46e-02 | 1.80e-01 | 8.56e-02 | 4.90e-02 |
 | `fourier-lowg-0.5pct` | 1.89e-01 | 1.56e-02 | 6.85e-02 | 3.07e-02 | 1.65e-02 |
+| `fourier-coded-lowg-0.5pct` | 1.89e-01 | 1.56e-02 | 6.85e-02 | 3.07e-02 | 1.65e-02 |
 | `fourier-lowg-1pct` | 1.13e-01 | 5.52e-03 | 1.91e-02 | 1.12e-02 | 5.18e-03 |
+| `fourier-coded-lowg-1pct` | 1.13e-01 | 5.52e-03 | 1.91e-02 | 1.12e-02 | 5.18e-03 |
 | `fourier-lowg-5pct` | 2.37e-02 | 4.23e-04 | 1.85e-03 | 1.01e-03 | 6.88e-04 |
+| `fourier-coded-lowg-5pct` | 2.37e-02 | 4.23e-04 | 1.85e-03 | 1.01e-03 | 6.88e-04 |
 | `fourier-lowg-25pct` | 2.01e-03 | 1.30e-04 | 4.96e-04 | 2.49e-04 | 3.35e-04 |
+| `fourier-coded-lowg-25pct` | 2.01e-03 | 1.30e-04 | 4.96e-04 | 2.49e-04 | 3.35e-04 |
 | `fourier-lowg-100pct` | 4.81e-08 | 5.07e-08 | 7.12e-08 | 4.96e-08 | 4.85e-08 |
+| `fourier-coded-lowg-100pct` | 2.69e-06 | 2.59e-06 | 3.30e-06 | 2.64e-06 | 2.67e-06 |
 | `delta-fourier-lowg-0.25pct` | 1.47e-01 | 4.23e-02 | 1.80e-01 | 6.86e-02 | 4.73e-02 |
+| `delta-fourier-coded-lowg-0.25pct` | 1.47e-01 | 4.23e-02 | 1.80e-01 | 6.86e-02 | 4.73e-02 |
 | `delta-fourier-lowg-0.5pct` | 1.07e-01 | 1.77e-02 | 6.89e-02 | 5.63e-02 | 2.23e-02 |
+| `delta-fourier-coded-lowg-0.5pct` | 1.07e-01 | 1.77e-02 | 6.89e-02 | 5.63e-02 | 2.23e-02 |
 | `delta-fourier-lowg-1pct` | 8.57e-02 | 9.50e-03 | 1.99e-02 | 4.32e-02 | 1.10e-02 |
+| `delta-fourier-coded-lowg-1pct` | 8.57e-02 | 9.50e-03 | 1.99e-02 | 4.32e-02 | 1.10e-02 |
 | `delta-fourier-lowg-5pct` | 3.41e-02 | 2.24e-03 | 2.89e-03 | 1.26e-02 | 1.84e-03 |
+| `delta-fourier-coded-lowg-5pct` | 3.41e-02 | 2.24e-03 | 2.89e-03 | 1.26e-02 | 1.84e-03 |
 | `delta-fourier-lowg-25pct` | 9.01e-03 | 5.86e-04 | 1.29e-03 | 1.58e-03 | 4.59e-04 |
+| `delta-fourier-coded-lowg-25pct` | 9.01e-03 | 5.86e-04 | 1.29e-03 | 1.58e-03 | 4.59e-04 |
 
 ### χ² by material category (mean)
 
 | config | oxide (n=18) | other (n=14) | intermetallic (n=11) | oxychalcogenide (n=4) | chalcogenide (n=3) |
 |---|:---:|:---:|:---:|:---:|:---:|
 | `direct` | 6.41e-16 | 6.42e-16 | 6.24e-16 | 6.40e-16 | 6.54e-16 |
+| `direct-coded` | 3.53e-12 | 5.19e-13 | 5.19e-13 | 5.19e-13 | 5.17e-13 |
 | `cutoff-top-1pct` | 8.31e-01 | 8.26e-01 | 7.14e-01 | 8.48e-01 | 8.03e-01 |
 | `cutoff-top-5pct` | 5.24e-01 | 5.53e-01 | 3.68e-01 | 5.50e-01 | 5.52e-01 |
 | `cutoff-top-25pct` | 1.50e-01 | 2.03e-01 | 1.93e-01 | 1.62e-01 | 1.77e-01 |
 | `cutoff-top-100pct` | 6.41e-16 | 6.42e-16 | 6.24e-16 | 6.40e-16 | 6.54e-16 |
 | `fourier-lowg-0.25pct` | 5.70e+01 | 4.40e-02 | 2.15e-01 | 8.63e-02 | 1.70e-02 |
+| `fourier-coded-lowg-0.25pct` | 5.70e+01 | 4.40e-02 | 2.15e-01 | 8.63e-02 | 1.70e-02 |
 | `fourier-lowg-0.5pct` | 2.30e+01 | 1.61e-02 | 4.72e-02 | 1.36e-02 | 2.26e-03 |
+| `fourier-coded-lowg-0.5pct` | 2.30e+01 | 1.61e-02 | 4.72e-02 | 1.36e-02 | 2.26e-03 |
 | `fourier-lowg-1pct` | 2.27e+00 | 2.56e-03 | 6.36e-03 | 1.23e-03 | 2.34e-04 |
+| `fourier-coded-lowg-1pct` | 2.27e+00 | 2.56e-03 | 6.36e-03 | 1.23e-03 | 2.34e-04 |
 | `fourier-lowg-5pct` | 3.47e-02 | 2.01e-06 | 3.83e-05 | 1.56e-05 | 2.89e-06 |
+| `fourier-coded-lowg-5pct` | 3.47e-02 | 2.01e-06 | 3.83e-05 | 1.56e-05 | 2.89e-06 |
 | `fourier-lowg-25pct` | 1.63e-04 | 1.21e-07 | 1.52e-06 | 2.12e-07 | 5.79e-07 |
+| `fourier-coded-lowg-25pct` | 1.63e-04 | 1.21e-07 | 1.52e-06 | 2.12e-07 | 5.79e-07 |
 | `fourier-lowg-100pct` | 2.84e-12 | 1.53e-13 | 3.00e-14 | 3.45e-14 | 2.25e-14 |
+| `fourier-coded-lowg-100pct` | 2.17e-09 | 1.57e-10 | 3.57e-11 | 4.42e-11 | 2.81e-11 |
 | `delta-fourier-lowg-0.25pct` | 8.59e-01 | 2.29e-02 | 2.15e-01 | 2.09e-02 | 1.57e-02 |
+| `delta-fourier-coded-lowg-0.25pct` | 8.59e-01 | 2.29e-02 | 2.15e-01 | 2.09e-02 | 1.57e-02 |
 | `delta-fourier-lowg-0.5pct` | 9.64e-01 | 8.74e-03 | 4.71e-02 | 1.71e-02 | 3.29e-03 |
+| `delta-fourier-coded-lowg-0.5pct` | 9.64e-01 | 8.74e-03 | 4.71e-02 | 1.71e-02 | 3.29e-03 |
 | `delta-fourier-lowg-1pct` | 6.65e-01 | 3.61e-03 | 6.44e-03 | 1.14e-02 | 8.32e-04 |
+| `delta-fourier-coded-lowg-1pct` | 6.65e-01 | 3.61e-03 | 6.44e-03 | 1.14e-02 | 8.32e-04 |
 | `delta-fourier-lowg-5pct` | 4.13e-01 | 2.90e-04 | 8.15e-05 | 1.89e-03 | 2.61e-05 |
+| `delta-fourier-coded-lowg-5pct` | 4.13e-01 | 2.90e-04 | 8.15e-05 | 1.89e-03 | 2.61e-05 |
 | `delta-fourier-lowg-25pct` | 8.60e-02 | 8.46e-06 | 1.47e-05 | 5.19e-05 | 1.27e-06 |
+| `delta-fourier-coded-lowg-25pct` | 8.60e-02 | 8.46e-06 | 1.47e-05 | 5.19e-05 | 1.27e-06 |
 
 </details>
 
