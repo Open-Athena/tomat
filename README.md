@@ -38,15 +38,12 @@ NMAE from `encode → decode` alone, with no model in the loop. The
 transformer's total error on the same metric will be `floor +
 prediction_error`.
 
-**Reference points.** electrAI (recently rebranded RHOAR-Net; "Rho
-Augmented Resolution Network") is OA's in-house 3D ResUNet. On the same
-MP subset used here, electrAI's best reported validation NMAE is
-**2.60%** (Jan 2026 monthly review, 100-epoch run; 50-epoch runs cluster
-around 2.7–3.1% and were "still learning"). There is **no published MP
-SotA** for density prediction to benchmark against — Li et al 2024 (the
-paper electrAI replicates) reports only molecular datasets, best 0.14%
-on QM9. So tomat's target on MP is beating OA's own ResNet, not a
-paper number.
+**Reference point.** electrAI (recently rebranded RHOAR-Net; "Rho
+Augmented Resolution Network") is OA's in-house 3D ResUNet, and the
+stepping-stone target tomat is trying to match at comparable compute.
+On the same MP subset used here, electrAI's best reported validation
+NMAE is **2.60%** (Jan 2026 monthly review, 100-epoch run; 50-epoch
+runs cluster around 2.7–3.1% and were "still learning").
 
 For tomat to *beat* electrAI on NMAE, the tokenizer floor needs to be
 well below 2.6%, leaving headroom for the transformer to add some

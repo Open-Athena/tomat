@@ -21,16 +21,34 @@ v5p-8) and its float-encoding tricks (SE/M0/M1).
 The **2.6%** NMAE figure we keep citing is **electrAI/RHOAR-Net's best
 validation NMAE on Materials Project**, from a 100-epoch internal run
 (Jan 2026 monthly review; 50-epoch runs cluster around 2.7–3.1% and were
-"still learning"). It is **OA-internal, not published SotA**:
+"still learning"). It's an in-house ResUNet number, not the published
+SotA.
 
-- Li et al 2025 ([arXiv:2402.12335], the paper electrAI replicates) reports
-  only molecular benchmarks (best 0.14% on QM9). No MP number in that paper.
-- Materials Project density prediction was an OA extension to the ResNet
-  approach. There's no published MP-density SotA to benchmark against.
-- electrAI's own ratchet is the relevant target. tomat beating it at
-  comparable compute would justify the architectural bet.
+**Published SotA on MP charge density: ChargE3Net** (Koker et al,
+[npj Computational Materials 2024][ChargE3Net]): E(3)-equivariant GNN
+trained on ~106k MP structures, reporting **0.52 ± 0.01% NMAE** on a
+2000-sample MP test split. Baselines in the same paper: invDeepDFT
+(0.86%), equiDeepDFT (0.80%). OA benchmarks electrAI against
+ChargE3Net.
+
+Context: Li et al 2025 ([arXiv:2402.12335], the paper electrAI
+architecturally replicates) is a separate molecular-only line and
+reports 0.14% on QM9, no MP number. I earlier conflated "the paper
+electrAI replicates" with "the MP state of the art" — they're
+different, and the correction was prompted by Betsy. See also the
+feedback memory on needing real literature searches for negative
+claims about the published field.
+
+So the hierarchy of targets is roughly:
+
+| reference | MP NMAE | role for tomat |
+|---|---:|---|
+| ChargE3Net (Koker et al 2024) | 0.52% | published SotA — longer-term target |
+| electrAI / RHOAR-Net (OA 2026) | 2.60% | stepping-stone internal target |
+| tomat reconstruction-floor only | varies by scheme | must be well below both to be competitive |
 
 [arXiv:2402.12335]: https://arxiv.org/abs/2402.12335
+[ChargE3Net]: https://www.nature.com/articles/s41524-024-01343-1
 
 ### Floor vs achieved-loss framing
 

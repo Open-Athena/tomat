@@ -11,13 +11,15 @@ transformer can never beat 1% NMAE even with perfect prediction*).
 
 The transformer's total NMAE is `reconstruction_floor + prediction_error`
 where the floor is what `encode → decode` alone loses before any model
-runs. The MP reference point is electrAI (a.k.a. RHOAR-Net) at **2.60%
-validation NMAE** (Jan 2026 monthly review, 100-epoch run) — OA's own
-ResNet, not a published SotA (Li et al 2024 reports only on molecular
-datasets, no MP number). For tomat to beat it, our floor needs to be
-well below 2.6%, leaving headroom for transformer prediction error. A
-scheme whose floor approaches or exceeds 2.6% is disqualified; a floor
-well below it is a *prerequisite* to competing, not an achievement.
+runs. The immediate MP reference point is electrAI (a.k.a. RHOAR-Net)
+at **2.60% validation NMAE** (Jan 2026 monthly review, 100-epoch run) —
+OA's in-house 3D ResUNet, and tomat's stepping-stone target. The
+published SotA on MP charge density is **ChargE3Net** (Koker et al, npj
+Computational Materials 2024) at ~0.52% NMAE, which is what OA
+benchmarks electrAI against; matching that is the longer-term target.
+For tomat's floor to be *competitive* with either target, it must sit
+well below them — a floor approaching 2.6% is disqualified against
+electrAI, and a floor approaching 0.52% is disqualified against SotA.
 
 One more caveat on NMAE as a target: Yael's investigation in the same
 Jan 2026 review shows the metric is dominated by high-density (near-
