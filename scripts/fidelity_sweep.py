@@ -27,14 +27,18 @@ from click import argument, command, option
 
 from tomat.data.classify import classify_elements
 from tomat.data.mp import load_chgcar, list_mp_ids
+from tomat.float_codec import FP16Codec
 from tomat.tokenizers import (
     CutoffEncoded,
     CutoffTokenizer,
     DeltaDensityTokenizer,
     DensityTokenizer,
+    DirectCodedTokenizer,
     DirectTokenizer,
     FourierTokenizer,
 )
+
+DEFAULT_CODEC_CONFIG = Path("configs/density-fp16.json")
 
 err = partial(print, file=sys.stderr)
 
@@ -45,7 +49,7 @@ class SweepConfig:
     tokenizer: DensityTokenizer
 
 
-def default_configs() -> list[SweepConfig]:
+def default_configs(codec_config: Path = DEFAULT_CODEC_CONFIG) -> list[SweepConfig]:
     """Each cutoff/fourier entry keeps a fraction of the representation.
 
     Label convention reflects what's kept:
@@ -56,6 +60,12 @@ def default_configs() -> list[SweepConfig]:
     Both sort by the scheme's natural ranking, but the ranking criterion differs.
     """
     cfgs: list[SweepConfig] = [SweepConfig("direct", DirectTokenizer())]
+    if codec_config.exists():
+        codec = FP16Codec.from_json(codec_config)
+        cfgs.append(SweepConfig("direct-coded", DirectCodedTokenizer(codec=codec)))
+    else:
+        err(f"[warn] {codec_config} missing; skipping direct-coded. "
+            "Run scripts/fit_density_codec.py to generate it.")
     for frac in (0.01, 0.05, 0.25, 1.0):
         cfgs.append(SweepConfig(f"cutoff-top-{frac * 100:g}pct", CutoffTokenizer(top_fraction=frac)))
     for frac in (0.0025, 0.005, 0.01, 0.05, 0.25, 1.0):

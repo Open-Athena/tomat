@@ -6,8 +6,15 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
+from tomat.float_codec import FP16Codec
 from tomat.pads import GaussianPADS, SlaterPADS
-from tomat.tokenizers import CutoffTokenizer, DeltaDensityTokenizer, DirectTokenizer, FourierTokenizer
+from tomat.tokenizers import (
+    CutoffTokenizer,
+    DeltaDensityTokenizer,
+    DirectCodedTokenizer,
+    DirectTokenizer,
+    FourierTokenizer,
+)
 
 
 def make_density(shape: tuple[int, int, int] = (16, 18, 20), seed: int = 0) -> np.ndarray:
@@ -41,6 +48,16 @@ def test_direct_is_lossless():
     assert recon.shape == density.shape
     # float64 → float32 → float64 loses ~ulp; should be effectively lossless.
     assert nmae(density, recon) < 1e-6
+
+
+def test_direct_coded_roundtrip_hits_codec_precision():
+    density = make_density() + 1e-3  # keep all voxels positive and well inside log range
+    codec = FP16Codec(log_min=-5.0, log_max=1.0)
+    tok = DirectCodedTokenizer(codec=codec)
+    recon = tok.roundtrip(fake_chgcar(density))
+    assert recon.shape == density.shape
+    # 24-bit over 6 decades → ~1e-6 relative precision → NMAE ≲ 1e-6.
+    assert nmae(density, recon) < 5e-6
 
 
 def test_cutoff_top_fraction_one_is_lossless():
