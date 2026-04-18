@@ -119,3 +119,178 @@ a { color: var(--link); }
 }
 
 code { background: var(--code-bg); padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.9em; }
+
+.deck-link {
+  font-size: 0.9rem;
+  color: var(--link);
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.2rem 0.55rem;
+  margin-left: auto;
+}
+
+.deck-link:hover { background: var(--card-bg); }
+
+/* While the deck is mounted, let it fill the viewport. */
+body.in-deck #root { max-width: none; padding: 0; margin: 0; }
+
+/* --- Deck layout -------------------------------------------------------- */
+/* Escape #root's max-width by fixing the deck to the viewport. */
+.deck {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  background: var(--bg);
+}
+
+.deck-drawer {
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  padding: 0.75rem 0.5rem;
+  background: var(--card-bg);
+}
+
+.deck-drawer-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.deck-home {
+  flex: 1;
+  font-size: 0.85rem;
+  color: var(--muted);
+  text-decoration: none;
+  padding: 0.3rem 0.5rem;
+  border-radius: 3px;
+}
+
+.deck-home:hover { background: var(--bg); color: var(--fg); }
+
+.deck-theme-toggle {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  padding: 0.2rem 0.4rem;
+  font-size: 0.9rem;
+  color: var(--fg);
+}
+
+.deck-thumbs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.deck-thumb {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 1.5rem 1fr;
+  align-items: center;
+  gap: 0.5rem;
+  text-align: left;
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 0.45rem 0.5rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.deck-thumb:hover { background: var(--bg); }
+
+.deck-thumb.active {
+  background: var(--bg);
+  border-color: var(--link);
+}
+
+.deck-thumb-idx {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.8rem;
+  text-align: right;
+}
+
+.deck-thumb.active .deck-thumb-idx { color: var(--link); }
+
+.deck-thumb-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.deck-main {
+  overflow-y: auto;
+}
+
+.deck-slide {
+  min-height: 100vh;
+  padding: 3rem 4rem 2rem;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  border-bottom: 1px dashed var(--border);
+  position: relative;
+}
+
+.deck-slide-inner {
+  max-width: 900px;
+  width: 100%;
+  margin: 0 auto;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.deck-slide h1 { font-size: 2.5rem; margin: 0 0 1rem; }
+.deck-slide h2 { font-size: 1.75rem; margin: 0 0 1rem; }
+.deck-slide p, .deck-slide li { font-size: 1.1rem; line-height: 1.5; }
+
+.slide-title {
+  text-align: center;
+  margin-top: 15vh;
+}
+
+.slide-title h1 { font-size: 3.5rem; }
+.slide-title .subtitle { font-size: 1.4rem; color: var(--muted); margin: 0 0 2rem; }
+.slide-title .byline { font-size: 1rem; color: var(--muted); }
+
+.equation {
+  text-align: center;
+  font-size: 1.2rem;
+  padding: 1rem;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.note { color: var(--muted); font-size: 0.95rem; font-style: italic; }
+
+.deck-slide-footer {
+  display: flex;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 0.8rem;
+  margin-top: 1rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.5rem;
+}
+
+.slide-plot { width: 100%; }
+.slide-plot h2 { text-align: left; margin-bottom: 1rem; }
+
+@media (max-width: 720px) {
+  .deck { grid-template-columns: 1fr; }
+  .deck-drawer { display: none; }
+  .deck-slide { padding: 2rem 1.5rem; }
+}
