@@ -41,9 +41,19 @@ import pyarrow.parquet as pq
 from click import command, option
 
 from tomat.data.zarr_io import load_rho_gga
+from tomat.float_codec import FP16Codec
 from tomat.tokenizers.patch import PatchTokenizer, SPECIAL_TOKENS
 
 err = partial(print, file=sys.stderr)
+
+
+# Density-codec builders keyed by name. These are the variants we sweep over.
+# Each takes ``(log_min, log_max)`` fitted from rho_gga densities.
+DENSITY_CODECS: dict[str, callable] = {
+    "tomol_3byte":    FP16Codec.tomol_3byte,     # 3 tokens/value, 1024 vocab, 24-bit
+    "two_token_9_12": FP16Codec.two_token_9_12,  # 2 tokens/value, 4608 vocab, 21-bit
+    "fp16_1token":    FP16Codec.fp16_1token,     # 1 token/value,  65 536 vocab, 16-bit
+}
 
 
 def _build_schema() -> pa.Schema:
@@ -65,6 +75,13 @@ def _build_schema() -> pa.Schema:
         help='Key in split file (default: validation).')
 @option('-m', '--patches-per-material', type=int, default=32,
         help='Random patch offsets to sample per material.')
+@option('-c', '--density-codec', type=click.Choice(sorted(DENSITY_CODECS)),
+        default='two_token_9_12',
+        help='FP16 codec variant for density values (affects vocab size + tokens/value).')
+@option('--density-log-min', type=float, default=-4.127,
+        help='Codec log_min (rho_gga p0.01 with padding).')
+@option('--density-log-max', type=float, default=4.967,
+        help='Codec log_max (rho_gga p99.99 with padding).')
 @option('-p', '--patch-size', type=int, default=14,
         help='Patch edge length (voxels). Default 14.')
 @option('-o', '--output-dir', type=click.Path(path_type=Path), required=True,
@@ -79,6 +96,9 @@ def main(
     split_file: Path | None,
     split: str,
     patches_per_material: int,
+    density_codec: str,
+    density_log_min: float,
+    density_log_max: float,
     patch_size: int,
     output_dir: Path,
     seed: int,
@@ -98,10 +118,12 @@ def main(
     if n_materials:
         task_ids = task_ids[:n_materials]
     err(f"[tokenize] split={split} materials={len(task_ids)} "
-        f"patches/material={patches_per_material} patch_size={patch_size}")
+        f"patches/material={patches_per_material} patch_size={patch_size} "
+        f"density_codec={density_codec}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    tokenizer = PatchTokenizer(patch_size=patch_size)
+    codec = DENSITY_CODECS[density_codec](log_min=density_log_min, log_max=density_log_max)
+    tokenizer = PatchTokenizer(patch_size=patch_size, density_codec=codec)
     rng = np.random.default_rng(seed)
     schema = _build_schema()
 
@@ -184,6 +206,7 @@ def main(
         "missing_task_ids": missing[:50],  # truncate
         "patches_per_material": patches_per_material,
         "patch_size": patch_size,
+        "density_codec_name": density_codec,
         "seed": seed,
         "total_rows": total_rows,
         "n_shards": shard_idx + 1 if writer is not None or total_rows > 0 else 0,

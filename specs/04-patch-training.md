@@ -110,6 +110,36 @@ experiments/tomat_patch_30m.py  →  Qwen3 training on v5p-8
    `pyproject.toml` when ready to run, or run from a marin-experiments
    checkout that already has them.
 
+## Sweep axes
+
+Once the baseline `(codec=two_token_9_12, patch_size=14)` hello-world
+trains, the natural knobs to sweep are:
+
+| axis | where it lives | default | sweep values |
+|---|---|---|---|
+| **codec** | preprocessing | `two_token_9_12` | `tomol_3byte` / `two_token_9_12` / `fp16_1token` |
+| **patch_size** | preprocessing | 14 | 12 / 14 / 16 |
+| **M** (patches/material) | preprocessing | 32 | 16 / 32 / 64 / 128 |
+| **N** (shuffle buffer) | training (Levanter `BlockShuffleConfig`) | 4096 | 1k / 4k / 16k |
+
+Only `(codec, patch_size)` require separate parquet shard sets.
+[`scripts/sweep_preprocess.py`](../scripts/sweep_preprocess.py)
+dispatches these — at an 8k context budget 6 of the 9 combos fit (the
+3-byte codec + P ≥ 14, plus 2-token codec + P = 16, all overflow).
+
+`M` is bounded at preprocessing (preprocess at `M = M_max = 128`);
+training configs sub-sample down via Levanter's row limits. `N` is a
+pure training-time parameter. So the sweep footprint is:
+
+* **Preprocessing**: 6 runs producing 6 parquet shard sets.
+* **Training**: one Qwen3 config per valid `(codec, patch_size)`,
+  optionally × per-axis sweep over `M` and `N`.
+
+[`src/tomat/training/sweep.py`](../src/tomat/training/sweep.py) is the
+single source of truth for codec ↔ token-count mapping, vocab-size
+accounting, and the default sweep grids — shared by the preprocessing
+script and (future) training config generators.
+
 ## Open design questions
 
 * **Patch size.** 14³ chosen because it fits 8k with buffer. 12³ fits
