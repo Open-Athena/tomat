@@ -1,26 +1,21 @@
 """Tomat 30M hello-world: Qwen3 on patch-tokenized rho_gga CHGCARs.
 
-**SCAFFOLD — NOT YET RUNNABLE.** Two Marin-integration pieces need to
-be filled in before this launches on a TPU:
+**SCAFFOLD — NOT YET RUNNABLE.** One concrete hook still needs to be
+wired:
 
-1. A HuggingFace tokenizer artifact that matches our 6,790-token vocab.
-   Levanter's data-pipeline expects an ``AutoTokenizer.from_pretrained``
-   handle; for our numeric-only vocab the simplest thing is a
-   ``WordLevel`` tokenizer with ``{str(i): i}`` mappings. Upload to
-   ``openathena/tomat-patch-tokenizer`` on HF (or a local path) and
-   wire the name below.
+  Point the ``UrlDatasetSourceConfig`` below at the actual parquet-shard
+  directory produced by ``scripts/tokenize_patches.py``. Either
+  - GCS-hosted parquet (easiest for TPU training) — `rsync` the output
+    dir into `gs://<bucket>/tomat/rho-gga-val/`, or
+  - Modal-volume-hosted parquet if the v5p job has the tomat-rho-gga
+    volume mounted.
 
-2. A pre-tokenized dataset artifact referenced by ``default_tokenize``
-   or equivalent. Options:
-   - Run ``scripts/tokenize_patches.py`` locally/on della to produce
-     parquet shards, push to HF as ``openathena/tomat-rho-gga-val``,
-     then use ``default_download`` to pull them on the training node.
-   - Or mount the parquet from the ``tomat-rho-gga`` Modal volume
-     directly into the training job — cleaner, skips the HF round
-     trip. Needs a Marin dataset source config that reads a volume
-     mount; look at ``marin.processing.tokenize`` for the hook.
+The nice news: **Levanter ships a ``PrebuiltLmDatasetFormat``** that
+takes ``input_ids`` columns directly, so we don't need a HF tokenizer
+artifact at all. Our parquet shards are exactly in that format already
+(``input_ids: list<int32>``).
 
-Once those land, replace the ``TODO`` markers below and launch with:
+Once the dataset path is set, launch with::
 
     uv run iris --config lib/iris/examples/marin.yaml job run \\
         --extra marin:tpu --tpu v5p-8 -- \\
@@ -36,21 +31,20 @@ Config mirrors ``will-tomol/experiments/tatt/tomol25_30m.py`` with:
 * Batch 64, 1 B training tokens, v5p-8 — same as tomol.
 """
 
+from levanter.data.text import (
+    DatasetComponent,
+    LmDataConfig,
+    PrebuiltLmDatasetFormat,
+    UrlDatasetSourceConfig,
+)
 from levanter.layers.rotary import Llama3RotaryEmbeddingsConfig
 from levanter.models.qwen import Qwen3Config
 from levanter.optim import AdamHConfig
 
-from experiments.defaults import default_download, default_tokenize, default_train
+from experiments.defaults import default_train
 from experiments.simple_train_config import SimpleTrainConfig
 from fray.cluster import ResourceConfig
 from marin.execution.executor import executor_main
-from marin.processing.tokenize.data_configs import lm_data_config
-
-# TODO: replace with the HF path for the passthrough WordLevel tokenizer
-# matching tomat's 6 790-token vocab (see `src/tomat/tokenizers/patch.py`
-# for the layout). A ``PatchVocab.to_hf_tokenizer()`` helper would be
-# the cleanest way to generate it.
-TOKENIZER = "openathena/tomat-patch-tokenizer"  # TODO
 
 SEQ_LEN = 8192
 BATCH_SIZE = 64
@@ -90,30 +84,38 @@ train_config = SimpleTrainConfig(
     steps_per_eval=500,
 )
 
-# TODO: wire to the actual tomat pre-tokenized dataset. Two-path sketch:
-#
-# (a) HF-backed (mirror tomol's flow):
-#     tomat_download = default_download(
-#         name="raw/tomat-rho-gga-val",
-#         hf_dataset_id="openathena/tomat-rho-gga-val",
-#         revision="<commit-sha>",
-#     )
-#     tomat_tokenized = default_tokenize(
-#         name="tomat-val",
-#         dataset=tomat_download / "data/*.parquet",
-#         tokenizer=TOKENIZER,
-#     )
-#
-# (b) Modal-volume-backed (skips HF round-trip):
-#     tomat_tokenized = <custom dataset source pointing at the
-#                       tomat-rho-gga volume's /tokenized/val/*.parquet>
-#
-# For the first run: split off a tiny "val" subset (even just 32 of 4303
-# structures) so we can iterate fast; full val + train are a later
-# knob.
-tomat_tokenized = ...  # TODO
+# TODO: point at the tomat tokenized parquet. Change to the real path:
+#   scripts/tokenize_patches.py writes
+#     <output-dir>/shard-NNNNN.parquet  (columns: task_id, offset_{x,y,z}, input_ids)
+# A GCS mirror (`gs://...`) is simplest for TPU jobs; local path works
+# for CPU / debugging.
+TOMAT_TRAIN_URL = "gs://TODO-bucket/tomat/rho-gga-train/*.parquet"
+TOMAT_VAL_URL = "gs://TODO-bucket/tomat/rho-gga-val/*.parquet"
 
-tomat_data = lm_data_config(tomat_tokenized)  # TODO: add validation_sets
+_prebuilt = PrebuiltLmDatasetFormat(input_ids_key="input_ids")
+
+tomat_train_source = UrlDatasetSourceConfig(
+    urls=[TOMAT_TRAIN_URL],
+    cache_dir="gs://TODO-bucket/tomat/cache/train",
+    format=_prebuilt,
+)
+
+tomat_val_source = UrlDatasetSourceConfig(
+    urls=[TOMAT_VAL_URL],
+    cache_dir="gs://TODO-bucket/tomat/cache/val",
+    format=_prebuilt,
+)
+
+tomat_data = LmDataConfig(
+    train_components=[
+        DatasetComponent(source=tomat_train_source, cache_dir=tomat_train_source.cache_dir,
+                         format=_prebuilt),
+    ],
+    validation_sets={
+        "tomat-val": DatasetComponent(source=tomat_val_source, cache_dir=tomat_val_source.cache_dir,
+                                      format=_prebuilt),
+    },
+)
 
 training_step = default_train(
     name="tomat-patch-30m",
