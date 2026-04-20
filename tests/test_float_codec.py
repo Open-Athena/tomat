@@ -13,7 +13,7 @@ def nmae(a: np.ndarray, b: np.ndarray) -> float:
 @pytest.fixture
 def codec() -> FP16Codec:
     # 8-decade range typical for electron densities in e/bohr³.
-    return FP16Codec(log_min=-6.0, log_max=2.0)
+    return FP16Codec.tomol_3byte(log_min=-6.0, log_max=2.0)
 
 
 def test_signed_shape(codec):
@@ -80,3 +80,82 @@ def test_se_sign_layout(codec):
     comps_neg = codec.encode_signed(np.array([-1.0]))
     assert comps_pos[0, 0] < 256
     assert 256 <= comps_neg[0, 0] < 512
+
+
+# ---- two-token 9+12 variant -----------------------------------------------
+
+
+def test_two_token_9_12_shape_and_vocabs():
+    codec = FP16Codec.two_token_9_12(log_min=-6.0, log_max=2.0)
+    assert codec.tokens_per_value_signed == 2
+    assert codec.signed_vocabs == (512, 4096)
+    assert codec.total_mag_bits_signed == 20  # 8 + 12
+
+    comps = codec.encode_signed(np.array([1.0, -1.0, 1e-3, -1e-3]))
+    assert comps.shape == (4, 2)
+    assert (comps[:, 0] >= 0).all() and (comps[:, 0] < 512).all()
+    assert (comps[:, 1] >= 0).all() and (comps[:, 1] < 4096).all()
+
+
+def test_two_token_9_12_roundtrip_precision():
+    """21-bit total (1 sign + 20 mag) over 8 decades → rel-err ~1e-5."""
+    codec = FP16Codec.two_token_9_12(log_min=-6.0, log_max=2.0)
+    rng = np.random.default_rng(42)
+    logs = rng.uniform(codec.log_min, codec.log_max, size=20_000)
+    signs = rng.choice([-1.0, 1.0], size=20_000)
+    vals = signs * 10 ** logs
+    recon = codec.decode_signed(codec.encode_signed(vals))
+    rel_err = np.abs(recon - vals) / np.abs(vals)
+    # Step = 8 / 2^20 ≈ 7.6e-6 decades → rel_err max ≈ 1.8e-5.
+    assert rel_err.max() < 5e-5
+
+
+def test_two_token_9_12_sign_in_first_token():
+    codec = FP16Codec.two_token_9_12(log_min=-6.0, log_max=2.0)
+    comps_pos = codec.encode_signed(np.array([1.0]))
+    comps_neg = codec.encode_signed(np.array([-1.0]))
+    assert comps_pos[0, 0] < 256
+    assert 256 <= comps_neg[0, 0] < 512
+
+
+# ---- one-token fp16 variant ----------------------------------------------
+
+
+def test_fp16_1token_shape_and_vocab():
+    codec = FP16Codec.fp16_1token(log_min=-6.0, log_max=2.0)
+    assert codec.tokens_per_value_signed == 1
+    assert codec.signed_vocabs == (65_536,)
+    assert codec.total_mag_bits_signed == 15
+
+    comps = codec.encode_signed(np.array([1.0, -1.0, 1e-3, -1e-3]))
+    assert comps.shape == (4, 1)
+    assert (comps >= 0).all() and (comps < 65_536).all()
+
+
+def test_fp16_1token_roundtrip_precision():
+    """16-bit total (1 sign + 15 mag) over 8 decades → rel-err ~6e-4."""
+    codec = FP16Codec.fp16_1token(log_min=-6.0, log_max=2.0)
+    rng = np.random.default_rng(7)
+    logs = rng.uniform(codec.log_min, codec.log_max, size=10_000)
+    signs = rng.choice([-1.0, 1.0], size=10_000)
+    vals = signs * 10 ** logs
+    recon = codec.decode_signed(codec.encode_signed(vals))
+    rel_err = np.abs(recon - vals) / np.abs(vals)
+    # Step = 8 / 2^15 ≈ 2.4e-4 decades → rel_err max ≈ 5.6e-4.
+    assert rel_err.max() < 2e-3
+
+
+def test_fp16_1token_sign_layout():
+    codec = FP16Codec.fp16_1token(log_min=-6.0, log_max=2.0)
+    comps_pos = codec.encode_signed(np.array([1.0]))
+    comps_neg = codec.encode_signed(np.array([-1.0]))
+    # First half is positive, second half is negative; boundary at 2^15 = 32768.
+    assert comps_pos[0, 0] < 32_768
+    assert comps_neg[0, 0] >= 32_768
+
+
+def test_all_variants_zero_roundtrips_to_zero():
+    for builder in (FP16Codec.tomol_3byte, FP16Codec.two_token_9_12, FP16Codec.fp16_1token):
+        codec = builder(log_min=-6.0, log_max=2.0)
+        recon = codec.decode_signed(codec.encode_signed(np.array([0.0, 1e-20, -1e-20])))
+        assert (recon == 0.0).all(), f"zero round-trip failed for {builder.__name__}"

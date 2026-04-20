@@ -13,6 +13,7 @@ from tomat.tokenizers import (
     DeltaDensityTokenizer,
     DirectCodedTokenizer,
     DirectTokenizer,
+    DownsampledTokenizer,
     FourierCodedTokenizer,
     FourierTokenizer,
 )
@@ -59,6 +60,41 @@ def test_direct_coded_roundtrip_hits_codec_precision():
     assert recon.shape == density.shape
     # 24-bit over 6 decades → ~1e-6 relative precision → NMAE ≲ 1e-6.
     assert nmae(density, recon) < 5e-6
+
+
+def test_downsampled_direct_shapes_and_token_count():
+    """Avg-pool 16³ grid by 4× → inner grid is 4³; token count shrinks 64×."""
+    density = make_density(shape=(16, 16, 16)) + 1e-3
+    inner = DirectCodedTokenizer(codec=FP16Codec.fp16_1token(log_min=-5, log_max=1))
+    tok = DownsampledTokenizer(base=inner, factor=4)
+    encoded = tok.encode(fake_chgcar(density))
+    recon = tok.roundtrip(fake_chgcar(density))
+    assert recon.shape == density.shape
+    # 16³ / 4³ = 64 coarse voxels × 1 token/value (fp16) = 64 tokens
+    assert tok.token_count(encoded) == 64
+
+
+def test_downsampled_uniform_grid_roundtrips_losslessly_up_to_codec_floor():
+    """If the grid is piecewise-uniform over pool blocks, avg-pool + repeat is exact."""
+    # 8³ grid, 2×2×2 blocks each filled with block-unique value.
+    block_vals = np.arange(1, 65, dtype=np.float64).reshape(4, 4, 4) * 0.1
+    density = np.repeat(
+        np.repeat(np.repeat(block_vals, 2, axis=0), 2, axis=1), 2, axis=2,
+    )
+    codec = FP16Codec.tomol_3byte(log_min=-3, log_max=1)
+    tok = DownsampledTokenizer(base=DirectCodedTokenizer(codec=codec), factor=2)
+    recon = tok.roundtrip(fake_chgcar(density))
+    # No within-block variation → avg-pool + repeat is exact; only codec noise.
+    assert nmae(density, recon) < 1e-5
+
+
+def test_downsampled_factor_1_is_transparent():
+    density = make_density()
+    inner = DirectCodedTokenizer(codec=FP16Codec.tomol_3byte(log_min=-5, log_max=1))
+    baseline_nmae = nmae(density, inner.roundtrip(fake_chgcar(density + 1e-3)))
+    wrapped = DownsampledTokenizer(base=inner, factor=1)
+    wrapped_nmae = nmae(density, wrapped.roundtrip(fake_chgcar(density + 1e-3)))
+    assert abs(wrapped_nmae - baseline_nmae) < 1e-10
 
 
 def test_fourier_coded_full_basis_approaches_codec_floor():

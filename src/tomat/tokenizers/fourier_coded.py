@@ -66,4 +66,7 @@ class FourierCodedTokenizer(DensityTokenizer):
         return np.fft.irfftn(flat.reshape(rfft_shape), s=encoded.grid_shape, axes=axes)
 
     def token_count(self, encoded: FourierCodedEncoded) -> int:
-        return fourier_tokens(int(encoded.flat_indices.size))
+        return fourier_tokens(
+            int(encoded.flat_indices.size),
+            tokens_per_real=self.codec.tokens_per_value_signed,
+        )

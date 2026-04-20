@@ -49,4 +49,7 @@ class DirectCodedTokenizer(DensityTokenizer):
         return flat.reshape(encoded.shape)
 
     def token_count(self, encoded: DirectCodedEncoded) -> int:
-        return direct_tokens(int(np.prod(encoded.shape)))
+        return direct_tokens(
+            int(np.prod(encoded.shape)),
+            tokens_per_real=self.codec.tokens_per_value_signed,
+        )
