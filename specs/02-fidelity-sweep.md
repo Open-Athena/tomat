@@ -45,7 +45,13 @@ real data point.
 | 5. Fourier truncation | `tokenizers/fourier.py` | high-`\|G\|` coefficients dropped |
 
 Scheme 4 (Δρ vs ρ) is orthogonal to the above and is a follow-up: requires a
-PADS (superposition-of-atomic-densities) preprocessing step to compute.
+promolecule-density (superposition-of-atomic-densities) preprocessing step
+to compute.
+
+(Not to be confused with OA's PADS — *Pre-tabulated Atomic Density
+Superposition* — which is a VASP-derived tabulated per-element density used
+by RHOAR-Net to generate low-resolution input densities, not as a Δρ
+subtraction.)
 
 Not in this PR: schemes 2 (VQ-VAE), 6 (spherical harmonics), 7 (Gaussian /
 RI fit), and the tomol-style SE/M0/M1 float codec applied on top of
@@ -84,16 +90,17 @@ See [`../README.md`](../README.md) for the full table. Headline: Fourier
 truncation beats voxel-cutoff by ~2 orders of magnitude at every sparsity
 level.
 
-Δρ (scheme 4) has been scaffolded on top of Fourier with a crude Gaussian
-promolecule-density baseline (`tomat.pads.GaussianPADS`, σ=0.4 Å). It
-doesn't yet act as a physically faithful atomic-density model — real
-atoms have core cusps (high-|G| content) that a Gaussian doesn't
-reproduce, and our VASP CHGCARs use pseudopotentials that don't have
-all-electron cores anyway. So the current Δρ variants bound "what the
-pipeline does with an obviously-too-smooth PADS," not "the real Δρ
-scheme's performance." Upgrading PADS to a Clementi-Raimondi
-Slater-multi-shell or (better) pseudopotential-matched valence density
-is the concrete next deliverable.
+Δρ (scheme 4) has been scaffolded on top of Fourier with analytic
+promolecule-density models (`tomat.promolecule.GaussianPromolecule`,
+σ=0.4 Å; `SlaterPromolecule`; `MultiShellSlaterPromolecule`). None is a
+physically faithful atomic-density model — Gaussian has no core cusp,
+multi-shell Slater with Slater's-rule Z_eff reproduces Clementi-Raimondi
+ζ to ~1% on first-row atoms but worse on d-block metals, and our VASP
+CHGCARs use pseudopotentials that don't have all-electron cores anyway.
+So the current Δρ variants bound "what the pipeline does with an
+imperfect promolecule," not "the real Δρ scheme's performance."
+Upgrading to a pseudopotential-matched valence density (POTCAR-derived)
+is the concrete next deliverable for this axis.
 
 Key take-aways from this round:
 
@@ -110,8 +117,9 @@ Key take-aways from this round:
    easy part and throwing away the hard part.
 3. **Category matters a lot for Fourier.** Oxides are 10–50× worse than
    every other category at each sparsity level. This is a concrete
-   argument for pursuing scheme 4 (Δρ) next — subtracting the PADS
-   removes the atomic-core structure that presumably drives this gap.
+   argument for pursuing scheme 4 (Δρ) next — subtracting the
+   promolecule density removes the atomic-core structure that
+   presumably drives this gap.
 4. **Dataset skew.** The first 50 mp-ids in electrai's curated 2,885 set
    (alphabetical) contain no halides or oxyhalides. Stratified re-run
    is queued; doesn't change the headline (cutoff is disqualified
@@ -119,9 +127,9 @@ Key take-aways from this round:
 
 ## Follow-ups (separate PRs)
 
-1. **Add the Δρ variant** (scheme 4) once a PADS implementation exists — it
-   composes with each of 1/3/5. The doc claims it improves all three, so
-   we should measure the claim.
+1. **Add the Δρ variant** (scheme 4) once a promolecule implementation
+   exists — it composes with each of 1/3/5. The doc claims it improves
+   all three, so we should measure the claim.
 2. **Float codec** (tomol-style SE/M0/M1) layered on top of scheme 1. Gives
    the "scheme 1 at production fidelity" number as opposed to the lossless
    baseline reported here.

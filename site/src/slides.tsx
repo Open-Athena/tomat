@@ -114,7 +114,7 @@ export const slides: Slide[] = [
         </ul>
         <p><strong>Next:</strong></p>
         <ul>
-          <li><strong>4. Δρ</strong> — subtract a promolecule density (PADS), tokenize the residual. Composes with 1/3/5.</li>
+          <li><strong>4. Δρ</strong> — subtract an analytic promolecule density, tokenize the residual. Composes with 1/3/5.</li>
         </ul>
         <p className="note">
           Deferred: 2 (VQ-VAE), 6 (spherical harmonics), 7 (Gaussian/RI fit).
@@ -232,31 +232,6 @@ export const slides: Slide[] = [
     ),
   },
   {
-    id: 'delta-pads',
-    title: 'Δρ + PADS',
-    thumb: 'Δρ',
-    render: () => (
-      <>
-        <h2>Δρ — subtracting the promolecule</h2>
-        <p>
-          Scheme 4: compute a <strong>PADS</strong> (Promolecule Atomic Density
-          Sum), subtract from ρ, tokenize the residual Δρ. At decode, add the
-          PADS back.
-        </p>
-        <p>
-          Current PADS: <strong>MultiShellSlater</strong> — Slater-type radial
-          density per occupied shell, Z<sub>eff</sub> via Slater's rules,
-          valence-only (crude approximation of VASP pseudopotentials).
-        </p>
-        <ul>
-          <li>At 1% coefs: <strong>12%</strong> NMAE / <strong>70%</strong> χ² improvement.</li>
-          <li>Oxides specifically: <strong>24%</strong> NMAE reduction at 1% coefs.</li>
-          <li>At 5–25% coefs: no improvement (PAW/all-electron mismatch).</li>
-        </ul>
-      </>
-    ),
-  },
-  {
     id: 'context-length',
     title: 'Context length reality',
     thumb: 'Context',
@@ -281,11 +256,10 @@ export const slides: Slide[] = [
       <>
         <h2>Next</h2>
         <ol>
-          <li><strong>Better PADS:</strong> POTCAR-matched valence density (actual pseudopotential, not Slater orbitals). Should fix the 5–25% regression.</li>
-          <li><strong>VQ-VAE baseline (Layer B):</strong> compress patches of ρ or Δρ to discrete tokens — unblocks 4k/16k context.</li>
-          <li><strong>Float codec (tomol-style SE/M0/M1)</strong> on top of scheme 1 for the "scheme 1 at production fidelity" number.</li>
+          <li><strong>Train a small model</strong> on downsampled 32³ grids — simplest path to a working end-to-end pipeline, even at poor accuracy.</li>
+          <li><strong>Patch-based tokenization:</strong> each voxel patch → one token (ViT-style) or hierarchical / adaptive refinement. Cuts context by patch volume.</li>
+          <li><strong>VQ-VAE baseline:</strong> learned compression of patches to discrete tokens.</li>
           <li><strong>Stratified halide sweep:</strong> first 50 mp-ids had no halides; stratify and re-run.</li>
-          <li><strong>Modal harness:</strong> move CHGCAR-heavy jobs off laptop.</li>
         </ol>
       </>
     ),

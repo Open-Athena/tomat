@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from tomat.float_codec import FP16Codec
-from tomat.pads import GaussianPADS, SlaterPADS
+from tomat.promolecule import GaussianPromolecule, SlaterPromolecule
 from tomat.tokenizers import (
     CutoffTokenizer,
     DeltaDensityTokenizer,
@@ -156,33 +156,37 @@ def fake_chgcar_with_structure(density: np.ndarray) -> SimpleNamespace:
 def test_delta_fourier_full_basis_is_lossless():
     density = make_density()
     chg = fake_chgcar_with_structure(density)
-    # At 100% coefs, Fourier is lossless, and PADS cancels exactly on decode.
-    wrapped = DeltaDensityTokenizer(FourierTokenizer(coefficient_fraction=1.0), pads=GaussianPADS())
+    # At 100% coefs, Fourier is lossless, and the promolecule cancels exactly on decode.
+    wrapped = DeltaDensityTokenizer(
+        FourierTokenizer(coefficient_fraction=1.0), promolecule=GaussianPromolecule()
+    )
     recon = wrapped.roundtrip(chg)
     # FourierEncoded stores coefs as complex64, so 1e-5 is the float32 roundoff floor.
     assert nmae(density, recon) < 1e-4
 
 
 def test_delta_preserves_sum_within_noise():
-    """At full Fourier basis the roundtrip should preserve total mass; PADS is a
-    deterministic add/subtract so it can't introduce net mass."""
+    """At full Fourier basis the roundtrip should preserve total mass; the
+    promolecule is a deterministic add/subtract so it can't introduce net mass."""
     density = make_density()
     chg = fake_chgcar_with_structure(density)
-    wrapped = DeltaDensityTokenizer(FourierTokenizer(coefficient_fraction=1.0), pads=SlaterPADS())
+    wrapped = DeltaDensityTokenizer(
+        FourierTokenizer(coefficient_fraction=1.0), promolecule=SlaterPromolecule()
+    )
     recon = wrapped.roundtrip(chg)
-    # Float32 roundoff in FourierEncoded; SlaterPADS's sharp core amplifies it.
+    # Float32 roundoff in FourierEncoded; SlaterPromolecule's sharp core amplifies it.
     assert abs(density.sum() - recon.sum()) < 1e-4 * abs(density.sum())
 
 
-def test_pads_sums_match_total_electrons_under_integration():
-    """∫ ρ_PADS dV should equal Σ Z over atoms (for both PADS variants)."""
+def test_promolecule_sums_match_total_electrons_under_integration():
+    """∫ ρ_pro dV should equal Σ Z over atoms (for both analytic variants)."""
     density = make_density()
     chg = fake_chgcar_with_structure(density)
     voxel_volume = 64.0 / density.size  # cell volume / N_voxels
     expected_electrons = 6 + 8  # C + O
 
-    for pads in (GaussianPADS(sigma_angstrom=0.3), SlaterPADS()):
-        grid = pads.compute(chg)
+    for pro in (GaussianPromolecule(sigma_angstrom=0.3), SlaterPromolecule()):
+        grid = pro.compute(chg)
         total = grid.sum() * voxel_volume
         # Periodic-image truncation + coarse grid means this isn't exact,
         # but should be within a few percent for reasonable σ/α.

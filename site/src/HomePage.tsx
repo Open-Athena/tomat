@@ -13,7 +13,7 @@ function ExtLink({ href, children }: { href: string; children: React.ReactNode }
 const SCHEME_DESC: Record<string, string> = {
   cutoff: 'voxel value',
   fourier: 'low |G|',
-  'delta-fourier': 'PADS subtracted, low |G|',
+  'delta-fourier': 'promolecule subtracted, low |G|',
 }
 
 const SCHEMES_WITH_FRACTION = ['cutoff-top', 'fourier-lowg', 'delta-fourier-lowg']

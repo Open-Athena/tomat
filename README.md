@@ -188,9 +188,9 @@ Auto-regenerated via [`mdcmd`][mdcmd] from [`results/sweep-n50.csv`](./results/s
 
 Cutoff NMAE matches `1 − mass_captured` exactly by construction — dropped voxels contribute their full density to the error. So $\mathrm{NMAE}_\mathrm{floor}(\text{cutoff-top-}X) = 1 − \text{mass}_\text{top-}X$, and for this dataset the top 5% of voxels carries only ~50% of total integrated density. The remaining ~50% lives in the long mid/low-$ρ$ tail — which is why top-$K$ cutoff can't be competitive on NMAE without keeping nearly all voxels.
 
-**Δρ with multi-shell Slater PADS** (the `MultiShellSlaterPADS` default
-as of the most recent sweep) behaves differently across metrics and
-sparsity regimes:
+**Δρ with a multi-shell Slater promolecule density**
+(`MultiShellSlaterPromolecule`, valence-only, via Slater's-rule Z_eff)
+behaves differently across metrics and sparsity regimes:
 
 * **At aggressive compression (≤ 1% coefs)**: Δρ helps modestly on NMAE
   (1%: 4.78e-2 → 4.20e-2, ~12% better) and more strongly on χ² (1%:
@@ -198,21 +198,30 @@ sparsity regimes:
   metric that rewards low-ρ accuracy — exactly Yael's point that
   NMAE under-credits chemistry.
 * **At high fidelity (5–25% coefs)**: Δρ *loses* on both metrics
-  (5% NMAE: 9.16e-3 → 1.47e-2; 5% χ²: 1.25e-2 → 1.49e-1). Our PADS
-  doesn't perfectly match VASP's pseudopotential valence density, so
-  residual PADS error dominates when the Fourier compression is no
-  longer the bottleneck.
+  (5% NMAE: 9.16e-3 → 1.47e-2; 5% χ²: 1.25e-2 → 1.49e-1). Our analytic
+  promolecule doesn't perfectly match VASP's pseudopotential valence
+  density, so residual promolecule error dominates when the Fourier
+  compression is no longer the bottleneck.
 * **Oxide-specific picture**: at 1% NMAE we see 11.3% → 8.6% (~24%
   better); χ² goes from 2.27 (oxide) → 0.67 (Δρ). Directional
   confirmation that removing the atomic-core content helps oxides
-  most — but our PADS is still an all-electron Slater approximation,
-  not POTCAR-matched.
+  most — but our promolecule is still an all-electron Slater
+  approximation, not POTCAR-matched.
 
-**Implication**: Δρ's fundamental value depends on PADS accuracy. A
-POTCAR-derived pseudo-valence PADS would likely amplify both the
-aggressive-compression win and the high-fidelity regression, since the
-PADS would match the data's conventions exactly. That's the clear
-next step for `scheme 4`.
+**Implication**: Δρ's fundamental value depends on how well the
+promolecule density matches the VASP-PAW conventions the CHGCARs
+follow. A POTCAR-derived pseudo-valence model would likely amplify both
+the aggressive-compression win and the high-fidelity regression, since
+it would match the data's conventions exactly. That's one next step
+for `scheme 4`.
+
+> **Note on terminology**: the local term "promolecule density" refers
+> to the chemistry-standard $\sum_\text{atoms}\rho_\text{atom}(r-R)$
+> (a.k.a. Independent Atom Model). *Not to be confused with OA's
+> PADS — Pre-tabulated Atomic Density Superposition — which is a
+> VASP-derived tabulated density used by RHOAR-Net to generate
+> low-resolution **inputs** without a VASP license at inference, a
+> different use case.*
 
 ### Plots
 
@@ -265,8 +274,9 @@ tokenize-and-train.
 * **Oxides are the worst case for Fourier**, 10–50× worse than every
   other category. Most likely the compact O core has non-negligible
   power at high \|G\|, so the lowpass leaves a residual. This is a
-  concrete argument for **scheme 4 (Δρ)** next: subtracting PADS removes
-  the atomic-core contribution and should flatten the category gap.
+  concrete argument for **scheme 4 (Δρ)** next: subtracting a
+  promolecule density removes the atomic-core contribution and should
+  flatten the category gap.
 * **Dataset skew caveat:** the electrai-curated 2,885-subset has no
   halides or oxyhalides in the first n=50 (alphabetical by mp-id).
   Per the design doc's sparsity table, halides are the sparsest class
@@ -296,35 +306,49 @@ from S3 to `data/mp-cache/`; subsequent runs are local.
 ## Layout
 
 ```
-pyproject.toml            # deps: pymatgen, numpy, click (marin stack deferred to PR 2)
+pyproject.toml            # deps: pymatgen, numpy, click (marin stack deferred)
 src/tomat/
+  float_codec.py          # FP16-like log-uniform codec (3 tokens per signed float)
+  promolecule.py          # analytic atomic-density models for Δρ subtraction
+  token_count.py          # per-scheme token accounting (assumes codec fidelity)
   tokenizers/
     base.py               # DensityTokenizer ABC (encode → decode → roundtrip)
-    direct.py             # scheme 1
+    direct.py             # scheme 1 (float32 baseline)
+    direct_coded.py       # scheme 1 with FP16 codec
     cutoff.py             # scheme 3
-    fourier.py            # scheme 5
+    fourier.py            # scheme 5 (complex coefs, native precision)
+    fourier_coded.py      # scheme 5 with FP16 codec on real+imag
+    delta.py              # scheme 4 (Δρ = ρ − ρ_promolecule) — wraps any base
   data/
     mp.py                 # S3 → pymatgen Chgcar, local caching
     classify.py           # material-type classifier (halide/oxide/intermetallic/...)
+configs/
+  fp16-channels.json      # codec (log_min, log_max) per channel
 scripts/
   fidelity_sweep.py       # tokenize → detokenize → NMAE, per-scheme CSV output
+  fit_density_codec.py    # fit codec ranges from cached CHGCARs
+  summarize_sweep.py      # markdown tables from the sweep CSV
+  plot_sweep.py           # matplotlib plots
 specs/
   00-project-context.md   # positioning, sibling-project notes, open questions
   01-tokenization-strategies.md  # the 7 candidate schemes + tradeoffs
   02-fidelity-sweep.md    # this sweep's plan + current results
+site/                     # React + Plotly interactive dashboard (tomat.oa.dev)
 tests/
-  test_tokenizers.py      # 17 roundtrip tests on synthetic densities (no IO)
+  test_tokenizers.py      # roundtrip tests on synthetic densities (no IO)
+  test_float_codec.py     # codec precision / clamping / zero-handling
 ```
 
 ## Follow-ups
 
-- Add Δρ (scheme 4) variant. Requires a PADS (superposition of atomic
-  densities) preprocessing step. Composes with schemes 1/3/5; doc
-  predicts it improves all real-space representations.
+- Train a tiny Qwen3 on downsampled-grid direct-coded tokens as an
+  end-to-end plumbing test (priority; accuracy secondary).
+- Patch-based tokenization (ViT-style): each voxel patch → one token,
+  or hierarchical / adaptive refinement.
 - Copy grug's `launch.py`/`model.py`/`train.py` from
   `marin/experiments/grug/base/` and wire against the chosen tokenizer
-  output — becomes the training entrypoint.
-- Add a tomol-style SE/M0/M1 float codec on top of scheme 1 to get the
-  "scheme 1 at production fidelity" NMAE number.
-- Implement schemes 2 (VQ-VAE), 6 (SH), 7 (Gaussian / RI) only if the
-  first three hit a fidelity floor above electrAI's ~2.6% NMAE.
+  output — the training entrypoint.
+- Implement scheme 2 (VQ-VAE) — learned compression of density patches
+  to discrete tokens; unblocks 4k/16k context windows.
+- Implement schemes 6 (SH) and 7 (Gaussian / RI) only if the real-space
+  schemes hit a fidelity floor above electrAI's ~2.6% NMAE.

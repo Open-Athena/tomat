@@ -1,29 +1,41 @@
-"""Pro-atomic density sum (PADS): ρ_PADS(r) = Σ atoms ρ_atom(r − R_atom).
+"""Promolecule density: ρ_pro(r) = Σ atoms ρ_atom(r − R_atom).
 
-PADS is the superposition of isolated-atom electron densities placed at
-the nuclear positions of a structure. It's a cheap, physically-motivated
+The *promolecule* model (also: Independent Atom Model, IAM) replaces the
+molecule's self-consistent density with a sum of isolated-atom densities
+placed at the nuclear positions. It is a cheap, physically-motivated
 approximation of the total electron density; the *deformation density*
-Δρ = ρ − ρ_PADS captures only the redistribution that happens upon
-bonding (the chemically interesting part).
+Δρ = ρ − ρ_pro captures the redistribution upon bonding — the chemically
+interesting part.
 
-Three implementations, in order of increasing accuracy:
+This module provides three analytic promolecule-density implementations
+used by :class:`~tomat.tokenizers.delta.DeltaDensityTokenizer` to turn
+scheme 4 (Δρ tokenization) into a concrete computation:
 
-1. :class:`GaussianPADS` — one Gaussian per atom. Smooth; no core cusps.
-2. :class:`SlaterPADS` — Slater-1s core (2 e⁻) + Gaussian valence. A
-   2-shell toy model.
-3. :class:`MultiShellSlaterPADS` — full multi-shell Slater-type orbitals
-   per occupied shell, with Z_eff from Slater's rules. All-electron,
+1. :class:`GaussianPromolecule` — one Gaussian per atom. Smooth; no core cusps.
+2. :class:`SlaterPromolecule` — Slater-1s core (2 e⁻) + Gaussian valence.
+   A two-shell toy model.
+3. :class:`MultiShellSlaterPromolecule` — full multi-shell Slater-type
+   orbitals per occupied shell, with Z_eff from Slater's rules. All-electron,
    no fitted parameters; works for any element.
 
 For quantitative claims, the next step up is **Clementi-Raimondi 1963**
 fitted ζ values (trivial table lookup for Z ≤ 36, more accurate than
 Slater's rules) or **pyscf RHF/PBE** computed atomic densities.
 
+**Not to be confused with OA's PADS.** OA's PADS (*Pre-tabulated Atomic
+Density Superposition*) is a different thing: a VASP-derived tabulated
+per-element radial density used by RHOAR-Net to generate *input* density
+guesses without a VASP license at inference. PADS does not subtract from
+ρ — it replaces VASP SAD as the low-resolution input to the super-
+resolution model. The classes here build an analytic promolecule density
+used as a **subtraction** against the target CHGCAR for Δρ tokenization.
+See ``docs/discussion-notes.md`` for the longer note.
+
 Note on VASP-PAW mismatch: VASP CHGCARs contain frozen-core + valence
-densities. All-electron PADS (any of our three) roughly matches this
-*in principle* since the PAW core is itself from an atomic calculation,
-but any residual mismatch will appear as near-nucleus noise in Δρ.
-The exact fix is POTCAR-derived core+valence densities — deferred.
+densities. An all-electron promolecule (any of our three) roughly matches
+this *in principle* since the PAW core is itself from an atomic
+calculation, but any residual mismatch appears as near-nucleus noise in
+Δρ. A POTCAR-derived pseudo-valence density would close the gap.
 """
 
 from dataclasses import dataclass
@@ -56,11 +68,11 @@ def _grid_frac(grid_shape: tuple[int, int, int]) -> np.ndarray:
 
 
 @dataclass
-class GaussianPADS:
+class GaussianPromolecule:
     """One isotropic Gaussian per atom. Smooth — won't remove core-cusp high-|G| content.
 
-    Retained as a baseline for comparison; prefer :class:`SlaterPADS` for the
-    actual Δρ hypothesis test.
+    Retained as a baseline for comparison; prefer
+    :class:`MultiShellSlaterPromolecule` for the actual Δρ hypothesis test.
     """
 
     sigma_angstrom: float = 0.4
@@ -70,20 +82,20 @@ class GaussianPADS:
         lattice = np.asarray(chgcar.structure.lattice.matrix)
         grid_frac = _grid_frac(grid_shape)
 
-        pads = np.zeros(grid_shape, dtype=np.float64)
+        out = np.zeros(grid_shape, dtype=np.float64)
         norm = 1.0 / (self.sigma_angstrom * np.sqrt(2 * np.pi)) ** 3
         two_sigma_sq = 2 * self.sigma_angstrom**2
 
         for site in chgcar.structure:
             z = site.specie.Z
             r = _minimum_image_r(grid_frac, np.asarray(site.frac_coords), lattice)
-            pads += z * norm * np.exp(-(r**2) / two_sigma_sq)
+            out += z * norm * np.exp(-(r**2) / two_sigma_sq)
 
-        return pads
+        return out
 
 
 @dataclass
-class SlaterPADS:
+class SlaterPromolecule:
     """Two-component atomic density: Slater-1s core (2 electrons, cusp) + Gaussian valence.
 
     For each atom with nuclear charge Z:
@@ -105,8 +117,7 @@ class SlaterPADS:
     Still **crude** compared to proper multi-shell Slater or
     pyscf-computed densities — no angular structure, Z_eff from simple
     Slater rules rather than Clementi-Raimondi fits, single Gaussian
-    for all valence electrons regardless of element. But should suffice
-    to test the "Δρ helps on oxides" hypothesis directionally.
+    for all valence electrons regardless of element.
     """
 
     valence_sigma_angstrom: float = 0.5
@@ -125,20 +136,20 @@ class SlaterPADS:
         val_norm = 1.0 / (self.valence_sigma_angstrom * np.sqrt(2 * np.pi)) ** 3
         two_sigma_sq = 2 * self.valence_sigma_angstrom**2
 
-        pads = np.zeros(grid_shape, dtype=np.float64)
+        out = np.zeros(grid_shape, dtype=np.float64)
         for site in chgcar.structure:
             z = site.specie.Z
             r = _minimum_image_r(grid_frac, np.asarray(site.frac_coords), lattice)
 
             n_core_electrons = min(z, 2)
             a = self.core_alpha(z)
-            pads += n_core_electrons * a**3 / (8 * np.pi) * np.exp(-a * r)
+            out += n_core_electrons * a**3 / (8 * np.pi) * np.exp(-a * r)
 
             n_valence_electrons = max(0, z - 2)
             if n_valence_electrons:
-                pads += n_valence_electrons * val_norm * np.exp(-(r**2) / two_sigma_sq)
+                out += n_valence_electrons * val_norm * np.exp(-(r**2) / two_sigma_sq)
 
-        return pads
+        return out
 
 
 def slater_zeff(z: int, target_n: int, target_l: int, config: list[tuple[int, str, int]]) -> float:
@@ -207,7 +218,7 @@ def _slater_shell_density(r: np.ndarray, n: int, alpha: float, n_electrons: int)
 
 
 @dataclass
-class MultiShellSlaterPADS:
+class MultiShellSlaterPromolecule:
     """Sum of Slater-type radial densities over each atom's occupied shells.
 
     Pymatgen gives ``Element.full_electronic_structure`` as a list of
@@ -230,8 +241,8 @@ class MultiShellSlaterPADS:
     row-2 atoms (e.g. oxygen) this keeps ``2s/2p``, drops ``1s``. Not a
     perfect match to any specific POTCAR — VASP sometimes includes
     semi-core electrons (e.g. Li_sv, Ga_d) — but captures the right
-    electron count for most standard PPs and is vastly better than
-    all-electron PADS for subtracting from CHGCAR totals.
+    electron count for most standard PPs and is vastly better than an
+    all-electron form for subtracting from CHGCAR totals.
 
     When False, gives the true all-electron atomic density (matches
     tabulated HF references); suitable for Δρ against genuinely
@@ -246,7 +257,7 @@ class MultiShellSlaterPADS:
         lattice = np.asarray(chgcar.structure.lattice.matrix)
         grid_frac = _grid_frac(grid_shape)
 
-        pads = np.zeros(grid_shape, dtype=np.float64)
+        out = np.zeros(grid_shape, dtype=np.float64)
         for site in chgcar.structure:
             element: Element = site.specie
             z = element.Z
@@ -263,6 +274,6 @@ class MultiShellSlaterPADS:
                 z_eff = slater_zeff(z, n, l, element.full_electronic_structure)
                 n_star = SLATER_N_STAR.get(n, float(n))
                 alpha = z_eff / (n_star * self.bohr_angstrom)  # 1/Å
-                pads += _slater_shell_density(r, n, alpha, ne)
+                out += _slater_shell_density(r, n, alpha, ne)
 
-        return pads
+        return out

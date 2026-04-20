@@ -65,13 +65,15 @@ The `mass_cap` variant is interesting because it decouples fidelity from voxel-c
 
 ### 4. Deformation density prediction
 
-Predict Δρ = ρ_DFT − ρ_PADS (superposition of isolated atomic densities) instead of absolute ρ. Input = crystal structure; output = deformation density. At inference, add the cheaply-computed PADS to the predicted Δρ.
+Predict Δρ = ρ_DFT − ρ_pro (superposition of isolated atomic densities — the *promolecule* density) instead of absolute ρ. Input = crystal structure; output = deformation density. At inference, add the cheaply-computed promolecule density to the predicted Δρ.
+
+*Not to be confused with OA's PADS (**P**re-tabulated **A**tomic **D**ensity **S**uperposition), which is a VASP-derived tabulated per-element density used by RHOAR-Net to generate low-resolution input densities — a different thing.*
 
 - **Pros:**
   - Removes core-electron signal the model would otherwise re-derive from element identity
   - Δρ has smaller dynamic range, no nuclear cusps, values ~centered on zero — friendlier for tokenization
   - Highest-magnitude voxels are now the chemically meaningful ones (bonds, charge transfer), so schemes 1/2/3 all improve
-- **Cons:** Requires a one-time PADS pass over the dataset, and a cheap atomic-superposition step at inference (sub-second, deterministic, no NN). Arguably less elegant — the model learns "less."
+- **Cons:** Requires a one-time promolecule-density pass over the dataset, and a cheap atomic-superposition step at inference (sub-second, deterministic, no NN). Arguably less elegant — the model learns "less."
 
 Note: this is orthogonal to the tokenization choice — it changes what's being tokenized, not how.
 

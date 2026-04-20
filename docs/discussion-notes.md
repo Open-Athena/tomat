@@ -114,29 +114,41 @@ Detailed table in `README.md`; key points:
 
 ## Δρ (scheme 4) status
 
-Pipeline scaffolded (`src/tomat/pads.py`, `src/tomat/tokenizers/delta.py`).
-Two PADS implementations:
+Pipeline scaffolded (`src/tomat/promolecule.py`,
+`src/tomat/tokenizers/delta.py`). Three analytic promolecule-density
+implementations:
 
-- `GaussianPADS` — one isotropic Gaussian per atom. Smooth, no cusps. Crude
-  but doesn't introduce artifacts when wrong.
-- `SlaterPADS` — 2-electron Slater-1s core (Slater's-rule $Z_\mathrm{eff}$)
-  + Gaussian valence. Has the exponential form Δρ wants in principle,
-  but the Slater's-rule α is tuned for all-electron densities, not VASP's
-  pseudopotential ones. Currently produces cusps ~40× too sharp for our
-  CHGCAR data; this introduces worse artifacts than it removes.
+- `GaussianPromolecule` — one isotropic Gaussian per atom. Smooth, no
+  cusps. Crude but doesn't introduce artifacts when wrong.
+- `SlaterPromolecule` — 2-electron Slater-1s core (Slater's-rule
+  $Z_\mathrm{eff}$) + Gaussian valence. Has the exponential form Δρ
+  wants in principle, but the Slater's-rule α is tuned for all-electron
+  densities, not VASP's pseudopotential ones.
+- `MultiShellSlaterPromolecule` — full multi-shell Slater-type orbitals
+  per occupied shell with Slater's-rule Z_eff. Reproduces
+  Clementi-Raimondi ζ values to ~1% on first-row atoms; worse on
+  d-block. Valence-only mode approximates what VASP pseudopotential
+  CHGCARs contain.
 
-**Result with GaussianPADS**: Δρ-Fourier gives a small oxide-specific
-improvement (~14% lower mean NMAE at 5% coefs), tied elsewhere.
-Directionally consistent with the hypothesis but limited because the
-Gaussian doesn't capture the high-|G| content the test was supposed to
-remove.
+**Naming correction**: this module was briefly named `pads.py` — that
+was wrong. OA's *PADS* (Pre-tabulated Atomic Density Superposition) is
+a distinct, VASP-derived tabulated density used by RHOAR-Net to generate
+low-resolution input densities without a VASP license at inference. The
+technique here is a *promolecule-density subtraction* — a standard
+chemistry tool (Independent Atom Model / IAM), not PADS.
 
-**Path to a real Δρ test**: replace `SlaterPADS`'s Slater's-rule α with
-**Clementi-Raimondi multi-shell** Slater expansions, OR with
+**Result with `MultiShellSlaterPromolecule`**: Δρ-Fourier gives a small
+oxide-specific improvement at low retention (~12% lower NMAE / ~70%
+lower χ² at 1% coefs), no improvement at 5–25% coefs (PAW/all-electron
+mismatch dominates there).
+
+**Path to a real Δρ test**: replace the analytic promolecule with
 **pseudopotential-matched valence densities** parsed from the VASP POTCAR
 files (since our training data is pseudopotential CHGCARs, this is the
-exact-match version). Either is ~half a day of work; expected to amplify
-the oxide improvement substantially.
+exact-match version). POTCARs are available on della
+(`/home/ROSENGROUP/software/vasp/vasp_potcars/potpaw_PBE.64/`). Licensed —
+don't commit; a fitted per-element radial-density npz is the portable
+form.
 
 ## Context-length feasibility
 
@@ -276,12 +288,13 @@ User is interested in diffusion-over-density as the natural framework for
 SCF-trajectory training. The mapping is clean:
 
 - **Forward (noising)** = SCF iteration, going backwards from converged
-  to PADS guess. Each "noising step" is an inverse SCF step (gives a
-  less-converged density).
+  to the initial-guess density (e.g. OA's PADS, or VASP SAD). Each
+  "noising step" is an inverse SCF step (gives a less-converged density).
 - **Reverse (denoising)** = predict $\rho_{i+1}$ given $\rho_i$.
-- **Inference** = start from PADS, run reverse process to converged.
+- **Inference** = start from the initial-guess density, run reverse
+  process to converged.
 
-Training data per SCF run: the full sequence $(\rho_\mathrm{PADS},
+Training data per SCF run: the full sequence $(\rho_\mathrm{init},
 \rho_1, \rho_2, \ldots, \rho_\mathrm{final})$. Score-matching /
 flow-matching loss over this trajectory.
 
@@ -312,8 +325,8 @@ by chaos.
 
 1. Iterates of one material are highly correlated; per-example
    information content sublinear in N.
-2. Trains the wrong skill (mid-converged → final is easier than PADS →
-   final).
+2. Trains the wrong skill (mid-converged → final is easier than
+   initial-guess → final).
 3. Code-specific: VASP's iterate trajectory depends on its mixing
    scheme. Model would learn VASP-mixing dynamics, not a universal
    refinement operator.
@@ -362,9 +375,9 @@ proprietary tooling worth being explicit about.
    effective potential. Independent of (1) and (2).
 
 VASP sits at (periodic, plane-wave, PAW-pseudopotential). Our CHGCARs
-are shaped by all three choices; PADS approximations that don't account
-for them (especially the pseudopotential axis) produce systematic errors
-near nuclei.
+are shaped by all three choices; promolecule-density approximations
+that don't account for them (especially the pseudopotential axis)
+produce systematic errors near nuclei.
 
 ### Why VASP dominates materials QC
 
@@ -412,9 +425,9 @@ Why none of them "won" — mostly path dependence:
 3. **Re-establish the electrAI baseline.** Their 2.6% NMAE is on
    VASP-PAW data; if our training data shifts, we need to recompute
    the baseline against the new data too.
-4. **Can't do POTCAR-matched PADS for existing data.** Would switch to
-   QE's PSP files for the recomputed dataset (they have parsers; it's
-   fine, just different).
+4. **Can't do POTCAR-matched pseudo-valence promolecule for existing
+   data.** Would switch to QE's PSP files for the recomputed dataset
+   (they have parsers; it's fine, just different).
 5. **Gain full reproducibility.** Anyone can rerun end-to-end with no
    proprietary deps. Attractive for open science / Marin-community
    alignment.
@@ -452,8 +465,10 @@ Not a decision right now; a flag for the team.
   `O_GW` vs `O_h`), so reproduction is possible given a license.
 - `pymatgen.io.vasp.inputs.Potcar` can parse them **if we have them
   locally** — doesn't help otherwise.
-- For POTCAR-matched PADS, we'd need OA to have a licensed VASP install
-  and the specific POTCAR versions MP used. Worth checking with Betsy.
+- For a POTCAR-matched pseudo-valence promolecule density, we'd need a
+  licensed VASP install + the specific POTCAR versions MP used. The
+  rosengroup has both on della (`vasp/6.5.1` module; POTCARs under
+  `/home/ROSENGROUP/software/vasp/vasp_potcars/potpaw_PBE.64/`).
 
 ## Glossary
 
@@ -474,8 +489,9 @@ Not a decision right now; a flag for the team.
 | term | meaning |
 |---|---|
 | **$\rho(r)$** | electron density at point $r$. Units: e/Å³. Integral over a region = expected electron count. |
-| **$\Delta\rho$** | deformation density = $\rho - \rho_\mathrm{PADS}$. Bonding-only; smaller dynamic range; smoother |
-| **PADS / SAD / IAM** | Promolecule / Superposition of Atomic Densities / Independent Atom Model — all names for $\sum_\mathrm{atoms} \rho_\mathrm{atom}(r-R)$ |
+| **$\Delta\rho$** | deformation density = $\rho - \rho_\mathrm{pro}$. Bonding-only; smaller dynamic range; smoother |
+| **Promolecule / SAD / IAM** | Promolecule / Superposition of Atomic Densities / Independent Atom Model — all names for $\sum_\mathrm{atoms} \rho_\mathrm{atom}(r-R)$ |
+| **PADS** (OA-specific) | *Pre-tabulated Atomic Density Superposition* — VASP-derived tabulated per-element radial densities used by RHOAR-Net to generate low-resolution *input* density guesses without a VASP license at inference. Not a Δρ subtraction. |
 | **CHGCAR** | VASP's output file for $\rho(r)$ on a grid. Stored as $\rho \times V_\mathrm{cell}$ (so divide by `lattice.volume` to get e/Å³) |
 | **ELFCAR** | VASP's output file for the **Electron Localization Function** $\eta(r) \in [0,1]$. Bonding-analysis quantity; not derivable from $\rho$ alone (needs kinetic energy density $\tau$) |
 | **WAVECAR** | VASP's output file for the orbitals $\psi_i(r)$ themselves |
