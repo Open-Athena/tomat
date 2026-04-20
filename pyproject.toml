@@ -12,6 +12,7 @@ dependencies = [
     "dvx",
     "matplotlib",
     "numpy",
+    "pyarrow>=15",
     "pymatgen",
     "zarr>=3.0",
 ]

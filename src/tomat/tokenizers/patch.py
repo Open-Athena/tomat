@@ -282,3 +282,180 @@ class PatchTokenizer:
 
         tokens.append(S["[EOS]"])
         return tokens
+
+    # ---- detokenization --------------------------------------------------
+
+    def detokenize(self, tokens: list[int] | np.ndarray) -> PatchSample:
+        """Invert :meth:`tokenize`. Raises ``ValueError`` on malformed input."""
+        toks = list(tokens)
+        vocab = self.vocab
+        S = SPECIAL_TOKENS
+
+        if not toks or toks[0] != S["[BOS]"] or toks[-1] != S["[EOS]"]:
+            raise ValueError("expected sequence to be BOS-prefixed and EOS-suffixed")
+
+        def find_block(open_tok: int, close_tok: int, start: int) -> tuple[int, int]:
+            try:
+                i = toks.index(open_tok, start)
+            except ValueError as e:
+                raise ValueError(f"missing open token {open_tok} after index {start}") from e
+            try:
+                j = toks.index(close_tok, i + 1)
+            except ValueError as e:
+                raise ValueError(f"missing close token {close_tok} after index {i}") from e
+            return i + 1, j
+
+        # GRID
+        gi, gj = find_block(S["[GRID_START]"], S["[GRID_END]"], 1)
+        grid_shape = tuple(self._decode_int(t) for t in toks[gi:gj])
+        if len(grid_shape) != 3:
+            raise ValueError(f"expected 3 grid dims, got {len(grid_shape)}")
+
+        # ATOMS
+        ai, aj = find_block(S["[ATOMS_START]"], S["[ATOMS_END]"], gj + 1)
+        atomic_numbers = np.array([self._decode_atom(t) for t in toks[ai:aj]], dtype=np.int32)
+
+        # POSITIONS
+        pi, pj = find_block(S["[POS_START]"], S["[POS_END]"], aj + 1)
+        pos_tokens = toks[pi:pj]
+        coord_stride = vocab.position_codec.tokens_per_value_signed
+        expected_pos = len(atomic_numbers) * 3 * coord_stride
+        if len(pos_tokens) != expected_pos:
+            raise ValueError(
+                f"position block length {len(pos_tokens)} != expected {expected_pos}"
+            )
+        coords_flat = self._decode_codec(pos_tokens, vocab.position_codec, vocab.position_offset)
+        frac_coords = np.array(coords_flat, dtype=np.float64).reshape(-1, 3)
+
+        # SHAPE
+        si, sj = find_block(S["[SHAPE_START]"], S["[SHAPE_END]"], pj + 1)
+        patch_shape = tuple(self._decode_int(t) for t in toks[si:sj])
+        if len(patch_shape) != 3:
+            raise ValueError(f"expected 3 patch dims, got {len(patch_shape)}")
+
+        # OFFSET
+        oi, oj = find_block(S["[OFFSET_START]"], S["[OFFSET_END]"], sj + 1)
+        offset = tuple(self._decode_int(t) for t in toks[oi:oj])
+        if len(offset) != 3:
+            raise ValueError(f"expected 3 offset dims, got {len(offset)}")
+
+        # DENSITY
+        di, dj = find_block(S["[DENS_START]"], S["[DENS_END]"], oj + 1)
+        dens_tokens = toks[di:dj]
+        dens_stride = vocab.density_codec.tokens_per_value_signed
+        expected_dens = int(np.prod(patch_shape)) * dens_stride
+        if len(dens_tokens) != expected_dens:
+            raise ValueError(
+                f"density block length {len(dens_tokens)} != expected {expected_dens}"
+            )
+        density_flat = self._decode_codec(dens_tokens, vocab.density_codec, vocab.density_offset)
+        patch_density = np.array(density_flat).reshape(patch_shape).astype(np.float32)
+
+        return PatchSample(
+            task_id="",  # not encoded in the token stream
+            offset=offset,
+            patch_shape=patch_shape,
+            grid_shape=grid_shape,
+            atomic_numbers=atomic_numbers,
+            frac_coords=frac_coords,
+            patch_density=patch_density,
+        )
+
+    def _decode_int(self, tok: int) -> int:
+        if not INT_OFFSET <= tok < INT_END:
+            raise ValueError(f"int token {tok} out of [{INT_OFFSET}, {INT_END})")
+        return tok - INT_OFFSET
+
+    def _decode_atom(self, tok: int) -> int:
+        if not ATOM_OFFSET <= tok < ATOM_END:
+            raise ValueError(f"atom token {tok} out of [{ATOM_OFFSET}, {ATOM_END})")
+        return tok - ATOM_OFFSET + 1
+
+    def _decode_codec(
+        self, tokens: list[int], codec: FP16Codec, base_offset: int,
+    ) -> np.ndarray:
+        """Decode a flat sequence of codec tokens back to float values."""
+        stride = codec.tokens_per_value_signed
+        arr = np.array(tokens).reshape(-1, stride)
+        # Subtract per-component offsets to get ``(N, stride)`` raw components.
+        comp_offsets = np.cumsum([0] + list(codec.signed_vocabs[:-1]))
+        comps = arr - base_offset - comp_offsets[np.newaxis, :]
+        return codec.decode_signed(comps)
+
+    # ---- HF tokenizer export ---------------------------------------------
+
+    def export_hf_tokenizer_json(self) -> dict:
+        """Generate a HuggingFace ``tokenizer.json`` matching this vocab.
+
+        The returned dict can be written to disk with ``json.dump`` and
+        loaded via ``AutoTokenizer.from_pretrained`` (after placing it
+        alongside a minimal ``tokenizer_config.json``) — enough for
+        Marin/Levanter's data pipeline to treat tomat token IDs as pre-
+        tokenized input.
+
+        Uses a ``WordLevel`` model with one literal string token per
+        vocab ID. Token strings are the display names where meaningful
+        (``"[BOS]"``, ``"[Z=6]"``, …) and integer IDs for the codec /
+        int buckets. Mirrors tomol's approach for ``WillHeld/marin-tomol``.
+        """
+        vocab_map: dict[str, int] = {}
+
+        # Specials
+        for name, tid in SPECIAL_TOKENS.items():
+            vocab_map[name] = tid
+
+        # Atomic numbers
+        for z in range(1, MAX_ATOMIC_NUMBER + 1):
+            vocab_map[f"[Z={z}]"] = ATOM_OFFSET + (z - 1)
+
+        # Integers (grid / offset / shape)
+        for i in range(INT_VOCAB_SIZE):
+            vocab_map[f"[INT:{i}]"] = INT_OFFSET + i
+
+        # Position-codec tokens
+        v = self.vocab
+        cum = 0
+        for chan_idx, width in enumerate(v.position_codec.signed_vocabs):
+            for i in range(width):
+                vocab_map[f"[POS_{chan_idx}:{i}]"] = v.position_offset + cum + i
+            cum += width
+
+        # Density-codec tokens
+        cum = 0
+        for chan_idx, width in enumerate(v.density_codec.signed_vocabs):
+            for i in range(width):
+                vocab_map[f"[DENS_{chan_idx}:{i}]"] = v.density_offset + cum + i
+            cum += width
+
+        assert len(vocab_map) == v.total_vocab_size, (
+            f"vocab map size {len(vocab_map)} != expected {v.total_vocab_size}"
+        )
+
+        # Minimal WordLevel tokenizer.json — enough for Levanter to
+        # round-trip our pre-tokenized input_ids.
+        return {
+            "version": "1.0",
+            "truncation": None,
+            "padding": None,
+            "added_tokens": [
+                {
+                    "id": tid,
+                    "content": name,
+                    "single_word": False,
+                    "lstrip": False,
+                    "rstrip": False,
+                    "normalized": False,
+                    "special": True,
+                }
+                for name, tid in SPECIAL_TOKENS.items()
+            ],
+            "normalizer": None,
+            "pre_tokenizer": {"type": "WhitespaceSplit"},
+            "post_processor": None,
+            "decoder": None,
+            "model": {
+                "type": "WordLevel",
+                "vocab": vocab_map,
+                "unk_token": "[PAD]",  # no UNK needed for pre-tokenized input
+            },
+        }

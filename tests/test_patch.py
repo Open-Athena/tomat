@@ -133,6 +133,41 @@ def test_all_tokens_within_vocab(tokenizer, fake_structure):
     assert max(tokens) < tokenizer.vocab.total_vocab_size
 
 
+def test_roundtrip_recovers_sample(tokenizer, fake_structure):
+    """Tokenize then detokenize — values should match within codec precision."""
+    rng = np.random.default_rng(0)
+    density = rng.uniform(1e-3, 1.0, size=(16, 16, 16)).astype(np.float32)
+    original = tokenizer.make_sample(
+        task_id="mp-fake",
+        density=density,
+        structure=fake_structure,
+        offset=(3, 5, 7),
+    )
+    tokens = tokenizer.tokenize(original)
+    recovered = tokenizer.detokenize(tokens)
+
+    assert recovered.grid_shape == original.grid_shape
+    assert recovered.patch_shape == original.patch_shape
+    assert recovered.offset == original.offset
+    assert np.array_equal(recovered.atomic_numbers, original.atomic_numbers)
+    # Fractional coords through position codec: ~6 sig figs at 3-byte codec.
+    assert np.allclose(recovered.frac_coords, original.frac_coords, atol=1e-4)
+    # Density through 2-token 9+12 codec: ~1e-5 relative precision.
+    rel_err = np.abs(recovered.patch_density - original.patch_density) / np.maximum(
+        np.abs(original.patch_density), 1e-12
+    )
+    assert rel_err.max() < 1e-3
+
+
+def test_detokenize_rejects_malformed_sequence(tokenizer):
+    # Missing BOS
+    with pytest.raises(ValueError, match="BOS"):
+        tokenizer.detokenize([999, SPECIAL_TOKENS["[EOS]"]])
+    # Missing EOS
+    with pytest.raises(ValueError, match="EOS"):
+        tokenizer.detokenize([SPECIAL_TOKENS["[BOS]"], 999])
+
+
 def test_random_offsets_uniform_coverage(tokenizer):
     rng = np.random.default_rng(42)
     offsets = tokenizer.random_offsets(grid_shape=(16, 16, 16), n=10_000, rng=rng)
