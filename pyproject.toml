@@ -13,6 +13,7 @@ dependencies = [
     "matplotlib",
     "numpy",
     "pymatgen",
+    "zarr>=3.0",
 ]
 
 # The marin stack isn't on PyPI — marin-experiments/tiny-tpu ships a local
