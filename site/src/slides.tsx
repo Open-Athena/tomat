@@ -249,6 +249,110 @@ export const slides: Slide[] = [
     ),
   },
   {
+    id: 'pivot-patches',
+    title: 'Pivot: patches, not full grids',
+    thumb: 'Patches',
+    render: () => (
+      <>
+        <h2>Pivot: patches, not full grids</h2>
+        <p>
+          At native resolution (40³ to 448³ rho_gga grids) no single-token-per-voxel
+          scheme fits 8–16k context. Downsampling to 32³ / 64³ throws away exactly the
+          information the DFT solver spent hours computing.
+        </p>
+        <p><strong>New direction:</strong> one training example = one <code>P × P × P</code> sub-cube
+          of a material's native-resolution grid, prefixed with the material's atomic
+          inventory + the patch's offset within the parent grid.</p>
+        <ul>
+          <li><strong>Any voxel is a valid anchor.</strong> Crystals are periodic, so
+            the tokenizer extracts patches with PBC wrap — no "edge" to avoid.</li>
+          <li><strong>M patches per material</strong> (default 32) → 4,305 val structures
+            × 32 = ~138k training rows, each a distinct local context.</li>
+          <li><strong>P = 14 → 14³ × 2 tokens/voxel = 5,488 density tokens;</strong>
+            ~200-token preamble; total ~5.7k, fits 8k with 2k headroom.</li>
+          <li><strong>Offset seed = free data augmentation;</strong> re-running preprocessing
+            with a different RNG seed samples a different set of patches from the same crystals.</li>
+        </ul>
+      </>
+    ),
+  },
+  {
+    id: 'patch-layout',
+    title: 'Patch token layout',
+    thumb: 'Layout',
+    render: () => (
+      <>
+        <h2>What each training example looks like</h2>
+        <pre className="token-layout">
+{`[BOS]
+[GRID_START]   nx ny nz           [GRID_END]    `}<span className="comment">{`# parent grid shape`}</span>{`
+[ATOMS_START]  Z₁ Z₂ … Zₙ         [ATOMS_END]   `}<span className="comment">{`# atomic numbers`}</span>{`
+[POS_START]    ⟨x₁ y₁ z₁⟩ …        [POS_END]     `}<span className="comment">{`# frac coords (3-byte codec)`}</span>{`
+[SHAPE_START]  P P P                [SHAPE_END]   `}<span className="comment">{`# patch dims`}</span>{`
+[OFFSET_START] ix iy iz              [OFFSET_END]  `}<span className="comment">{`# patch anchor (low corner)`}</span>{`
+`}<span className="hi">{`[HI_START]     hx hy hz              [HI_END]      `}<span className="comment">{`# wrapped high corner`}</span></span>{`
+[DENS_START]   d₀ d₁ … d_{P³−1}     [DENS_END]    `}<span className="comment">{`# density (2-token 9+12 codec)`}</span>{`
+[EOS]`}
+        </pre>
+        <p>
+          <strong>Vocab (6,792 total):</strong> 18 specials + 118 atomic Zs +
+          1,024 ints + 1,024 position-codec + 4,608 density-codec.
+        </p>
+        <p>
+          <strong>Why <code>[HI_START]</code>?</strong>{' '}
+          Encodes <code>(ix + P − 1) mod nx</code> per axis. On any axis where
+          <code> hi &lt; lo</code> the patch crossed the PBC boundary. Derivable from
+          <code> (grid, offset, P)</code> via modular arithmetic, but making it an
+          explicit observable at layer 1 saves the model from learning it — 5 tokens
+          out of ~5,700.
+        </p>
+      </>
+    ),
+  },
+  {
+    id: 'patch-example',
+    title: 'Example: NaCl patch, P=4, 16³ grid',
+    thumb: 'Example',
+    render: () => (
+      <>
+        <h2>Example: NaCl patch, P=4, 16³ grid, offset=(14, 2, 5)</h2>
+        <div className="token-example">
+          <div className="row"><span className="idx">[0]</span><span className="tok">1</span><span className="lbl">[BOS]</span></div>
+          <div className="row"><span className="idx">[1]</span><span className="tok">7</span><span className="lbl">[GRID_START]</span></div>
+          <div className="row"><span className="idx">[2]</span><span className="tok">152</span><span className="lbl">int = 16 <span className="comment">(nx)</span></span></div>
+          <div className="row"><span className="idx">[3]</span><span className="tok">152</span><span className="lbl">int = 16 <span className="comment">(ny)</span></span></div>
+          <div className="row"><span className="idx">[4]</span><span className="tok">152</span><span className="lbl">int = 16 <span className="comment">(nz)</span></span></div>
+          <div className="row"><span className="idx">[5]</span><span className="tok">8</span><span className="lbl">[GRID_END]</span></div>
+          <div className="row"><span className="idx">[6]</span><span className="tok">3</span><span className="lbl">[ATOMS_START]</span></div>
+          <div className="row"><span className="idx">[7]</span><span className="tok">28</span><span className="lbl">atom Z = 11 <span className="comment">(Na)</span></span></div>
+          <div className="row"><span className="idx">[8]</span><span className="tok">34</span><span className="lbl">atom Z = 17 <span className="comment">(Cl)</span></span></div>
+          <div className="row"><span className="idx">[9]</span><span className="tok">4</span><span className="lbl">[ATOMS_END]</span></div>
+          <div className="row sep"><span className="idx">[10–29]</span><span className="tok">…</span><span className="lbl">POS block — 2 atoms × 3 coords × 3 tokens/coord</span></div>
+          <div className="row"><span className="idx">[30]</span><span className="tok">9</span><span className="lbl">[SHAPE_START]</span></div>
+          <div className="row"><span className="idx">[31–33]</span><span className="tok">140</span><span className="lbl">int = 4, 4, 4 <span className="comment">(P=4 cube)</span></span></div>
+          <div className="row"><span className="idx">[34]</span><span className="tok">10</span><span className="lbl">[SHAPE_END]</span></div>
+          <div className="row"><span className="idx">[35]</span><span className="tok">11</span><span className="lbl">[OFFSET_START]</span></div>
+          <div className="row"><span className="idx">[36]</span><span className="tok">150</span><span className="lbl">int = 14 <span className="comment">(ix)</span></span></div>
+          <div className="row"><span className="idx">[37]</span><span className="tok">138</span><span className="lbl">int = 2 <span className="comment">(iy)</span></span></div>
+          <div className="row"><span className="idx">[38]</span><span className="tok">141</span><span className="lbl">int = 5 <span className="comment">(iz)</span></span></div>
+          <div className="row"><span className="idx">[39]</span><span className="tok">12</span><span className="lbl">[OFFSET_END]</span></div>
+          <div className="row hi"><span className="idx">[40]</span><span className="tok">13</span><span className="lbl">[HI_START]</span></div>
+          <div className="row hi"><span className="idx">[41]</span><span className="tok">137</span><span className="lbl">int = 1 <span className="comment">(hx — WRAPS: 1 &lt; 14)</span></span></div>
+          <div className="row hi"><span className="idx">[42]</span><span className="tok">141</span><span className="lbl">int = 5 <span className="comment">(hy — no wrap: 5 &gt; 2)</span></span></div>
+          <div className="row hi"><span className="idx">[43]</span><span className="tok">144</span><span className="lbl">int = 8 <span className="comment">(hz — no wrap: 8 &gt; 5)</span></span></div>
+          <div className="row hi"><span className="idx">[44]</span><span className="tok">14</span><span className="lbl">[HI_END]</span></div>
+          <div className="row sep"><span className="idx">[45–174]</span><span className="tok">…</span><span className="lbl">DENS block — 4³ = 64 voxels × 2 tokens</span></div>
+          <div className="row"><span className="idx">[175]</span><span className="tok">2</span><span className="lbl">[EOS]</span></div>
+        </div>
+        <p className="note">
+          Total length 176 tokens. At production (P=14) the DENS block dominates:
+          5,488 of ~5,700 tokens. This patch anchor <code>(14, 2, 5)</code> wraps on
+          the x axis only — visible at <code>[41]</code> as <code>hx=1 &lt; lo_x=14</code>.
+        </p>
+      </>
+    ),
+  },
+  {
     id: 'status',
     title: 'Status (2026-04-21)',
     thumb: 'Status',
