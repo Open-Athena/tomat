@@ -43,6 +43,6 @@ def test_total_vocab_size_monotonic_in_codec():
     cfgs = {c.codec: c.total_vocab_size for c in all_configs() if c.patch_size == 14}
     # 3-byte (1024 density vocab) < 9+12 (4608) < fp16 (65536)
     assert cfgs["tomol_3byte"] < cfgs["two_token_9_12"] < cfgs["fp16_1token"]
-    # Non-density vocab = 16 + 118 + 1024 + 1024 = 2182
-    assert cfgs["tomol_3byte"] == 2182 + 1024
-    assert cfgs["fp16_1token"] == 2182 + 65_536
+    # Non-density vocab = 18 + 118 + 1024 + 1024 = 2184
+    assert cfgs["tomol_3byte"] == 2184 + 1024
+    assert cfgs["fp16_1token"] == 2184 + 65_536

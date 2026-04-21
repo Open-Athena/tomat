@@ -32,8 +32,9 @@ CODEC_DENSITY_VOCAB: dict[str, int] = {
 }
 
 # Fixed (non-density) vocab — specials + atoms + integers + positions.
-# See tomat.tokenizers.patch for the exact layout.
-NONDENSITY_VOCAB = 16 + 118 + 1024 + 1024  # = 2182
+# See tomat.tokenizers.patch for the exact layout. N_SPECIALS = 18 because
+# the HI block adds [HI_START]/[HI_END] on top of the 16 original specials.
+NONDENSITY_VOCAB = 18 + 118 + 1024 + 1024  # = 2184
 
 # Conservative preamble budget (tokens used by specials + atoms + positions
 # + shape/offset + delimiters), allowing ~80-atom structures. Real

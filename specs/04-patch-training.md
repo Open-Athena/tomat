@@ -25,12 +25,18 @@ Token layout emitted by [`src/tomat/tokenizers/patch.py`](../src/tomat/tokenizer
 [POS_START] x₁ y₁ z₁ … [POS_END]
 [SHAPE_START] P P P [SHAPE_END]
 [OFFSET_START] ix iy iz [OFFSET_END]
+[HI_START] hx hy hz [HI_END]
 [DENS_START] d₀ d₁ … d_{P³−1} [EOS]
 ```
 
 * **Position codec** — tomol 3-byte (SE + M0 + M1, 1 024 vocab).
 * **Density codec** — 2-token 9+12 (SE + M, 4 608 vocab).
-* **Total vocab** — 6 790 tokens.
+* **Total vocab** — 6 792 tokens.
+* **`[HI_START]` block** — wrapped high corner ``(ix+P−1) mod nx`` per
+  axis. On axes where ``hi < lo`` the patch crossed a PBC boundary.
+  Redundant with ``(grid, offset, shape)`` via modular arithmetic, but
+  cheap (5 tokens) and makes wrap directly observable to the model
+  instead of learned.
 
 ## Patch sampling
 
@@ -56,9 +62,9 @@ Target: a **30 M-parameter Qwen3** training on **8k context**, one patch
 per sequence. At the defaults above:
 
 * P = 14 → density payload 2 × 14³ = 5 488 tokens; structure preamble
-  ~200 tokens; total ~5.7 k. Fits 8 k with ~2 k buffer for large
-  structures (up to ~100 atoms before overflow).
-* Embeddings at hidden=512 tied: 6 790 × 512 ≈ 3.5 M params — ~12 % of
+  ~205 tokens (includes 5-token HI block); total ~5.7 k. Fits 8 k with
+  ~2 k buffer for large structures (up to ~100 atoms before overflow).
+* Embeddings at hidden=512 tied: 6 792 × 512 ≈ 3.5 M params — ~12 % of
   the 30 M budget.
 
 ## Pipeline

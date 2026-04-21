@@ -24,7 +24,7 @@ Once the dataset path is set, launch with::
 Config mirrors ``will-tomol/experiments/tatt/tomol25_30m.py`` with:
 
 * Same Qwen3 body (6 layers, hidden=512, 4 heads) ≈ 24 M transformer
-  params; with tied 6,790-vocab embeddings adds ~3.5 M → ~28 M total.
+  params; with tied 6,792-vocab embeddings adds ~3.5 M → ~28 M total.
 * Max seq length bumped to **8,192** (tomol-30M was 4,096) to fit
   a 14³ patch (5,488 density tokens) plus a 100-atom structure preamble
   with buffer.

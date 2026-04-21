@@ -24,17 +24,25 @@ Token layout
     [POS_END]
     [SHAPE_START] ⟨P⟩ ⟨P⟩ ⟨P⟩                             # patch dims (ints)
     [OFFSET_START] ⟨ix⟩ ⟨iy⟩ ⟨iz⟩                         # patch anchor (ints)
+    [HI_START]    ⟨hx⟩ ⟨hy⟩ ⟨hz⟩                          # wrapped high corner
     [DENS_START]  ⟨d₀ SE M⟩ ⟨d₁ SE M⟩ … ⟨d_{P³−1} SE M⟩   # density, 2-token codec
     [EOS]
 
+The `[HI_START]` block holds ``(ix + P − 1) mod nx`` etc. — the wrapped
+last-voxel index on each axis. Comparing it to ``(ix, iy, iz)``: on any
+axis where ``hi < lo`` the patch crossed the PBC boundary on that axis.
+Redundant with ``grid_shape + offset + patch_shape`` (all derivable via
+modular arithmetic) but makes wrap directly observable to the model at
+any layer; cost is 5 tokens out of ~5,700 per sample.
+
 Vocabulary (default codecs: positions = tomol 3-byte; density = 2-token 9+12)::
 
-    specials          :    0 …    15
-    atom Z=1..118     :   16 …   133
-    int range 0..1023 :  134 … 1157      # grid dims, offsets, sizes share this
-    position codec    : 1158 … 2181      # 512 SE + 256 M0 + 256 M1
-    density codec     : 2182 … 6789      # 512 SE + 4096 M
-    TOTAL             : 6790 tokens
+    specials          :    0 …    17
+    atom Z=1..118     :   18 …   135
+    int range 0..1023 :  136 … 1159      # grid dims, offsets, sizes share this
+    position codec    : 1160 … 2183      # 512 SE + 256 M0 + 256 M1
+    density codec    : 2184 … 6791      # 512 SE + 4096 M
+    TOTAL             : 6792 tokens
 
 At hidden=512 tied embeddings this is ~3.5 M params — small fraction of a
 30 M transformer body. At patch ``P=14``, density payload = 14³ × 2 = 5488
@@ -75,11 +83,13 @@ SPECIAL_TOKENS = {
     "[SHAPE_END]":     10,
     "[OFFSET_START]":  11,
     "[OFFSET_END]":    12,
-    "[DENS_START]":    13,
-    "[DENS_END]":      14,
-    "[NL]":            15,
+    "[HI_START]":      13,
+    "[HI_END]":        14,
+    "[DENS_START]":    15,
+    "[DENS_END]":      16,
+    "[NL]":            17,
 }
-N_SPECIALS = 16
+N_SPECIALS = 18
 
 ATOM_OFFSET = N_SPECIALS  # 16
 MAX_ATOMIC_NUMBER = 118   # Z ≤ 118 (Oganesson) covers all real chemistry
@@ -259,10 +269,21 @@ class PatchTokenizer:
         tokens.extend(vocab.int_token(int(p)) for p in sample.patch_shape)
         tokens.append(S["[SHAPE_END]"])
 
-        # Patch offset
+        # Patch offset (low corner)
         tokens.append(S["[OFFSET_START]"])
         tokens.extend(vocab.int_token(int(o)) for o in sample.offset)
         tokens.append(S["[OFFSET_END]"])
+
+        # Wrapped high corner: on any axis where hi < lo the patch crossed a
+        # PBC boundary. Strictly redundant with (grid_shape, offset,
+        # patch_shape) but makes wrap directly observable to the model.
+        tokens.append(S["[HI_START]"])
+        hi_corner = tuple(
+            (lo + P - 1) % N
+            for lo, P, N in zip(sample.offset, sample.patch_shape, sample.grid_shape)
+        )
+        tokens.extend(vocab.int_token(int(h)) for h in hi_corner)
+        tokens.append(S["[HI_END]"])
 
         # Density values (row-major flatten; decoder knows patch_shape)
         tokens.append(S["[DENS_START]"])
@@ -339,8 +360,23 @@ class PatchTokenizer:
         if len(offset) != 3:
             raise ValueError(f"expected 3 offset dims, got {len(offset)}")
 
+        # HI (wrapped high corner) — verify consistency with grid/offset/shape
+        hi_i, hi_j = find_block(S["[HI_START]"], S["[HI_END]"], oj + 1)
+        hi_corner = tuple(self._decode_int(t) for t in toks[hi_i:hi_j])
+        if len(hi_corner) != 3:
+            raise ValueError(f"expected 3 hi-corner dims, got {len(hi_corner)}")
+        expected_hi = tuple(
+            (lo + P - 1) % N
+            for lo, P, N in zip(offset, patch_shape, grid_shape)
+        )
+        if hi_corner != expected_hi:
+            raise ValueError(
+                f"hi-corner {hi_corner} inconsistent with offset+shape+grid "
+                f"(expected {expected_hi})"
+            )
+
         # DENSITY
-        di, dj = find_block(S["[DENS_START]"], S["[DENS_END]"], oj + 1)
+        di, dj = find_block(S["[DENS_START]"], S["[DENS_END]"], hi_j + 1)
         dens_tokens = toks[di:dj]
         dens_stride = vocab.density_codec.tokens_per_value_signed
         expected_dens = int(np.prod(patch_shape)) * dens_stride

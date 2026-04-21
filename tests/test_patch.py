@@ -43,8 +43,9 @@ def test_vocab_layout_is_contiguous(tokenizer):
     assert v.position_vocab_size == 1024
     # Density with 2-token 9+12: 512 + 4096 = 4608
     assert v.density_vocab_size == 4608
-    # Total: specials(16) + atoms(118) + ints(1024) + positions(1024) + density(4608)
-    assert v.total_vocab_size == 16 + 118 + 1024 + 1024 + 4608
+    # Total: specials(18) + atoms(118) + ints(1024) + positions(1024) + density(4608)
+    assert N_SPECIALS == 18
+    assert v.total_vocab_size == 18 + 118 + 1024 + 1024 + 4608
 
 
 def test_extract_patch_with_pbc_wrap(tokenizer):
@@ -86,10 +87,11 @@ def test_tokenize_structure(tokenizer, fake_structure):
     #   POS_START  2*3*3tok  POS_END         20
     #   SHAPE_START 3 ints SHAPE_END          5
     #   OFFSET_START 3 ints OFFSET_END        5
+    #   HI_START 3 ints HI_END                5
     #   DENS_START 8³ × 2tok DENS_END      1026
     #   EOS                                   1
-    # total                                1067
-    expected = 1 + 5 + 4 + 20 + 5 + 5 + (2 * tokenizer.patch_size ** 3 + 2) + 1
+    # total                                1072
+    expected = 1 + 5 + 4 + 20 + 5 + 5 + 5 + (2 * tokenizer.patch_size ** 3 + 2) + 1
     assert len(tokens) == expected
 
     # Special tokens present in the right order
@@ -166,6 +168,41 @@ def test_detokenize_rejects_malformed_sequence(tokenizer):
     # Missing EOS
     with pytest.raises(ValueError, match="EOS"):
         tokenizer.detokenize([SPECIAL_TOKENS["[BOS]"], 999])
+
+
+def test_hi_corner_tokens_encode_wrap(tokenizer, fake_structure):
+    """HI_START block encodes (offset + P - 1) mod grid; wrap flips hi < lo."""
+    rng = np.random.default_rng(0)
+    density = rng.uniform(1e-3, 1.0, size=(16, 16, 16)).astype(np.float32)
+    P = tokenizer.patch_size  # 8
+
+    # Non-wrapping patch at (0,0,0): hi = (0 + 8 - 1) mod 16 = 7 on each axis
+    s_nowrap = tokenizer.make_sample("mp-fake", density, fake_structure, offset=(0, 0, 0))
+    toks = tokenizer.tokenize(s_nowrap)
+    hi_start = toks.index(SPECIAL_TOKENS["[HI_START]"])
+    hi_end = toks.index(SPECIAL_TOKENS["[HI_END]"])
+    hi_ints = [t - INT_OFFSET for t in toks[hi_start + 1 : hi_end]]
+    assert hi_ints == [7, 7, 7]  # no wrap: hi > lo on every axis
+
+    # Wrapping patch at (12,12,12): hi = (12 + 8 - 1) mod 16 = 3 on each axis
+    s_wrap = tokenizer.make_sample("mp-fake", density, fake_structure, offset=(12, 12, 12))
+    toks = tokenizer.tokenize(s_wrap)
+    hi_start = toks.index(SPECIAL_TOKENS["[HI_START]"])
+    hi_end = toks.index(SPECIAL_TOKENS["[HI_END]"])
+    hi_ints = [t - INT_OFFSET for t in toks[hi_start + 1 : hi_end]]
+    assert hi_ints == [3, 3, 3]  # wrap: hi < lo on every axis
+
+
+def test_detokenize_rejects_inconsistent_hi_corner(tokenizer, fake_structure):
+    rng = np.random.default_rng(0)
+    density = rng.uniform(1e-3, 1.0, size=(16, 16, 16)).astype(np.float32)
+    sample = tokenizer.make_sample("mp-fake", density, fake_structure, offset=(3, 5, 7))
+    toks = tokenizer.tokenize(sample)
+    hi_start = toks.index(SPECIAL_TOKENS["[HI_START]"])
+    # Corrupt the first hi token.
+    toks[hi_start + 1] = INT_OFFSET + 999
+    with pytest.raises(ValueError, match="hi-corner"):
+        tokenizer.detokenize(toks)
 
 
 def test_random_offsets_uniform_coverage(tokenizer):
