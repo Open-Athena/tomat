@@ -52,14 +52,26 @@ export function HomePage() {
   return (
     <>
       <header>
-        <h1>tomat 🍅 — tokenizer fidelity</h1>
+        <h1>tomat 🍅 — tokenized materials</h1>
         <a className="deck-link" href="#/deck" title="Open slide deck">slides →</a>
         <ThemeToggle />
       </header>
 
+      <div className="pivot-banner">
+        <strong>Current direction: patch tokenization.</strong>{' '}
+        Each training example = one <code>P × P × P</code> sub-cube of a material's
+        native-resolution density, prefixed with atomic inventory + grid/patch/offset
+        metadata. Wrap-aware <code>[HI_START]</code> tokens encode PBC crossing directly.
+        30 M Qwen3 smoke on an A100 is the next milestone.{' '}
+        <a href="#/deck">Walk-through in the deck →</a>
+      </div>
+
+      <h2>Reconstruction-floor study (full-grid schemes)</h2>
       <p className="meta">
-        Reconstruction-error floor per tokenization scheme on n={samples} Materials
-        Project CHGCARs (128³ grid). Backed by live
+        The plots below measure <em>encoder/decoder fidelity only</em> — the NMAE floor
+        a transformer couldn't beat. They drove the pivot: at 128³ full-grid tokenization,
+        no scheme fits 16 k context with useful NMAE, which pushed us to patches.
+        n={samples} Materials Project CHGCARs (128³ grid). Backed by live
         {' '}<ExtLink href="https://github.com/Open-Athena/tomat/blob/main/results/sweep-n50.csv">sweep CSV</ExtLink>{' '}
         · <ExtLink href="https://github.com/Open-Athena/tomat">Open-Athena/tomat</ExtLink>
       </p>

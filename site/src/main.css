@@ -289,6 +289,18 @@ body.in-deck #root { max-width: none; padding: 0; margin: 0; }
 .slide-plot { width: 100%; }
 .slide-plot h2 { text-align: left; margin-bottom: 1rem; }
 
+.pivot-banner {
+  background: var(--code-bg);
+  border-left: 4px solid #c0392b;
+  padding: 0.9rem 1.2rem;
+  border-radius: 4px;
+  margin: 1.25rem 0 2rem;
+  line-height: 1.55;
+}
+@media (prefers-color-scheme: dark) {
+  .pivot-banner { border-left-color: #ff7f6b; }
+}
+
 .token-layout {
   background: var(--code-bg);
   border-radius: 6px;
