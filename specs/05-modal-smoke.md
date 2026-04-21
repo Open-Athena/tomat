@@ -98,7 +98,14 @@ scripts/tokenize_patches.py \
     -S 42
 ```
 
-128 materials × 32 patches = 4,096 rows ≈ 22 MB zstd. DVX-wrap:
+128 materials × 32 patches = 4,096 rows ≈ 22 MB zstd.
+
+**Seeding**: `-S 42` controls the patch-offset RNG at preprocessing —
+determines *which* 32 patches per material exist in the shards. This
+is a separate stream from the training-side block-shuffle seed (step
+2), so reshuffling the same shards doesn't require re-tokenizing.
+
+DVX-wrap:
 
 ```bash
 dvx repro --single data/tokenized/val-smoke.dvc
@@ -111,18 +118,32 @@ tokenizers/patch,data/zarr_io}.py` plus `__init__`s — same style as
 `results/sweep-n50.csv.dvc`.
 
 **Sanity**: pulled-back `meta.json` should show `total_rows: 4096`,
-`n_materials: 128`, `vocab.total_size: 6790`,
+`n_materials: 128`, `vocab.total_size: 6792`,
 `density_codec_name: two_token_9_12`.
 
 ### 2. Modal train function with Levanter
 
-Write `scripts/train_smoke_modal.py`. Image needs `levanter`,
-`pyarrow`, and the tomat package (for `PatchTokenizer`'s vocab size
-if we need to inject it at config-build time). Pin levanter to
-whichever version `marin-experiments/tiny-stories/pyproject.toml` uses
-— that's the closest-scale reference (see
-[`tiny-stories/launch.py`](/Users/ryan/c/oa/marin-experiments/tiny-stories/launch.py),
-~30 M Grug transformer trained via `ACCELERATOR=gpu`).
+Write `scripts/train_smoke_modal.py`. **Levanter is not on PyPI** —
+Marin ships `marin`, `marin-levanter`, `marin-iris`, `marin-zephyr`,
+`marin-rigging` via custom wheel indexes at
+`https://github.com/marin-community/marin/releases/expanded_assets/
+<pkg>-latest`. See `marin-experiments/tiny-stories/pyproject.toml` for
+the full incantation:
+
+- `dependencies = ["marin-levanter", ...]`
+- `[tool.uv] prerelease = "allow"` + `find-links = [...]`
+- `override-dependencies = [...]` (pins for `omegaconf`,
+  `antlr4-python3-runtime`, etc.)
+- `[[tool.uv.index]] name = "marin-resiliparse"` for the fork of
+  resiliparse that marin needs.
+
+The commented block in tomat's `pyproject.toml` is an older version of
+this — refresh it against the tiny-stories file and uncomment.
+
+Image build: have Modal `uv sync` the refreshed pyproject inside the
+image. Reference `marin-experiments/tiny-stories/launch.py` for
+`ResourceConfig.with_gpu("a100", ...)` usage — it's the closest-scale
+prior art (~30 M Grug transformer).
 
 Resource: `@app.function(gpu="A100", volumes={"/vol": volume},
 timeout=7200)`.
@@ -130,8 +151,10 @@ timeout=7200)`.
 Inside the function, build a minimal Levanter training entry:
 
 1. `Qwen3Config`: 6 layers, hidden=512, 4 heads, max_seq_len=8192,
-   vocab=6790 — identical to the Marin scaffold
-   (`experiments/tomat_patch_30m.py`).
+   vocab=**6792** — identical to the Marin scaffold
+   (`experiments/tomat_patch_30m.py`). Read the vocab size dynamically
+   from the tokenized shards' `meta.json` rather than hardcoding, so a
+   codec swap at preprocessing doesn't silently misalign.
 2. `LmDataConfig` with `UrlDatasetSourceConfig(urls=[
    "/vol/tokenized/val-smoke/*.parquet"], format=PrebuiltLmDatasetFormat(
    input_ids_key="input_ids"))` for both train and validation. Local
@@ -139,10 +162,16 @@ Inside the function, build a minimal Levanter training entry:
 3. Override: `num_train_steps=100`, `train_batch_size=8` (fits A100
    with 8k context and 30M params easily; bump if headroom obvious),
    `steps_per_eval=50`.
-4. Call `levanter.main.train_lm.main(TrainLmConfig(...))` (or the
-   current equivalent — locate via `grep -R "def main" $(python -c
-   "import levanter, os; print(os.path.dirname(levanter.__file__))")/main`).
-5. Write loss csv, final ckpt, and stdout tee to `/vol/results/smoke/`.
+4. `TrainerConfig.seed` + `BlockShuffleConfig.seed` both settable via
+   a `--seed` CLI flag; default `None` (non-deterministic) for
+   open-ended experimentation, explicit ints when reproducibility
+   matters. These are the training-side streams; the preprocessing
+   seed (step 1's `-S/--seed`) is already separate and independently
+   controllable.
+5. Call `levanter.main.train_lm.main(TrainLmConfig(...))` (or the
+   current equivalent — locate via `grep -R "def main"` inside the
+   installed `marin-levanter` package).
+6. Write loss csv, final ckpt, and stdout tee to `/vol/results/smoke/`.
 
 Local entrypoint: `modal run scripts/train_smoke_modal.py`, then
 `modal volume get tomat-rho-gga /results/smoke results/`.
@@ -164,7 +193,7 @@ e.g. print `levanter.__version__` at startup and grep).
 Want to see:
 - No tokenization / vocab-size mismatch at startup (`meta.json.vocab.
   total_size == Qwen3Config.vocab_size`).
-- `input_ids` min ≥ 0, max < 6790 — catches codec mis-config early.
+- `input_ids` min ≥ 0, max < 6792 — catches codec mis-config early.
 - Loss printed each step. Success = `loss[100] < loss[0]`, no NaNs,
   no flat-line.
 
@@ -207,7 +236,7 @@ On success:
 ## Done criteria
 
 - [ ] `data/tokenized/val-smoke.dvc` exists, tracks a 4,096-row
-      parquet dir with `vocab.total_size == 6790` in `meta.json`, and
+      parquet dir with `vocab.total_size == 6792` in `meta.json`, and
       records `meta.computation.{cmd,deps}`.
 - [ ] `scripts/tokenize_patches_modal.py` and
       `scripts/train_smoke_modal.py` committed.

@@ -249,6 +249,22 @@ export const slides: Slide[] = [
     ),
   },
   {
+    id: 'status',
+    title: 'Status (2026-04-21)',
+    thumb: 'Status',
+    render: () => (
+      <>
+        <h2>Where we are now</h2>
+        <ul>
+          <li><strong>Pivoted to patch tokenization</strong> — each training example is a P³ sub-cube of a material&rsquo;s native-resolution density grid, prefixed with atomic inventory + grid/patch/offset metadata. Resolves the 16k-context constraint without downsampling.</li>
+          <li><strong>30M Qwen3 scaffold</strong> — 6 layers, hidden=512, 8k context, 6,792-token vocab. Target hello-world: 100 steps, monotonically decreasing loss.</li>
+          <li><strong>Wrap-aware tokens</strong> — <code>[HI_START]</code> block encodes the wrapped high corner per axis; <code>hi &lt; lo</code> directly flags PBC wrap to the model without requiring it to learn modular arithmetic.</li>
+          <li><strong>Data pipeline</strong> — <code>tomat-rho-gga</code> Modal volume seeded with 4,305 native-resolution val-split Zarrs (~22 GB); patch tokenizer + parquet preprocessor shipped.</li>
+        </ul>
+      </>
+    ),
+  },
+  {
     id: 'next-steps',
     title: 'Next steps',
     thumb: 'Next',
@@ -256,10 +272,10 @@ export const slides: Slide[] = [
       <>
         <h2>Next</h2>
         <ol>
-          <li><strong>Train a small model</strong> on downsampled 32³ grids — simplest path to a working end-to-end pipeline, even at poor accuracy.</li>
-          <li><strong>Patch-based tokenization:</strong> each voxel patch → one token (ViT-style) or hierarchical / adaptive refinement. Cuts context by patch volume.</li>
-          <li><strong>VQ-VAE baseline:</strong> learned compression of patches to discrete tokens.</li>
-          <li><strong>Stratified halide sweep:</strong> first 50 mp-ids had no halides; stratify and re-run.</li>
+          <li><strong>Smoke training on Modal</strong> — tokenize ~128 val structures → 30M Qwen3 on one A100 for 100 steps. Immediate-access compute surface to close the loop end-to-end.</li>
+          <li><strong>Sweep over (codec × patch size × M × N)</strong> — preprocess + training grids defined; 6 of 9 (codec, P) combos fit 8k context.</li>
+          <li><strong>Scale to Marin + GCP TPU Research Cluster</strong> — real training run on v5p-8 once the smoke loop is green. Scaffold already in place.</li>
+          <li><strong>Full train split</strong> — smoke uses val-only (4,305 structures); train split adds 77k structures / ~390 GB.</li>
         </ol>
       </>
     ),
@@ -275,7 +291,7 @@ export const slides: Slide[] = [
           <li>Live dashboard: <Ext href="https://tomat.oa.dev/">tomat.oa.dev</Ext></li>
           <li>Repo: <Ext href={REPO}>Open-Athena/tomat</Ext></li>
           <li>Sweep CSV: <Ext href={`${REPO}/blob/main/results/sweep-n50.csv`}>results/sweep-n50.csv</Ext></li>
-          <li>Spec: <Ext href={`${REPO}/blob/main/specs/02-fidelity-sweep.md`}>specs/02-fidelity-sweep.md</Ext></li>
+          <li>Specs: <Ext href={`${REPO}/blob/main/specs/04-patch-training.md`}>04-patch-training</Ext>, <Ext href={`${REPO}/blob/main/specs/05-modal-smoke.md`}>05-modal-smoke</Ext>, <Ext href={`${REPO}/blob/main/specs/done/02-fidelity-sweep.md`}>02-fidelity-sweep (done)</Ext></li>
           <li>Notes: <Ext href={`${REPO}/blob/main/docs/discussion-notes.md`}>docs/discussion-notes.md</Ext></li>
         </ul>
       </>
