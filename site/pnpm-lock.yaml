@@ -11,6 +11,9 @@ importers:
       d3-dsv:
         specifier: ^3.0.1
         version: 3.0.1
+      oa-react-slides:
+        specifier: file:../oa-react-slides
+        version: file:../oa-react-slides(react@19.2.5)
       plotly.js-basic-dist:
         specifier: ^2.35.2
         version: 2.35.3
@@ -452,6 +455,12 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [win32]
+
+  '@fontsource/castoro@5.2.7':
+    resolution: {integrity: sha512-KntyAd+5Hq2CAqNVILDEu6B64DzeAxqTXRpzMJuWfsVnN/QeChCqN2bjWA1nwqVPjle3DQuJOiu+F99ZGYE6Hw==}
+
+  '@fontsource/inter@5.2.8':
+    resolution: {integrity: sha512-P6r5WnJoKiNVV+zvW2xM13gNdFhAEpQ9dQJHt3naLvfg+LkF2ldgSLiF4T41lf1SQCM9QmkqPTn4TH568IRagg==}
 
   '@jridgewell/gen-mapping@0.3.13':
     resolution: {integrity: sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==}
@@ -1608,6 +1617,11 @@ packages:
     resolution: {integrity: sha512-Dq3iuiFBkrbmuQjGFFF3zckXNCQoSD37/SdSbgcBailUx6knDvDwb5CympBgcoWHy36sfS12u74MHYkXyHq6bg==}
     engines: {node: '>=0.10.0'}
 
+  oa-react-slides@file:../oa-react-slides:
+    resolution: {directory: ../oa-react-slides, type: directory}
+    peerDependencies:
+      react: '>=18'
+
   object-assign@4.1.1:
     resolution: {integrity: sha512-rJgTQnkUnH1sFw8yT6VSU3zD3sWmu6sZhIseY8VX+GRu3P6F7Fu+JNDoXfklElbLJSnc3FUQHVe4cU5hj+BcUg==}
     engines: {node: '>=0.10.0'}
@@ -2459,6 +2473,10 @@ snapshots:
 
   '@esbuild/win32-x64@0.25.12':
     optional: true
+
+  '@fontsource/castoro@5.2.7': {}
+
+  '@fontsource/inter@5.2.8': {}
 
   '@jridgewell/gen-mapping@0.3.13':
     dependencies:
@@ -3744,6 +3762,12 @@ snapshots:
   number-is-integer@1.0.1:
     dependencies:
       is-finite: 1.1.0
+
+  oa-react-slides@file:../oa-react-slides(react@19.2.5):
+    dependencies:
+      '@fontsource/castoro': 5.2.7
+      '@fontsource/inter': 5.2.8
+      react: 19.2.5
 
   object-assign@4.1.1: {}
 

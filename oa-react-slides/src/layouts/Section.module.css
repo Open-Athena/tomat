@@ -1,0 +1,41 @@
+.section {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-start;
+  padding: var(--oa-slide-pad);
+  padding-left: 80px;
+  background: var(--oa-dark);
+  position: relative;
+  overflow: hidden;
+}
+
+.content {
+  position: relative;
+  z-index: 1;
+  max-width: 70%;
+}
+
+.content h1 {
+  font-family: var(--oa-font-serif);
+  font-weight: 400;
+  font-size: 3.2em;
+  line-height: 1.15;
+  color: var(--oa-text-gold);
+  margin-bottom: 0.3em;
+}
+
+.content p {
+  font-size: 1.2em;
+  color: var(--oa-text-on-dark);
+  opacity: 0.8;
+}
+
+.decoration {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 4px;
+  background: linear-gradient(90deg, var(--oa-copper), transparent);
+}

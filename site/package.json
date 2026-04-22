@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "d3-dsv": "^3.0.1",
+    "oa-react-slides": "file:../oa-react-slides",
     "plotly.js-basic-dist": "^2.35.2",
     "pltly": "https://gitlab.com/runsascoded/js/pltly/-/archive/6915b0559b81e35f21ad12f3c5f662faca4682d4/pltly-6915b0559b81e35f21ad12f3c5f662faca4682d4.tar.gz",
     "react": "^19.0.0",

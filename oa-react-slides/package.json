@@ -1,0 +1,29 @@
+{
+  "name": "oa-react-slides",
+  "version": "0.1.0",
+  "description": "React port of the Open Athena Slidev theme — warm beige + copper tones, Castoro/Inter typography, 14 layouts, 149 icons.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./styles": "./src/styles/index.ts",
+    "./styles/base.css": "./src/styles/base.css"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "dependencies": {
+    "@fontsource/castoro": "^5.2.7",
+    "@fontsource/inter": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
+  }
+}

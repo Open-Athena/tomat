@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Icon Reference — Open Athena Slidev Theme</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #f5f0eb;
+    color: #2d2d2d;
+    padding: 40px 48px;
+  }
+  h1 {
+    font-family: Georgia, serif;
+    font-weight: 400;
+    font-size: 2em;
+    margin-bottom: 8px;
+  }
+  .subtitle { color: #7a7a7a; font-size: 1.05em; margin-bottom: 12px; }
+  .usage {
+    background: #fff;
+    border: 1px solid #d5cbbd;
+    border-radius: 8px;
+    padding: 20px 24px;
+    margin-bottom: 32px;
+    font-size: 0.95em;
+    line-height: 1.7;
+  }
+  .usage code {
+    background: rgba(0,0,0,.06);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.9em;
+    color: #8b6340;
+  }
+  .usage pre {
+    background: #2a2a2a;
+    color: #d5cbbd;
+    padding: 14px 18px;
+    border-radius: 6px;
+    margin: 10px 0;
+    overflow-x: auto;
+    font-size: 0.9em;
+    line-height: 1.5;
+  }
+  .count { color: #7a7a7a; font-size: 0.9em; margin-bottom: 16px; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 16px;
+  }
+  .card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding: 16px 8px 12px;
+    background: #fff;
+    border: 1px solid #d5cbbd;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  .card:hover {
+    border-color: #a67c52;
+    box-shadow: 0 2px 8px rgba(166,124,82,.15);
+  }
+  .card img { display: block; }
+  .card span {
+    font-size: 0.75em;
+    color: #6b6b4f;
+    text-align: center;
+    word-break: break-word;
+  }
+  .toast {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%) translateY(80px);
+    background: #2a2a2a;
+    color: #d5cbbd;
+    padding: 10px 20px;
+    border-radius: 8px;
+    font-size: 0.9em;
+    opacity: 0;
+    transition: transform .25s, opacity .25s;
+    pointer-events: none;
+    z-index: 100;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .search {
+    width: 100%;
+    max-width: 400px;
+    padding: 10px 14px;
+    border: 1px solid #d5cbbd;
+    border-radius: 6px;
+    font-size: 1em;
+    margin-bottom: 20px;
+    background: #fff;
+    outline: none;
+  }
+  .search:focus { border-color: #a67c52; }
+</style>
+</head>
+<body>
+
+<h1>Icon Reference</h1>
+<p class="subtitle">Open Athena Slidev Theme &mdash; 147 icons</p>
+
+<div class="usage">
+  <strong>How to use icons in your slides:</strong>
+  <p>Place the icon before your heading text using standard markdown image syntax:</p>
+  <pre># ![](/icons/rocket.svg) My Slide Title
+## ![](/icons/chart-bar.svg) Column Header
+### ![](/icons/lightbulb.svg) Section Title</pre>
+  <p>Icons are automatically sized to match the heading text. Use <strong>black &amp; transparent</strong> SVGs only for a clean look. Click any icon below to copy its markdown reference.</p>
+</div>
+
+<input class="search" type="text" placeholder="Search icons..." oninput="filterIcons(this.value)" />
+<p class="count"><span id="visible-count">147</span> icons</p>
+
+<div class="grid" id="grid">
+      <div class="card" onclick="copyRef('ai')">
+        <img src="ai.svg" alt="ai" width="100" height="100" />
+        <span>ai</span>
+      </div>
+      <div class="card" onclick="copyRef('alert-circle')">
+        <img src="alert-circle.svg" alt="alert-circle" width="100" height="100" />
+        <span>alert-circle</span>
+      </div>
+      <div class="card" onclick="copyRef('alert-triangle')">
+        <img src="alert-triangle.svg" alt="alert-triangle" width="100" height="100" />
+        <span>alert-triangle</span>
+      </div>
+      <div class="card" onclick="copyRef('api')">
+        <img src="api.svg" alt="api" width="100" height="100" />
+        <span>api</span>
+      </div>
+      <div class="card" onclick="copyRef('apple')">
+        <img src="apple.svg" alt="apple" width="100" height="100" />
+        <span>apple</span>
+      </div>
+      <div class="card" onclick="copyRef('archive')">
+        <img src="archive.svg" alt="archive" width="100" height="100" />
+        <span>archive</span>
+      </div>
+      <div class="card" onclick="copyRef('arrow-down')">
+        <img src="arrow-down.svg" alt="arrow-down" width="100" height="100" />
+        <span>arrow-down</span>
+      </div>
+      <div class="card" onclick="copyRef('arrow-left')">
+        <img src="arrow-left.svg" alt="arrow-left" width="100" height="100" />
+        <span>arrow-left</span>
+      </div>
+      <div class="card" onclick="copyRef('arrow-right')">
+        <img src="arrow-right.svg" alt="arrow-right" width="100" height="100" />
+        <span>arrow-right</span>
+      </div>
+      <div class="card" onclick="copyRef('arrow-up')">
+        <img src="arrow-up.svg" alt="arrow-up" width="100" height="100" />
+        <span>arrow-up</span>
+      </div>
+      <div class="card" onclick="copyRef('arrow-white-down')">
+        <img src="arrow-white-down.svg" alt="arrow-white-down" width="100" height="100" />
+        <span>arrow-white-down</span>
+      </div>
+      <div class="card" onclick="copyRef('arrow-white-down-left')">
+        <img src="arrow-white-down-left.svg" alt="arrow-white-down-left" width="100" height="100" />
+        <span>arrow-white-down-left</span>
+      </div>
+      <div class="card" onclick="copyRef('arrow-white-down-right')">
+        <img src="arrow-white-down-right.svg" alt="arrow-white-down-right" width="100" height="100" />
+        <span>arrow-white-down-right</span>
+      </div>
+      <div class="card" onclick="copyRef('arrow-white-left')">
+        <img src="arrow-white-left.svg" alt="arrow-white-left" width="100" height="100" />
+        <span>arrow-white-left</span>
+      </div>
+      <div class="card" onclick="copyRef('arrow-white-right')">
+        <img src="arrow-white-right.svg" alt="arrow-white-right" width="100" height="100" />
+        <span>arrow-white-right</span>
+      </div>
+      <div class="card" onclick="copyRef('arrow-white-up')">
+        <img src="arrow-white-up.svg" alt="arrow-white-up" width="100" height="100" />
+        <span>arrow-white-up</span>
+      </div>
+      <div class="card" onclick="copyRef('arrow-white-up-left')">
+        <img src="arrow-white-up-left.svg" alt="arrow-white-up-left" width="100" height="100" />
+        <span>arrow-white-up-left</span>
+      </div>
+      <div class="card" onclick="copyRef('arrow-white-up-right')">
+        <img src="arrow-white-up-right.svg" alt="arrow-white-up-right" width="100" height="100" />
+        <span>arrow-white-up-right</span>
+      </div>
+      <div class="card" onclick="copyRef('atom')">
+        <img src="atom.svg" alt="atom" width="100" height="100" />
+        <span>atom</span>
+      </div>
+      <div class="card" onclick="copyRef('audio')">
+        <img src="audio.svg" alt="audio" width="100" height="100" />
+        <span>audio</span>
+      </div>
+      <div class="card" onclick="copyRef('award')">
+        <img src="award.svg" alt="award" width="100" height="100" />
+        <span>award</span>
+      </div>
+      <div class="card" onclick="copyRef('award2')">
+        <img src="award2.svg" alt="award2" width="100" height="100" />
+        <span>award2</span>
+      </div>
+      <div class="card" onclick="copyRef('bacteria')">
+        <img src="bacteria.svg" alt="bacteria" width="100" height="100" />
+        <span>bacteria</span>
+      </div>
+      <div class="card" onclick="copyRef('barcode')">
+        <img src="barcode.svg" alt="barcode" width="100" height="100" />
+        <span>barcode</span>
+      </div>
+      <div class="card" onclick="copyRef('battery')">
+        <img src="battery.svg" alt="battery" width="100" height="100" />
+        <span>battery</span>
+      </div>
+      <div class="card" onclick="copyRef('beaker')">
+        <img src="beaker.svg" alt="beaker" width="100" height="100" />
+        <span>beaker</span>
+      </div>
+      <div class="card" onclick="copyRef('bell')">
+        <img src="bell.svg" alt="bell" width="100" height="100" />
+        <span>bell</span>
+      </div>
+      <div class="card" onclick="copyRef('berkely')">
+        <img src="berkely.svg" alt="berkely" width="100" height="100" />
+        <span>berkely</span>
+      </div>
+      <div class="card" onclick="copyRef('big-data')">
+        <img src="big-data.svg" alt="big-data" width="100" height="100" />
+        <span>big-data</span>
+      </div>
+      <div class="card" onclick="copyRef('birds')">
+        <img src="birds.svg" alt="birds" width="100" height="100" />
+        <span>birds</span>
+      </div>
+      <div class="card" onclick="copyRef('book')">
+        <img src="book.svg" alt="book" width="100" height="100" />
+        <span>book</span>
+      </div>
+      <div class="card" onclick="copyRef('boston')">
+        <img src="boston.svg" alt="boston" width="100" height="100" />
+        <span>boston</span>
+      </div>
+      <div class="card" onclick="copyRef('box')">
+        <img src="box.svg" alt="box" width="100" height="100" />
+        <span>box</span>
+      </div>
+      <div class="card" onclick="copyRef('brain')">
+        <img src="brain.svg" alt="brain" width="100" height="100" />
+        <span>brain</span>
+      </div>
+      <div class="card" onclick="copyRef('bug')">
+        <img src="bug.svg" alt="bug" width="100" height="100" />
+        <span>bug</span>
+      </div>
+      <div class="card" onclick="copyRef('calendar')">
+        <img src="calendar.svg" alt="calendar" width="100" height="100" />
+        <span>calendar</span>
+      </div>
+      <div class="card" onclick="copyRef('category')">
+        <img src="category.svg" alt="category" width="100" height="100" />
+        <span>category</span>
+      </div>
+      <div class="card" onclick="copyRef('chart')">
+        <img src="chart.svg" alt="chart" width="100" height="100" />
+        <span>chart</span>
+      </div>
+      <div class="card" onclick="copyRef('chat')">
+        <img src="chat.svg" alt="chat" width="100" height="100" />
+        <span>chat</span>
+      </div>
+      <div class="card" onclick="copyRef('check')">
+        <img src="check.svg" alt="check" width="100" height="100" />
+        <span>check</span>
+      </div>
+      <div class="card" onclick="copyRef('chess-bishop')">
+        <img src="chess-bishop.svg" alt="chess-bishop" width="100" height="100" />
+        <span>chess-bishop</span>
+      </div>
+      <div class="card" onclick="copyRef('chess-king')">
+        <img src="chess-king.svg" alt="chess-king" width="100" height="100" />
+        <span>chess-king</span>
+      </div>
+      <div class="card" onclick="copyRef('chess-knight')">
+        <img src="chess-knight.svg" alt="chess-knight" width="100" height="100" />
+        <span>chess-knight</span>
+      </div>
+      <div class="card" onclick="copyRef('chess-pawn')">
+        <img src="chess-pawn.svg" alt="chess-pawn" width="100" height="100" />
+        <span>chess-pawn</span>
+      </div>
+      <div class="card" onclick="copyRef('chess-queen')">
+        <img src="chess-queen.svg" alt="chess-queen" width="100" height="100" />
+        <span>chess-queen</span>
+      </div>
+      <div class="card" onclick="copyRef('chess-rook')">
+        <img src="chess-rook.svg" alt="chess-rook" width="100" height="100" />
+        <span>chess-rook</span>
+      </div>
+      <div class="card" onclick="copyRef('classicification')">
+        <img src="classicification.svg" alt="classicification" width="100" height="100" />
+        <span>classicification</span>
+      </div>
+      <div class="card" onclick="copyRef('climate')">
+        <img src="climate.svg" alt="climate" width="100" height="100" />
+        <span>climate</span>
+      </div>
+      <div class="card" onclick="copyRef('clock')">
+        <img src="clock.svg" alt="clock" width="100" height="100" />
+        <span>clock</span>
+      </div>
+      <div class="card" onclick="copyRef('code')">
+        <img src="code.svg" alt="code" width="100" height="100" />
+        <span>code</span>
+      </div>
+      <div class="card" onclick="copyRef('coffee')">
+        <img src="coffee.svg" alt="coffee" width="100" height="100" />
+        <span>coffee</span>
+      </div>
+      <div class="card" onclick="copyRef('computer')">
+        <img src="computer.svg" alt="computer" width="100" height="100" />
+        <span>computer</span>
+      </div>
+      <div class="card" onclick="copyRef('cyber-brain')">
+        <img src="cyber-brain.svg" alt="cyber-brain" width="100" height="100" />
+        <span>cyber-brain</span>
+      </div>
+      <div class="card" onclick="copyRef('deep-neural-net')">
+        <img src="deep-neural-net.svg" alt="deep-neural-net" width="100" height="100" />
+        <span>deep-neural-net</span>
+      </div>
+      <div class="card" onclick="copyRef('distributed')">
+        <img src="distributed.svg" alt="distributed" width="100" height="100" />
+        <span>distributed</span>
+      </div>
+      <div class="card" onclick="copyRef('dna')">
+        <img src="dna.svg" alt="dna" width="100" height="100" />
+        <span>dna</span>
+      </div>
+      <div class="card" onclick="copyRef('download')">
+        <img src="download.svg" alt="download" width="100" height="100" />
+        <span>download</span>
+      </div>
+      <div class="card" onclick="copyRef('edit')">
+        <img src="edit.svg" alt="edit" width="100" height="100" />
+        <span>edit</span>
+      </div>
+      <div class="card" onclick="copyRef('extraction')">
+        <img src="extraction.svg" alt="extraction" width="100" height="100" />
+        <span>extraction</span>
+      </div>
+      <div class="card" onclick="copyRef('eye')">
+        <img src="eye.svg" alt="eye" width="100" height="100" />
+        <span>eye</span>
+      </div>
+      <div class="card" onclick="copyRef('eye-closed')">
+        <img src="eye-closed.svg" alt="eye-closed" width="100" height="100" />
+        <span>eye-closed</span>
+      </div>
+      <div class="card" onclick="copyRef('eye-off')">
+        <img src="eye-off.svg" alt="eye-off" width="100" height="100" />
+        <span>eye-off</span>
+      </div>
+      <div class="card" onclick="copyRef('files')">
+        <img src="files.svg" alt="files" width="100" height="100" />
+        <span>files</span>
+      </div>
+      <div class="card" onclick="copyRef('fire')">
+        <img src="fire.svg" alt="fire" width="100" height="100" />
+        <span>fire</span>
+      </div>
+      <div class="card" onclick="copyRef('fish')">
+        <img src="fish.svg" alt="fish" width="100" height="100" />
+        <span>fish</span>
+      </div>
+      <div class="card" onclick="copyRef('fish-dead')">
+        <img src="fish-dead.svg" alt="fish-dead" width="100" height="100" />
+        <span>fish-dead</span>
+      </div>
+      <div class="card" onclick="copyRef('flag')">
+        <img src="flag.svg" alt="flag" width="100" height="100" />
+        <span>flag</span>
+      </div>
+      <div class="card" onclick="copyRef('folder')">
+        <img src="folder.svg" alt="folder" width="100" height="100" />
+        <span>folder</span>
+      </div>
+      <div class="card" onclick="copyRef('fractal')">
+        <img src="fractal.svg" alt="fractal" width="100" height="100" />
+        <span>fractal</span>
+      </div>
+      <div class="card" onclick="copyRef('gears')">
+        <img src="gears.svg" alt="gears" width="100" height="100" />
+        <span>gears</span>
+      </div>
+      <div class="card" onclick="copyRef('git')">
+        <img src="git.svg" alt="git" width="100" height="100" />
+        <span>git</span>
+      </div>
+      <div class="card" onclick="copyRef('google')">
+        <img src="google.svg" alt="google" width="100" height="100" />
+        <span>google</span>
+      </div>
+      <div class="card" onclick="copyRef('gpu')">
+        <img src="gpu.svg" alt="gpu" width="100" height="100" />
+        <span>gpu</span>
+      </div>
+      <div class="card" onclick="copyRef('hammer')">
+        <img src="hammer.svg" alt="hammer" width="100" height="100" />
+        <span>hammer</span>
+      </div>
+      <div class="card" onclick="copyRef('handshake')">
+        <img src="handshake.svg" alt="handshake" width="100" height="100" />
+        <span>handshake</span>
+      </div>
+      <div class="card" onclick="copyRef('harvard')">
+        <img src="harvard.svg" alt="harvard" width="100" height="100" />
+        <span>harvard</span>
+      </div>
+      <div class="card" onclick="copyRef('heart')">
+        <img src="heart.svg" alt="heart" width="100" height="100" />
+        <span>heart</span>
+      </div>
+      <div class="card" onclick="copyRef('histogram')">
+        <img src="histogram.svg" alt="histogram" width="100" height="100" />
+        <span>histogram</span>
+      </div>
+      <div class="card" onclick="copyRef('image')">
+        <img src="image.svg" alt="image" width="100" height="100" />
+        <span>image</span>
+      </div>
+      <div class="card" onclick="copyRef('info')">
+        <img src="info.svg" alt="info" width="100" height="100" />
+        <span>info</span>
+      </div>
+      <div class="card" onclick="copyRef('key')">
+        <img src="key.svg" alt="key" width="100" height="100" />
+        <span>key</span>
+      </div>
+      <div class="card" onclick="copyRef('keyboard')">
+        <img src="keyboard.svg" alt="keyboard" width="100" height="100" />
+        <span>keyboard</span>
+      </div>
+      <div class="card" onclick="copyRef('lightbulb')">
+        <img src="lightbulb.svg" alt="lightbulb" width="100" height="100" />
+        <span>lightbulb</span>
+      </div>
+      <div class="card" onclick="copyRef('logic')">
+        <img src="logic.svg" alt="logic" width="100" height="100" />
+        <span>logic</span>
+      </div>
+      <div class="card" onclick="copyRef('london')">
+        <img src="london.svg" alt="london" width="100" height="100" />
+        <span>london</span>
+      </div>
+      <div class="card" onclick="copyRef('mail')">
+        <img src="mail.svg" alt="mail" width="100" height="100" />
+        <span>mail</span>
+      </div>
+      <div class="card" onclick="copyRef('map')">
+        <img src="map.svg" alt="map" width="100" height="100" />
+        <span>map</span>
+      </div>
+      <div class="card" onclick="copyRef('markdown')">
+        <img src="markdown.svg" alt="markdown" width="100" height="100" />
+        <span>markdown</span>
+      </div>
+      <div class="card" onclick="copyRef('matrix')">
+        <img src="matrix.svg" alt="matrix" width="100" height="100" />
+        <span>matrix</span>
+      </div>
+      <div class="card" onclick="copyRef('merge')">
+        <img src="merge.svg" alt="merge" width="100" height="100" />
+        <span>merge</span>
+      </div>
+      <div class="card" onclick="copyRef('microphone')">
+        <img src="microphone.svg" alt="microphone" width="100" height="100" />
+        <span>microphone</span>
+      </div>
+      <div class="card" onclick="copyRef('mit')">
+        <img src="mit.svg" alt="mit" width="100" height="100" />
+        <span>mit</span>
+      </div>
+      <div class="card" onclick="copyRef('moon')">
+        <img src="moon.svg" alt="moon" width="100" height="100" />
+        <span>moon</span>
+      </div>
+      <div class="card" onclick="copyRef('mountain')">
+        <img src="mountain.svg" alt="mountain" width="100" height="100" />
+        <span>mountain</span>
+      </div>
+      <div class="card" onclick="copyRef('neural-net')">
+        <img src="neural-net.svg" alt="neural-net" width="100" height="100" />
+        <span>neural-net</span>
+      </div>
+      <div class="card" onclick="copyRef('note')">
+        <img src="note.svg" alt="note" width="100" height="100" />
+        <span>note</span>
+      </div>
+      <div class="card" onclick="copyRef('nuclear')">
+        <img src="nuclear.svg" alt="nuclear" width="100" height="100" />
+        <span>nuclear</span>
+      </div>
+      <div class="card" onclick="copyRef('nyc')">
+        <img src="nyc.svg" alt="nyc" width="100" height="100" />
+        <span>nyc</span>
+      </div>
+      <div class="card" onclick="copyRef('nyu')">
+        <img src="nyu.svg" alt="nyu" width="100" height="100" />
+        <span>nyu</span>
+      </div>
+      <div class="card" onclick="copyRef('ocean')">
+        <img src="ocean.svg" alt="ocean" width="100" height="100" />
+        <span>ocean</span>
+      </div>
+      <div class="card" onclick="copyRef('open-ai')">
+        <img src="open-ai.svg" alt="open-ai" width="100" height="100" />
+        <span>open-ai</span>
+      </div>
+      <div class="card" onclick="copyRef('open-athena')">
+        <img src="open-athena.svg" alt="open-athena" width="100" height="100" />
+        <span>open-athena</span>
+      </div>
+      <div class="card" onclick="copyRef('orange')">
+        <img src="orange.svg" alt="orange" width="100" height="100" />
+        <span>orange</span>
+      </div>
+      <div class="card" onclick="copyRef('oscilloscope')">
+        <img src="oscilloscope.svg" alt="oscilloscope" width="100" height="100" />
+        <span>oscilloscope</span>
+      </div>
+      <div class="card" onclick="copyRef('paint')">
+        <img src="paint.svg" alt="paint" width="100" height="100" />
+        <span>paint</span>
+      </div>
+      <div class="card" onclick="copyRef('pen')">
+        <img src="pen.svg" alt="pen" width="100" height="100" />
+        <span>pen</span>
+      </div>
+      <div class="card" onclick="copyRef('people')">
+        <img src="people.svg" alt="people" width="100" height="100" />
+        <span>people</span>
+      </div>
+      <div class="card" onclick="copyRef('perceptron')">
+        <img src="perceptron.svg" alt="perceptron" width="100" height="100" />
+        <span>perceptron</span>
+      </div>
+      <div class="card" onclick="copyRef('person')">
+        <img src="person.svg" alt="person" width="100" height="100" />
+        <span>person</span>
+      </div>
+      <div class="card" onclick="copyRef('phage')">
+        <img src="phage.svg" alt="phage" width="100" height="100" />
+        <span>phage</span>
+      </div>
+      <div class="card" onclick="copyRef('phone')">
+        <img src="phone.svg" alt="phone" width="100" height="100" />
+        <span>phone</span>
+      </div>
+      <div class="card" onclick="copyRef('planet')">
+        <img src="planet.svg" alt="planet" width="100" height="100" />
+        <span>planet</span>
+      </div>
+      <div class="card" onclick="copyRef('princeton')">
+        <img src="princeton.svg" alt="princeton" width="100" height="100" />
+        <span>princeton</span>
+      </div>
+      <div class="card" onclick="copyRef('protein')">
+        <img src="protein.svg" alt="protein" width="100" height="100" />
+        <span>protein</span>
+      </div>
+      <div class="card" onclick="copyRef('refresh')">
+        <img src="refresh.svg" alt="refresh" width="100" height="100" />
+        <span>refresh</span>
+      </div>
+      <div class="card" onclick="copyRef('robot')">
+        <img src="robot.svg" alt="robot" width="100" height="100" />
+        <span>robot</span>
+      </div>
+      <div class="card" onclick="copyRef('rocket')">
+        <img src="rocket.svg" alt="rocket" width="100" height="100" />
+        <span>rocket</span>
+      </div>
+      <div class="card" onclick="copyRef('ruler')">
+        <img src="ruler.svg" alt="ruler" width="100" height="100" />
+        <span>ruler</span>
+      </div>
+      <div class="card" onclick="copyRef('saw')">
+        <img src="saw.svg" alt="saw" width="100" height="100" />
+        <span>saw</span>
+      </div>
+      <div class="card" onclick="copyRef('scroll')">
+        <img src="scroll.svg" alt="scroll" width="100" height="100" />
+        <span>scroll</span>
+      </div>
+      <div class="card" onclick="copyRef('search')">
+        <img src="search.svg" alt="search" width="100" height="100" />
+        <span>search</span>
+      </div>
+      <div class="card" onclick="copyRef('servers')">
+        <img src="servers.svg" alt="servers" width="100" height="100" />
+        <span>servers</span>
+      </div>
+      <div class="card" onclick="copyRef('sf')">
+        <img src="sf.svg" alt="sf" width="100" height="100" />
+        <span>sf</span>
+      </div>
+      <div class="card" onclick="copyRef('share')">
+        <img src="share.svg" alt="share" width="100" height="100" />
+        <span>share</span>
+      </div>
+      <div class="card" onclick="copyRef('solar-panel')">
+        <img src="solar-panel.svg" alt="solar-panel" width="100" height="100" />
+        <span>solar-panel</span>
+      </div>
+      <div class="card" onclick="copyRef('sprout')">
+        <img src="sprout.svg" alt="sprout" width="100" height="100" />
+        <span>sprout</span>
+      </div>
+      <div class="card" onclick="copyRef('stanford')">
+        <img src="stanford.svg" alt="stanford" width="100" height="100" />
+        <span>stanford</span>
+      </div>
+      <div class="card" onclick="copyRef('star')">
+        <img src="star.svg" alt="star" width="100" height="100" />
+        <span>star</span>
+      </div>
+      <div class="card" onclick="copyRef('sun')">
+        <img src="sun.svg" alt="sun" width="100" height="100" />
+        <span>sun</span>
+      </div>
+      <div class="card" onclick="copyRef('tea')">
+        <img src="tea.svg" alt="tea" width="100" height="100" />
+        <span>tea</span>
+      </div>
+      <div class="card" onclick="copyRef('tensor')">
+        <img src="tensor.svg" alt="tensor" width="100" height="100" />
+        <span>tensor</span>
+      </div>
+      <div class="card" onclick="copyRef('text')">
+        <img src="text.svg" alt="text" width="100" height="100" />
+        <span>text</span>
+      </div>
+      <div class="card" onclick="copyRef('thought')">
+        <img src="thought.svg" alt="thought" width="100" height="100" />
+        <span>thought</span>
+      </div>
+      <div class="card" onclick="copyRef('tokens')">
+        <img src="tokens.svg" alt="tokens" width="100" height="100" />
+        <span>tokens</span>
+      </div>
+      <div class="card" onclick="copyRef('tpu')">
+        <img src="tpu.svg" alt="tpu" width="100" height="100" />
+        <span>tpu</span>
+      </div>
+      <div class="card" onclick="copyRef('trashcan')">
+        <img src="trashcan.svg" alt="trashcan" width="100" height="100" />
+        <span>trashcan</span>
+      </div>
+      <div class="card" onclick="copyRef('tree')">
+        <img src="tree.svg" alt="tree" width="100" height="100" />
+        <span>tree</span>
+      </div>
+      <div class="card" onclick="copyRef('ui')">
+        <img src="ui.svg" alt="ui" width="100" height="100" />
+        <span>ui</span>
+      </div>
+      <div class="card" onclick="copyRef('vector')">
+        <img src="vector.svg" alt="vector" width="100" height="100" />
+        <span>vector</span>
+      </div>
+      <div class="card" onclick="copyRef('virus')">
+        <img src="virus.svg" alt="virus" width="100" height="100" />
+        <span>virus</span>
+      </div>
+      <div class="card" onclick="copyRef('water')">
+        <img src="water.svg" alt="water" width="100" height="100" />
+        <span>water</span>
+      </div>
+      <div class="card" onclick="copyRef('waveform')">
+        <img src="waveform.svg" alt="waveform" width="100" height="100" />
+        <span>waveform</span>
+      </div>
+      <div class="card" onclick="copyRef('wind')">
+        <img src="wind.svg" alt="wind" width="100" height="100" />
+        <span>wind</span>
+      </div>
+      <div class="card" onclick="copyRef('world')">
+        <img src="world.svg" alt="world" width="100" height="100" />
+        <span>world</span>
+      </div>
+      <div class="card" onclick="copyRef('wrench')">
+        <img src="wrench.svg" alt="wrench" width="100" height="100" />
+        <span>wrench</span>
+      </div>
+      <div class="card" onclick="copyRef('x')">
+        <img src="x.svg" alt="x" width="100" height="100" />
+        <span>x</span>
+      </div>
+      <div class="card" onclick="copyRef('zap')">
+        <img src="zap.svg" alt="zap" width="100" height="100" />
+        <span>zap</span>
+      </div>
+</div>
+
+<div class="toast" id="toast">Copied!</div>
+
+<script>
+function copyRef(name) {
+  const text = '![](/icons/' + name + '.svg)';
+  navigator.clipboard.writeText(text);
+  const t = document.getElementById('toast');
+  t.textContent = 'Copied: ' + text;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 1500);
+}
+function filterIcons(q) {
+  q = q.toLowerCase();
+  const cards = document.querySelectorAll('.card');
+  let n = 0;
+  cards.forEach(c => {
+    const name = c.querySelector('span').textContent;
+    const show = name.includes(q);
+    c.style.display = show ? '' : 'none';
+    if (show) n++;
+  });
+  document.getElementById('visible-count').textContent = n;
+}
+</script>
+</body>
+</html>
