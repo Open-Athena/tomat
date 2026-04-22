@@ -66,6 +66,7 @@ def tokenize(
     density_log_max: float,
     n_materials: int | None,
     seed: int,
+    pad_to: int | None,
 ) -> dict:
     """Invoke `scripts/tokenize_patches.py` as a subprocess with the
     Modal volume mount as `--rho-gga-dir`."""
@@ -89,6 +90,8 @@ def tokenize(
     ]
     if n_materials is not None:
         cmd += ["-n", str(n_materials)]
+    if pad_to is not None:
+        cmd += ["-L", str(pad_to)]
 
     _sp.run(cmd, check=True)
 
@@ -110,9 +113,10 @@ def main(
     density_log_max: float = 4.967,
     n_materials: int = 128,
     seed: int = 42,
+    pad_to: int = 8192,
     pull: bool = True,
 ) -> None:
-    err(f"[modal] tokenize → /vol/tokenized/{label}")
+    err(f"[modal] tokenize → /vol/tokenized/{label} (pad_to={pad_to})")
     result = tokenize.remote(
         label=label,
         split=split,
@@ -123,6 +127,7 @@ def main(
         density_log_max=density_log_max,
         n_materials=n_materials if n_materials > 0 else None,
         seed=seed,
+        pad_to=pad_to if pad_to > 0 else None,
     )
     meta = result["meta"]
     err(f"[modal] done: {meta['total_rows']:,} rows in {meta['n_shards']} shards")

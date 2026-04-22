@@ -89,6 +89,11 @@ def _build_schema() -> pa.Schema:
 @option('-S', '--seed', type=int, default=42, help='RNG seed.')
 @option('-R', '--rows-per-shard', type=int, default=2048,
         help='Rows per parquet file (default 2048 ≈ 100 MB at 5k tokens).')
+@option('-L', '--pad-to', type=int, default=None,
+        help='Right-pad every input_ids sequence to this length with [PAD]=0. '
+             'Required for Levanter PrebuiltLmDatasetFormat; error if any row '
+             "already exceeds --pad-to. Typical value matches the model's "
+             'max_seq_len (e.g., 8192 for tomat-30m).')
 @option('-n', '--n-materials', type=int, default=None,
         help='Debug: cap the number of materials (first N from split).')
 def main(
@@ -103,6 +108,7 @@ def main(
     output_dir: Path,
     seed: int,
     rows_per_shard: int,
+    pad_to: int | None,
     n_materials: int | None,
 ) -> None:
     # Resolve the task-id list for this split. Split files like
@@ -183,7 +189,15 @@ def main(
             batch_ox.append(int(off[0]))
             batch_oy.append(int(off[1]))
             batch_oz.append(int(off[2]))
-            batch_ids.append(tokenizer.tokenize(patch))
+            ids = tokenizer.tokenize(patch)
+            if pad_to is not None:
+                if len(ids) > pad_to:
+                    raise RuntimeError(
+                        f"tokenized sequence length {len(ids)} exceeds --pad-to {pad_to} "
+                        f"for task {task_id} offset {tuple(int(x) for x in off)}"
+                    )
+                ids = ids + [SPECIAL_TOKENS["[PAD]"]] * (pad_to - len(ids))
+            batch_ids.append(ids)
 
         # Flush the batch (one material) to parquet, starting a new shard
         # whenever rows_per_shard would be exceeded.
@@ -224,6 +238,7 @@ def main(
         "patch_size": patch_size,
         "density_codec_name": density_codec,
         "seed": seed,
+        "pad_to": pad_to,
         "total_rows": total_rows,
         "n_shards": shard_idx + 1 if writer is not None or total_rows > 0 else 0,
         "vocab": {

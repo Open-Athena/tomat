@@ -1,0 +1,29 @@
+outs:
+- md5: 7d214eff3e2dcda818d038037d07c367.dir
+  size: 305699
+  hash: md5
+  path: smoke
+meta:
+  # 100-step Qwen3 smoke run on Modal A100 against data/tokenized/val-smoke/.
+  # Trained on 128 val materials × 32 patches = 4,096 sequences of length
+  # 8,192; single-patch-per-sequence, no Marin orchestration. Loss dropped
+  # from 8.833 (= ln 6792, uniform-over-vocab baseline) at step 0 to 4.560
+  # at step 99. Ephemeral checkpoint not captured; results dir holds
+  # loss_curve.csv + meta.json + run.log only.
+  computation:
+    cmd: modal run scripts/train_smoke_modal.py --steps 100 --batch-size 8
+    deps:
+      data/tokenized/val-smoke.dvc: data/tokenized/val-smoke
+      scripts/train_smoke_modal.py: 38026c2fe006d950dffe3db8cb876fd8
+      scripts/tokenize_patches.py: fec61ce60557849962679a31482ad595
+      scripts/tokenize_patches_modal.py: 9f5117fefc6137d749a70d679e73e360
+  modal:
+    volume: tomat-rho-gga
+    gpu: A100
+    image_pkgs:
+      - marin-levanter (find-links)
+      - marin-haliax
+      - marin-fray
+      - dupekit
+      - jax[cuda12]
+  levanter_tracker: json_logger

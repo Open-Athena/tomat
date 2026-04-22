@@ -1,15 +1,12 @@
 outs:
-- md5: e542ebc7028a847c4059f92580256943.dir
-  size: 34479698
+- md5: 32b2f7a5a6aab50dff6c1a5ebc03a607.dir
+  size: 34445936
   hash: md5
   path: val-smoke
 meta:
-  # Generated on Modal: the rho_gga Zarrs live on the `tomat-rho-gga` volume
-  # (seeded via spec 03), not on local disk, so the source data is an external
-  # dep referenced by volume name + split-file name, not hashed here.
-  # Deterministic given the same volume state + code + seed.
   computation:
-    cmd: modal run scripts/tokenize_patches_modal.py --label val-smoke --n-materials 128
+    cmd: modal run scripts/tokenize_patches_modal.py --label val-smoke --n-materials
+      128
     deps:
       scripts/tokenize_patches.py: 4642dc0e88ad1d300f26d965eabd85a9
       scripts/tokenize_patches_modal.py: f48c478d40a386bc36af729f0b8b922e
