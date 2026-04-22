@@ -105,13 +105,29 @@ def main(
     rows_per_shard: int,
     n_materials: int | None,
 ) -> None:
-    # Resolve the task-id list for this split.
+    # Resolve the task-id list for this split. Split files like
+    # `split_limit_22M.json` may store either mp-ID strings directly or
+    # 0-based int indices into a sibling `mp_filelist.txt` — detect and
+    # resolve the latter.
     if split_file is not None:
         with open(split_file) as f:
             split_data = json.load(f)
         if split not in split_data:
             raise click.UsageError(f"split {split!r} not in {list(split_data)}")
-        task_ids = split_data[split]
+        entries = split_data[split]
+        if entries and isinstance(entries[0], int):
+            filelist_path = rho_gga_dir / "mp_filelist.txt"
+            if not filelist_path.exists():
+                raise click.UsageError(
+                    f"split file stores int indices but {filelist_path} not found — "
+                    "can't resolve indices to mp-IDs"
+                )
+            with open(filelist_path) as f:
+                filelist = [line.strip() for line in f if line.strip()]
+            task_ids = [filelist[i] for i in entries]
+            err(f"[tokenize] resolved {len(entries)} int indices via {filelist_path.name}")
+        else:
+            task_ids = list(entries)
     else:
         # No split file: use every zarr under label/
         task_ids = sorted(p.stem for p in (rho_gga_dir / 'label').glob('*.zarr'))

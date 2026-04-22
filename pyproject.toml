@@ -17,16 +17,17 @@ dependencies = [
     "zarr>=3.0",
 ]
 
-# The marin stack isn't on PyPI — marin-experiments/tiny-tpu ships a local
-# ./vendor/ wheel index populated via `uv build` from a marin checkout. Those
-# deps (marin, marin-levanter, marin-iris, marin-zephyr, marin-rigging, and
-# jax[tpu]/torch/torchvision pins) are deferred to PR 2 (training), when
-# we'll either vendor the wheels here or switch to git sources, mirroring
-# tiny-tpu's setup.
+# The marin stack isn't on PyPI — marin-experiments/{tiny-stories,speech-asr}
+# pulls it in via `find-links` pointing at GitHub Releases' "expanded_assets"
+# wheel index pages. When we need training here (spec 05), uncomment the
+# blocks below; they mirror marin-experiments/tiny-stories/pyproject.toml.
+# Until then Levanter/Marin/Iris are not installed, and the training scripts
+# in experiments/ import-error by design.
 
 [dependency-groups]
 dev = [
     "mdcmd",
+    "modal>=1.4.2",
     "pytest",
     "pytest-xdist",
 ]
@@ -34,8 +35,16 @@ dev = [
 [tool.uv]
 fork-strategy = "fewest"
 
-# The blocks below are deferred to PR 2 (when we add the marin deps).
-# They come from marin-experiments/tiny-tpu; resurrect when marin lands.
+# Marin / Levanter / Iris install (deferred — uncomment to enable training).
+# Mirrors marin-experiments/tiny-stories/pyproject.toml. When enabling:
+#   1. Add the marin packages back to [project].dependencies:
+#        "marin", "marin-levanter", "marin-iris", "marin-zephyr", "marin-rigging"
+#   2. Uncomment `prerelease = "allow"` above.
+#   3. Uncomment the `override-dependencies`, `find-links`, index, and
+#      sources blocks below.
+#
+# prerelease = "allow"
+#
 # override-dependencies = [
 #     "omegaconf>=2.4.0.dev4",
 #     "antlr4-python3-runtime==4.11",
@@ -44,7 +53,15 @@ fork-strategy = "fewest"
 #     "datasets>=3.1.0,<4.0.0",
 #     "equinox>=0.11.10",
 # ]
+#
 # find-links = [
+#     "https://github.com/marin-community/marin/releases/expanded_assets/marin-latest",
+#     "https://github.com/marin-community/marin/releases/expanded_assets/marin-haliax-latest",
+#     "https://github.com/marin-community/marin/releases/expanded_assets/marin-levanter-latest",
+#     "https://github.com/marin-community/marin/releases/expanded_assets/marin-iris-latest",
+#     "https://github.com/marin-community/marin/releases/expanded_assets/marin-zephyr-latest",
+#     "https://github.com/marin-community/marin/releases/expanded_assets/marin-rigging-latest",
+#     "https://github.com/marin-community/marin/releases/expanded_assets/marin-fray-latest",
 #     "https://github.com/marin-community/marin/releases/expanded_assets/dupekit-0.1.0-40ac799",
 #     "https://github.com/marin-community/kitoken/releases/expanded_assets/kitoken-0.10.2-a3012f4",
 # ]

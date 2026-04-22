@@ -1,8 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11,<3.13"
-# dependencies = ["modal"]
-# ///
+#!/usr/bin/env python
 """Modal wrapper around `scripts/tokenize_patches.py`.
 
 Runs patch tokenization inside a Modal function with the
@@ -135,12 +131,12 @@ def main(
     if pull:
         local_dst = Path("data/tokenized") / label
         local_dst.parent.mkdir(parents=True, exist_ok=True)
-        if local_dst.exists():
-            err(f"[modal] local dst {local_dst} exists; `modal volume get` will skip existing files")
         err(f"[modal] pull → {local_dst}")
+        # --force overwrites existing files; acceptable since the volume is
+        # the source of truth for this label and `dvx` hashes the pulled copy.
         subprocess.run(
             [
-                "modal", "volume", "get", VOLUME_NAME,
+                "modal", "volume", "get", "--force", VOLUME_NAME,
                 f"/tokenized/{label}",
                 str(local_dst.parent),
             ],
