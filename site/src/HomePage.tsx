@@ -1,222 +1,99 @@
-import { useMemo, useState } from 'react'
-import { Plot, useTheme } from 'pltly/react'
-import { METRIC_LABEL, type Metric, parseConfig, type SweepRow } from './types'
-import { useSweep } from './useSweep'
-import { FractionPlot, SCHEME_COLORS, SCHEME_LABEL } from './FractionPlot'
-import { ParetoPlot } from './ParetoPlot'
-import { ThemeToggle, themedHoverlabel } from './theme'
+import { SmokeLossPlot } from './SmokeLossPlot'
+import { ThemeToggle } from './theme'
 
 function ExtLink({ href, children }: { href: string; children: React.ReactNode }) {
   return <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>
 }
 
-const SCHEME_DESC: Record<string, string> = {
-  cutoff: 'voxel value',
-  fourier: 'low |G|',
-  'delta-fourier': 'promolecule subtracted, low |G|',
-}
-
-const SCHEMES_WITH_FRACTION = ['cutoff-top', 'fourier-lowg', 'delta-fourier-lowg']
-
-function schemeKey(scheme: string): string {
-  if (scheme === 'cutoff-top') return 'cutoff'
-  if (scheme === 'fourier-lowg') return 'fourier'
-  if (scheme === 'delta-fourier-lowg') return 'delta-fourier'
-  return scheme
-}
-
 export function HomePage() {
   const base = (import.meta.env.BASE_URL || '/').replace(/\/$/, '')
-  const { rows, error } = useSweep(`${base}/sweep-n50.csv`)
-
-  const [metric, setMetric] = useState<Metric>('nmae')
-  const [logY, setLogY] = useState(true)
-  const [showMinMax, setShowMinMax] = useState(true)
-  const [enabledSchemes, setEnabledSchemes] = useState(new Set(Object.keys(SCHEME_COLORS)))
-  const { isDark } = useTheme()
-  const hoverlabel = themedHoverlabel(isDark)
-  const toggleScheme = (s: string) => {
-    const next = new Set(enabledSchemes)
-    next.has(s) ? next.delete(s) : next.add(s)
-    setEnabledSchemes(next)
-  }
-
-  const byCategory = useMemo(() => buildByCategory(rows ?? [], metric), [rows, metric])
-
-  if (error) return <pre>Error loading sweep CSV: {error.message}</pre>
-  if (!rows) return <p>Loading sweep CSV…</p>
-
-  const samples = new Set(rows.map(r => r.mp_id)).size
-  const metricLabel = METRIC_LABEL[metric]
 
   return (
     <>
       <header>
         <h1>tomat 🍅 — tokenized materials</h1>
-        <a className="deck-link" href="#/deck" title="Open slide deck">slides →</a>
         <ThemeToggle />
       </header>
 
-      <div className="pivot-banner">
-        <strong>Current direction: patch tokenization.</strong>{' '}
-        Each training example = one <code>P × P × P</code> sub-cube of a material's
-        native-resolution density, prefixed with atomic inventory + grid/patch/offset
-        metadata. Wrap-aware <code>[HI_START]</code> tokens encode PBC crossing directly.
-        30 M Qwen3 smoke on an A100 is the next milestone.{' '}
-        <a href="#/deck">Walk-through in the deck →</a>
-      </div>
-
-      <h2>Reconstruction-floor study (full-grid schemes)</h2>
       <p className="meta">
-        The plots below measure <em>encoder/decoder fidelity only</em> — the NMAE floor
-        a transformer couldn't beat. They drove the pivot: at 128³ full-grid tokenization,
-        no scheme fits 16 k context with useful NMAE, which pushed us to patches.
-        n={samples} Materials Project CHGCARs (128³ grid). Backed by live
-        {' '}<ExtLink href="https://github.com/Open-Athena/tomat/blob/main/results/sweep-n50.csv">sweep CSV</ExtLink>{' '}
-        · <ExtLink href="https://github.com/Open-Athena/tomat">Open-Athena/tomat</ExtLink>
+        LLM-based electron-density prediction for periodic crystals. Transformer
+        alternative to electrAI's 3D ResUNet — we tokenize ρ(r) directly and train
+        a sequence model over the resulting token stream.{' '}
+        <ExtLink href="https://github.com/Open-Athena/tomat">Open-Athena/tomat</ExtLink>.
       </p>
 
-      <div className="controls">
-        <label>
-          Metric:
-          <select value={metric} onChange={e => setMetric(e.target.value as Metric)}>
-            {(Object.keys(METRIC_LABEL) as Metric[]).map(m => (
-              <option key={m} value={m}>{METRIC_LABEL[m]}</option>
-            ))}
-          </select>
-        </label>
-        <label>
-          <input type="checkbox" checked={logY} onChange={e => setLogY(e.target.checked)} />
-          log y
-        </label>
-        <label>
-          <input type="checkbox" checked={showMinMax} onChange={e => setShowMinMax(e.target.checked)} />
-          min/max band
-        </label>
-        {Object.keys(SCHEME_COLORS).map(s => (
-          <label key={s} title={SCHEME_DESC[s]}>
-            <input
-              type="checkbox"
-              checked={enabledSchemes.has(s)}
-              onChange={() => toggleScheme(s)}
-            />
-            <span style={{ color: SCHEME_COLORS[s] }}>{SCHEME_LABEL[s]}</span>
-          </label>
-        ))}
-      </div>
-
-      <h2>{metricLabel} vs fraction of representation kept</h2>
-      <div className="plot-card">
-        <FractionPlot
-          rows={rows}
-          metric={metric}
-          logY={logY}
-          showMinMax={showMinMax}
-          enabledSchemes={enabledSchemes}
-        />
-      </div>
-
-      <h2>{metricLabel} vs tokens per structure (Pareto)</h2>
-      <p className="meta">
-        Coded variants assume FP16 codec fidelity end-to-end (3 tokens per real value,
-        6 per complex). Vertical lines mark typical transformer context lengths.
+      <h2>Patch tokenization</h2>
+      <p>
+        Each training example is one <code>P × P × P</code> sub-cube of a material's
+        native-resolution density, prefixed with:
       </p>
-      <div className="plot-card">
-        <ParetoPlot
-          rows={rows}
-          metric={metric}
-          showMinMax={showMinMax}
-          enabledSchemes={enabledSchemes}
-        />
-      </div>
+      <ul>
+        <li>The full grid shape <code>(nx, ny, nz)</code>.</li>
+        <li>The material's atomic inventory (Z + fractional coordinates).</li>
+        <li>The patch's low-corner anchor <code>(ix, iy, iz)</code>, its shape
+          <code> (P, P, P)</code>, and the wrapped <strong>high corner</strong>{' '}
+          <code>(hx, hy, hz) = (ix+P−1) mod nx</code>. On any axis where
+          <code> hi &lt; lo</code> the patch crossed a PBC boundary — the model
+          sees that as a direct observation rather than having to learn modular
+          arithmetic.</li>
+      </ul>
+      <p>
+        At <code>P = 14</code> with a 2-token-per-voxel density codec, each
+        sequence is <code>14³ × 2 = 5,488</code> density tokens plus a ~200-token
+        preamble — fits 8k context with headroom for a 100-atom structure. Vocab
+        is 6,792 tokens total (18 specials + 118 atomic Z + 1,024 ints +
+        1,024 position-codec + 4,608 density-codec).
+      </p>
 
-      <h2>{metricLabel} by material category (mean, 5% fraction)</h2>
+      <h2>Smoke training (30 M Qwen3, Modal A100)</h2>
       <div className="plot-card">
-        <Plot
-          data={byCategory.schemes
-            .filter(s => enabledSchemes.has(s.key))
-            .map(s => ({
-              x: byCategory.categories.map(c => `${c} (n=${byCategory.counts[c]})`),
-              y: s.values,
-              type: 'bar' as const,
-              name: SCHEME_LABEL[s.key],
-              marker: { color: SCHEME_COLORS[s.key] },
-              hovertemplate: '%{y:.3~%}<extra></extra>',
-            }))}
-          layout={{
-            autosize: true,
-            height: 500,
-            margin: { t: 10, r: 40, b: 50, l: 60 },
-            hovermode: 'x unified',
-            hoverlabel,
-            barmode: 'group',
-            yaxis: {
-              type: logY ? 'log' : 'linear',
-              title: { text: `Mean ${metricLabel}` },
-              fixedrange: false,
-              tickformat: '.2~%',
-              hoverformat: '.3~%',
-            },
-            legend: { orientation: 'h', x: 0.5, xanchor: 'center', y: -0.15, yanchor: 'top' },
-          }}
-          style={{ width: '100%' }}
-        />
+        <SmokeLossPlot url={`${base}/smoke-loss.csv`} />
       </div>
+      <p className="meta">
+        128 val-split materials × 32 random patches = 4,096 training sequences;
+        6-layer Qwen3, hidden=512, tied embeddings, 8k context, batch 8, seed 42.
+        Run tracked on{' '}
+        <ExtLink href="https://wandb.ai/PrinceOA/tomat/runs/q824om6c">W&amp;B: rosy-durian-1</ExtLink>{' '}
+        · provenance in{' '}
+        <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/results/smoke.dvc">
+          <code>results/smoke.dvc</code>
+        </ExtLink>.
+      </p>
+
+      <h2>Up next</h2>
+      <ul>
+        <li><strong>(codec × patch_size × M × N) sweep</strong> — preprocess &amp;
+          training grids already defined; 6 of 9 (codec, P) combos fit 8k context.</li>
+        <li><strong>Marin + GCP TPU Research Cluster</strong> — real training
+          run on v5p-8; current Modal A100 setup is the local smoke.</li>
+        <li><strong>Full train split</strong> — smoke uses val-only (4,305
+          structures, ~22 GB on the <code>tomat-rho-gga</code> Modal volume);
+          train split adds 77 k structures / ~390 GB.</li>
+      </ul>
+
+      <h2>Past presentations</h2>
+      <ul>
+        <li>
+          <strong>2026-04-21 weekly meeting</strong> —{' '}
+          <a href="#/deck">live deck</a> ·{' '}
+          <a href={`${base}/2026-04-21-weekly-meeting-deck.pdf`}>PDF</a>.
+          Covers the pivot to patch tokenization and reconstruction-floor
+          context that motivated it.
+        </li>
+      </ul>
+      <p className="note">
+        The live <a href="#/deck">deck</a> is a frozen snapshot of the most
+        recent talk; check the PDF for the exact version shown at a given
+        meeting.
+      </p>
 
       <div className="footer">
-        Data regenerated via{' '}
-        <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/scripts/fidelity_sweep.py">
-          <code>uv run scripts/fidelity_sweep.py -n 50</code>
-        </ExtLink>
-        ; provenance tracked in{' '}
-        <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/results/sweep-n50.csv.dvc">
-          <code>results/sweep-n50.csv.dvc</code>
-        </ExtLink>{' '}
-        (<code>dvx status</code>). Plots built from the committed CSV — no server needed.
+        Specs:{' '}
+        <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/specs/04-patch-training.md">04-patch-training</ExtLink>,{' '}
+        <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/specs/05-modal-smoke.md">05-modal-smoke</ExtLink>,{' '}
+        <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/specs/06-oa-react-slides.md">06-oa-react-slides</ExtLink>,{' '}
+        <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/specs/done/02-fidelity-sweep.md">02-fidelity-sweep (done)</ExtLink>.
       </div>
     </>
   )
-}
-
-interface ByCategory {
-  categories: string[]
-  counts: Record<string, number>
-  schemes: { key: string; values: number[] }[]
-}
-
-function buildByCategory(rows: SweepRow[], metric: Metric, targetFraction = 0.05): ByCategory {
-  const byCatConfig = new Map<string, Map<string, number[]>>()
-  const catCounts: Record<string, Set<string>> = {}
-  for (const r of rows) {
-    const parsed = parseConfig(r.config)
-    if (!parsed || parsed.fraction !== targetFraction) continue
-    if (!SCHEMES_WITH_FRACTION.includes(parsed.scheme)) continue
-    const key = schemeKey(parsed.scheme)
-    if (!byCatConfig.has(r.category)) byCatConfig.set(r.category, new Map())
-    const inner = byCatConfig.get(r.category)!
-    if (!inner.has(key)) inner.set(key, [])
-    const v = r[metric]
-    if (Number.isFinite(v)) inner.get(key)!.push(v as number)
-    if (!catCounts[r.category]) catCounts[r.category] = new Set()
-    catCounts[r.category].add(r.mp_id)
-  }
-  const categories = [...byCatConfig.keys()].sort(
-    (a, b) => catCounts[b].size - catCounts[a].size,
-  )
-  const counts = Object.fromEntries(
-    Object.entries(catCounts).map(([c, s]) => [c, s.size]),
-  )
-  const schemeKeys = [...new Set(categories.flatMap(c => [...byCatConfig.get(c)!.keys()]))]
-  const schemes = schemeKeys.map(key => ({
-    key,
-    values: categories.map(cat => {
-      const arr = byCatConfig.get(cat)?.get(key) ?? []
-      return arr.length ? mean(arr) : NaN
-    }),
-  }))
-  return { categories, counts, schemes }
-}
-
-function mean(xs: number[]): number {
-  return xs.reduce((s, x) => s + x, 0) / xs.length
 }

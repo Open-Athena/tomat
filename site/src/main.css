@@ -40,7 +40,7 @@ body {
 }
 
 #root {
-  max-width: 1200px;
+  max-width: 900px;
   margin: 0 auto;
   padding: 1.5rem;
 }
@@ -338,4 +338,64 @@ body.in-deck #root { max-width: none; padding: 0; margin: 0; }
   .deck { grid-template-columns: 1fr; }
   .deck-drawer { display: none; }
   .deck-slide { padding: 2rem 1.5rem; }
+}
+
+/* --- Print mode: one-slide-per-page PDF via Playwright ------------------ */
+/* Consumed by `pnpm --dir site snapshot` (scripts/snapshot-deck.mjs). Layout
+ * only — theme colors come through from the regular CSS variables so the PDF
+ * matches whatever colorScheme Playwright emulates (dark by default). */
+@media print {
+  @page {
+    size: 11in 8.5in;  /* landscape US Letter */
+    margin: 0;
+  }
+
+  html, body, #root, body.in-deck #root {
+    max-width: none;
+    padding: 0;
+    margin: 0;
+  }
+
+  .deck-drawer,
+  .deck-slide-footer,
+  .deck-link,
+  .theme-toggle {
+    display: none !important;
+  }
+
+  /* Unstack the fixed grid so the printer sees one tall flow. */
+  .deck {
+    position: static;
+    display: block;
+  }
+
+  .deck-main {
+    overflow: visible !important;
+  }
+
+  .deck-slide {
+    min-height: 0;
+    height: 8.5in;
+    max-height: 8.5in;
+    box-sizing: border-box;
+    padding: 0.6in 0.8in;
+    page-break-after: always;
+    break-after: page;
+    border: none !important;
+    overflow: hidden;
+  }
+
+  .deck-slide:last-child {
+    page-break-after: auto;
+    break-after: auto;
+  }
+
+  /* Plots shouldn't overflow page margins. */
+  .plot-card,
+  .slide-plot,
+  .token-layout,
+  .token-example {
+    max-width: 100%;
+    overflow: hidden;
+  }
 }
