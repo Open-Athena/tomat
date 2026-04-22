@@ -58,7 +58,11 @@ export function SmokeLossPlot({ url }: { url: string }) {
           hovermode: 'x unified',
           hoverlabel: themedHoverlabel(isDark),
           xaxis: { title: { text: 'step' }, fixedrange: false },
-          yaxis: { title: { text: 'train loss (nats/token)' }, fixedrange: false },
+          yaxis: {
+            title: { text: 'train loss (nats/token)' },
+            rangemode: 'tozero',
+            fixedrange: false,
+          },
           legend: { orientation: 'h', x: 0.5, xanchor: 'center', y: -0.2, yanchor: 'top' },
         }}
         style={{ width: '100%' }}

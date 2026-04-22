@@ -1,0 +1,97 @@
+name: Smoke (Modal A100)
+
+# Runs the tokenize → train end-to-end pipeline on Modal. Deterministic under
+# seed=42, so repeated runs at the same (n_materials, steps, batch_size,
+# codec, patch_size) settings should produce the same loss curve.
+#
+# Default inputs match the val-smoke profile (128 mats × 32 patches, 100
+# steps, batch 8) — ≈2 min wall + ~$0.05 of A100 time per run. Manual
+# dispatches can scale up; the workflow itself is config-only.
+#
+# Required repo secrets:
+#   MODAL_TOKEN_ID, MODAL_TOKEN_SECRET  (from `modal token set` — the
+#   modal CLI stores both under ~/.modal.toml locally; grab them from
+#   `modal profile current` / `modal token show`)
+# The training function pulls its W&B key from the `wandb-credentials`
+# Modal secret (configured in Modal's own secret store, not in GHA).
+
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: 'Parquet shard label (also W&B run tag). Default val-smoke.'
+        type: string
+        default: 'val-smoke'
+      n_materials:
+        description: 'Number of val-split materials to tokenize (0 = all 4,305).'
+        type: string
+        default: '128'
+      steps:
+        description: 'Training steps.'
+        type: string
+        default: '100'
+      batch_size:
+        description: 'Train batch size.'
+        type: string
+        default: '8'
+      seed:
+        description: 'RNG seed (preprocessing + training share one for now).'
+        type: string
+        default: '42'
+      skip_tokenize:
+        description: 'Reuse an existing parquet on the volume (same `label`).'
+        type: boolean
+        default: false
+  # Once Modal usage is stable, consider enabling push-to-main for a
+  # continuous smoke gate. Commented out until we're confident we want
+  # the spend on every merge.
+  # push:
+  #   branches: [main]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --group dev
+
+      - name: Tokenize patches (Modal)
+        if: ${{ !inputs.skip_tokenize }}
+        run: |
+          uv run modal run scripts/tokenize_patches_modal.py \
+            --label "${{ inputs.label }}" \
+            --n-materials "${{ inputs.n_materials }}" \
+            --pad-to 8192 \
+            --seed "${{ inputs.seed }}" \
+            --no-pull
+
+      - name: Train (Modal A100)
+        run: |
+          uv run modal run scripts/train_smoke_modal.py \
+            --label "${{ inputs.label }}" \
+            --steps "${{ inputs.steps }}" \
+            --batch-size "${{ inputs.batch_size }}" \
+            --seed "${{ inputs.seed }}"
+
+      - name: Assert loss descended below uniform baseline
+        run: |
+          # Pull results/smoke/loss_curve.csv off the Modal volume and
+          # sanity-check: last-step loss strictly less than step-0 loss
+          # (and well below ln(6792) ≈ 8.82).
+          uv run modal volume get --force tomat-rho-gga /results/smoke /tmp/smoke-gha
+          python3 - <<'PY'
+          import csv, math, sys
+          with open('/tmp/smoke-gha/smoke/loss_curve.csv') as f:
+              rows = list(csv.DictReader(f))
+          first, last = float(rows[0]['train_loss']), float(rows[-1]['train_loss'])
+          baseline = math.log(6792)
+          print(f'first={first:.3f} last={last:.3f} baseline={baseline:.3f}')
+          assert last < first, f'last loss {last} not below first {first}'
+          assert last < baseline - 1.0, f'last loss {last} within 1.0 of uniform baseline {baseline}'
+          PY
