@@ -74,8 +74,11 @@ def decode_token(tid: int, tokenizer: PatchTokenizer) -> str:
 @click.option("--dens-tail", type=int, default=6, help="density tokens to show at end")
 def main(parquet: str, row: int, patch_size: int, dens_head: int, dens_tail: int) -> None:
     t = PatchTokenizer()
-    table = pq.read_table(parquet, columns=["input_ids"])
+    table = pq.read_table(parquet)
     ids = table.column("input_ids").to_pylist()[row]
+    mp_id = table.column("task_id")[row].as_py() if "task_id" in table.column_names else None
+    if mp_id:
+        print(f"# {mp_id}  https://elvis.oa.dev/?m={mp_id}")
 
     # Walk block-by-block so we can group like-kinded tokens per line.
     S = SPECIAL_TOKENS

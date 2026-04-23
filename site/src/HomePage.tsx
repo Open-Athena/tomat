@@ -1,5 +1,4 @@
 import { ScalingLossPlot } from './ScalingLossPlot'
-import { SmokeLossPlot } from './SmokeLossPlot'
 import { ThemeToggle } from './theme'
 
 function ExtLink({ href, children }: { href: string; children: React.ReactNode }) {
@@ -46,8 +45,10 @@ export function HomePage() {
         1,024 position-codec + 4,608 density-codec).
       </p>
       <p>
-        Real row from <code>train-full</code> (Y₃Si₃Ag₃, grid 64×108×108,
-        P=14 patch at offset (5, 9, 44)):
+        Real row from <code>train-full</code> —{' '}
+        <ExtLink href="https://elvis.oa.dev/?m=mp-2282417">
+          <code>mp-2282417</code>
+        </ExtLink>{' '}(Y₃Si₃Ag₃, grid 64×108×108), P=14 patch at offset (5, 9, 44):
       </p>
       <pre className="tokens-example">{`[BOS]
 [GRID_START]   64 108 108                             [GRID_END]
@@ -67,21 +68,6 @@ export function HomePage() {
         <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/scripts/show_tokens.py">
           <code>scripts/show_tokens.py</code>
         </ExtLink>{' '}renders any parquet row in this form.
-      </p>
-
-      <h2>Smoke training (30 M Qwen3, Modal A100)</h2>
-      <div className="plot-card">
-        <SmokeLossPlot url={`${base}/smoke-loss.csv`} />
-      </div>
-      <p className="meta">
-        128 val-split materials × 32 random patches = 4,096 training sequences;
-        6-layer Qwen3, hidden=512, tied embeddings, 8k context, batch 8, seed 42.
-        Run tracked on{' '}
-        <ExtLink href="https://wandb.ai/PrinceOA/tomat/runs/q824om6c">W&amp;B: rosy-durian-1</ExtLink>{' '}
-        · provenance in{' '}
-        <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/results/smoke.dvc">
-          <code>results/smoke.dvc</code>
-        </ExtLink>.
       </p>
 
       <h2>Scale training runs (2026-04-22 / 23)</h2>

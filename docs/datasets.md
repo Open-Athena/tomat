@@ -38,7 +38,10 @@ All: codec `two_token_9_12`, patch_size P=14, pad_to 8192, seed 42.
 
 ### Example training sequence
 
-A real row from `train-full` (Y₃Si₃Ag₃, grid 64 × 108 × 108, P=14 patch at offset (5, 9, 44)):
+A real row from `train-full` —
+[`mp-2282417`](https://elvis.oa.dev/?m=mp-2282417) (Y₃Si₃Ag₃, grid 64 × 108 × 108),
+P=14 patch at offset (5, 9, 44). Click the link to load the material in
+elvis and view its atomic structure + density field.
 
 ```
 [BOS]
