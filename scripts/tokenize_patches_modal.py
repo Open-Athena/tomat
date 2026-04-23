@@ -183,6 +183,7 @@ def parallel(
     seed: int = 42,
     pad_to: int = 8192,
     n_workers: int = 16,
+    worker_indices: str = "",
     pull: bool = False,
 ) -> None:
     """Parallel tokenize via Modal's ``.map()`` — dispatches ``n_workers``
@@ -193,9 +194,20 @@ def parallel(
     post-merge step in this MVP (per spec 07). Pull-to-local is off by
     default since train-scale parquet is large; set ``--pull`` for
     DVX-hashing the output when the label fits on local disk.
+
+    Pass ``--worker-indices "26,27,28,29,30,31"`` to only (re)run a
+    subset of the modular-stride slices, e.g. to recover from a prior
+    launch where some workers never spun up. The modular-stride math
+    still uses ``n_workers`` so output lands in the right dirs.
     """
-    err(f"[modal] parallel tokenize → /vol/tokenized/{label} "
-        f"(n_workers={n_workers}, pad_to={pad_to})")
+    if worker_indices:
+        indices = [int(s) for s in worker_indices.split(",") if s.strip()]
+        err(f"[modal] parallel tokenize → /vol/tokenized/{label} "
+            f"(n_workers={n_workers}, only workers={indices}, pad_to={pad_to})")
+    else:
+        indices = list(range(n_workers))
+        err(f"[modal] parallel tokenize → /vol/tokenized/{label} "
+            f"(n_workers={n_workers}, pad_to={pad_to})")
 
     # `tokenize.spawn(...)` returns a FunctionCall handle immediately; Modal
     # runs all N concurrently. `fc.get()` waits for that worker's result.
@@ -209,11 +221,11 @@ def parallel(
             seed=seed, pad_to=pad_to if pad_to > 0 else None,
             worker_idx=i, n_workers=n_workers,
         )
-        for i in range(n_workers)
+        for i in indices
     ]
 
     outcomes = []
-    for i, fc in enumerate(calls):
+    for i, fc in zip(indices, calls):
         try:
             outcomes.append(fc.get())
             err(f"[modal] worker {i} done: "
@@ -223,7 +235,7 @@ def parallel(
             raise
 
     total_rows = sum(o["meta"]["total_rows"] for o in outcomes)
-    err(f"[modal] all {n_workers} workers done: {total_rows:,} total rows "
+    err(f"[modal] {len(indices)} worker(s) done: {total_rows:,} total rows "
         f"across /vol/tokenized/{label}/worker-*")
 
     if pull:
