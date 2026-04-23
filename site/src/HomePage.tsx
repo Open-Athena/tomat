@@ -70,6 +70,43 @@ export function HomePage() {
         </ExtLink>{' '}renders any parquet row in this form.
       </p>
 
+      <h2>Tokenized datasets</h2>
+      <p>
+        All <code>two_token_9_12</code> density codec, P=14, pad_to=8192, seed 42.
+        "Tokens (pad)" counts padded positions (what the model trains on at each
+        step); actual non-pad content is ~5,700 tokens for a 9-atom patch (see above).
+      </p>
+      <table className="runs-table">
+        <thead>
+          <tr><th>label</th><th>split</th><th>mats</th><th>patches/mat</th><th>rows</th><th>tokens (pad)</th><th>on-disk (GCS)</th><th>notes</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>val-smoke-n2</code></td><td>val</td><td>2</td><td>32</td><td>64</td><td>524 K</td><td>— (local)</td><td>throwaway</td>
+          </tr>
+          <tr>
+            <td><code>val-smoke</code></td><td>val</td><td>128</td><td>32</td><td>4,096</td><td>34 M</td><td>~33 MB</td><td>earliest smoke target</td>
+          </tr>
+          <tr>
+            <td><code>val-full</code></td><td>val</td><td>4,305</td><td>32</td><td>137,696</td><td>1.13 B</td><td>1.49 GB</td><td>"4 k mats" — primary compute-scaling target</td>
+          </tr>
+          <tr>
+            <td><code>val-full-m128</code></td><td>val</td><td>4,305</td><td>128</td><td>549,664</td><td>4.50 B</td><td>1.44 GB</td><td>4× more unique patches/mat</td>
+          </tr>
+          <tr>
+            <td><strong><code>train-full</code></strong></td><td>train</td><td><strong>77,498</strong></td><td>32</td><td><strong>2,478,912</strong></td><td><strong>20.31 B</strong></td><td><strong>21.1 GB</strong></td><td>first run 2026-04-23 (headline dataset)</td>
+          </tr>
+        </tbody>
+      </table>
+      <p className="note">
+        Raw densities: 86,192 Zarr directories on Princeton della at{' '}
+        <code>/scratch/gpfs/ROSENGROUP/.../rho_gga/</code>
+        {' '}(~412 GB total; ~5 MB / structure mean). Staged onto two Modal volumes —{' '}
+        <code>tomat-rho-gga</code> (val, 22 GB) and <code>tomat-rho-gga-train</code>
+        {' '}(train, 370 GB) — where the tokenize pipeline runs and emits parquet,
+        which then syncs to <code>gs://marin-eu-west4/tomat/tokenized/</code>.
+      </p>
+
       <h2>Scale training runs (2026-04-22 / 23)</h2>
       <p>
         Seed 42, 8k context, patch P=14. First 5 rows on <code>val-full</code>
