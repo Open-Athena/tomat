@@ -65,7 +65,7 @@ volume = modal.Volume.from_name(VOLUME_NAME)
 wandb_secret = modal.Secret.from_name("wandb-credentials")
 
 
-@app.function(gpu="A100", volumes={MOUNT: volume}, secrets=[wandb_secret], timeout=3600)
+@app.function(gpu="A100", volumes={MOUNT: volume}, secrets=[wandb_secret], timeout=28800)  # 8h (5k bs=32 at 3.2 s/step ≈ 4.4 h; leaves slack)
 def train_smoke(
     steps: int,
     batch_size: int,
@@ -74,6 +74,33 @@ def train_smoke(
     results_label: str,
 ) -> dict:
     """Run `levanter.main.train_lm.main` with a prebuilt-parquet config."""
+    return _train_smoke_impl(steps, batch_size, seed, label, results_label)
+
+
+@app.function(gpu="A100:4", volumes={MOUNT: volume}, secrets=[wandb_secret], timeout=28800)
+def train_smoke_4gpu(
+    steps: int,
+    batch_size: int,
+    seed: int,
+    label: str,
+    results_label: str,
+) -> dict:
+    """Same as train_smoke but on 4× A100 (intra-node). Levanter auto-shards
+    the batch across JAX's default 'data' mesh axis; no code change needed.
+    Use a 4× bigger `--batch-size` than the single-GPU run to keep per-device
+    batch constant — that way MFU/GPU stays comparable and wall-time drops
+    ~3-3.5× (NCCL tax ≈ 10-15%)."""
+    return _train_smoke_impl(steps, batch_size, seed, label, results_label)
+
+
+def _train_smoke_impl(
+    steps: int,
+    batch_size: int,
+    seed: int,
+    label: str,
+    results_label: str,
+) -> dict:
+    """Shared body — identical Levanter config under both A100:1 and A100:4."""
     import json
     from levanter.data.text import (
         DatasetComponent,
@@ -81,6 +108,8 @@ def train_smoke(
         PrebuiltLmDatasetFormat,
         UrlDatasetSourceConfig,
     )
+    from datetime import timedelta
+    from levanter.checkpoint import CheckpointerConfig
     from levanter.layers.rotary import Llama3RotaryEmbeddingsConfig
     from levanter.main.train_lm import TrainLmConfig, main as train_lm_main
     from levanter.models.qwen import Qwen3Config
@@ -99,17 +128,37 @@ def train_smoke(
     cache_dir = f"{results_dir}/cache"
     Path(results_dir).mkdir(parents=True, exist_ok=True)
 
-    # Nuke any stale dataset cache from a prior run — Levanter caches tokens
-    # from the parquet once and reuses indefinitely, which masks re-tokenize
-    # changes if we don't clear it. Cheap enough to rebuild on each smoke.
-    import shutil
-    if Path(cache_dir).exists():
-        err(f"[smoke] clearing stale cache {cache_dir}")
-        shutil.rmtree(cache_dir)
+    # Parallel tokenize writes per-worker subdirs (worker-00/, worker-01/, …).
+    # Detect and glob all their shards; pick any one worker's meta.json since
+    # vocab + patch_size + codec are shared across workers.
+    worker_dirs = sorted(Path(parquet_dir).glob("worker-*"))
+    is_parallel = bool(worker_dirs)
+    if is_parallel:
+        parquet_glob = f"{parquet_dir}/worker-*/*.parquet"
+        meta_path = f"{worker_dirs[0]}/meta.json"
+    else:
+        parquet_glob = f"{parquet_dir}/*.parquet"
+        meta_path = f"{parquet_dir}/meta.json"
+
+    # Keep any existing dataset cache from a prior run — Levanter's cache is
+    # content-hash-keyed, so if the parquet or hyperparams change the
+    # effective path changes and it rebuilds automatically. Removed the
+    # earlier unconditional nuke because a resume-run would otherwise
+    # rebuild the ~1 min cache every time we pick up a checkpoint.
 
     # Read vocab size from the tokenizer's meta.json so a codec swap at
     # preprocessing doesn't silently misalign model and data.
-    meta = json.loads(Path(f"{parquet_dir}/meta.json").read_text())
+    meta = json.loads(Path(meta_path).read_text())
+    # For parallel runs, worker-0's meta.n_materials is its slice only.
+    # Sum across all workers to report the true dataset size.
+    if is_parallel:
+        total_mats = 0
+        total_rows = 0
+        for wd in worker_dirs:
+            m = json.loads((wd / "meta.json").read_text())
+            total_mats += m["n_materials"]
+            total_rows += m["total_rows"]
+        meta = {**meta, "n_materials": total_mats, "total_rows": total_rows}
     vocab_size = meta["vocab"]["total_size"]
     err(f"[smoke] vocab_size={vocab_size}, patch_size={meta['patch_size']}, "
         f"codec={meta['density_codec_name']}, rows={meta['total_rows']}")
@@ -119,7 +168,7 @@ def train_smoke(
     # PassthroughTokenizer.encode(".") and crashes — BPB computation expects
     # a real tokenizer).
     source = UrlDatasetSourceConfig(
-        train_urls=[f"{parquet_dir}/*.parquet"],
+        train_urls=[parquet_glob],
     )
     prebuilt_fmt = PrebuiltLmDatasetFormat(input_ids_key="input_ids")
     component = DatasetComponent(
@@ -149,22 +198,66 @@ def train_smoke(
         tie_word_embeddings=True,
     )
 
+    # Project per preprocessing axis: loss curves of two runs in the same W&B
+    # project are guaranteed to share codec + patch_size (so they share the
+    # same parquet shards, vocab, sequence length). Mixing (codec, P) combos
+    # would put runs with different train-loss meanings on the same plot.
+    # Group captures the training-side sampling axes (M = patches per material,
+    # N = shuffle buffer) — relevant for the sweep in spec 04.
+    M = meta["patches_per_material"]
+    # Shuffle buffer N isn't plumbed into the smoke config yet; emit a literal
+    # placeholder so the group name composes cleanly once we do. Update when
+    # `BlockShuffleConfig.window_blocks` becomes a real knob.
+    N = "default"
+    project = f"tomat-{meta['density_codec_name']}-P{meta['patch_size']}"
+    group = f"M{M}-N{N}"
+
+    # Deterministic run_id so a re-invocation after a Modal function timeout
+    # lands in the same W&B run (appends to the curve) AND finds the existing
+    # Levanter checkpoints under results_label/checkpoints/<run_id>/.
+    # Excludes `steps` deliberately — extending a 1k-step run into a 5k-step
+    # run should be the same run, not a new one.
+    run_id = f"{results_label}-bs{batch_size}-seed{seed}"
+
     # Dual-tracker: W&B for browsable runs + JSON-to-stdout as a fallback that
     # makes the loss curve visible in the Modal log even if W&B init hiccups.
+    is_smoke = meta["n_materials"] <= 200
     trackers = (
         WandbConfig(
-            project="tomat",
-            tags=["smoke", "patch", f"P{meta['patch_size']}", meta["density_codec_name"]],
+            id=run_id,
+            resume="allow",
+            project=project,
+            group=group,
+            tags=[
+                "smoke" if is_smoke else "scale",
+                f"mats{meta['n_materials']}",
+                f"bs{batch_size}",
+                f"seed{seed}",
+            ],
             save_code=False,  # Modal image doesn't carry the repo tree; skip wandb's code-snapshot
         ),
         JsonLoggerConfig(),
     )
+
+    # Checkpoint to volume so timeout/preempt → rerun resumes cleanly.
+    # `append_run_id_to_base_path=True` means actual dir is
+    # f"{results_dir}/checkpoints/{run_id}/"; Levanter auto-resumes from the
+    # latest step when `trainer.initial_state` finds one there.
+    checkpointer = CheckpointerConfig(
+        base_path=f"{results_dir}/checkpoints",
+        save_interval=timedelta(minutes=10),
+        # Keep permanent snapshots every 1000 steps (overrides 15-min rolling).
+        keep=[{"every": 1000}],
+    )
+
     trainer = TrainerConfig(
+        id=run_id,
         seed=seed,
         num_train_steps=steps,
         train_batch_size=batch_size,
         steps_per_eval=max(steps // 2, 1),
         tracker=trackers,
+        checkpointer=checkpointer,
     )
 
     optimizer = AdamConfig(
@@ -210,3 +303,23 @@ def main(
     )
     err(f"[modal] done: results at {result['results_dir']} on volume {VOLUME_NAME}")
     err(f"[modal] pull with: modal volume get --force {VOLUME_NAME} /results/{results_label} results/")
+
+
+@app.local_entrypoint()
+def main_4gpu(
+    steps: int = 5000,
+    batch_size: int = 128,  # 4× single-GPU default to keep per-device bs constant
+    seed: int = 42,
+    label: str = "val-full",
+    results_label: str = "val-full-5k-bs128-4gpu",
+) -> None:
+    err(f"[modal] A100:4 smoke train: {steps} steps, nominal batch={batch_size} "
+        f"(per-device {batch_size // 4}), seed={seed}")
+    result = train_smoke_4gpu.remote(
+        steps=steps,
+        batch_size=batch_size,
+        seed=seed,
+        label=label,
+        results_label=results_label,
+    )
+    err(f"[modal] done: results at {result['results_dir']} on volume {VOLUME_NAME}")
