@@ -24,6 +24,7 @@ mirror the output into the local repo.
 """
 
 from functools import partial
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -32,7 +33,11 @@ import modal
 
 err = partial(print, file=sys.stderr)
 
-VOLUME_NAME = "tomat-rho-gga"
+# Env-var so we can point at `tomat-rho-gga-train` (77 k structures, spec 08)
+# without forking the script. Modal volumes resolve at local-entrypoint time,
+# so swapping this per-invocation gives us a single tokenize pipeline for both
+# val and train splits.
+VOLUME_NAME = os.environ.get("TOMAT_VOLUME", "tomat-rho-gga")
 MOUNT = "/vol"
 
 # Install tomat's runtime deps + make the tomat package importable in-function.
