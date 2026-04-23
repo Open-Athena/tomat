@@ -1,354 +1,204 @@
 # tomat 🍅
-**to**kenized **mat**erials; LLM/transformer-based approach to predicting DFT-converged electron density for periodic crystals.
 
-Uses a sequence model over a tokenized representation of $ρ$ (contrast with [electrAI]'s 3D ResUNet over voxel grids).
+**to**kenized **mat**erials — an LLM/transformer approach to predicting
+DFT-converged electron density for periodic crystals. Sibling to
+[tomol] (tokenized molecules). Positioned against [electrAI]/RHOAR-Net,
+the 3D ResUNet over voxel grids.
 
-Sibling to [tomol] (**to**kenized **mo**lecules, Will Held's OMol25 S2EF
-work). See [`specs/00-project-context.md`](./specs/00-project-context.md)
-for positioning and the tomol/electrAI relationship.
-
-**Interactive plots:** [tomat.oa.dev](https://tomat.oa.dev) ([source](./site/)).
+**Interactive dashboard**: [tomat.oa.dev](https://tomat.oa.dev) ([source](./site/)).
 
 [electrAI]: https://github.com/Quantum-Accelerators/electrai
 [tomol]: https://huggingface.co/ihxds/ToMol-marin-1B
 
-## Status
+## Patch tokenization
 
-Very early. Repo exists to characterize the **reconstruction-error floor**
-of candidate tokenization schemes before committing to training — the
-transformer's achievable NMAE is bounded below by how much information
-each scheme throws away on encode/decode.
+Each training example is one P × P × P sub-cube of a material's
+native-resolution density, prefixed with:
 
-Seven candidate schemes are enumerated in
-[`specs/01-tokenization-strategies.md`](./specs/01-tokenization-strategies.md).
-Three of the seven ("the easy three" — no trained VQ-VAE, no basis
-choice, no RI-fitting step) are implemented so far.
+- The full grid shape `(nx, ny, nz)`.
+- The material's atomic inventory (Z + fractional coordinates).
+- The patch's low-corner anchor `(ix, iy, iz)`, its shape `(P, P, P)`,
+  and the wrapped **high corner** `(hx, hy, hz) = (ix+P−1) mod nx`. On
+  any axis where `hi < lo` the patch crossed a PBC boundary — the model
+  sees that as a direct observation rather than having to learn
+  modular arithmetic.
 
-## Preliminary results
+At `P = 14` with a 2-token-per-voxel density codec, each sequence is
+`14³ × 2 = 5,488` density tokens plus a ~200-token preamble — fits 8k
+context with headroom for a 100-atom structure. Vocab is **6,792 tokens**
+(18 specials + 118 atomic Z + 1,024 ints + 1,024 position-codec +
+4,608 density-codec).
 
-**Data:** the electrAI-curated 2,885-entry MP subset on S3
-(`s3://openathena/electrai/mp/chg_datasets/dataset_4/label/`), 128³
-voxel grids. `label/` = DFT-converged ρ (the thing we want to tokenize).
+## Example training sequence
 
-**Metric:** NMAE = `sum(|ρ_reconstructed − ρ_original|) / sum(|ρ_original|)`
-— the same metric electrAI uses, for apples-to-apples comparison.
+Real row from `train-full` — [mp-2282417](https://elvis.oa.dev/?m=mp-2282417)
+(Y₃Si₃Ag₃, grid 64×108×108), P=14 patch at offset (5, 9, 44):
 
-What the sweep measures is the tokenizer's **reconstruction floor** — the
-NMAE from `encode → decode` alone, with no model in the loop. The
-transformer's total error on the same metric will be `floor +
-prediction_error`.
+```
+[BOS]
+[GRID_START]   64 108 108                             [GRID_END]
+[ATOMS_START]  Y Y Y Si Si Si Ag Ag Ag                [ATOMS_END]
+[POS_START]    (p236 p699 p1003  p240 p767 p1005  p0 p512 p768)  …  (+7 more atoms)  [POS_END]
+[SHAPE_START]  14 14 14                               [SHAPE_END]
+[OFFSET_START] 5 9 44                                 [OFFSET_END]
+[HI_START]     18 22 57                               [HI_END]
+[DENS_START]   d172 d909  d169 d4175  d168 d525  …  d158 d2204    # 5,488 density tokens = 2 × 14³
+[DENS_END]
+[EOS]
+[PAD] × 2,586                                         # right-padded to 8,192
+```
 
-**Reference point.** electrAI (recently rebranded RHOAR-Net; "Rho
-Augmented Resolution Network") is OA's in-house 3D ResUNet, and the
-stepping-stone target tomat is trying to match at comparable compute.
-On the same MP subset used here, electrAI's best reported validation
-NMAE is **2.60%** (Jan 2026 monthly review, 100-epoch run; 50-epoch
-runs cluster around 2.7–3.1% and were "still learning").
+Atom Zs render as element symbols (`Y`, `Si`, `Ag`). Position codec =
+3 tokens/coord × 3 coords → 9 tokens/atom. Density codec emits 2 tokens
+per voxel. [`scripts/show_tokens.py`](./scripts/show_tokens.py) renders
+any parquet row in this form.
 
-For tomat to *beat* electrAI on NMAE, the tokenizer floor needs to be
-well below 2.6%, leaving headroom for the transformer to add some
-prediction error. A floor approaching 2.6% is disqualifying; a floor
-well below is a *prerequisite* to competing, not an achievement.
+## Tokenized datasets
 
-**Caveat on the metric itself.** electrAI's own Jan 2026 review surfaces
-a concern (Yael's investigation) that MAE/NMAE is dominated by
-high-density regions — voxels near nuclei where ρ is ~e+02 — while
-chemically interesting signal (bonds, charge transfer) lives at much
-lower density. Across loss functions, the ratio of low- to
-high-density error contribution varies from ~0.005 (MAE) to ~15
-(Chi-Squared). A scheme that "beats 2.6% NMAE" while discarding
-low-density information may be winning the metric but losing the science.
+All `two_token_9_12` density codec, P=14, pad_to=8192, seed 42. Full
+table + storage layout in [`docs/datasets.md`](./docs/datasets.md).
 
-The fidelity sweep now reports NMAE, χ² (low-ρ-weighted), Hellinger,
-JSD, and Weighted MAE in each row of [`results/sweep-n50.csv`](./results/sweep-n50.csv);
-the tables below show NMAE + χ² side-by-side so the divergence between
-"whole-density error" and "low-density-weighted error" is visible at a
-glance. Full breakdowns available via
-`uv run scripts/summarize_sweep.py results/sweep-n50.csv`.
+| label | split | mats | patches/mat | rows | tokens (pad) | on-disk (GCS) |
+|---|---|---:|---:|---:|---:|---:|
+| `val-smoke` | val | 128 | 32 | 4,096 | 34 M | ~33 MB |
+| `val-full` | val | 4,305 | 32 | 137,696 | 1.13 B | 1.49 GB |
+| `val-full-m128` | val | 4,305 | 128 | 549,664 | 4.50 B | 1.44 GB |
+| **`train-full`** | train | **77,498** | 32 | **2,478,912** | **20.31 B** | **21.1 GB** |
 
-**Schemes:**
+Raw Zarrs live on Princeton della (`/scratch/gpfs/…/rho_gga/`, ~412 GB
+total); staged onto two Modal volumes (`tomat-rho-gga` val, 22 GB;
+`tomat-rho-gga-train` train, 370 GB) where tokenize runs and emits
+parquet, which syncs to `gs://marin-eu-west4/tomat/tokenized/`.
 
-| scheme | implementation | what's kept | what's dropped |
-|---|---|---|---|
-| 1 — direct | `DirectTokenizer` | float32 copy of the density grid | nothing (sanity-check baseline) |
-| 3 — voxel cutoff | `CutoffTokenizer` | top-K% voxels ranked by density value | all other voxels are zeroed |
-| 5 — Fourier lowpass | `FourierTokenizer` | lowest-K% FFT coefficients by \|G\| | high-frequency modes |
+Note on naming: `val-full` is MP's validation split (~4 k mats); we
+used it as early compute-scaling training data because it was seeded
+to Modal first. `train-full` (77 k mats) is the proper train split.
+"4 k mats" / "77 k mats" are the semantic descriptions if the val/train
+labels get confusing.
 
-### Tables
+## Scale training runs
 
-Auto-regenerated via [`mdcmd`][mdcmd] from [`results/sweep-n50.csv`](./results/sweep-n50.csv).
+![scaling loss curves](./site/public/scaling-loss.png)
 
-<!-- `uv run scripts/summarize_sweep.py results/sweep-n50.csv -m nmae -m chi_sq --html` -->
-<details open><summary>Fidelity-sweep tables</summary>
+Seed 42, 8k context, P=14. A100 runs on val-full ("4 k mats"); TPU
+runs on the full train split. Project
+[`tomat-two_token_9_12-P14`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14).
 
-### Overall (n=50, 128³ grid)
+| run | model | data | compute | batch (per-dev) | steps | tokens | FLOPs (×10¹⁸) | MFU | tok/s | final loss |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| [A100:1 bs=32](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-bs32-seed42) | 30M | val-full | Modal A100:1 | 32 (32) | 2,560 / 5k (OOM) | 0.67 B | 0.32 | 12.4% | 80 k | 2.235 |
+| [A100:2 bs=32](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-2gpu-bs32-seed42) | 30M | val-full | Modal A100:2 | 32 (16) | 5,000 | 1.31 B | 0.62 | 12.0% | 157 k | **1.962** |
+| [A100:4 bs=64](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs64-4gpu-bs64-seed42) | 30M | val-full | Modal A100:4 | 64 (16) | 5,000 | 2.62 B | 1.25 | 11.96% | 313 k | 1.975 |
+| [A100:8 bs=128](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs128-8gpu-bs128-seed42) | 30M | val-full | Modal A100:8 | 128 (16) | 5,000 | 5.24 B | 2.49 | 11.86% | 624 k | 2.022 |
+| [TPU v6e-4 bs=128](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-tpu-bs128-seed42) | 30M | val-full | Marin TPU v6e-4 | 128 (32) | 1,000 | 1.05 B | 0.50 | 10.25% | 792 k | 2.620 |
+| [**TPU v6e-8 bs=256**](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-bs256-seed42) | 30M | **train-full** | Marin TPU v6e-8 | 256 (32) | 2,000 | **4.19 B** | **2.00** | 8.38% | 1,297 k | **2.214** |
+| [**TPU v6e-16 bs=512** (multihost)](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu16-30M-bs512-seed42) | 30M | train-full | Marin TPU v6e-16 (4 VMs) | 512 (32) | 2,000 | **8.39 B** | **4.00** | 6.6% | **1,983 k** | **2.212** |
+| [**TPU v6e-8 bs=128** (+ val, bf16)](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-200M-bs128-val-bf16-seed42) | **208M** | train-full | Marin TPU v6e-8 | 128 (16) | in flight | — | — | — | 294 k | — |
 
-| config | mean NMAE | mean χ² | mean mass captured |
-|---|---:|---:|---:|
-| `direct` | 2.15e-08 | 6.38e-16 | — |
-| `direct-coded` | 6.24e-07 | 1.60e-12 | — |
-| `cutoff-top-1pct` | 8.04e-01 | 8.04e-01 | 0.196 |
-| `cutoff-top-5pct` | 5.01e-01 | 5.01e-01 | 0.499 |
-| `cutoff-top-25pct` | 1.77e-01 | 1.77e-01 | 0.823 |
-| `cutoff-top-100pct` | 2.15e-08 | 6.38e-16 | 1.000 |
-| `fourier-lowg-0.25pct` | 1.68e-01 | 2.06e+01 | — |
-| `fourier-coded-lowg-0.25pct` | 1.68e-01 | 2.06e+01 | — |
-| `fourier-lowg-0.5pct` | 9.08e-02 | 8.30e+00 | — |
-| `fourier-coded-lowg-0.5pct` | 9.08e-02 | 8.30e+00 | — |
-| `fourier-lowg-1pct` | 4.78e-02 | 8.21e-01 | — |
-| `fourier-coded-lowg-1pct` | 4.78e-02 | 8.21e-01 | — |
-| `fourier-lowg-5pct` | 9.16e-03 | 1.25e-02 | — |
-| `fourier-coded-lowg-5pct` | 9.16e-03 | 1.25e-02 | — |
-| `fourier-lowg-25pct` | 9.08e-04 | 5.90e-05 | — |
-| `fourier-coded-lowg-25pct` | 9.08e-04 | 5.90e-05 | — |
-| `fourier-lowg-100pct` | 5.40e-08 | 1.08e-12 | — |
-| `fourier-coded-lowg-100pct` | 2.79e-06 | 8.39e-10 | — |
-| `delta-fourier-lowg-0.25pct` | 1.13e-01 | 3.66e-01 | — |
-| `delta-fourier-coded-lowg-0.25pct` | 1.13e-01 | 3.66e-01 | — |
-| `delta-fourier-lowg-0.5pct` | 6.44e-02 | 3.62e-01 | — |
-| `delta-fourier-coded-lowg-0.5pct` | 6.44e-02 | 3.62e-01 | — |
-| `delta-fourier-lowg-1pct` | 4.20e-02 | 2.43e-01 | — |
-| `delta-fourier-coded-lowg-1pct` | 4.20e-02 | 2.43e-01 | — |
-| `delta-fourier-lowg-5pct` | 1.47e-02 | 1.49e-01 | — |
-| `delta-fourier-coded-lowg-5pct` | 1.47e-02 | 1.49e-01 | — |
-| `delta-fourier-lowg-25pct` | 3.85e-03 | 3.10e-02 | — |
-| `delta-fourier-coded-lowg-25pct` | 3.85e-03 | 3.10e-02 | — |
+Headlines:
 
-### NMAE by material category (mean)
-
-| config | oxide (n=18) | other (n=14) | intermetallic (n=11) | oxychalcogenide (n=4) | chalcogenide (n=3) |
-|---|:---:|:---:|:---:|:---:|:---:|
-| `direct` | 2.15e-08 | 2.15e-08 | 2.12e-08 | 2.15e-08 | 2.17e-08 |
-| `direct-coded` | 6.24e-07 | 6.24e-07 | 6.24e-07 | 6.24e-07 | 6.22e-07 |
-| `cutoff-top-1pct` | 8.31e-01 | 8.26e-01 | 7.14e-01 | 8.48e-01 | 8.03e-01 |
-| `cutoff-top-5pct` | 5.24e-01 | 5.53e-01 | 3.68e-01 | 5.50e-01 | 5.52e-01 |
-| `cutoff-top-25pct` | 1.50e-01 | 2.03e-01 | 1.93e-01 | 1.62e-01 | 1.77e-01 |
-| `cutoff-top-100pct` | 2.15e-08 | 2.15e-08 | 2.12e-08 | 2.15e-08 | 2.17e-08 |
-| `fourier-lowg-0.25pct` | 2.96e-01 | 4.46e-02 | 1.80e-01 | 8.56e-02 | 4.90e-02 |
-| `fourier-coded-lowg-0.25pct` | 2.96e-01 | 4.46e-02 | 1.80e-01 | 8.56e-02 | 4.90e-02 |
-| `fourier-lowg-0.5pct` | 1.89e-01 | 1.56e-02 | 6.85e-02 | 3.07e-02 | 1.65e-02 |
-| `fourier-coded-lowg-0.5pct` | 1.89e-01 | 1.56e-02 | 6.85e-02 | 3.07e-02 | 1.65e-02 |
-| `fourier-lowg-1pct` | 1.13e-01 | 5.52e-03 | 1.91e-02 | 1.12e-02 | 5.18e-03 |
-| `fourier-coded-lowg-1pct` | 1.13e-01 | 5.52e-03 | 1.91e-02 | 1.12e-02 | 5.18e-03 |
-| `fourier-lowg-5pct` | 2.37e-02 | 4.23e-04 | 1.85e-03 | 1.01e-03 | 6.88e-04 |
-| `fourier-coded-lowg-5pct` | 2.37e-02 | 4.23e-04 | 1.85e-03 | 1.01e-03 | 6.88e-04 |
-| `fourier-lowg-25pct` | 2.01e-03 | 1.30e-04 | 4.96e-04 | 2.49e-04 | 3.35e-04 |
-| `fourier-coded-lowg-25pct` | 2.01e-03 | 1.30e-04 | 4.96e-04 | 2.49e-04 | 3.35e-04 |
-| `fourier-lowg-100pct` | 4.81e-08 | 5.07e-08 | 7.12e-08 | 4.96e-08 | 4.85e-08 |
-| `fourier-coded-lowg-100pct` | 2.69e-06 | 2.59e-06 | 3.30e-06 | 2.64e-06 | 2.67e-06 |
-| `delta-fourier-lowg-0.25pct` | 1.47e-01 | 4.23e-02 | 1.80e-01 | 6.86e-02 | 4.73e-02 |
-| `delta-fourier-coded-lowg-0.25pct` | 1.47e-01 | 4.23e-02 | 1.80e-01 | 6.86e-02 | 4.73e-02 |
-| `delta-fourier-lowg-0.5pct` | 1.07e-01 | 1.77e-02 | 6.89e-02 | 5.63e-02 | 2.23e-02 |
-| `delta-fourier-coded-lowg-0.5pct` | 1.07e-01 | 1.77e-02 | 6.89e-02 | 5.63e-02 | 2.23e-02 |
-| `delta-fourier-lowg-1pct` | 8.57e-02 | 9.50e-03 | 1.99e-02 | 4.32e-02 | 1.10e-02 |
-| `delta-fourier-coded-lowg-1pct` | 8.57e-02 | 9.50e-03 | 1.99e-02 | 4.32e-02 | 1.10e-02 |
-| `delta-fourier-lowg-5pct` | 3.41e-02 | 2.24e-03 | 2.89e-03 | 1.26e-02 | 1.84e-03 |
-| `delta-fourier-coded-lowg-5pct` | 3.41e-02 | 2.24e-03 | 2.89e-03 | 1.26e-02 | 1.84e-03 |
-| `delta-fourier-lowg-25pct` | 9.01e-03 | 5.86e-04 | 1.29e-03 | 1.58e-03 | 4.59e-04 |
-| `delta-fourier-coded-lowg-25pct` | 9.01e-03 | 5.86e-04 | 1.29e-03 | 1.58e-03 | 4.59e-04 |
-
-### χ² by material category (mean)
-
-| config | oxide (n=18) | other (n=14) | intermetallic (n=11) | oxychalcogenide (n=4) | chalcogenide (n=3) |
-|---|:---:|:---:|:---:|:---:|:---:|
-| `direct` | 6.41e-16 | 6.42e-16 | 6.24e-16 | 6.40e-16 | 6.54e-16 |
-| `direct-coded` | 3.53e-12 | 5.19e-13 | 5.19e-13 | 5.19e-13 | 5.17e-13 |
-| `cutoff-top-1pct` | 8.31e-01 | 8.26e-01 | 7.14e-01 | 8.48e-01 | 8.03e-01 |
-| `cutoff-top-5pct` | 5.24e-01 | 5.53e-01 | 3.68e-01 | 5.50e-01 | 5.52e-01 |
-| `cutoff-top-25pct` | 1.50e-01 | 2.03e-01 | 1.93e-01 | 1.62e-01 | 1.77e-01 |
-| `cutoff-top-100pct` | 6.41e-16 | 6.42e-16 | 6.24e-16 | 6.40e-16 | 6.54e-16 |
-| `fourier-lowg-0.25pct` | 5.70e+01 | 4.40e-02 | 2.15e-01 | 8.63e-02 | 1.70e-02 |
-| `fourier-coded-lowg-0.25pct` | 5.70e+01 | 4.40e-02 | 2.15e-01 | 8.63e-02 | 1.70e-02 |
-| `fourier-lowg-0.5pct` | 2.30e+01 | 1.61e-02 | 4.72e-02 | 1.36e-02 | 2.26e-03 |
-| `fourier-coded-lowg-0.5pct` | 2.30e+01 | 1.61e-02 | 4.72e-02 | 1.36e-02 | 2.26e-03 |
-| `fourier-lowg-1pct` | 2.27e+00 | 2.56e-03 | 6.36e-03 | 1.23e-03 | 2.34e-04 |
-| `fourier-coded-lowg-1pct` | 2.27e+00 | 2.56e-03 | 6.36e-03 | 1.23e-03 | 2.34e-04 |
-| `fourier-lowg-5pct` | 3.47e-02 | 2.01e-06 | 3.83e-05 | 1.56e-05 | 2.89e-06 |
-| `fourier-coded-lowg-5pct` | 3.47e-02 | 2.01e-06 | 3.83e-05 | 1.56e-05 | 2.89e-06 |
-| `fourier-lowg-25pct` | 1.63e-04 | 1.21e-07 | 1.52e-06 | 2.12e-07 | 5.79e-07 |
-| `fourier-coded-lowg-25pct` | 1.63e-04 | 1.21e-07 | 1.52e-06 | 2.12e-07 | 5.79e-07 |
-| `fourier-lowg-100pct` | 2.84e-12 | 1.53e-13 | 3.00e-14 | 3.45e-14 | 2.25e-14 |
-| `fourier-coded-lowg-100pct` | 2.17e-09 | 1.57e-10 | 3.57e-11 | 4.42e-11 | 2.81e-11 |
-| `delta-fourier-lowg-0.25pct` | 8.59e-01 | 2.29e-02 | 2.15e-01 | 2.09e-02 | 1.57e-02 |
-| `delta-fourier-coded-lowg-0.25pct` | 8.59e-01 | 2.29e-02 | 2.15e-01 | 2.09e-02 | 1.57e-02 |
-| `delta-fourier-lowg-0.5pct` | 9.64e-01 | 8.74e-03 | 4.71e-02 | 1.71e-02 | 3.29e-03 |
-| `delta-fourier-coded-lowg-0.5pct` | 9.64e-01 | 8.74e-03 | 4.71e-02 | 1.71e-02 | 3.29e-03 |
-| `delta-fourier-lowg-1pct` | 6.65e-01 | 3.61e-03 | 6.44e-03 | 1.14e-02 | 8.32e-04 |
-| `delta-fourier-coded-lowg-1pct` | 6.65e-01 | 3.61e-03 | 6.44e-03 | 1.14e-02 | 8.32e-04 |
-| `delta-fourier-lowg-5pct` | 4.13e-01 | 2.90e-04 | 8.15e-05 | 1.89e-03 | 2.61e-05 |
-| `delta-fourier-coded-lowg-5pct` | 4.13e-01 | 2.90e-04 | 8.15e-05 | 1.89e-03 | 2.61e-05 |
-| `delta-fourier-lowg-25pct` | 8.60e-02 | 8.46e-06 | 1.47e-05 | 5.19e-05 | 1.27e-06 |
-| `delta-fourier-coded-lowg-25pct` | 8.60e-02 | 8.46e-06 | 1.47e-05 | 5.19e-05 | 1.27e-06 |
-
-</details>
-
-[mdcmd]: https://pypi.org/project/mdcmd/
-
-### Commentary
-
-Cutoff NMAE matches `1 − mass_captured` exactly by construction — dropped voxels contribute their full density to the error. So $\mathrm{NMAE}_\mathrm{floor}(\text{cutoff-top-}X) = 1 − \text{mass}_\text{top-}X$, and for this dataset the top 5% of voxels carries only ~50% of total integrated density. The remaining ~50% lives in the long mid/low-$ρ$ tail — which is why top-$K$ cutoff can't be competitive on NMAE without keeping nearly all voxels.
-
-**Δρ with a multi-shell Slater promolecule density**
-(`MultiShellSlaterPromolecule`, valence-only, via Slater's-rule Z_eff)
-behaves differently across metrics and sparsity regimes:
-
-* **At aggressive compression (≤ 1% coefs)**: Δρ helps modestly on NMAE
-  (1%: 4.78e-2 → 4.20e-2, ~12% better) and more strongly on χ² (1%:
-  8.21e-1 → 2.43e-1, **~70% better**). Δρ's win is larger on the
-  metric that rewards low-ρ accuracy — exactly Yael's point that
-  NMAE under-credits chemistry.
-* **At high fidelity (5–25% coefs)**: Δρ *loses* on both metrics
-  (5% NMAE: 9.16e-3 → 1.47e-2; 5% χ²: 1.25e-2 → 1.49e-1). Our analytic
-  promolecule doesn't perfectly match VASP's pseudopotential valence
-  density, so residual promolecule error dominates when the Fourier
-  compression is no longer the bottleneck.
-* **Oxide-specific picture**: at 1% NMAE we see 11.3% → 8.6% (~24%
-  better); χ² goes from 2.27 (oxide) → 0.67 (Δρ). Directional
-  confirmation that removing the atomic-core content helps oxides
-  most — but our promolecule is still an all-electron Slater
-  approximation, not POTCAR-matched.
-
-**Implication**: Δρ's fundamental value depends on how well the
-promolecule density matches the VASP-PAW conventions the CHGCARs
-follow. A POTCAR-derived pseudo-valence model would likely amplify both
-the aggressive-compression win and the high-fidelity regression, since
-it would match the data's conventions exactly. That's one next step
-for `scheme 4`.
-
-> **Note on terminology**: the local term "promolecule density" refers
-> to the chemistry-standard $\sum_\text{atoms}\rho_\text{atom}(r-R)$
-> (a.k.a. Independent Atom Model). *Not to be confused with OA's
-> PADS — Pre-tabulated Atomic Density Superposition — which is a
-> VASP-derived tabulated density used by RHOAR-Net to generate
-> low-resolution **inputs** without a VASP license at inference, a
-> different use case.*
-
-### Plots
-
-![NMAE vs fraction kept](./results/plots/nmae-vs-fraction.png)
-
-![NMAE by material category at 5% kept](./results/plots/nmae-by-category.png)
-
-![Cutoff NMAE = 1 − mass captured](./results/plots/mass-captured-cutoff.png)
-
-Regenerate via `uv run scripts/plot_sweep.py results/sweep-n50.csv` (or
-`dvx run` for the full provenance chain).
-
-### Observations (n=50, preliminary)
-
-**Budget framing.** We want `floor + prediction_error < 0.026`. The floor
-is what the sweep measures; prediction error is the work the transformer
-has to do. Lower floor = more budget for the model to be imperfect.
-
-**Context-length feasibility.** With tomol-style SE/M0/M1 float encoding
-(3 tokens per real value, 6 tokens per complex Fourier coef), Marin's
-standard 4k/16k context windows fit:
-
-| target seq len | Fourier fraction (direct float encoding) | median NMAE | viable? |
-|---|:---:|:---:|:---:|
-| 4k | ≤ 0.06% | — (not measured; worse than 0.25%) | no |
-| 16k | ≤ 0.25% | 8.9% | **no** — already ~3× over electrAI budget |
-| 64k | ≤ 1% | 0.9% | yes on median; oxide tail (mean 4.8%) tight |
-| 256k+ | 5% | 0.10% | yes, comfortable; expensive |
-
-**Direct-float Fourier encoding needs ≥64k context to be in budget**, and
-even then oxides are borderline. For the usual 4–16k regime, **VQ or
-patching is required**, not optional — this rules out naive
-tokenize-and-train.
-
-* **Fourier dominates voxel-cutoff at every sparsity level by ~2 orders
-  of magnitude.** The chemically-interesting information lives in the
-  low-spatial-frequency modes, not in the top-density voxels (which are
-  concentrated near nuclei and don't carry bond/charge-transfer signal).
-* **Cutoff (scheme 3) is a non-starter as-is.** At 25% of voxels it's
-  still at 18% NMAE — already 7× over electrai's achieved loss before
-  any model is trained. The rank-by-density criterion is backwards for
-  this task: top-density voxels are near nuclei and trivially
-  reconstructible from atomic positions, so the scheme is keeping the
-  easy part and throwing away the hard part.
-* **Fourier's budget at 5% coefs is comfortable in the median case
-  (~2.5% budget) but tight in mean** (1.7% budget) — and is already
-  *negative* for oxides in the mean (floor 2.4% vs target 2.6%, leaving
-  ~0.2% budget for the transformer). Oxides at 1% coefs blow the budget
-  outright (floor 11.3%).
-* **Oxides are the worst case for Fourier**, 10–50× worse than every
-  other category. Most likely the compact O core has non-negligible
-  power at high \|G\|, so the lowpass leaves a residual. This is a
-  concrete argument for **scheme 4 (Δρ)** next: subtracting a
-  promolecule density removes the atomic-core contribution and should
-  flatten the category gap.
-* **Dataset skew caveat:** the electrai-curated 2,885-subset has no
-  halides or oxyhalides in the first n=50 (alphabetical by mp-id).
-  Per the design doc's sparsity table, halides are the sparsest class
-  and the one cutoff was originally motivated by — so cutoff may look
-  relatively better if we re-run on a stratified sample. Doesn't change
-  the headline (cutoff 18% at 25% kept is catastrophic), but worth
-  confirming.
-
-Raw CSV in [`results/sweep-n50.csv`](./results/sweep-n50.csv); regenerate
-tables with `uv run scripts/summarize_sweep.py results/sweep-n50.csv`. See
-[`specs/02-fidelity-sweep.md`](./specs/02-fidelity-sweep.md) for scope
-notes and follow-ups.
+- **A100 scaling is linear**: 157 k → 313 k → 624 k tok/s across A100:2/4/8
+  at per-device bs=16 (2× per doubling, MFU flat ~12%).
+- **TPU v6e-4 ≈ 10× A100:1 tok/s** at the same per-device batch — matching
+  the 12× hardware-FLOPs ratio minus a ~17% MFU gap.
+- **train-full** (18× more data): loss drops 2.62 → 2.21, but the 30M
+  model is now **~7× past Chinchilla-optimal** so it's parameter-bound,
+  not data-bound. Bigger model is the next axis.
+- **Multihost TPU (v6e-16) works**: 4 VMs × 4 chips, 1.98 M tok/s at
+  ~78% scaling efficiency vs v6e-8. Required adding
+  `jax.distributed.initialize()` at script entry because Levanter's
+  `WandbConfig.init` calls a multihost broadcast before the trainer's
+  own distributed setup fires.
+- **208M Qwen3** (hidden=1024, 12 layers, 16 heads) now running on the
+  same train-full — right in Chinchilla's zone for 4 B tokens, bf16
+  compute, first real validation split wired in.
 
 ## Running
 
+Python (tokenize + training):
+
 ```bash
-spd                                            # project + venv setup
-uv sync                                        # install deps
-uv run pytest tests/                           # 17 tokenizer tests (no S3 IO)
-uv run scripts/fidelity_sweep.py -n 10         # quick smoke test
-uv run scripts/fidelity_sweep.py -n 50 -o tmp/sweep-n50.csv
+spd                                 # direnv + versioned venv
+uv sync                             # install deps
+uv run pytest tests/                # tokenizer roundtrip tests
 ```
 
-CHGCARs are ~73 MB each. The first run against a given mp-id downloads
-from S3 to `data/mp-cache/`; subsequent runs are local.
+Modal-side tokenize (laptop → Modal A100 volume → GCS):
+
+```bash
+TOMAT_VOLUME=tomat-rho-gga modal run \
+  scripts/tokenize_patches_modal.py::parallel \
+  --label val-full --split validation --n-workers 16
+```
+
+Marin/TPU training (from `marin/`):
+
+```bash
+cd marin
+uv run iris --cluster=marin job run \
+  --tpu v6e-8 --enable-extra-resources --cpu 32 --memory 64GB \
+  --env-vars WANDB_API_KEY "$WANDB_API_KEY" \
+  --env-vars TOMAT_LABEL train-full --env-vars TOMAT_MODEL 30M \
+  -- python train_tomat_tpu.py
+```
+
+Env-var knobs on the TPU script: `TOMAT_LABEL`, `TOMAT_STEPS`,
+`TOMAT_BATCH_SIZE`, `TOMAT_SEED`, `TOMAT_MODEL` (`30M` or `200M`),
+`TOMAT_VAL_SEQS`, `TOMAT_RESULTS_LABEL`.
+
+Static-PNG plot regeneration: `scripts/make_scaling_plot_png.py`. Data
+pull from W&B: `scripts/pull_wandb_runs.py`. Token-row decoder:
+`scripts/show_tokens.py`.
 
 ## Layout
 
 ```
-pyproject.toml            # deps: pymatgen, numpy, click (marin stack deferred)
 src/tomat/
-  float_codec.py          # FP16-like log-uniform codec (3 tokens per signed float)
-  promolecule.py          # analytic atomic-density models for Δρ subtraction
-  token_count.py          # per-scheme token accounting (assumes codec fidelity)
+  float_codec.py                 # FP16-like log-uniform codec (3 tokens per signed float)
+  promolecule.py                 # analytic atomic-density models (Δρ subtraction; scheme 4)
   tokenizers/
-    base.py               # DensityTokenizer ABC (encode → decode → roundtrip)
-    direct.py             # scheme 1 (float32 baseline)
-    direct_coded.py       # scheme 1 with FP16 codec
-    cutoff.py             # scheme 3
-    fourier.py            # scheme 5 (complex coefs, native precision)
-    fourier_coded.py      # scheme 5 with FP16 codec on real+imag
-    delta.py              # scheme 4 (Δρ = ρ − ρ_promolecule) — wraps any base
+    patch.py                     # patch tokenizer (the one used for training)
+    base.py, direct.py,          # earlier fidelity-sweep tokenizers (schemes 1/3/5)
+    cutoff.py, fourier*.py, delta.py
   data/
-    mp.py                 # S3 → pymatgen Chgcar, local caching
-    classify.py           # material-type classifier (halide/oxide/intermetallic/...)
-configs/
-  fp16-channels.json      # codec (log_min, log_max) per channel
+    mp.py                        # S3 → pymatgen Chgcar, local caching
+    zarr_io.py                   # Zarr → density array (from della/Modal volume)
+    classify.py                  # material-type classifier
 scripts/
-  fidelity_sweep.py       # tokenize → detokenize → NMAE, per-scheme CSV output
-  fit_density_codec.py    # fit codec ranges from cached CHGCARs
-  summarize_sweep.py      # markdown tables from the sweep CSV
-  plot_sweep.py           # matplotlib plots
+  tokenize_patches*.py           # patch tokenizer + Modal parallel wrapper
+  train_smoke_modal.py           # Modal A100 training (A100:{1,2,4,8} variants)
+  fidelity_sweep*.py, fit_*.py   # earlier fidelity-sweep entry points
+  show_tokens.py                 # decode a parquet row to human-readable form
+  sync_parquets_to_gcs.py        # Modal-vol → GCS upload with md5 verify
+  pull_wandb_runs.py             # W&B → CSV dump for plots
+  make_scaling_plot_png.py       # static scaling-loss PNG for README / slides
+  verify_val_full_parquet.py     # Modal-side row-group integrity scan
+marin/
+  train_tomat_tpu.py             # TPU training script (v6e-4/8/16, 30M/200M, bf16, val)
+  pyproject.toml, uv.lock        # marin-community find-links + TPU-gated jax
+docs/
+  datasets.md                    # raw Zarr layout, tokenized sets, scale-runs table
+site/                            # React + Plotly interactive dashboard (tomat.oa.dev)
 specs/
-  00-project-context.md   # positioning, sibling-project notes, open questions
-  01-tokenization-strategies.md  # the 7 candidate schemes + tradeoffs
-  02-fidelity-sweep.md    # this sweep's plan + current results
-site/                     # React + Plotly interactive dashboard (tomat.oa.dev)
-tests/
-  test_tokenizers.py      # roundtrip tests on synthetic densities (no IO)
-  test_float_codec.py     # codec precision / clamping / zero-handling
+  00..09-*.md                    # design / project / spec documents
 ```
 
 ## Follow-ups
 
-- Train a tiny Qwen3 on downsampled-grid direct-coded tokens as an
-  end-to-end plumbing test (priority; accuracy secondary).
-- Patch-based tokenization (ViT-style): each voxel patch → one token,
-  or hierarchical / adaptive refinement.
-- Copy grug's `launch.py`/`model.py`/`train.py` from
-  `marin/experiments/grug/base/` and wire against the chosen tokenizer
-  output — the training entrypoint.
-- Implement scheme 2 (VQ-VAE) — learned compression of density patches
-  to discrete tokens; unblocks 4k/16k context windows.
-- Implement schemes 6 (SH) and 7 (Gaussian / RI) only if the real-space
-  schemes hit a fidelity floor above electrAI's ~2.6% NMAE.
+- Finish the 208M run, confirm final loss < 30M baseline.
+- DVX-track raw Zarrs + parquet manifests (spec 09, della-side).
+- TransformerEngine on Modal A100:4 for the bs=128 apples-to-apples
+  GPU point (currently limited to per-device bs=16 due to attention
+  OOM; spec / post-meeting).
+- Scale model further (600M-1B) once 208M results land.
+
+## Earlier work
+
+For the pre-training fidelity sweep (NMAE / χ² reconstruction floors
+across cutoff/Fourier/Δρ tokenizers), see
+[`specs/done/02-fidelity-sweep.md`](./specs/done/02-fidelity-sweep.md)
+and [`results/sweep-n50.csv`](./results/sweep-n50.csv). Headline from
+that phase: Fourier lowpass beats voxel cutoff by ~2 orders of magnitude
+on NMAE at every sparsity; direct-float Fourier encoding needs ≥64 k
+context to get in budget → patches (what we train on today) were the
+right answer.
