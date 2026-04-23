@@ -36,27 +36,35 @@ for the train volume.
 
 All: val split, codec `two_token_9_12`, patch_size P=14, pad_to 8192, seed 42.
 
-| label | mats | patches/mat (M) | rows | notes |
-|---|---:|---:|---:|---|
-| `val-smoke-n2` | 2 | 32 | 64 | throwaway |
-| `val-smoke` | 128 | 32 | 4,096 | earliest smoke-training target (`rosy-durian-1`) |
-| `val-full` | 4,305 | 32 | 137,696 | primary val scale (2 oversized skipped → 137,664 effective) |
-| `val-full-m128` | 4,305 | 128 | 550,784 | 4× more unique patches/mat; untrained against as of 2026-04-23 |
+Token counts are `rows × seq_len` at `pad_to=8192` (training counts padded
+positions — actual non-pad tokens per row vary by material size).
+
+| label | mats | patches/mat (M) | rows | tokens (pad) | on-disk (GCS) | notes |
+|---|---:|---:|---:|---:|---:|---|
+| `val-smoke-n2` | 2 | 32 | 64 | 524 K | — (local only) | throwaway |
+| `val-smoke` | 128 | 32 | 4,096 | 34 M | ~33 MB | earliest smoke-training target (`rosy-durian-1`) |
+| `val-full` | 4,305 | 32 | 137,696 | 1.13 B | 1.59 GB | primary val scale (2 oversized skipped → 137,664 effective) |
+| `val-full-m128` | 4,305 | 128 | 550,784 | 4.51 B | 1.55 GB | 4× more unique patches/mat; first scale run 2026-04-23 (v6e-16 target) |
 
 **Oversized materials skipped**: 2 materials (`mp-1884050`, `mp-1849033`) have
 grid dims > 1024 on one axis (48 × 48 × 1120/1372 — slab-like structures).
 The `INT_VOCAB_SIZE=1024` cap in [`src/tomat/tokenizers/patch.py`](../src/tomat/tokenizers/patch.py)
 can't represent them; preprocessing logs them in each shard's `meta.json`.
 
-## Tokenized parquet sets — planned (on `tomat-rho-gga-train`)
+## Tokenized parquet sets — train-split (on `tomat-rho-gga-train`)
 
-Once the della → `tomat-rho-gga-train` upload completes, running spec 07's
-parallel tokenize (`scripts/tokenize_patches_modal.py::parallel --label
-train-full --split train --n-workers 64`) produces:
+della → `tomat-rho-gga-train` upload complete (77,498 structures).
+Parallel tokenize kicked off 2026-04-23 (64 Modal workers):
 
-| label | mats | patches/mat (M) | rows | notes |
-|---|---:|---:|---:|---|
-| `train-full` | ~77 k | 32 | ~2.5 M | first pass; sized like `val-full` per-material |
+```
+TOMAT_VOLUME=tomat-rho-gga-train modal run \
+    scripts/tokenize_patches_modal.py::parallel \
+    --label train-full --split train --n-workers 64
+```
+
+| label | mats | patches/mat (M) | rows (est) | tokens (est) | on-disk (est) | notes |
+|---|---:|---:|---:|---:|---:|---|
+| `train-full` | ~77,498 | 32 | ~2.48 M | ~20 B | ~28 GB | first pass; per-material sizing matches `val-full` |
 
 ## W&B projects
 
