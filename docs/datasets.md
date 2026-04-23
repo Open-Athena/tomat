@@ -32,29 +32,41 @@ Spec references: [03-modal-seed](../specs/done/03-modal-seed.md) for the val
 volume; [08-della-seed-train-split](../specs/08-della-seed-train-split.md)
 for the train volume.
 
-## Tokenized parquet sets (on `tomat-rho-gga`)
+## Tokenized parquet sets
 
-All: val split, codec `two_token_9_12`, patch_size P=14, pad_to 8192, seed 42.
+All: codec `two_token_9_12`, patch_size P=14, pad_to 8192, seed 42.
 
-Token counts are `rows × seq_len` at `pad_to=8192` (training counts padded
-positions — actual non-pad tokens per row vary by material size).
+### A note on "tokens (pad)"
 
-| label | mats | patches/mat (M) | rows | tokens (pad) | on-disk (GCS) | notes |
-|---|---:|---:|---:|---:|---:|---|
-| `val-smoke-n2` | 2 | 32 | 64 | 524 K | — (local only) | throwaway |
-| `val-smoke` | 128 | 32 | 4,096 | 34 M | ~33 MB | earliest smoke-training target (`rosy-durian-1`) |
-| `val-full` | 4,305 | 32 | 137,696 | 1.13 B | 1.59 GB | primary val scale (2 oversized skipped → 137,664 effective) |
-| `val-full-m128` | 4,305 | 128 | 550,784 | 4.51 B | 1.55 GB | 4× more unique patches/mat; first scale run 2026-04-23 (v6e-16 target) |
+Each parquet row is one training sequence, right-padded to `pad_to=8192`
+tokens so the model's fixed-length context is always full. The **tokens
+(pad)** column is `rows × pad_to` — the number of token positions the
+model trains *on*, including the padded positions. This is the right
+number for compute accounting (FLOPs/token × tokens trained), Chinchilla
+ratios, and comparing runs.
 
-**Oversized materials skipped**: 2 materials (`mp-1884050`, `mp-1849033`) have
-grid dims > 1024 on one axis (48 × 48 × 1120/1372 — slab-like structures).
-The `INT_VOCAB_SIZE=1024` cap in [`src/tomat/tokenizers/patch.py`](../src/tomat/tokenizers/patch.py)
-can't represent them; preprocessing logs them in each shard's `meta.json`.
+The actual *non-pad* content per row is smaller and varies by material:
 
-## Tokenized parquet sets — train-split (on `tomat-rho-gga-train`)
+- **Density block**: `2 × P³` tokens (density codec emits 2 tokens/voxel).
+  At P=14, that's `2 × 14³ = 5,488` tokens.
+- **Preamble**: grid shape + atomic inventory (Z + fractional coords) +
+  patch anchor. Scales with atom count; typically ~200 tokens for a
+  100-atom structure, less for smaller.
 
-della → `tomat-rho-gga-train` upload complete (77,498 structures).
-Parallel tokenize kicked off 2026-04-23 (64 Modal workers):
+So for a 100-atom material at P=14: ~5,688 non-pad tokens + ~2,504 pad
+= 8,192. Padded positions contribute ~0 to train loss (they're masked in
+the cross-entropy) but the model still runs forward/backward through them.
+
+| label | split | mats | patches/mat (M) | rows | tokens (pad) | on-disk (GCS) | notes |
+|---|---|---:|---:|---:|---:|---:|---|
+| `val-smoke-n2` | val | 2 | 32 | 64 | 524 K | — (local only) | throwaway |
+| `val-smoke` | val | 128 | 32 | 4,096 | 34 M | ~33 MB | earliest smoke target (`rosy-durian-1`) |
+| `val-full` | val | 4,305 | 32 | 137,696 | 1.13 B | 1.49 GB | primary val scale (2 oversized skipped → 137,664 effective) |
+| `val-full-m128` | val | 4,305 | 128 | 549,664 | 4.50 B | 1.44 GB | 4× more unique patches/mat |
+| `train-full` | train | 77,498 | 32 | 2,478,912 | 20.31 B | 21.1 GB | first run on this 2026-04-23 |
+
+Val-split labels live on Modal volume `tomat-rho-gga`; train-split lives on
+`tomat-rho-gga-train`. Production tokenize command (env-var-swappable volume):
 
 ```
 TOMAT_VOLUME=tomat-rho-gga-train modal run \
@@ -62,9 +74,10 @@ TOMAT_VOLUME=tomat-rho-gga-train modal run \
     --label train-full --split train --n-workers 64
 ```
 
-| label | mats | patches/mat (M) | rows (est) | tokens (est) | on-disk (est) | notes |
-|---|---:|---:|---:|---:|---:|---|
-| `train-full` | ~77,498 | 32 | ~2.48 M | ~20 B | ~28 GB | first pass; per-material sizing matches `val-full` |
+**Oversized materials skipped**: 2 materials (`mp-1884050`, `mp-1849033`) have
+grid dims > 1024 on one axis (48 × 48 × 1120/1372 — slab-like structures).
+The `INT_VOCAB_SIZE=1024` cap in [`src/tomat/tokenizers/patch.py`](../src/tomat/tokenizers/patch.py)
+can't represent them; preprocessing logs them in each shard's `meta.json`.
 
 ## W&B projects
 
@@ -84,24 +97,32 @@ Within a project, **groups** split runs by the training-side sampling axes
 Qwen3-30M (hidden=512, 6 layers, 4 heads, seq=8192), seed 42. Project:
 [`tomat-two_token_9_12-P14`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14).
 
-| run | data | compute | batch | per-dev | steps | MFU | tok/s | final loss |
-|---|---|---|---:|---:|---:|---:|---:|---:|
-| [`val-full-5k-bs32-bs32-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-bs32-seed42) | val-full | Modal A100:1 | 32 | 32 | 2,560 (OOM) | 12.4% | 80 k | 2.235 |
-| [`val-full-5k-bs32-2gpu-bs32-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-2gpu-bs32-seed42) | val-full | Modal A100:2 | 32 | 16 | 5,000 | 12.0% | 157 k | **1.962** |
-| [`val-full-5k-bs64-4gpu-bs64-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs64-4gpu-bs64-seed42) | val-full | Modal A100:4 | 64 | 16 | 5,000 | 11.96% | 313 k | 1.975 |
-| [`val-full-5k-bs128-8gpu-bs128-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs128-8gpu-bs128-seed42) | val-full | Modal A100:8 | 128 | 16 | 5,000 | 11.86% | 624 k | 2.022 |
-| [`val-full-tpu-bs128-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-tpu-bs128-seed42) | val-full | Marin TPU v6e-4 | 128 | 32 | 1,000 | 10.25% | 792 k | 2.620 |
-| [`train-full-tpu8-bs256-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-bs256-seed42) | **train-full** | Marin TPU v6e-8 | 256 | 32 | 2,000 | 8.38% | **1,297 k** | **2.214** |
+| run | model | data | compute | batch | per-dev | steps | MFU | tok/s | final loss |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|
+| [`val-full-5k-bs32-bs32-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-bs32-seed42) | 30M | val-full | Modal A100:1 | 32 | 32 | 2,560 (OOM) | 12.4% | 80 k | 2.235 |
+| [`val-full-5k-bs32-2gpu-bs32-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-2gpu-bs32-seed42) | 30M | val-full | Modal A100:2 | 32 | 16 | 5,000 | 12.0% | 157 k | **1.962** |
+| [`val-full-5k-bs64-4gpu-bs64-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs64-4gpu-bs64-seed42) | 30M | val-full | Modal A100:4 | 64 | 16 | 5,000 | 11.96% | 313 k | 1.975 |
+| [`val-full-5k-bs128-8gpu-bs128-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs128-8gpu-bs128-seed42) | 30M | val-full | Modal A100:8 | 128 | 16 | 5,000 | 11.86% | 624 k | 2.022 |
+| [`val-full-tpu-bs128-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-tpu-bs128-seed42) | 30M | val-full | Marin TPU v6e-4 | 128 | 32 | 1,000 | 10.25% | 792 k | 2.620 |
+| [`train-full-tpu8-bs256-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-bs256-seed42) | 30M | **train-full** | Marin TPU v6e-8 | 256 | 32 | 2,000 | 8.38% | 1,297 k | **2.214** |
+| [`train-full-tpu16-30M-bs512-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu16-30M-bs512-seed42) | 30M | train-full | Marin TPU v6e-16 (multihost, 4 VMs) | 512 | 32 | in flight | — | **2,042 k** | — |
+| [`train-full-tpu8-200M-bs128-val-bf16-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-200M-bs128-val-bf16-seed42) | **208M** | train-full | Marin TPU v6e-8 + bf16 | 128 | 16 | in flight | — | 294 k | — |
 
 Headlines:
 - **A100 scaling is linear**: 157 k → 313 k → 624 k tok/s at per-dev bs=16,
   MFU flat ~12% across 2/4/8 chips.
 - **TPU v6e-4 ≈ 10× A100:1** tok/s at same per-device bs (matches the 12×
   hardware-FLOPs ratio minus a ~17% MFU gap).
-- **train-full run**: 4.19 B tokens trained (18× more data than val-full),
-  loss dropped 2.62 → 2.21 (0.41 nats). MFU is *lower* at 8.38% because
-  30 M is too small to saturate v6e-8 — 4 B tokens through a 30 M model is
-  ~7× past Chinchilla-optimal, so we're parameter-bound. Bigger model next.
+- **train-full**: 4.19 B tokens through the 30 M model, loss 2.62 → 2.21
+  (0.41 nats on 18× more data). MFU drops to 8.4% on v6e-8 because 30 M
+  is too small to saturate the chip — parameter-bound, not data-bound.
+- **Multihost TPU (v6e-16) works**: 4 VMs × 4 chips, 2.04 M tok/s
+  (1.57× v6e-8, ~78% scaling efficiency). Unblocked by adding
+  `jax.distributed.initialize()` at script entry — Levanter's `WandbConfig.init`
+  tries a multihost broadcast before the trainer's own distributed setup fires.
+- **200 M model** (hidden=1024, 12 layers, 16 heads) running on v6e-8
+  with bf16 compute and a 256-seq held-out validation split — first real
+  generalization number coming.
 
 ## DVX provenance
 

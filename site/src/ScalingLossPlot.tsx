@@ -16,7 +16,9 @@ const RUNS: RunSpec[] = [
   { file: 'val-full-5k-bs64-4gpu-bs64-seed42.csv',   name: 'A100:4 bs=64 (val-full)',     color: '#ff7f0e' },
   { file: 'val-full-5k-bs128-8gpu-bs128-seed42.csv', name: 'A100:8 bs=128 (val-full)',    color: '#d62728' },
   { file: 'val-full-tpu-bs128-seed42.csv',           name: 'TPU v6e-4 bs=128 (val-full)', color: '#9467bd' },
-  { file: 'train-full-tpu8-bs256-seed42.csv',        name: 'TPU v6e-8 bs=256 (train-full)', color: '#000000' },
+  { file: 'train-full-tpu8-bs256-seed42.csv',        name: '30M: TPU v6e-8 bs=256 (train-full)', color: '#8c564b' },
+  { file: 'train-full-tpu16-30M-bs512-seed42.csv',   name: '30M: TPU v6e-16 bs=512 (train-full)', color: '#17becf' },
+  { file: 'train-full-tpu8-200M-bs128-val-bf16-seed42.csv', name: '200M: TPU v6e-8 bs=128 (train-full)', color: '#000000' },
 ]
 
 export function ScalingLossPlot({ baseUrl }: { baseUrl: string }) {

@@ -101,8 +101,16 @@ export function HomePage() {
             <td>val-full</td><td>Marin TPU v6e-4</td><td>128 (32)</td><td>1 k</td><td>10.25%</td><td>792 k</td><td>2.620</td>
           </tr>
           <tr>
-            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-bs256-seed42"><strong>bs=256, TPU v6e-8</strong></ExtLink></td>
-            <td><strong>train-full</strong></td><td>Marin TPU v6e-8</td><td>256 (32)</td><td>2 k</td><td>8.38%</td><td><strong>1,297 k</strong></td><td><strong>2.214</strong></td>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-bs256-seed42"><strong>30M bs=256, TPU v6e-8</strong></ExtLink></td>
+            <td><strong>train-full</strong></td><td>Marin TPU v6e-8</td><td>256 (32)</td><td>2 k</td><td>8.38%</td><td>1,297 k</td><td><strong>2.214</strong></td>
+          </tr>
+          <tr>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu16-30M-bs512-seed42"><strong>30M bs=512, TPU v6e-16</strong> (multihost)</ExtLink></td>
+            <td>train-full</td><td>Marin TPU v6e-16 (4 hosts)</td><td>512 (32)</td><td>2 k (running)</td><td>—</td><td><strong>2,042 k</strong></td><td>—</td>
+          </tr>
+          <tr>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-200M-bs128-val-bf16-seed42"><strong>200M bs=128, TPU v6e-8</strong> (+ val, bf16)</ExtLink></td>
+            <td>train-full</td><td>Marin TPU v6e-8</td><td>128 (16)</td><td>2 k (running)</td><td>—</td><td>294 k</td><td>—</td>
           </tr>
         </tbody>
       </table>
@@ -113,14 +121,22 @@ export function HomePage() {
         batch (v6e: 918 TFLOPs/chip × 4 ≈ 12× an A100).
       </p>
       <p className="meta">
-        <strong>New: train-full on v6e-8 run.</strong> Same 30 M model but
+        <strong>train-full + larger compute.</strong> Same 30 M model but
         <strong> 18× more training data</strong> (77 k materials vs 4,305) →
-        0.41 nats lower loss (2.62 → 2.21). At bs=256 on 8 chips the model
-        throughput is 1.3 M tok/s; MFU is actually lower (~8%) because 30 M
-        params is too small to saturate v6e-8. 4.2 B tokens through a
-        30 M model is <strong>~7× past Chinchilla-optimal</strong> — loss
-        is flattening because we're parameter-bound, not data-bound.
-        Next: 200 M model on the same data (currently queued).
+        0.41 nats lower loss (2.62 → 2.21). On v6e-8 that's 1.3 M tok/s;
+        the multihost v6e-16 stretch (4 VMs × 4 chips) adds another 1.57×
+        throughput to <strong>2.04 M tok/s</strong>. MFU at 30 M stays low
+        (8–10%) — the model's too small to saturate the chips. 4.2 B tokens
+        through 30 M is <strong>~7× past Chinchilla-optimal</strong>.
+      </p>
+      <p className="meta">
+        <strong>Larger model.</strong> Parallel run with a 200 M Qwen3
+        (hidden=1024, 12 layers, 16 heads, tied embeddings) on the same
+        train-full — right in Chinchilla's zone for 4 B tokens and
+        exercising the TPU's native bf16 compute properly. First real
+        validation split (256 held-out sequences) is wired in on this
+        run too, so we'll have a generalization number alongside train
+        loss for the first time.
       </p>
 
       <h2>Up next</h2>

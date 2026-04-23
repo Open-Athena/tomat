@@ -97,6 +97,11 @@ def main(entity: str, project: str, out_dir: Path, run_ids: tuple[str, ...]) -> 
 
 
 def _compute_label(run_id: str, cfg: dict) -> str:
+    # TPU sizes are embedded in the run_id as tpu, tpu4, tpu8, tpu16, etc.
+    if "tpu16" in run_id:
+        return "TPU v6e-16"
+    if "tpu8" in run_id:
+        return "TPU v6e-8"
     if "tpu" in run_id:
         return "TPU v6e-4"
     if "8gpu" in run_id:
