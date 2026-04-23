@@ -129,9 +129,9 @@ Within a project, **groups** split runs by the training-side sampling axes
 Qwen3-30M (hidden=512, 6 layers, 4 heads, seq=8192), seed 42. Project:
 [`tomat-two_token_9_12-P14`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14).
 
-FLOP values below are in **ExaFLOPs (EF = 10¹⁸)**.
+FLOP values below are in units of 10¹⁸.
 
-| run | model | data | compute | batch | per-dev | steps | tokens | EF (10¹⁸) | MFU | tok/s | final loss |
+| run | model | data | compute | batch | per-dev | steps | tokens | FLOPs (×10¹⁸) | MFU | tok/s | final loss |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | [`val-full-5k-bs32-bs32-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-bs32-seed42) | 30M | val-full | Modal A100:1 | 32 | 32 | 2,560 (OOM) | 0.67 B | 0.32 | 12.4% | 80 k | 2.235 |
 | [`val-full-5k-bs32-2gpu-bs32-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-2gpu-bs32-seed42) | 30M | val-full | Modal A100:2 | 32 | 16 | 5,000 | 1.31 B | 0.62 | 12.0% | 157 k | **1.962** |

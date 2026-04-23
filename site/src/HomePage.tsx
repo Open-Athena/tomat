@@ -134,7 +134,7 @@ export function HomePage() {
       </div>
       <table className="runs-table">
         <thead>
-          <tr><th>run</th><th>model</th><th>data</th><th>compute</th><th>bs (per-dev)</th><th>steps</th><th>tokens</th><th>EF (10¹⁸)</th><th>MFU</th><th>tok/s</th><th>final loss</th></tr>
+          <tr><th>run</th><th>model</th><th>data</th><th>compute</th><th>bs (per-dev)</th><th>steps</th><th>tokens</th><th>FLOPs (×10¹⁸)</th><th>MFU</th><th>tok/s</th><th>final loss</th></tr>
         </thead>
         <tbody>
           <tr>
