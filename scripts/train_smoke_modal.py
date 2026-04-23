@@ -60,31 +60,6 @@ image = (
     .add_local_python_source("tomat")
 )
 
-# Separate image for TE-enabled runs. `transformer-engine[jax]` ships only an
-# sdist (no prebuilt wheels), so it source-builds C++ extensions against CUDA
-# headers — needs `nvcc` + the CUDA devel toolkit, which `debian_slim` lacks.
-# Branching off an NVIDIA CUDA devel image gets us nvcc + cuDNN headers; the
-# rest of the marin deps install identically.
-image_te = (
-    modal.Image.from_registry(
-        "nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04",
-        add_python="3.12",
-    )
-    .apt_install("git")
-    .pip_install("uv")
-    .run_commands(
-        f"uv pip install --system --pre {_find_links_args} "
-        "marin-levanter marin-haliax marin-fray dupekit "
-        "'jax[cuda12]' 'pyarrow>=15' fsspec "
-        # TE source-build: needs the CUDA devel toolkit we just picked up.
-        # Levanter's default GPU backend is NVTE; with TE installed it uses
-        # fused attention and skips materializing the bs×heads×seq×seq matrix
-        # that OOMs the no-TE path at bs=128/seq=8192 on 40GB A100s.
-        "'transformer-engine[jax]'",
-    )
-    .add_local_python_source("tomat")
-)
-
 app = modal.App("tomat-train-smoke", image=image)
 volume = modal.Volume.from_name(VOLUME_NAME)
 wandb_secret = modal.Secret.from_name("wandb-credentials")
@@ -140,21 +115,6 @@ def train_smoke_4gpu(
     Use a 4× bigger `--batch-size` than the single-GPU run to keep per-device
     batch constant — that way MFU/GPU stays comparable and wall-time drops
     ~3-3.5× (NCCL tax ≈ 10-15%)."""
-    return _train_smoke_impl(steps, batch_size, seed, label, results_label)
-
-
-@app.function(image=image_te, gpu="A100:4", volumes={MOUNT: volume}, secrets=[wandb_secret], timeout=28800)
-def train_smoke_4gpu_te(
-    steps: int,
-    batch_size: int,
-    seed: int,
-    label: str,
-    results_label: str,
-) -> dict:
-    """A100:4 with TransformerEngine installed — Levanter's NVTE backend is
-    the GPU default, so fused attention activates automatically. Targets
-    bs=128 (per-device bs=32, matching A100:1) without the attention-matrix
-    OOM that the no-TE `train_smoke_4gpu` hits."""
     return _train_smoke_impl(steps, batch_size, seed, label, results_label)
 
 
@@ -430,21 +390,3 @@ def main_8gpu(
     err(f"[modal] done: results at {result['results_dir']} on volume {VOLUME_NAME}")
 
 
-@app.local_entrypoint()
-def main_4gpu_te(
-    steps: int = 5000,
-    batch_size: int = 128,
-    seed: int = 42,
-    label: str = "val-full",
-    results_label: str = "val-full-5k-bs128-4gpu-te",
-) -> None:
-    err(f"[modal] A100:4+TE train: {steps} steps, batch={batch_size} "
-        f"(per-device {batch_size // 4}), seed={seed}")
-    result = train_smoke_4gpu_te.remote(
-        steps=steps,
-        batch_size=batch_size,
-        seed=seed,
-        label=label,
-        results_label=results_label,
-    )
-    err(f"[modal] done: results at {result['results_dir']} on volume {VOLUME_NAME}")
