@@ -1,3 +1,4 @@
+import { ScalingLossPlot } from './ScalingLossPlot'
 import { SmokeLossPlot } from './SmokeLossPlot'
 import { ThemeToggle } from './theme'
 
@@ -62,41 +63,50 @@ export function HomePage() {
 
       <h2>Scale training runs (2026-04-22 / 23)</h2>
       <p>
-        All against <code>val-full</code> (4,305 materials × 32 patches = 137,696
-        sequences), same 30 M Qwen3, seed 42, 8k context. Runs live in the{' '}
+        Same 30 M Qwen3 on <code>val-full</code> (4,305 mats × 32 patches = 137,696
+        sequences), seed 42, 8k context. Runs live in the{' '}
         <ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14">
           <code>tomat-two_token_9_12-P14</code>
         </ExtLink>{' '}W&amp;B project.
       </p>
+      <div className="plot-card">
+        <ScalingLossPlot baseUrl={`${base}/run-histories`} />
+      </div>
       <table className="runs-table">
         <thead>
-          <tr><th>run</th><th>compute</th><th>bs</th><th>steps</th><th>MFU</th><th>tok/s</th><th>status</th></tr>
+          <tr><th>run</th><th>compute</th><th>bs (per-dev)</th><th>steps</th><th>MFU</th><th>tok/s</th><th>final loss</th></tr>
         </thead>
         <tbody>
           <tr>
-            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-seed42">bs=32, A100:1</ExtLink></td>
-            <td>Modal A100:1</td><td>32</td><td>5 k</td><td>12.4%</td><td>81 k</td><td>running</td>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-bs32-seed42">bs=32, A100:1</ExtLink></td>
+            <td>Modal A100:1</td><td>32 (32)</td><td>2,560 / 5 k</td><td>12.4%</td><td>80 k</td><td>2.235 (OOM)</td>
+          </tr>
+          <tr>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-2gpu-bs32-seed42">bs=32, A100:2</ExtLink></td>
+            <td>Modal A100:2</td><td>32 (16)</td><td>5 k</td><td>12.0%</td><td>157 k</td><td><strong>1.962</strong></td>
           </tr>
           <tr>
             <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs64-4gpu-bs64-seed42">bs=64, A100:4</ExtLink></td>
-            <td>Modal A100:4</td><td>64</td><td>5 k</td><td>—</td><td>—</td><td>running (no TE)</td>
+            <td>Modal A100:4</td><td>64 (16)</td><td>5 k</td><td>11.96%</td><td>313 k</td><td><strong>1.975</strong></td>
           </tr>
           <tr>
-            <td>bs=128, A100:4 + TE</td>
-            <td>Modal A100:4</td><td>128</td><td>5 k</td><td>—</td><td>—</td><td>image build</td>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs128-8gpu-bs128-seed42">bs=128, A100:8</ExtLink></td>
+            <td>Modal A100:8</td><td>128 (16)</td><td>5 k</td><td>11.86%</td><td>624 k</td><td><strong>2.022</strong></td>
           </tr>
           <tr>
             <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-tpu-bs128-seed42">bs=128, TPU v6e-4</ExtLink></td>
-            <td>Marin TPU v6e-4</td><td>128</td><td>1 k</td><td>10.3%</td><td>792 k</td><td>done, loss 2.62, 34 min</td>
+            <td>Marin TPU v6e-4</td><td>128 (32)</td><td>1 k</td><td>10.25%</td><td><strong>792 k</strong></td><td>2.620</td>
           </tr>
         </tbody>
       </table>
       <p className="meta">
-        Headline: <strong>TPU v6e-4 ≈ 10× A100:1</strong> tokens/sec at the
-        same per-device batch — v6e has ~12× the peak FLOPs, with slightly
-        lower MFU. A100:4 bs=128 OOMed without TransformerEngine (the
-        no-TE path materializes the <code>bs × heads × seq × seq</code>
-        attention matrix ≈ 22 GiB/chip on our config).
+        Near-perfect data-parallel scaling across A100:2/4/8 at fixed
+        per-device bs=16 (157 k → 313 k → 624 k tok/s = 2.0× per doubling,
+        MFU stable ~12%). TPU v6e-4 ≈ <strong>10× A100:1 tok/s</strong>
+        at same per-device batch — matching the hardware FLOPs ratio
+        (v6e: 918 TFLOPs/chip × 4 = 12× an A100). A100:1 bs=32
+        per-device=32 OOMed at step 2,560 on a 22-GiB attention-matrix
+        allocation; per-device=16 fits comfortably.
       </p>
 
       <h2>Up next</h2>
