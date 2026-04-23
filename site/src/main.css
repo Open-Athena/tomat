@@ -276,6 +276,21 @@ body.in-deck #root { max-width: none; padding: 0; margin: 0; }
 
 .note { color: var(--muted); font-size: 0.95rem; font-style: italic; }
 
+.runs-table {
+  border-collapse: collapse;
+  margin: 0.75rem 0 0.5rem;
+  font-size: 0.95rem;
+}
+.runs-table th,
+.runs-table td {
+  padding: 0.35rem 0.75rem;
+  border: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+.runs-table th { background: var(--card-bg); font-weight: 600; }
+.runs-table td:nth-child(n+3):nth-child(-n+6) { text-align: right; }
+
 .deck-slide-footer {
   display: flex;
   justify-content: space-between;

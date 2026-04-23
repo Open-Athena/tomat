@@ -71,6 +71,23 @@ Within a project, **groups** split runs by the training-side sampling axes
 (`M<N>-N<N>`); **tags** carry filterable dimensions (`smoke`/`scale`,
 `bs32`/`bs128`, `mats128`/`mats4305`, `seed42`, ...).
 
+### Current scale runs (2026-04-22 → 04-23, pre-meeting)
+
+All against `val-full` (4,305 mats, 137,696 sequences), seed 42, Qwen3-30M
+(hidden=512, 6 layers, 4 heads, seq=8192). Projects:
+[`tomat-two_token_9_12-P14`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14).
+
+| run | compute | batch | per-device | steps | MFU | tok/s | status |
+|---|---|---:|---:|---:|---:|---:|---|
+| [`val-full-5k-bs32-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-seed42) | Modal A100:1 | 32 | 32 | 5000 | 12.4% | 81k | running |
+| [`val-full-5k-bs128-4gpu-bs128-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs128-4gpu-bs128-seed42) | Modal A100:4 | 128 | 32 | 5000 | ~12% @ step 9 | 312k | **OOM at step 9** (attention matrix, no TE) |
+| [`val-full-5k-bs64-4gpu-bs64-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs64-4gpu-bs64-seed42) | Modal A100:4 | 64 | 16 | 5000 | — | — | running (Track A) |
+| `val-full-5k-bs128-4gpu-te-bs128-seed42` | Modal A100:4 + TE | 128 | 32 | 5000 | — | — | building CUDA devel image (Track B) |
+| [`val-full-tpu-bs128-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-tpu-bs128-seed42) | Marin TPU v6e-4 | 128 | 32 | 1000 | 10.3% | 792k | done — final loss 2.62, 34 min wall |
+
+Headline: **TPU v6e-4 is ~10× A100:1 tok/s at same per-device batch**,
+with slightly lower MFU (10.3% vs 12.4%) but 12× more raw FLOPs.
+
 ## DVX provenance
 
 Every parquet shard dir that we care about has a `.dvc` file recording the

@@ -60,15 +60,60 @@ export function HomePage() {
         </ExtLink>.
       </p>
 
+      <h2>Scale training runs (2026-04-22 / 23)</h2>
+      <p>
+        All against <code>val-full</code> (4,305 materials × 32 patches = 137,696
+        sequences), same 30 M Qwen3, seed 42, 8k context. Runs live in the{' '}
+        <ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14">
+          <code>tomat-two_token_9_12-P14</code>
+        </ExtLink>{' '}W&amp;B project.
+      </p>
+      <table className="runs-table">
+        <thead>
+          <tr><th>run</th><th>compute</th><th>bs</th><th>steps</th><th>MFU</th><th>tok/s</th><th>status</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-seed42">bs=32, A100:1</ExtLink></td>
+            <td>Modal A100:1</td><td>32</td><td>5 k</td><td>12.4%</td><td>81 k</td><td>running</td>
+          </tr>
+          <tr>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs64-4gpu-bs64-seed42">bs=64, A100:4</ExtLink></td>
+            <td>Modal A100:4</td><td>64</td><td>5 k</td><td>—</td><td>—</td><td>running (no TE)</td>
+          </tr>
+          <tr>
+            <td>bs=128, A100:4 + TE</td>
+            <td>Modal A100:4</td><td>128</td><td>5 k</td><td>—</td><td>—</td><td>image build</td>
+          </tr>
+          <tr>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-tpu-bs128-seed42">bs=128, TPU v6e-4</ExtLink></td>
+            <td>Marin TPU v6e-4</td><td>128</td><td>1 k</td><td>10.3%</td><td>792 k</td><td>done, loss 2.62, 34 min</td>
+          </tr>
+        </tbody>
+      </table>
+      <p className="meta">
+        Headline: <strong>TPU v6e-4 ≈ 10× A100:1</strong> tokens/sec at the
+        same per-device batch — v6e has ~12× the peak FLOPs, with slightly
+        lower MFU. A100:4 bs=128 OOMed without TransformerEngine (the
+        no-TE path materializes the <code>bs × heads × seq × seq</code>
+        attention matrix ≈ 22 GiB/chip on our config).
+      </p>
+
       <h2>Up next</h2>
       <ul>
+        <li><strong>Full train split</strong> — 77 k structures / ~390 GB
+          upload from della in progress ({' '}
+          <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/specs/08-della-seed-train-split.md">
+            spec 08
+          </ExtLink>); parallel tokenize + training-scale run per{' '}
+          <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/specs/07-full-train-scale.md">
+            spec 07
+          </ExtLink>.</li>
         <li><strong>(codec × patch_size × M × N) sweep</strong> — preprocess &amp;
           training grids already defined; 6 of 9 (codec, P) combos fit 8k context.</li>
-        <li><strong>Marin + GCP TPU Research Cluster</strong> — real training
-          run on v5p-8; current Modal A100 setup is the local smoke.</li>
-        <li><strong>Full train split</strong> — smoke uses val-only (4,305
-          structures, ~22 GB on the <code>tomat-rho-gga</code> Modal volume);
-          train split adds 77 k structures / ~390 GB.</li>
+        <li><strong>DVX-track val-full + raw zarrs</strong> (<ExtLink href="https://github.com/Open-Athena/tomat/blob/main/specs/09-dvx-track-val-full.md">spec 09</ExtLink>)
+          — drift-detection manifests after we caught a silent 1-in-80 GCS
+          upload corruption via a ZSTD decompression error.</li>
       </ul>
 
       <h2>Past presentations</h2>
@@ -92,7 +137,14 @@ export function HomePage() {
         <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/specs/04-patch-training.md">04-patch-training</ExtLink>,{' '}
         <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/specs/05-modal-smoke.md">05-modal-smoke</ExtLink>,{' '}
         <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/specs/06-oa-react-slides.md">06-oa-react-slides</ExtLink>,{' '}
+        <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/specs/07-full-train-scale.md">07-full-train-scale</ExtLink>,{' '}
+        <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/specs/08-della-seed-train-split.md">08-della-seed-train-split</ExtLink>,{' '}
+        <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/specs/09-dvx-track-val-full.md">09-dvx-track-val-full</ExtLink>,{' '}
         <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/specs/done/02-fidelity-sweep.md">02-fidelity-sweep (done)</ExtLink>.
+        {' '}Datasets reference:{' '}
+        <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/docs/datasets.md">
+          <code>docs/datasets.md</code>
+        </ExtLink>.
       </div>
     </>
   )
