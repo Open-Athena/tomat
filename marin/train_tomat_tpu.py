@@ -39,29 +39,33 @@ from levanter.tracker.wandb import WandbConfig
 from levanter.trainer import TrainerConfig
 
 BUCKET = "gs://marin-eu-west4/tomat"
-PARQUET_GLOB = f"{BUCKET}/tokenized/val-full/worker-*/*.parquet"
 
 
 def main():
+    # Data label selects which pre-tokenized parquet set on GCS to train on.
+    # Defaults to `val-full` (137k seqs); override via TOMAT_LABEL for larger
+    # sets like `val-full-m128` (550k seqs, same materials with 128 patches each).
+    label = os.environ.get("TOMAT_LABEL", "val-full")
     steps = int(os.environ.get("TOMAT_STEPS", "1000"))
-    batch_size = int(os.environ.get("TOMAT_BATCH_SIZE", "128"))  # v6e-4 = 4 chips; per-chip bs=32
+    batch_size = int(os.environ.get("TOMAT_BATCH_SIZE", "128"))
     seed = int(os.environ.get("TOMAT_SEED", "42"))
+    # `results_label` disambiguates W&B runs when we sweep compute/data without
+    # changing the core config (e.g. v6e-4 vs v6e-16).
+    results_label_env = os.environ.get("TOMAT_RESULTS_LABEL")
 
-    # Vocab size is tomat-specific (6,792 for two_token_9_12 + P=14 + HI-block).
-    # One of the workers has the meta.json with this; read from GCS to avoid
-    # hardcoding (and surface mismatches early).
-    meta_url = f"{BUCKET}/tokenized/val-full/worker-00/meta.json"
+    parquet_glob = f"{BUCKET}/tokenized/{label}/worker-*/*.parquet"
+    meta_url = f"{BUCKET}/tokenized/{label}/worker-00/meta.json"
     import fsspec
     with fsspec.open(meta_url, "r") as f:
         meta = json.load(f)
     vocab_size = meta["vocab"]["total_size"]
-    print(f"[tomat-tpu] vocab_size={vocab_size}, patch={meta['patch_size']}, "
-          f"codec={meta['density_codec_name']}")
+    print(f"[tomat-tpu] label={label}, vocab_size={vocab_size}, "
+          f"patch={meta['patch_size']}, codec={meta['density_codec_name']}")
 
-    results_label = f"val-full-tpu-bs{batch_size}-seed{seed}"
+    results_label = results_label_env or f"{label}-tpu-bs{batch_size}-seed{seed}"
     run_id = results_label
 
-    source = UrlDatasetSourceConfig(train_urls=[PARQUET_GLOB])
+    source = UrlDatasetSourceConfig(train_urls=[parquet_glob])
     prebuilt = PrebuiltLmDatasetFormat(input_ids_key="input_ids")
     component = DatasetComponent(
         source=source,
