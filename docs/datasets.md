@@ -26,7 +26,7 @@ Each Zarr: float32, zstd-compressed, shape varies from ~40³ to ~448³ voxels
 | volume | created | contents | size |
 |---|---|---|---:|
 | `tomat-rho-gga` | 2026-04-20 | val-split raw Zarrs (4,305 `mp-*.zarr`) + tokenized parquet dirs | ~22 GB raw + ~100 MB parquet |
-| `tomat-rho-gga-train` | 2026-04-22 | **populating**: train-split raw Zarrs (~77 k `mp-*.zarr`) from della | target ~370 GB |
+| `tomat-rho-gga-train` | 2026-04-22 | train-split raw Zarrs (77,498 `mp-*.zarr`) + `tokenized/` output from spec 07 parallel tokenize | ~370 GB |
 
 Spec references: [03-modal-seed](../specs/done/03-modal-seed.md) for the val
 volume; [08-della-seed-train-split](../specs/08-della-seed-train-split.md)

@@ -24,7 +24,8 @@ import modal
 
 err = partial(print, file=sys.stderr)
 
-VOLUME_NAME = "tomat-rho-gga"
+import os
+VOLUME_NAME = os.environ.get("TOMAT_VOLUME", "tomat-rho-gga")
 MOUNT = "/vol"
 LABEL = "val-full"
 
