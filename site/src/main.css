@@ -291,6 +291,19 @@ body.in-deck #root { max-width: none; padding: 0; margin: 0; }
 .runs-table th { background: var(--card-bg); font-weight: 600; }
 .runs-table td:nth-child(n+3):nth-child(-n+6) { text-align: right; }
 
+.tokens-example {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.75rem 1rem;
+  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  white-space: pre;
+  margin: 0.5rem 0;
+}
+
 .deck-slide-footer {
   display: flex;
   justify-content: space-between;

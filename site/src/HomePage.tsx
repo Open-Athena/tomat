@@ -45,6 +45,29 @@ export function HomePage() {
         is 6,792 tokens total (18 specials + 118 atomic Z + 1,024 ints +
         1,024 position-codec + 4,608 density-codec).
       </p>
+      <p>
+        Real row from <code>train-full</code> (Y₃Si₃Ag₃, grid 64×108×108,
+        P=14 patch at offset (5, 9, 44)):
+      </p>
+      <pre className="tokens-example">{`[BOS]
+[GRID_START]   64 108 108                             [GRID_END]
+[ATOMS_START]  Y Y Y Si Si Si Ag Ag Ag                [ATOMS_END]
+[POS_START]    (p236 p699 p1003  p240 p767 p1005  p0 p512 p768)  …  (+7 more atoms)  [POS_END]
+[SHAPE_START]  14 14 14                               [SHAPE_END]
+[OFFSET_START] 5 9 44                                 [OFFSET_END]
+[HI_START]     18 22 57                               [HI_END]
+[DENS_START]   d172 d909  d169 d4175  d168 d525  …  d158 d2204    # 5,488 density tokens = 2 × 14³
+[DENS_END]
+[EOS]
+[PAD] × 2,586                                         # right-padded to 8,192`}</pre>
+      <p className="note">
+        Atom Zs render as element symbols (<code>Y</code>, <code>Si</code>,
+        <code>Ag</code>). Position codec = 3 tokens/coord × 3 coords → 9 tokens/atom.
+        Density codec emits 2 tokens per voxel. Helper at{' '}
+        <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/scripts/show_tokens.py">
+          <code>scripts/show_tokens.py</code>
+        </ExtLink>{' '}renders any parquet row in this form.
+      </p>
 
       <h2>Smoke training (30 M Qwen3, Modal A100)</h2>
       <div className="plot-card">
@@ -63,14 +86,25 @@ export function HomePage() {
 
       <h2>Scale training runs (2026-04-22 / 23)</h2>
       <p>
-        Same 30 M Qwen3 across these runs, seed 42, 8k context. First 5 rows
-        are on <code>val-full</code> (4,305 mats × 32 patches = 137,696 sequences,
-        ~1.1 B tokens); last row is the first run on the new{' '}
-        <code>train-full</code> (77,498 mats × 32 patches = 2.48 M sequences,
-        ~20 B tokens, 18× more). Runs live in the{' '}
+        Seed 42, 8k context, patch P=14. First 5 rows on <code>val-full</code>
+        {' '}(4,305 mats × 32 patches = 137,696 sequences, ~1.1 B tokens) with
+        30 M Qwen3. Later rows on <code>train-full</code> (77,498 mats ×
+        32 patches = 2.48 M sequences, ~20 B tokens, 18× more) — the last of
+        which swaps in a <strong>208 M Qwen3</strong> (hidden=1024, 12 layers,
+        16 heads, bf16 compute + val). Click a legend entry to solo-highlight
+        that trace; click again or outside the legend to unpin. Runs live in
+        the{' '}
         <ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14">
           <code>tomat-two_token_9_12-P14</code>
         </ExtLink>{' '}W&amp;B project.
+      </p>
+      <p className="note">
+        Note on dataset naming: despite the <code>val-full</code> label, we
+        use it as compute-scaling <em>training</em> data — it's MP's <em>validation</em>
+        {' '}split (~4 k mats); it was seeded to Modal first and smaller, so it was
+        the natural early target. <code>train-full</code> (~77 k mats) is the
+        proper train split. "4 k mats" and "77 k mats" are the semantic
+        descriptions if the val/train labels get confusing.
       </p>
       <div className="plot-card">
         <ScalingLossPlot baseUrl={`${base}/run-histories`} />

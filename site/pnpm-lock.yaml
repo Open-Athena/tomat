@@ -18,8 +18,8 @@ importers:
         specifier: ^2.35.2
         version: 2.35.3
       pltly:
-        specifier: https://gitlab.com/runsascoded/js/pltly/-/archive/6915b0559b81e35f21ad12f3c5f662faca4682d4/pltly-6915b0559b81e35f21ad12f3c5f662faca4682d4.tar.gz
-        version: https://gitlab.com/runsascoded/js/pltly/-/archive/6915b0559b81e35f21ad12f3c5f662faca4682d4/pltly-6915b0559b81e35f21ad12f3c5f662faca4682d4.tar.gz(plotly.js@2.35.3(mapbox-gl@1.13.3)(webpack@5.106.2))(react-plotly.js@2.6.0(plotly.js@2.35.3(mapbox-gl@1.13.3)(webpack@5.106.2))(react@19.2.5))(react@19.2.5)
+        specifier: https://gitlab.com/runsascoded/js/pltly/-/archive/9c64c11de2aa3656c308dfdad56eafbc5c2fb32e/pltly-9c64c11de2aa3656c308dfdad56eafbc5c2fb32e.tar.gz
+        version: https://gitlab.com/runsascoded/js/pltly/-/archive/9c64c11de2aa3656c308dfdad56eafbc5c2fb32e/pltly-9c64c11de2aa3656c308dfdad56eafbc5c2fb32e.tar.gz(plotly.js@2.35.3(mapbox-gl@1.13.3)(webpack@5.106.2))(react-plotly.js@2.6.0(plotly.js@2.35.3(mapbox-gl@1.13.3)(webpack@5.106.2))(react@19.2.5))(react@19.2.5)
       react:
         specifier: ^19.0.0
         version: 19.2.5
@@ -1687,9 +1687,9 @@ packages:
   plotly.js@2.35.3:
     resolution: {integrity: sha512-7RaC6FxmCUhpD6H4MpD+QLUu3hCn76I11rotRefrh3m1iDvWqGnVqVk9dSaKmRAhFD3vsNsYea0OxnR1rc2IzQ==}
 
-  pltly@https://gitlab.com/runsascoded/js/pltly/-/archive/6915b0559b81e35f21ad12f3c5f662faca4682d4/pltly-6915b0559b81e35f21ad12f3c5f662faca4682d4.tar.gz:
-    resolution: {tarball: https://gitlab.com/runsascoded/js/pltly/-/archive/6915b0559b81e35f21ad12f3c5f662faca4682d4/pltly-6915b0559b81e35f21ad12f3c5f662faca4682d4.tar.gz}
-    version: 0.1.0-dist.32807ca
+  pltly@https://gitlab.com/runsascoded/js/pltly/-/archive/9c64c11de2aa3656c308dfdad56eafbc5c2fb32e/pltly-9c64c11de2aa3656c308dfdad56eafbc5c2fb32e.tar.gz:
+    resolution: {tarball: https://gitlab.com/runsascoded/js/pltly/-/archive/9c64c11de2aa3656c308dfdad56eafbc5c2fb32e/pltly-9c64c11de2aa3656c308dfdad56eafbc5c2fb32e.tar.gz}
+    version: 0.1.0-dist.ee4dd04
     peerDependencies:
       plotly.js: '>=2'
       react: '>=17'
@@ -3878,7 +3878,7 @@ snapshots:
       - supports-color
       - webpack
 
-  pltly@https://gitlab.com/runsascoded/js/pltly/-/archive/6915b0559b81e35f21ad12f3c5f662faca4682d4/pltly-6915b0559b81e35f21ad12f3c5f662faca4682d4.tar.gz(plotly.js@2.35.3(mapbox-gl@1.13.3)(webpack@5.106.2))(react-plotly.js@2.6.0(plotly.js@2.35.3(mapbox-gl@1.13.3)(webpack@5.106.2))(react@19.2.5))(react@19.2.5):
+  pltly@https://gitlab.com/runsascoded/js/pltly/-/archive/9c64c11de2aa3656c308dfdad56eafbc5c2fb32e/pltly-9c64c11de2aa3656c308dfdad56eafbc5c2fb32e.tar.gz(plotly.js@2.35.3(mapbox-gl@1.13.3)(webpack@5.106.2))(react-plotly.js@2.6.0(plotly.js@2.35.3(mapbox-gl@1.13.3)(webpack@5.106.2))(react@19.2.5))(react@19.2.5):
     dependencies:
       plotly.js: 2.35.3(mapbox-gl@1.13.3)(webpack@5.106.2)
       react: 19.2.5

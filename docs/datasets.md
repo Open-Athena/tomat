@@ -36,6 +36,35 @@ for the train volume.
 
 All: codec `two_token_9_12`, patch_size P=14, pad_to 8192, seed 42.
 
+### Example training sequence
+
+A real row from `train-full` (Y₃Si₃Ag₃, grid 64 × 108 × 108, P=14 patch at offset (5, 9, 44)):
+
+```
+[BOS]
+[GRID_START]  64 108 108                      [GRID_END]
+[ATOMS_START] Y Y Y Si Si Si Ag Ag Ag         [ATOMS_END]
+[POS_START]   (p236 p699 p1003 p240 p767 p1005 p0 p512 p768)  …  (+7 more atoms)  [POS_END]
+[SHAPE_START] 14 14 14                        [SHAPE_END]
+[OFFSET_START] 5 9 44                         [OFFSET_END]
+[HI_START]    18 22 57                        [HI_END]
+[DENS_START]  d172 d909 d169 d4175 …  d158 d2204    # 5,488 density tokens = 2 × 14³
+[DENS_END]
+[EOS]
+[PAD] × 2,586                                 # right-padded to 8,192
+```
+
+- Atom Zs render as element symbols (`Y`, `Si`, `Ag`).
+- Position tokens are a 3-byte fixed-point codec (512 + 256 + 256 vocabs); one
+  coord → 3 tokens; one atom (3 coords) → 9 tokens → `(p… p… p…   p… p… p…   p… p… p…)`.
+- Density tokens are a 2-token 9/12-bit codec → `2 × P³` per patch (5,488 at P=14).
+- Preamble (BOS + grid + atoms + positions + shape + offset + hi + DENS_START)
+  is ~30 + 10·n_atoms tokens; padded tail absorbs the rest. For a 100-atom
+  structure the preamble is ~1,030 tokens, leaving ~1,670 of pad.
+
+The helper script [`scripts/show_tokens.py`](../scripts/show_tokens.py)
+renders any parquet row into this layout.
+
 ### A note on "tokens (pad)"
 
 Each parquet row is one training sequence, right-padded to `pad_to=8192`

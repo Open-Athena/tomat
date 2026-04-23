@@ -1,0 +1,17 @@
+[BOS]
+[GRID_START]  64 108 108
+[GRID_END]
+[ATOMS_START]  Y Y Y Si Si Si Ag Ag Ag
+[ATOMS_END]
+[POS_START]    (p236 p699 p1003 p240 p767 p1005 p0 p512 p768)  (p236 p699 p1003 p231 p689 p869 p231 p689 p869)  …  (+7 more atoms)
+[POS_END]
+[SHAPE_START]  14 14 14
+[SHAPE_END]
+[OFFSET_START]  5 9 44
+[OFFSET_END]
+[HI_START]  18 22 57
+[HI_END]
+[DENS_START]   d172 d909 d169 d4175 d168 d525  …  d157 d3047 d158 d601 d158 d2204  # 5,488 density tokens (= 2 × 14³)
+[DENS_END]
+[EOS]
+[PAD] × 2586   # right-padded to 8192
