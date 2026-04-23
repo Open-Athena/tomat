@@ -102,6 +102,31 @@ def train_smoke(
     return _train_smoke_impl(steps, batch_size, seed, label, results_label)
 
 
+@app.function(gpu="A100:2", volumes={MOUNT: volume}, secrets=[wandb_secret], timeout=28800)
+def train_smoke_2gpu(
+    steps: int,
+    batch_size: int,
+    seed: int,
+    label: str,
+    results_label: str,
+) -> dict:
+    """A100:2 — same body as train_smoke_4gpu. Use bs=32 (per-device bs=16)
+    to stay under the attention-matrix OOM threshold without TE."""
+    return _train_smoke_impl(steps, batch_size, seed, label, results_label)
+
+
+@app.function(gpu="A100:8", volumes={MOUNT: volume}, secrets=[wandb_secret], timeout=28800)
+def train_smoke_8gpu(
+    steps: int,
+    batch_size: int,
+    seed: int,
+    label: str,
+    results_label: str,
+) -> dict:
+    """A100:8 — same body as train_smoke_4gpu. Use bs=128 (per-device bs=16)."""
+    return _train_smoke_impl(steps, batch_size, seed, label, results_label)
+
+
 @app.function(gpu="A100:4", volumes={MOUNT: volume}, secrets=[wandb_secret], timeout=28800)
 def train_smoke_4gpu(
     steps: int,
@@ -356,6 +381,46 @@ def main_4gpu(
     err(f"[modal] A100:4 smoke train: {steps} steps, nominal batch={batch_size} "
         f"(per-device {batch_size // 4}), seed={seed}")
     result = train_smoke_4gpu.remote(
+        steps=steps,
+        batch_size=batch_size,
+        seed=seed,
+        label=label,
+        results_label=results_label,
+    )
+    err(f"[modal] done: results at {result['results_dir']} on volume {VOLUME_NAME}")
+
+
+@app.local_entrypoint()
+def main_2gpu(
+    steps: int = 5000,
+    batch_size: int = 32,  # per-device bs=16 to stay OOM-safe without TE
+    seed: int = 42,
+    label: str = "val-full",
+    results_label: str = "val-full-5k-bs32-2gpu",
+) -> None:
+    err(f"[modal] A100:2 train: {steps} steps, nominal batch={batch_size} "
+        f"(per-device {batch_size // 2}), seed={seed}")
+    result = train_smoke_2gpu.remote(
+        steps=steps,
+        batch_size=batch_size,
+        seed=seed,
+        label=label,
+        results_label=results_label,
+    )
+    err(f"[modal] done: results at {result['results_dir']} on volume {VOLUME_NAME}")
+
+
+@app.local_entrypoint()
+def main_8gpu(
+    steps: int = 5000,
+    batch_size: int = 128,  # per-device bs=16
+    seed: int = 42,
+    label: str = "val-full",
+    results_label: str = "val-full-5k-bs128-8gpu",
+) -> None:
+    err(f"[modal] A100:8 train: {steps} steps, nominal batch={batch_size} "
+        f"(per-device {batch_size // 8}), seed={seed}")
+    result = train_smoke_8gpu.remote(
         steps=steps,
         batch_size=batch_size,
         seed=seed,
