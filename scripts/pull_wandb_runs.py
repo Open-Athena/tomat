@@ -82,6 +82,8 @@ def main(entity: str, project: str, out_dir: Path, run_ids: tuple[str, ...]) -> 
             "mean_mfu": summary_metrics.get("throughput/mean_mfu"),
             "final_tok_s": summary_metrics.get("throughput/tokens_per_second"),
             "parameter_count": summary_metrics.get("parameter_count"),
+            "total_gflops": summary_metrics.get("throughput/total_gflops"),
+            "total_tokens": summary_metrics.get("throughput/total_tokens"),
             "state": run.state,
         })
 

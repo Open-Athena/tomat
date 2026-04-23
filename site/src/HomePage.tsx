@@ -77,40 +77,40 @@ export function HomePage() {
       </div>
       <table className="runs-table">
         <thead>
-          <tr><th>run</th><th>data</th><th>compute</th><th>bs (per-dev)</th><th>steps</th><th>MFU</th><th>tok/s</th><th>final loss</th></tr>
+          <tr><th>run</th><th>model</th><th>data</th><th>compute</th><th>bs (per-dev)</th><th>steps</th><th>tokens</th><th>FLOPs</th><th>MFU</th><th>tok/s</th><th>final loss</th></tr>
         </thead>
         <tbody>
           <tr>
-            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-bs32-seed42">bs=32, A100:1</ExtLink></td>
-            <td>val-full</td><td>Modal A100:1</td><td>32 (32)</td><td>2,560 / 5 k</td><td>12.4%</td><td>80 k</td><td>2.235 (OOM)</td>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-bs32-seed42">A100:1 bs=32</ExtLink></td>
+            <td>30M</td><td>val-full</td><td>Modal A100:1</td><td>32 (32)</td><td>2,560/5k (OOM)</td><td>0.67 B</td><td>0.32×10¹⁸</td><td>12.4%</td><td>80 k</td><td>2.235</td>
           </tr>
           <tr>
-            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-2gpu-bs32-seed42">bs=32, A100:2</ExtLink></td>
-            <td>val-full</td><td>Modal A100:2</td><td>32 (16)</td><td>5 k</td><td>12.0%</td><td>157 k</td><td>1.962</td>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-2gpu-bs32-seed42">A100:2 bs=32</ExtLink></td>
+            <td>30M</td><td>val-full</td><td>Modal A100:2</td><td>32 (16)</td><td>5 k</td><td>1.31 B</td><td>0.62×10¹⁸</td><td>12.0%</td><td>157 k</td><td><strong>1.962</strong></td>
           </tr>
           <tr>
-            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs64-4gpu-bs64-seed42">bs=64, A100:4</ExtLink></td>
-            <td>val-full</td><td>Modal A100:4</td><td>64 (16)</td><td>5 k</td><td>11.96%</td><td>313 k</td><td>1.975</td>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs64-4gpu-bs64-seed42">A100:4 bs=64</ExtLink></td>
+            <td>30M</td><td>val-full</td><td>Modal A100:4</td><td>64 (16)</td><td>5 k</td><td>2.62 B</td><td>1.25×10¹⁸</td><td>11.96%</td><td>313 k</td><td>1.975</td>
           </tr>
           <tr>
-            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs128-8gpu-bs128-seed42">bs=128, A100:8</ExtLink></td>
-            <td>val-full</td><td>Modal A100:8</td><td>128 (16)</td><td>5 k</td><td>11.86%</td><td>624 k</td><td>2.022</td>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs128-8gpu-bs128-seed42">A100:8 bs=128</ExtLink></td>
+            <td>30M</td><td>val-full</td><td>Modal A100:8</td><td>128 (16)</td><td>5 k</td><td>5.24 B</td><td>2.49×10¹⁸</td><td>11.86%</td><td>624 k</td><td>2.022</td>
           </tr>
           <tr>
-            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-tpu-bs128-seed42">bs=128, TPU v6e-4</ExtLink></td>
-            <td>val-full</td><td>Marin TPU v6e-4</td><td>128 (32)</td><td>1 k</td><td>10.25%</td><td>792 k</td><td>2.620</td>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-tpu-bs128-seed42">TPU v6e-4 bs=128</ExtLink></td>
+            <td>30M</td><td>val-full</td><td>Marin TPU v6e-4</td><td>128 (32)</td><td>1 k</td><td>1.05 B</td><td>0.50×10¹⁸</td><td>10.25%</td><td>792 k</td><td>2.620</td>
           </tr>
           <tr>
-            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-bs256-seed42"><strong>30M bs=256, TPU v6e-8</strong></ExtLink></td>
-            <td><strong>train-full</strong></td><td>Marin TPU v6e-8</td><td>256 (32)</td><td>2 k</td><td>8.38%</td><td>1,297 k</td><td><strong>2.214</strong></td>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-bs256-seed42"><strong>TPU v6e-8 bs=256</strong></ExtLink></td>
+            <td>30M</td><td><strong>train-full</strong></td><td>Marin TPU v6e-8</td><td>256 (32)</td><td>2 k</td><td><strong>4.19 B</strong></td><td><strong>2.00×10¹⁸</strong></td><td>8.38%</td><td>1,297 k</td><td><strong>2.214</strong></td>
           </tr>
           <tr>
-            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu16-30M-bs512-seed42"><strong>30M bs=512, TPU v6e-16</strong> (multihost)</ExtLink></td>
-            <td>train-full</td><td>Marin TPU v6e-16 (4 hosts)</td><td>512 (32)</td><td>2 k (running)</td><td>—</td><td><strong>2,042 k</strong></td><td>—</td>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu16-30M-bs512-seed42"><strong>TPU v6e-16 bs=512</strong> (multihost)</ExtLink></td>
+            <td>30M</td><td>train-full</td><td>Marin TPU v6e-16 (4 hosts)</td><td>512 (32)</td><td>in flight</td><td>—</td><td>—</td><td>—</td><td><strong>2,042 k</strong></td><td>—</td>
           </tr>
           <tr>
-            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-200M-bs128-val-bf16-seed42"><strong>200M bs=128, TPU v6e-8</strong> (+ val, bf16)</ExtLink></td>
-            <td>train-full</td><td>Marin TPU v6e-8</td><td>128 (16)</td><td>2 k (running)</td><td>—</td><td>294 k</td><td>—</td>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-200M-bs128-val-bf16-seed42"><strong>TPU v6e-8 bs=128</strong> (+ val, bf16)</ExtLink></td>
+            <td><strong>208M</strong></td><td>train-full</td><td>Marin TPU v6e-8</td><td>128 (16)</td><td>in flight</td><td>—</td><td>—</td><td>—</td><td>294 k</td><td>—</td>
           </tr>
         </tbody>
       </table>

@@ -97,16 +97,16 @@ Within a project, **groups** split runs by the training-side sampling axes
 Qwen3-30M (hidden=512, 6 layers, 4 heads, seq=8192), seed 42. Project:
 [`tomat-two_token_9_12-P14`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14).
 
-| run | model | data | compute | batch | per-dev | steps | MFU | tok/s | final loss |
-|---|---|---|---|---:|---:|---:|---:|---:|---:|
-| [`val-full-5k-bs32-bs32-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-bs32-seed42) | 30M | val-full | Modal A100:1 | 32 | 32 | 2,560 (OOM) | 12.4% | 80 k | 2.235 |
-| [`val-full-5k-bs32-2gpu-bs32-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-2gpu-bs32-seed42) | 30M | val-full | Modal A100:2 | 32 | 16 | 5,000 | 12.0% | 157 k | **1.962** |
-| [`val-full-5k-bs64-4gpu-bs64-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs64-4gpu-bs64-seed42) | 30M | val-full | Modal A100:4 | 64 | 16 | 5,000 | 11.96% | 313 k | 1.975 |
-| [`val-full-5k-bs128-8gpu-bs128-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs128-8gpu-bs128-seed42) | 30M | val-full | Modal A100:8 | 128 | 16 | 5,000 | 11.86% | 624 k | 2.022 |
-| [`val-full-tpu-bs128-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-tpu-bs128-seed42) | 30M | val-full | Marin TPU v6e-4 | 128 | 32 | 1,000 | 10.25% | 792 k | 2.620 |
-| [`train-full-tpu8-bs256-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-bs256-seed42) | 30M | **train-full** | Marin TPU v6e-8 | 256 | 32 | 2,000 | 8.38% | 1,297 k | **2.214** |
-| [`train-full-tpu16-30M-bs512-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu16-30M-bs512-seed42) | 30M | train-full | Marin TPU v6e-16 (multihost, 4 VMs) | 512 | 32 | in flight | — | **2,042 k** | — |
-| [`train-full-tpu8-200M-bs128-val-bf16-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-200M-bs128-val-bf16-seed42) | **208M** | train-full | Marin TPU v6e-8 + bf16 | 128 | 16 | in flight | — | 294 k | — |
+| run | model | data | compute | batch | per-dev | steps | tokens | total FLOPs | MFU | tok/s | final loss |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| [`val-full-5k-bs32-bs32-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-bs32-seed42) | 30M | val-full | Modal A100:1 | 32 | 32 | 2,560 (OOM) | 0.67 B | 0.32 × 10¹⁸ | 12.4% | 80 k | 2.235 |
+| [`val-full-5k-bs32-2gpu-bs32-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-2gpu-bs32-seed42) | 30M | val-full | Modal A100:2 | 32 | 16 | 5,000 | 1.31 B | 0.62 × 10¹⁸ | 12.0% | 157 k | **1.962** |
+| [`val-full-5k-bs64-4gpu-bs64-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs64-4gpu-bs64-seed42) | 30M | val-full | Modal A100:4 | 64 | 16 | 5,000 | 2.62 B | 1.25 × 10¹⁸ | 11.96% | 313 k | 1.975 |
+| [`val-full-5k-bs128-8gpu-bs128-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs128-8gpu-bs128-seed42) | 30M | val-full | Modal A100:8 | 128 | 16 | 5,000 | 5.24 B | 2.49 × 10¹⁸ | 11.86% | 624 k | 2.022 |
+| [`val-full-tpu-bs128-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-tpu-bs128-seed42) | 30M | val-full | Marin TPU v6e-4 | 128 | 32 | 1,000 | 1.05 B | 0.50 × 10¹⁸ | 10.25% | 792 k | 2.620 |
+| [`train-full-tpu8-bs256-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-bs256-seed42) | 30M | **train-full** | Marin TPU v6e-8 | 256 | 32 | 2,000 | **4.19 B** | **2.00 × 10¹⁸** | 8.38% | 1,297 k | **2.214** |
+| [`train-full-tpu16-30M-bs512-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu16-30M-bs512-seed42) | 30M | train-full | Marin TPU v6e-16 (multihost, 4 VMs) | 512 | 32 | in flight | — | — | — | **2,042 k** | — |
+| [`train-full-tpu8-200M-bs128-val-bf16-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-200M-bs128-val-bf16-seed42) | **208M** | train-full | Marin TPU v6e-8 + bf16 | 128 | 16 | in flight | — | — | — | 294 k | — |
 
 Headlines:
 - **A100 scaling is linear**: 157 k → 313 k → 624 k tok/s at per-dev bs=16,
