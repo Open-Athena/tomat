@@ -167,7 +167,7 @@ export function HomePage() {
           </tr>
           <tr>
             <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-200M-bs128-val-bf16-seed42"><strong>TPU v6e-8 bs=128</strong> (+ val, bf16)</ExtLink></td>
-            <td><strong>208M</strong></td><td>train-full</td><td>Marin TPU v6e-8</td><td>128 (16)</td><td>1,147 / 2 k</td><td>1.20 B</td><td>2.98</td><td>9.9%</td><td>294 k</td><td>2.261 (live)</td>
+            <td><strong>208M</strong></td><td>train-full</td><td>Marin TPU v6e-8</td><td>128 (16)</td><td>2 k</td><td>2.10 B</td><td><strong>5.18</strong></td><td>9.88%</td><td>294 k</td><td><strong>2.060</strong></td>
           </tr>
         </tbody>
       </table>
@@ -187,13 +187,14 @@ export function HomePage() {
         through 30 M is <strong>~7× past Chinchilla-optimal</strong>.
       </p>
       <p className="meta">
-        <strong>Larger model.</strong> Parallel run with a 200 M Qwen3
-        (hidden=1024, 12 layers, 16 heads, tied embeddings) on the same
-        train-full — right in Chinchilla's zone for 4 B tokens and
-        exercising the TPU's native bf16 compute properly. First real
-        validation split (256 held-out sequences) is wired in on this
-        run too, so we'll have a generalization number alongside train
-        loss for the first time.
+        <strong>Larger model.</strong> Same train-full but with a 208 M Qwen3
+        (hidden=1024, 12 layers, 16 heads, tied embeddings, bf16 compute) and
+        a real val split (256 held-out sequences) wired in for the first
+        time. Finished at <strong>loss 2.060 on 2.1 B tokens</strong> —{' '}
+        0.15 nats below the 30 M baseline at roughly half the tokens.
+        7× fewer params than Chinchilla-optimal for 2 B tokens, so there's
+        still plenty of data-efficiency headroom at this scale. Next step is
+        another ≈2× parameter jump and more tokens.
       </p>
 
       <h2>Up next</h2>

@@ -93,7 +93,7 @@ runs on the full train split. Project
 | [TPU v6e-4 bs=128](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-tpu-bs128-seed42) | 30M | val-full | Marin TPU v6e-4 | 128 (32) | 1,000 | 1.05 B | 0.50 | 10.25% | 792 k | 2.620 |
 | [**TPU v6e-8 bs=256**](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-bs256-seed42) | 30M | **train-full** | Marin TPU v6e-8 | 256 (32) | 2,000 | **4.19 B** | **2.00** | 8.38% | 1,297 k | **2.214** |
 | [**TPU v6e-16 bs=512** (multihost)](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu16-30M-bs512-seed42) | 30M | train-full | Marin TPU v6e-16 (4 VMs) | 512 (32) | 2,000 | **8.39 B** | **4.00** | 6.6% | **1,983 k** | **2.212** |
-| [**TPU v6e-8 bs=128** (+ val, bf16)](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-200M-bs128-val-bf16-seed42) | **208M** | train-full | Marin TPU v6e-8 | 128 (16) | in flight | — | — | — | 294 k | — |
+| [**TPU v6e-8 bs=128** (+ val, bf16)](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-200M-bs128-val-bf16-seed42) | **208M** | train-full | Marin TPU v6e-8 | 128 (16) | 2,000 | 2.10 B | **5.18** | 9.88% | 294 k | **2.060** |
 
 Headlines:
 
@@ -109,9 +109,11 @@ Headlines:
   `jax.distributed.initialize()` at script entry because Levanter's
   `WandbConfig.init` calls a multihost broadcast before the trainer's
   own distributed setup fires.
-- **208M Qwen3** (hidden=1024, 12 layers, 16 heads) now running on the
-  same train-full — right in Chinchilla's zone for 4 B tokens, bf16
-  compute, first real validation split wired in.
+- **208M Qwen3** (hidden=1024, 12 layers, 16 heads, bf16, with real
+  val split) on the same train-full finished at **loss 2.060 on 2.1 B
+  tokens** — 0.15 nats below the 30 M baseline at roughly half the
+  tokens. Still ~7× param-bound for 2 B tokens, so the next axis is
+  another parameter jump + more tokens.
 
 ## Running
 
@@ -185,12 +187,11 @@ specs/
 
 ## Follow-ups
 
-- Finish the 208M run, confirm final loss < 30M baseline.
+- Scale model further (600M–1B) now that 208M cleared the 30M baseline.
 - DVX-track raw Zarrs + parquet manifests (spec 09, della-side).
 - TransformerEngine on Modal A100:4 for the bs=128 apples-to-apples
   GPU point (currently limited to per-device bs=16 due to attention
   OOM; spec / post-meeting).
-- Scale model further (600M-1B) once 208M results land.
 
 ## Earlier work
 
