@@ -140,15 +140,63 @@ once the volume is live.)
 
 ## Done criteria
 
-- [ ] `modal volume list` shows `tomat-rho-gga-train` (V2).
-- [ ] `modal volume ls tomat-rho-gga-train /label | wc -l` ≈ 77,498
-      (a few hundred missing is fine — flag the count).
-- [ ] Spec moved to `specs/done/08-della-seed-train-split.md` after
-      the verification read succeeds + laptop session's tokenize kicks off.
+- [x] `modal volume list` shows `tomat-rho-gga-train` (V2).
+- [x] `modal volume ls tomat-rho-gga-train /label | wc -l` ≈ 77,498 — exact
+      match, 0 missing.
+- [x] Spec moved to `specs/done/08-della-seed-train-split.md` after the
+      verification read succeeded. (Laptop-session tokenize kicks off
+      independently once it picks up this commit.)
 
-## Outcome (fill in when done)
+## Outcome
 
-- `tomat-rho-gga-train` created at `YYYY-MM-DD HH:MM TZ`.
-- Train task IDs: ___; hard-link stage size ~___ GB; missing count ___.
-- Upload wall time: ___.
-- Verification: read `mp-____.zarr` shape ___, n_sites ___.
+- `tomat-rho-gga-train` created 2026-04-22 20:15 EDT on della9.
+- Train task IDs: **77,498** (matches spec). Hard-link stage size **383 GB**
+  (all hardlinks into `globus_share_OA/mp/chg_datasets/rho_gga/label/` —
+  originals untouched). Missing count: **0**.
+- Upload wall time: **~45 min** (sequential chunked; see below).
+  Full pipeline on della9 (login node) between 20:15 and 22:08 EDT.
+- Verification: `mp-2282417.zarr` shape `(64, 108, 108)` float32, 9 sites
+  (Ag, Si, Y), ρ range `[-34.16, 1413]`. Read through Modal-mount via
+  `scripts/verify_modal_volume.py` with `TOMAT_VOL=tomat-rho-gga-train`.
+
+### What actually happened (vs plan)
+
+Plan called for a single `modal volume put` of `$STAGE/label`. Two snags:
+
+1. **Login-node CPU arbiter kills single big `put`.** A whole-stage put
+   spent 9:49 user + 5:51 sys CPU on local scan/hash before any bytes hit
+   the wire; della login-node arbiter killed it ~21 min in (sustained
+   >50%-of-a-core over its rolling window). Modal volume was still empty.
+2. **Compute nodes can't reach `api.modal.com` by default.** Blind sbatch
+   to `cpu` partition on `della-h14n2` hit `Could not connect to the Modal
+   server` (no DNS). Follow-up probe confirmed compute nodes have no direct
+   egress. But `module load proxy/default` in sbatch sets
+   `{http,https}_proxy=http://della-proxy:8080` and **api.modal.com IS on
+   the allowlist** (huggingface.co yes, pypi.org + github.com no). Future
+   parallel Modal uploads can run on compute nodes via this proxy.
+
+**Workaround used here**: kept it on the login node but split the stage
+into 78 × 1000-zarr chunks (via `mv` within the same fs — near-free rename,
+not new hardlinks) and put them sequentially. Each chunk:
+
+- ~30-60 s wall clock, ~15 s user CPU — well under arbiter's rolling budget.
+- V2 put of `chunks/chunk-NNN` → `/label` merges contents directly (no
+  trailing-slash nesting bug that V1 had; confirmed with canary).
+
+Artifacts left behind:
+
+- `scripts/verify_modal_volume.py` now takes volume via `TOMAT_VOL` env var
+  (Modal resolves `Volume.from_name` at module load, so CLI flag isn't
+  viable).
+- `tmp/split_chunks.py`, `tmp/chunked_upload.sh` — one-shot; not committed.
+- Staging dir cleaned up post-verify (hardlinks, so no source data touched).
+
+## Follow-up
+
+- **Next time, load `proxy/default` on compute nodes** to parallelize
+  Modal uploads. N parallel puts on a single compute node (or across
+  several via sbatch array) should cut wall-clock from ~45 min to <10 min
+  for 400 GB. Spec 03's follow-up to "use V2 for future volumes" already
+  held here; add "and use the proxy module for parallel puts".
+- If a future spec needs `pypi.org` or `github.com` through the proxy, file
+  an RC ticket to extend the allowlist.

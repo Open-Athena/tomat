@@ -3,13 +3,17 @@
 # requires-python = ">=3.11,<3.13"
 # dependencies = ["modal"]
 # ///
-"""Verify the seeded `tomat-rho-gga` Modal volume.
+"""Verify a seeded `tomat-rho-gga*` Modal volume.
 
 Mounts the volume in a Modal function, lists `label/`, opens one Zarr
 group, reads its `charge_density_total` array and `structure` JSON
 attribute, and prints a one-line summary back to the local caller.
+
+Volume selected by the ``TOMAT_VOL`` env var (default ``tomat-rho-gga``),
+since Modal resolves ``Volume.from_name`` at module load time.
 """
 
+import os
 from functools import partial
 import sys
 
@@ -17,7 +21,7 @@ import modal
 
 err = partial(print, file=sys.stderr)
 
-VOLUME_NAME = "tomat-rho-gga"
+VOLUME_NAME = os.environ.get("TOMAT_VOL", "tomat-rho-gga")
 MOUNT = "/vol"
 
 image = (
