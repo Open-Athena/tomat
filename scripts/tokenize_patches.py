@@ -42,7 +42,7 @@ from click import command, option
 
 from tomat.data.zarr_io import load_rho_gga
 from tomat.float_codec import FP16Codec
-from tomat.tokenizers.patch import PatchTokenizer, SPECIAL_TOKENS
+from tomat.tokenizers.patch import INT_VOCAB_SIZE, PatchTokenizer, SPECIAL_TOKENS
 
 err = partial(print, file=sys.stderr)
 
@@ -94,8 +94,15 @@ def _build_schema() -> pa.Schema:
              'Required for Levanter PrebuiltLmDatasetFormat; error if any row '
              "already exceeds --pad-to. Typical value matches the model's "
              'max_seq_len (e.g., 8192 for tomat-30m).')
+@option('-w', '--worker-idx', type=int, default=0,
+        help='When parallel: this worker processes task_ids[worker_idx::n_workers]. '
+             'Default 0 (serial). Output auto-nested under worker-NN/ when '
+             'n_workers > 1.')
+@option('-W', '--n-workers', type=int, default=1,
+        help='Total worker count (default 1 = serial). See --worker-idx.')
 @option('-n', '--n-materials', type=int, default=None,
-        help='Debug: cap the number of materials (first N from split).')
+        help='Debug: cap the number of materials (first N from split). Applied '
+             'before worker slicing so n_materials is a global cap.')
 def main(
     rho_gga_dir: Path,
     split_file: Path | None,
@@ -109,6 +116,8 @@ def main(
     seed: int,
     rows_per_shard: int,
     pad_to: int | None,
+    worker_idx: int,
+    n_workers: int,
     n_materials: int | None,
 ) -> None:
     # Resolve the task-id list for this split. Split files like
@@ -139,14 +148,26 @@ def main(
         task_ids = sorted(p.stem for p in (rho_gga_dir / 'label').glob('*.zarr'))
     if n_materials:
         task_ids = task_ids[:n_materials]
-    err(f"[tokenize] split={split} materials={len(task_ids)} "
+    all_count = len(task_ids)
+    if n_workers > 1:
+        if not 0 <= worker_idx < n_workers:
+            raise click.UsageError(
+                f"worker_idx {worker_idx} out of range [0, {n_workers})"
+            )
+        task_ids = task_ids[worker_idx::n_workers]
+        output_dir = output_dir / f"worker-{worker_idx:02d}"
+    err(f"[tokenize] split={split} materials={len(task_ids)}"
+        f"{f' (slice {worker_idx}/{n_workers} of {all_count})' if n_workers > 1 else ''} "
         f"patches/material={patches_per_material} patch_size={patch_size} "
         f"density_codec={density_codec}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     codec = DENSITY_CODECS[density_codec](log_min=density_log_min, log_max=density_log_max)
     tokenizer = PatchTokenizer(patch_size=patch_size, density_codec=codec)
-    rng = np.random.default_rng(seed)
+    # Each worker gets a decorrelated RNG stream via seed XOR worker_idx —
+    # identical serial and parallel runs produce different offsets by design;
+    # what's reproducible is a single (seed, n_workers) tuple.
+    rng = np.random.default_rng(seed ^ worker_idx)
     schema = _build_schema()
 
     # Streaming shard writer.
@@ -161,6 +182,7 @@ def main(
 
     total_rows = 0
     missing: list[str] = []
+    oversized: list[tuple[str, tuple[int, int, int]]] = []
     for mat_idx, task_id in enumerate(task_ids, start=1):
         zarr_path = rho_gga_dir / 'label' / f'{task_id}.zarr'
         if not zarr_path.exists():
@@ -168,8 +190,19 @@ def main(
             continue
 
         sample = load_rho_gga(zarr_path)
+        shape = sample.data['total'].shape
+
+        # The int vocab maxes out at INT_VOCAB_SIZE (=1024 by default); any
+        # grid dim ≥ that would blow up `vocab.int_token(n)`. Skip + log so
+        # a small oversized-tail doesn't kill the whole run. Spec 03/04
+        # described rho_gga as 40³–448³ but at least a handful of val-split
+        # materials have dims up to ~1400.
+        if any(d >= INT_VOCAB_SIZE for d in shape):
+            oversized.append((task_id, tuple(int(d) for d in shape)))
+            continue
+
         offsets = tokenizer.random_offsets(
-            sample.data['total'].shape, n=patches_per_material, rng=rng,
+            shape, n=patches_per_material, rng=rng,
         )
 
         batch_task_ids: list[str] = []
@@ -234,6 +267,10 @@ def main(
         "n_materials": len(task_ids),
         "n_materials_missing": len(missing),
         "missing_task_ids": missing[:50],  # truncate
+        "n_materials_oversized": len(oversized),
+        "oversized_task_ids": [
+            {"task_id": tid, "shape": list(sh)} for tid, sh in oversized[:50]
+        ],
         "patches_per_material": patches_per_material,
         "patch_size": patch_size,
         "density_codec_name": density_codec,
@@ -258,7 +295,7 @@ def main(
     }
     (output_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     err(f"[tokenize] done: {total_rows:,} rows in {meta['n_shards']} shards "
-        f"({len(missing)} task ids missing)")
+        f"({len(missing)} missing, {len(oversized)} oversized-skipped)")
 
 
 if __name__ == '__main__':

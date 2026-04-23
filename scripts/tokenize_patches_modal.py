@@ -55,7 +55,7 @@ app = modal.App("tomat-tokenize-patches", image=image)
 volume = modal.Volume.from_name(VOLUME_NAME)
 
 
-@app.function(volumes={MOUNT: volume}, timeout=3600)
+@app.function(volumes={MOUNT: volume}, timeout=14400)  # 4h
 def tokenize(
     label: str,
     split: str,
@@ -67,9 +67,16 @@ def tokenize(
     n_materials: int | None,
     seed: int,
     pad_to: int | None,
+    worker_idx: int = 0,
+    n_workers: int = 1,
 ) -> dict:
     """Invoke `scripts/tokenize_patches.py` as a subprocess with the
-    Modal volume mount as `--rho-gga-dir`."""
+    Modal volume mount as `--rho-gga-dir`.
+
+    When called in parallel (via the ``tokenize_parallel`` entrypoint),
+    `worker_idx` / `n_workers` slice the task-id list across workers
+    and the tokenizer auto-nests output under `worker-NN/`.
+    """
     import json as _json
     import subprocess as _sp
 
@@ -87,6 +94,8 @@ def tokenize(
         "--density-log-max", str(density_log_max),
         "-o", output_dir,
         "-S", str(seed),
+        "-w", str(worker_idx),
+        "-W", str(n_workers),
     ]
     if n_materials is not None:
         cmd += ["-n", str(n_materials)]
@@ -98,8 +107,15 @@ def tokenize(
     # Commit the volume writes so a subsequent `modal volume get` sees them.
     volume.commit()
 
-    meta = _json.loads(Path(f"{output_dir}/meta.json").read_text())
-    return {"output_dir": output_dir, "meta": meta}
+    # When parallel, the tokenizer wrote under worker-NN/; per-worker meta
+    # lives there. The parallel entrypoint merges meta after all workers
+    # finish. Return the worker-local dir for caller sanity-checking.
+    worker_dir = (
+        f"{output_dir}/worker-{worker_idx:02d}"
+        if n_workers > 1 else output_dir
+    )
+    meta = _json.loads(Path(f"{worker_dir}/meta.json").read_text())
+    return {"output_dir": worker_dir, "meta": meta}
 
 
 @app.local_entrypoint()
@@ -139,6 +155,76 @@ def main(
         err(f"[modal] pull → {local_dst}")
         # --force overwrites existing files; acceptable since the volume is
         # the source of truth for this label and `dvx` hashes the pulled copy.
+        subprocess.run(
+            [
+                "modal", "volume", "get", "--force", VOLUME_NAME,
+                f"/tokenized/{label}",
+                str(local_dst.parent),
+            ],
+            check=True,
+        )
+
+
+@app.local_entrypoint()
+def parallel(
+    label: str = "val-full",
+    split: str = "validation",
+    patches_per_material: int = 32,
+    patch_size: int = 14,
+    density_codec: str = "two_token_9_12",
+    density_log_min: float = -4.127,
+    density_log_max: float = 4.967,
+    n_materials: int = 0,
+    seed: int = 42,
+    pad_to: int = 8192,
+    n_workers: int = 16,
+    pull: bool = False,
+) -> None:
+    """Parallel tokenize via Modal's ``.map()`` — dispatches ``n_workers``
+    containers that each process ``task_ids[i::n_workers]`` and write to
+    a per-worker subdir ``/vol/tokenized/<label>/worker-NN/``.
+
+    Training reads from the per-worker dirs directly via glob; no
+    post-merge step in this MVP (per spec 07). Pull-to-local is off by
+    default since train-scale parquet is large; set ``--pull`` for
+    DVX-hashing the output when the label fits on local disk.
+    """
+    err(f"[modal] parallel tokenize → /vol/tokenized/{label} "
+        f"(n_workers={n_workers}, pad_to={pad_to})")
+
+    # `tokenize.spawn(...)` returns a FunctionCall handle immediately; Modal
+    # runs all N concurrently. `fc.get()` waits for that worker's result.
+    calls = [
+        tokenize.spawn(
+            label=label, split=split,
+            patches_per_material=patches_per_material, patch_size=patch_size,
+            density_codec=density_codec,
+            density_log_min=density_log_min, density_log_max=density_log_max,
+            n_materials=n_materials if n_materials > 0 else None,
+            seed=seed, pad_to=pad_to if pad_to > 0 else None,
+            worker_idx=i, n_workers=n_workers,
+        )
+        for i in range(n_workers)
+    ]
+
+    outcomes = []
+    for i, fc in enumerate(calls):
+        try:
+            outcomes.append(fc.get())
+            err(f"[modal] worker {i} done: "
+                f"{outcomes[-1]['meta']['total_rows']:,} rows")
+        except Exception as e:
+            err(f"[modal] worker {i} FAILED: {e}")
+            raise
+
+    total_rows = sum(o["meta"]["total_rows"] for o in outcomes)
+    err(f"[modal] all {n_workers} workers done: {total_rows:,} total rows "
+        f"across /vol/tokenized/{label}/worker-*")
+
+    if pull:
+        local_dst = Path("data/tokenized") / label
+        local_dst.parent.mkdir(parents=True, exist_ok=True)
+        err(f"[modal] pull → {local_dst}")
         subprocess.run(
             [
                 "modal", "volume", "get", "--force", VOLUME_NAME,
