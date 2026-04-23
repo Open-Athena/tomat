@@ -11,11 +11,12 @@ interface RunSpec {
 }
 
 const RUNS: RunSpec[] = [
-  { file: 'val-full-5k-bs32-bs32-seed42.csv',        name: 'A100:1 bs=32',  color: '#1f77b4' },
-  { file: 'val-full-5k-bs32-2gpu-bs32-seed42.csv',   name: 'A100:2 bs=32',  color: '#2ca02c' },
-  { file: 'val-full-5k-bs64-4gpu-bs64-seed42.csv',   name: 'A100:4 bs=64',  color: '#ff7f0e' },
-  { file: 'val-full-5k-bs128-8gpu-bs128-seed42.csv', name: 'A100:8 bs=128', color: '#d62728' },
-  { file: 'val-full-tpu-bs128-seed42.csv',           name: 'TPU v6e-4 bs=128', color: '#9467bd' },
+  { file: 'val-full-5k-bs32-bs32-seed42.csv',        name: 'A100:1 bs=32 (val-full)',     color: '#1f77b4' },
+  { file: 'val-full-5k-bs32-2gpu-bs32-seed42.csv',   name: 'A100:2 bs=32 (val-full)',     color: '#2ca02c' },
+  { file: 'val-full-5k-bs64-4gpu-bs64-seed42.csv',   name: 'A100:4 bs=64 (val-full)',     color: '#ff7f0e' },
+  { file: 'val-full-5k-bs128-8gpu-bs128-seed42.csv', name: 'A100:8 bs=128 (val-full)',    color: '#d62728' },
+  { file: 'val-full-tpu-bs128-seed42.csv',           name: 'TPU v6e-4 bs=128 (val-full)', color: '#9467bd' },
+  { file: 'train-full-tpu8-bs256-seed42.csv',        name: 'TPU v6e-8 bs=256 (train-full)', color: '#000000' },
 ]
 
 export function ScalingLossPlot({ baseUrl }: { baseUrl: string }) {

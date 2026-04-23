@@ -63,8 +63,11 @@ export function HomePage() {
 
       <h2>Scale training runs (2026-04-22 / 23)</h2>
       <p>
-        Same 30 M Qwen3 on <code>val-full</code> (4,305 mats × 32 patches = 137,696
-        sequences), seed 42, 8k context. Runs live in the{' '}
+        Same 30 M Qwen3 across these runs, seed 42, 8k context. First 5 rows
+        are on <code>val-full</code> (4,305 mats × 32 patches = 137,696 sequences,
+        ~1.1 B tokens); last row is the first run on the new{' '}
+        <code>train-full</code> (77,498 mats × 32 patches = 2.48 M sequences,
+        ~20 B tokens, 18× more). Runs live in the{' '}
         <ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14">
           <code>tomat-two_token_9_12-P14</code>
         </ExtLink>{' '}W&amp;B project.
@@ -74,39 +77,50 @@ export function HomePage() {
       </div>
       <table className="runs-table">
         <thead>
-          <tr><th>run</th><th>compute</th><th>bs (per-dev)</th><th>steps</th><th>MFU</th><th>tok/s</th><th>final loss</th></tr>
+          <tr><th>run</th><th>data</th><th>compute</th><th>bs (per-dev)</th><th>steps</th><th>MFU</th><th>tok/s</th><th>final loss</th></tr>
         </thead>
         <tbody>
           <tr>
             <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-bs32-seed42">bs=32, A100:1</ExtLink></td>
-            <td>Modal A100:1</td><td>32 (32)</td><td>2,560 / 5 k</td><td>12.4%</td><td>80 k</td><td>2.235 (OOM)</td>
+            <td>val-full</td><td>Modal A100:1</td><td>32 (32)</td><td>2,560 / 5 k</td><td>12.4%</td><td>80 k</td><td>2.235 (OOM)</td>
           </tr>
           <tr>
             <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs32-2gpu-bs32-seed42">bs=32, A100:2</ExtLink></td>
-            <td>Modal A100:2</td><td>32 (16)</td><td>5 k</td><td>12.0%</td><td>157 k</td><td><strong>1.962</strong></td>
+            <td>val-full</td><td>Modal A100:2</td><td>32 (16)</td><td>5 k</td><td>12.0%</td><td>157 k</td><td>1.962</td>
           </tr>
           <tr>
             <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs64-4gpu-bs64-seed42">bs=64, A100:4</ExtLink></td>
-            <td>Modal A100:4</td><td>64 (16)</td><td>5 k</td><td>11.96%</td><td>313 k</td><td><strong>1.975</strong></td>
+            <td>val-full</td><td>Modal A100:4</td><td>64 (16)</td><td>5 k</td><td>11.96%</td><td>313 k</td><td>1.975</td>
           </tr>
           <tr>
             <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-5k-bs128-8gpu-bs128-seed42">bs=128, A100:8</ExtLink></td>
-            <td>Modal A100:8</td><td>128 (16)</td><td>5 k</td><td>11.86%</td><td>624 k</td><td><strong>2.022</strong></td>
+            <td>val-full</td><td>Modal A100:8</td><td>128 (16)</td><td>5 k</td><td>11.86%</td><td>624 k</td><td>2.022</td>
           </tr>
           <tr>
             <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-tpu-bs128-seed42">bs=128, TPU v6e-4</ExtLink></td>
-            <td>Marin TPU v6e-4</td><td>128 (32)</td><td>1 k</td><td>10.25%</td><td><strong>792 k</strong></td><td>2.620</td>
+            <td>val-full</td><td>Marin TPU v6e-4</td><td>128 (32)</td><td>1 k</td><td>10.25%</td><td>792 k</td><td>2.620</td>
+          </tr>
+          <tr>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-bs256-seed42"><strong>bs=256, TPU v6e-8</strong></ExtLink></td>
+            <td><strong>train-full</strong></td><td>Marin TPU v6e-8</td><td>256 (32)</td><td>2 k</td><td>8.38%</td><td><strong>1,297 k</strong></td><td><strong>2.214</strong></td>
           </tr>
         </tbody>
       </table>
       <p className="meta">
         Near-perfect data-parallel scaling across A100:2/4/8 at fixed
-        per-device bs=16 (157 k → 313 k → 624 k tok/s = 2.0× per doubling,
-        MFU stable ~12%). TPU v6e-4 ≈ <strong>10× A100:1 tok/s</strong>
-        at same per-device batch — matching the hardware FLOPs ratio
-        (v6e: 918 TFLOPs/chip × 4 = 12× an A100). A100:1 bs=32
-        per-device=32 OOMed at step 2,560 on a 22-GiB attention-matrix
-        allocation; per-device=16 fits comfortably.
+        per-device bs=16 (157 k → 313 k → 624 k tok/s, MFU stable ~12%).
+        TPU v6e-4 ≈ <strong>10× A100:1</strong> tok/s at same per-device
+        batch (v6e: 918 TFLOPs/chip × 4 ≈ 12× an A100).
+      </p>
+      <p className="meta">
+        <strong>New: train-full on v6e-8 run.</strong> Same 30 M model but
+        <strong> 18× more training data</strong> (77 k materials vs 4,305) →
+        0.41 nats lower loss (2.62 → 2.21). At bs=256 on 8 chips the model
+        throughput is 1.3 M tok/s; MFU is actually lower (~8%) because 30 M
+        params is too small to saturate v6e-8. 4.2 B tokens through a
+        30 M model is <strong>~7× past Chinchilla-optimal</strong> — loss
+        is flattening because we're parameter-bound, not data-bound.
+        Next: 200 M model on the same data (currently queued).
       </p>
 
       <h2>Up next</h2>
