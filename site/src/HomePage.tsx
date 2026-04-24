@@ -1,3 +1,4 @@
+import { MatsMetadataPlots } from './MatsMetadataPlots'
 import { ScalingLossPlot } from './ScalingLossPlot'
 import { ThemeToggle } from './theme'
 
@@ -107,6 +108,88 @@ export function HomePage() {
         which then syncs to <code>gs://marin-eu-west4/tomat/tokenized/</code>.
       </p>
 
+      <h2>MP metadata — n_atoms / dims / voxels across train-full</h2>
+      <p>
+        Distributions across <strong>77,466 materials</strong> in the{' '}
+        <code>train-full</code> split (same MP source as val-full; near-
+        identical shape). Long-tail-of-atoms drives the preamble budget
+        below.
+      </p>
+      <MatsMetadataPlots url={`${base}/mats-md.csv`} />
+      <p className="note">
+        Source: first row of each material's parquet preamble (extracted
+        via <code>scripts/pull_preamble_stats_modal.py</code>; 77k-mat
+        scan runs on Modal in &lt;90 s via the{' '}
+        <code>tomat-gcp-sa</code> secret).
+      </p>
+
+      <h2>Preamble size + context-length budget</h2>
+      <p>
+        Each sequence is <code>preamble + density + EOS</code> tokens before
+        padding. Preamble length scales with <strong>atom count N</strong>:
+        {' '}<code>28 + 10·N</code> for cubes (<code>29 + 10·N</code> for balls,
+        which trade <code>SHAPE+OFFSET+HI</code> for{' '}
+        <code>RADIUS+CENTER+BOUNDS</code>). Density is{' '}
+        <code>2 × V_patch</code> with our 2-token codec —{' '}
+        <code>5,488</code> for P=14, <code>6,750</code> for P=15, etc.
+      </p>
+      <p>
+        For the 77,466-material <code>train-full</code> corpus:
+        <strong> median N = 12 atoms, p99 = 88, max = 154</strong>. The
+        long-tail-of-atoms determines how many materials we drop at each
+        patch-size × context-length combo:
+      </p>
+      <div className="plot-card">
+        <img src={`${base}/preamble-dist.png`} alt="Preamble distribution" style={{ width: '100%', height: 'auto' }} />
+      </div>
+      <p>Largest P / R² that fits at each CL (fraction kept):</p>
+      <table className="runs-table">
+        <thead>
+          <tr><th>context length</th><th>cube P (100% / 99% / 95%)</th><th>ball R² (100% / 99% / 95%)</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>8 k</strong></td><td>14 / 15 / 15</td><td>85 / 89 / 92</td></tr>
+          <tr><td><strong>16 k</strong></td><td>19 / 19 / 19</td><td>145 / 149 / 151</td></tr>
+          <tr><td><strong>32 k</strong></td><td>24 / 25 / 25</td><td>240 / 243 / 244</td></tr>
+        </tbody>
+      </table>
+      <p className="note">
+        <strong>Takeaway:</strong> P=15 at 8k context loses only{' '}
+        <strong>6 mats out of 77,466</strong> (&lt;0.01%) — all at the
+        very tail of the atom distribution (n_atoms ∈ {'{144, 152, 154}'},
+        seq_len 8,218–8,318). P=16 at 8k doesn't fit at all. 16k unlocks
+        up to P=19 (100% kept); 32k up to P=24. Ball thresholds are
+        slightly bigger than cube-equivalent P because balls pack more
+        voxels per bounding-cube than corners-inclusive cubes. The
+        tokenizer skips overflow materials with a log message so we
+        never crash mid-run.
+      </p>
+
+      <h2>Ball patches — geometry & math</h2>
+      <p>
+        Ball patches (ablation against cubes, matched by voxel count)
+        contain all integer voxels <code>(i, j, k)</code> with{' '}
+        <code>i² + j² + k² ≤ R²</code>. The number of voxels on the shell
+        at exactly <code>i² + j² + k² = n</code> is{' '}
+        <ExtLink href="https://oeis.org/A005875"><code>r₃(n)</code></ExtLink>{' '}
+        — sum-of-three-squares — and the cumulative count{' '}
+        <code>V(n) = Σ r₃(k)</code> is{' '}
+        <ExtLink href="https://oeis.org/A117609">OEIS A117609</ExtLink>,
+        asymptotically approaching the continuous ball volume{' '}
+        <code>⁴⁄₃ π R³</code>.
+      </p>
+      <div className="plot-card">
+        <img src={`${base}/ball-voxel-counts.png`} alt="Ball voxel counts vs R²" style={{ width: '100%', height: 'auto' }} />
+      </div>
+      <p className="note">
+        Shell counts are spiky — <strong>32 values of n ≤ 200</strong>{' '}
+        have <code>r₃(n) = 0</code> (integers of the form{' '}
+        <code>4ᵃ(8b+7)</code> — Gauss, 1801). Cumulative counts tightly
+        track <code>⁴⁄₃ π R³</code>. Ablation-matched thresholds:
+        R²=75 ≈ cube P=14 (2,777 vs 2,744 voxels), R²=86 ≈ P=15,
+        R²=138 = P=19 exact (6,859), R²=153 ≈ P=20.
+      </p>
+
       <h2>Scale training runs (2026-04-22 / 23)</h2>
       <p>
         Seed 42, 8k context, patch P=14. First 5 rows on <code>val-full</code>
@@ -167,7 +250,11 @@ export function HomePage() {
           </tr>
           <tr>
             <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-200M-bs128-val-bf16-seed42"><strong>TPU v6e-8 bs=128</strong> (+ val, bf16)</ExtLink></td>
-            <td><strong>208M</strong></td><td>train-full</td><td>Marin TPU v6e-8</td><td>128 (16)</td><td>2 k</td><td>2.10 B</td><td><strong>5.18</strong></td><td>9.88%</td><td>294 k</td><td><strong>2.060</strong></td>
+            <td><strong>208M</strong></td><td>train-full</td><td>Marin TPU v6e-8</td><td>128 (16)</td><td>6 k</td><td><strong>6.29 B</strong></td><td><strong>15.55</strong></td><td>9.86%</td><td>293 k</td><td><strong>1.661</strong> (eval 1.683)</td>
+          </tr>
+          <tr>
+            <td><ExtLink href="https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu16-1B-bs128-val-bf16-seed42"><strong>TPU v6e-16 bs=128</strong> (1B, multihost)</ExtLink></td>
+            <td><strong>1B</strong></td><td>train-full</td><td>Marin TPU v6e-16 (4 hosts)</td><td>128 (8)</td><td>4 k</td><td>4.19 B</td><td><strong>43.20</strong></td><td><strong>17.53%</strong></td><td>250 k</td><td><strong>1.524</strong> (eval 1.537)</td>
           </tr>
         </tbody>
       </table>
@@ -187,14 +274,30 @@ export function HomePage() {
         through 30 M is <strong>~7× past Chinchilla-optimal</strong>.
       </p>
       <p className="meta">
-        <strong>Larger model.</strong> Same train-full but with a 208 M Qwen3
-        (hidden=1024, 12 layers, 16 heads, tied embeddings, bf16 compute) and
-        a real val split (256 held-out sequences) wired in for the first
-        time. Finished at <strong>loss 2.060 on 2.1 B tokens</strong> —{' '}
-        0.15 nats below the 30 M baseline at roughly half the tokens.
-        7× fewer params than Chinchilla-optimal for 2 B tokens, so there's
-        still plenty of data-efficiency headroom at this scale. Next step is
-        another ≈2× parameter jump and more tokens.
+        <strong>Larger model.</strong> 208 M Qwen3 (hidden=1024, 12 layers,
+        16 heads, tied embeddings, bf16 compute) with a real val split
+        (256 held-out sequences). Extended to <strong>loss 1.661
+        on 6.29 B tokens</strong> (eval 1.683 / BPB 0.595) — 0.55 nats
+        below the 30 M baseline at similar tokens. 15.55 EF compute.
+      </p>
+      <p className="meta">
+        <strong>1 B scale.</strong> Qwen3 1 B (hidden=2048, 20 layers,
+        16 heads, 5632 ffn) on v6e-16 multihost, 4 B tokens at bs=128
+        → <strong>loss 1.524 (eval 1.537)</strong>. 0.137 nats better
+        than 208 M on <em>half</em> the tokens — strong scaling signal.
+        MFU jumped to <strong>17.5 %</strong> (vs 9.9 % at 208 M and
+        ~8–10 % at 30 M), confirming the small-model-under-saturates-
+        chip hypothesis. 1 B at 4 tokens/param is ~5× under Chinchilla-
+        optimal, so there's still clean "more tokens" headroom.
+      </p>
+      <p className="note">
+        <strong>NB:</strong> the train/eval <em>loss</em> and <em>BPB</em>{' '}
+        numbers above are <strong>token-space cross-entropy</strong> — NOT
+        directly comparable to electrAI / charg3net's voxel-space{' '}
+        <strong>NMAE</strong> (2% / 0.5%). To produce a comparable NMAE we
+        need to greedy-decode the density-codec tokens and compare decoded
+        floats against ground truth; that eval infrastructure is in
+        progress (spec 17).
       </p>
 
       <h2>Up next</h2>

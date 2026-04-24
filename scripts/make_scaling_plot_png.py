@@ -26,7 +26,8 @@ RUNS = [
     ("val-full-tpu-bs128-seed42",           "TPU v6e-4 bs=128 (val-full, 30M)",  "#9467bd"),
     ("train-full-tpu8-bs256-seed42",        "TPU v6e-8 bs=256 (train-full, 30M)", "#8c564b"),
     ("train-full-tpu16-30M-bs512-seed42",   "TPU v6e-16 bs=512 (train-full, 30M)", "#17becf"),
-    ("train-full-tpu8-200M-bs128-val-bf16-seed42", "TPU v6e-8 bs=128 (train-full, 200M)", "#ffd400"),
+    ("train-full-tpu8-200M-bs128-val-bf16-seed42", "TPU v6e-8 bs=128 (train-full, 208M)", "#ffd400"),
+    ("train-full-tpu16-1B-bs128-val-bf16-seed42", "TPU v6e-16 bs=128 (train-full, 1B multihost)", "#e83e8c"),
 ]
 
 base = Path("site/public/run-histories")

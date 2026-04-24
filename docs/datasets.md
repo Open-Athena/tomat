@@ -140,7 +140,8 @@ FLOP values below are in units of 10¹⁸.
 | [`val-full-tpu-bs128-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/val-full-tpu-bs128-seed42) | 30M | val-full | Marin TPU v6e-4 | 128 | 32 | 1,000 | 1.05 B | 0.50 | 10.25% | 792 k | 2.620 |
 | [`train-full-tpu8-bs256-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-bs256-seed42) | 30M | **train-full** | Marin TPU v6e-8 | 256 | 32 | 2,000 | **4.19 B** | **2.00** | 8.38% | 1,297 k | **2.214** |
 | [`train-full-tpu16-30M-bs512-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu16-30M-bs512-seed42) | 30M | train-full | Marin TPU v6e-16 (multihost, 4 VMs) | 512 | 32 | 2,000 | **8.39 B** | **4.00** | — | **2,042 k** | **2.212** |
-| [`train-full-tpu8-200M-bs128-val-bf16-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-200M-bs128-val-bf16-seed42) | **208M** | train-full | Marin TPU v6e-8 + bf16 | 128 | 16 | 2,000 | **2.10 B** | **5.18** | 9.88% | 294 k | **2.060** |
+| [`train-full-tpu8-200M-bs128-val-bf16-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu8-200M-bs128-val-bf16-seed42) | **208M** | train-full | Marin TPU v6e-8 + bf16 | 128 | 16 | 6,000 | **6.29 B** | **15.55** | 9.86% | 293 k | **1.661** (eval 1.683) |
+| [`train-full-tpu16-1B-bs128-val-bf16-seed42`](https://wandb.ai/PrinceOA/tomat-two_token_9_12-P14/runs/train-full-tpu16-1B-bs128-val-bf16-seed42) | **1B** | train-full | Marin TPU v6e-16 (4 hosts) + bf16 | 128 | 8 | 4,000 | **4.19 B** | **43.20** | **17.53%** | 250 k | **1.524** (eval 1.537) |
 
 Headlines:
 - **A100 scaling is linear**: 157 k → 313 k → 624 k tok/s at per-dev bs=16,
@@ -155,10 +156,16 @@ Headlines:
   `jax.distributed.initialize()` at script entry — Levanter's `WandbConfig.init`
   tries a multihost broadcast before the trainer's own distributed setup fires.
 - **208 M model** (hidden=1024, 12 layers, 16 heads, bf16, with 256-seq
-  held-out val split) on train-full finished at **loss 2.060 on 2.10 B
-  tokens** — 0.15 nats below the 30 M baseline at roughly half the tokens.
-  Still ~7× param-bound for 2 B tokens; next axis is another parameter
-  jump and more tokens.
+  held-out val split) on train-full, extended to **loss 1.661 on 6.29 B
+  tokens** (eval 1.683 / BPB 0.595) — 0.55 nats below the 30 M baseline.
+- **1 B model** (hidden=2048, 20 layers, 16 heads, 5632 ffn) on v6e-16
+  multihost → **loss 1.524 (eval 1.537)** on 4.19 B tokens. 0.137 nats
+  better than 208 M at *half* the tokens. MFU 17.5 % (vs 9.9 % at 208 M)
+  confirms model-size-under-saturates-chip.
+
+**Caveat:** train/val loss + BPB above are token-space cross-entropy —
+NOT directly comparable to electrAI/charg3net voxel-space NMAE. See
+`specs/17-density-loss-design.md` for eval infra in progress.
 
 ## DVX provenance
 

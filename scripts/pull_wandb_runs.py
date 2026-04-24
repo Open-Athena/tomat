@@ -39,6 +39,10 @@ def main(entity: str, project: str, out_dir: Path, run_ids: tuple[str, ...]) -> 
             "val-full-5k-bs64-4gpu-bs64-seed42",
             "val-full-5k-bs128-8gpu-bs128-seed42",
             "val-full-tpu-bs128-seed42",
+            "train-full-tpu8-bs256-seed42",
+            "train-full-tpu16-30M-bs512-seed42",
+            "train-full-tpu8-200M-bs128-val-bf16-seed42",
+            "train-full-tpu16-1B-bs128-val-bf16-seed42",
         )
 
     out_dir.mkdir(parents=True, exist_ok=True)

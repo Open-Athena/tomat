@@ -19,7 +19,9 @@ const RUNS: RunSpec[] = [
   { file: 'train-full-tpu8-bs256-seed42.csv',        name: 'TPU v6e-8 bs=256 (train-full, 30M)',  color: '#8c564b' },
   { file: 'train-full-tpu16-30M-bs512-seed42.csv',   name: 'TPU v6e-16 bs=512 (train-full, 30M)', color: '#17becf' },
   // Bright gold for 200M — visible on both light and dark themes.
-  { file: 'train-full-tpu8-200M-bs128-val-bf16-seed42.csv', name: 'TPU v6e-8 bs=128 (train-full, 200M)', color: '#ffd400' },
+  { file: 'train-full-tpu8-200M-bs128-val-bf16-seed42.csv', name: 'TPU v6e-8 bs=128 (train-full, 208M)', color: '#ffd400' },
+  // Magenta for 1B — distinct from other traces.
+  { file: 'train-full-tpu16-1B-bs128-val-bf16-seed42.csv', name: 'TPU v6e-16 bs=128 (train-full, 1B multihost)', color: '#e83e8c' },
 ]
 
 const ALL_NAMES = RUNS.map(r => r.name) as readonly string[]
