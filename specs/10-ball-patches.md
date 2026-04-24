@@ -114,15 +114,24 @@ block). Negligible.
 ## Sampling ball centers
 
 For a material of grid shape (nx, ny, nz), sample M ball centers
-uniformly from the grid interior (any voxel can be a center; edges get
-clipped balls).
+uniformly across the full grid (any voxel can be a center). **Use PBC
+wrap** — a ball centered at `(cx, cy, cz)` includes voxel
+`((cx+dx) mod nx, (cy+dy) mod ny, (cz+dz) mod nz)` for each offset
+`(dx, dy, dz)` in the canonical ball. This matches how cube patches
+already work in `tokenize_patches.py` (`np.take(..., mode='wrap')`),
+and matches the physical PBC of the underlying crystal.
 
-Open question: do we clip at the edge (ball near corner has fewer
-voxels) or pad (ball near corner gets fake zero voxels)? Start with
-**clip + record clipped bounds** — pad introduces fictitious signal.
+Consequences of PBC-wrap:
+- Every ball has exactly the same voxel count (no edge clipping).
+- The `[BOUNDS_*]` block becomes redundant (can drop).
+- Every voxel is an equally-valid center → uniform random sampling
+  gives uniform exposure across all positions.
+- Matches crystal physics: neighboring voxels across the grid edge are
+  physically neighbors (by PBC), and the model should treat them as
+  such.
 
-Edge-clipped balls still fit the preamble: `[BOUNDS_*]` records the
-actual clipped extent so the decoder knows the geometry.
+~~Pre-PBC version (deprecated):~~ edge-clip with `[BOUNDS_*]` block.
+Keep as a fallback if PBC reveals unexpected issues during training.
 
 ## Ablation protocol
 
@@ -144,29 +153,70 @@ Outputs to collect:
   order from cube center) to isolate the "sort by radial distance"
   effect from the "use spherical support" effect.
 
+## Inference-time tiling: covering a full material with balls
+
+Balls don't tessellate ℝ³ without gaps — unlike cubes — but that's fine,
+because we want **overlapping** tiling at inference anyway (multiple
+predictions per voxel → average for robustness, matches spec 11's
+per-material-reconstruction flow). Key facts:
+
+- Place ball centers on a **cubic lattice** with spacing `d`. Every
+  voxel is within distance `d·√3/2` of some lattice center. For full
+  coverage we need `d·√3/2 ≤ R` ⇒ `d ≤ 2R/√3 ≈ 1.155·R`.
+- For `d = R·√2 ≈ 1.414·R` (slightly larger than the full-coverage
+  threshold — matches a looser cubic pack), **some voxels get 1×
+  coverage, others get 2×+**, average ≈ 1.5× across the grid.
+  Non-uniform but bounded.
+- Tighter spacing (`d ≤ R/√2 ≈ 0.707·R`, 8× more centers) gives ≥2×
+  coverage everywhere — expensive but perfectly uniform.
+- Combined with PBC-wrap (above), there are no edge artifacts to worry
+  about — every ball has the same voxel count, every position is a
+  valid center, coverage statistics are translation-invariant.
+
+**For training**: uniform random center sampling. Each voxel gets
+`~M·V_ball/V_grid` hits on average — non-uniform across mats (small
+mats are over-covered) but fine for training since we see each mat
+many times across epochs.
+
+**For inference-time mat reconstruction (spec 11)**: pick a stride
+based on the precision/cost tradeoff we want:
+- stride = R·√2 (1.5× avg overlap): minimum for usable reconstruction.
+- stride = R (2-3× avg overlap): better uniformity.
+- stride = R/√2 (8× avg overlap): maximum voxel-consensus, 8× cost.
+
+Recommend starting with stride = R (simple, moderate overlap) and
+tuning if per-voxel variance is too high.
+
 ## Limitations / caveats
 
-- **Balls don't tile.** Full-material reconstruction requires
-  overlapping balls and averaging / max-pooling of density estimates
-  in overlap regions. Cube patches can reconstruct via disjoint
-  tiling. This is the main architectural cost of balls.
-- **Edge clipping** breaks the "every patch has the same geometry"
-  invariant the model might exploit. Needs attention — possibly
-  restrict ball centers to interior voxels (≥R from every edge), which
-  reduces effective patch density near boundaries.
+- **Ball tiling requires ≥1.5× overlap** at inference (can't be made
+  disjoint). Minor compute overhead; an asset for voxel-consensus.
 - **Variable shell sizes across r²** mean the model sees irregular
   "stride" in the density-token stream. Unlike cube patches where
   every voxel has the same local neighborhood structure, ball voxels
   at r²=5 (24 of them) get sandwiched between r²=4 (6 voxels) and r²=6
   (24 voxels) in the token stream — the model has to infer shell
   structure from sequence position.
+- **Edge behavior (if not using PBC)** would break "every patch has
+  the same geometry." PBC avoids this entirely.
 
 ## Recommendation
 
-Defer until **P=15/8k cube retokenize** + **per-mat validation infra**
-both land. Those are higher-certainty wins. Balls are a cool-if-it-works
-ablation worth ~1 week of engineering, but won't move the needle alone
-if the per-patch loss is already in a good place.
+Defer until **LMQ-codec retokenize** (spec 18) lands — at which point
+the ball tokenizer can reuse it directly. Balls are a cool-if-it-works
+ablation, best run alongside the LMQ + density-L_1 loss work so the
+comparison is apples-to-apples in the new regime.
+
+## Non-goals (considered and dropped)
+
+- **AR-consistency training over overlapping patches**: force the
+  model's predictions on a shared voxel from two different patches'
+  contexts to agree (self-consistency loss). Useful in semi-supervised
+  settings where GT is scarce/noisy. We have per-voxel GT for every
+  training material, so GT-supervised L_1 on many overlapping patches
+  is strictly more informative than consistency regularization. Keep
+  as a possible future unsup-/semi-sup lever if we ever work without
+  GT.
 
 ## Links / adjacent specs
 
