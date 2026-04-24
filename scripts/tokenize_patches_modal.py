@@ -211,13 +211,16 @@ def parallel(
     n_materials: int = 0,
     seed: int = 42,
     pad_to: int = 8192,
-    n_workers: int = 16,
+    n_workers: int = 256,
     worker_indices: str = "",
     pull: bool = False,
     shape: str = "cube",
     r2_max: int = 75,
     lmq_path: str = "",
 ) -> None:
+    # NB: default bumped 16 → 256 per Ryan's 2026-04-24 observation that Modal
+    # has plenty of headroom. Volume read throughput is the ceiling around this
+    # scale; 256 workers finishes M=32 tokenize in ~5 min vs ~30 min at 64.
     """Parallel tokenize via Modal's ``.map()`` — dispatches ``n_workers``
     containers that each process ``task_ids[i::n_workers]`` and write to
     a per-worker subdir ``/vol/tokenized/<label>/worker-NN/``.
