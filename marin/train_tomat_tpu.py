@@ -176,7 +176,6 @@ def main():
             build_density_loss_args,
             configure_density_loss,
         )
-        from tomat.float_codec import LMQCodec
 
         if not lmq_path_env:
             raise ValueError(
@@ -186,7 +185,30 @@ def main():
         model_config_cls = Qwen3DensityConfig
         print(f"[tomat-tpu] density-L_1 loss: weight={density_l1_weight}, "
               f"mode={density_l1_mode}, lmq_path={lmq_path_env}")
-        lmq_codec = LMQCodec.load(lmq_path_env)
+
+        # Inline-load the codec .npz since the `tomat` package isn't on the
+        # Marin workspace PYTHONPATH (iris bundles only this directory).
+        class _LMQCodecInline:
+            def __init__(self, boundaries, recon_points, clip_max):
+                self.boundaries = boundaries
+                self.recon_points = recon_points
+                self.clip_max = clip_max
+            @property
+            def n_bins(self):
+                return len(self.recon_points)
+
+        def _load_lmq(path: str) -> _LMQCodecInline:
+            import fsspec as _fs
+            with _fs.open(path, "rb") as f:
+                data = np.load(f, allow_pickle=True)
+                return _LMQCodecInline(
+                    boundaries=np.asarray(data["boundaries"], dtype=np.float32),
+                    recon_points=np.asarray(data["recon_points"], dtype=np.float32),
+                    clip_max=float(data["clip_max"]),
+                )
+
+        import numpy as np
+        lmq_codec = _load_lmq(lmq_path_env)
 
         # Compute density vocab offsets per PatchVocab layout
         # (specials=18, atoms=118, ints=1024, pos=pos_total, density=lmq_codec.n_bins)

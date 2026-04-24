@@ -26,13 +26,37 @@ VOLUME_NAME = os.environ.get("TOMAT_VOLUME", "tomat-rho-gga-train")
 MOUNT = "/vol"
 BUCKET = "gs://marin-eu-west4/tomat"
 
-# Fine histogram setup: linear bins over [LIN_LO, LIN_HI].
-# Densities are non-negative; MP rho_gga typically in [0, ~150] e/bohr³ but
-# log_max=4.97 (in the old codec) implies max ≈ 144. Extend to 200 for safety.
-LIN_LO = 0.0
-LIN_HI = 200.0
-N_FINE = 1_000_000  # 1M fine bins over [0, 200] → 2e-4 resolution
-FINE_DX = (LIN_HI - LIN_LO) / N_FINE
+# Fine histogram setup. Densities span ~7 orders of magnitude (min ~1e-6, max
+# ~5e4) so LINEAR fine binning is hopeless — linear bins in [0, 5e4] at even 1M
+# bins = 5e-2 resolution at the bottom, missing all the 1e-3..1e-2 atomic
+# structure that NMAE cares about. Use LOG-SPACED fine bins instead.
+#
+# A small fraction of voxels have ρ < 0 (likely artifacts: 0.00something % of
+# the distribution per the total-stats pull) — clip those to 0 (= bin 0).
+import math
+
+LIN_LO = 1e-6       # anything below → bin 0 (effectively "zero density")
+LIN_HI = 1e5        # clip max; well above the observed 5.12e4 max
+N_FINE = 1_000_000
+_LOG_LO = math.log(LIN_LO)
+_LOG_HI = math.log(LIN_HI)
+FINE_DLOG = (_LOG_HI - _LOG_LO) / N_FINE
+
+
+def _value_to_fine_bin(values):
+    """Map float densities → fine-bin index in [0, N_FINE). Uses numpy."""
+    import numpy as np
+    v = np.clip(values, LIN_LO, LIN_HI)
+    logv = np.log(v)
+    idx = ((logv - _LOG_LO) / FINE_DLOG).astype(np.int64)
+    return np.clip(idx, 0, N_FINE - 1)
+
+
+def _fine_bin_centers():
+    """Return (N_FINE,) array of float centers in linear space."""
+    import numpy as np
+    log_centers = _LOG_LO + (np.arange(N_FINE) + 0.5) * FINE_DLOG
+    return np.exp(log_centers)
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -112,15 +136,12 @@ def histogram_stripe(mat_ids: list[str]) -> tuple[Any, dict]:
             n_missing += 1
             continue
         n_voxels += density.size
-        # Clip before binning — preserves everything below LIN_HI exactly; any
-        # outliers go to the top bin (tracked separately via stats).
+        # Log-spaced binning. Negative values clip to LIN_LO (bin 0). Values
+        # above LIN_HI clip to the top bin. Stats track how many fall at the
+        # bounds.
         n_over = int((density > LIN_HI).sum())
         n_neg = int((density < 0).sum())
-        dens_clip = np.clip(density, LIN_LO, LIN_HI - 1e-9)
-        bin_idx = np.minimum(
-            (dens_clip / FINE_DX).astype(np.int64),
-            N_FINE - 1,
-        )
+        bin_idx = _value_to_fine_bin(density)
         hist += np.bincount(bin_idx, minlength=N_FINE)[:N_FINE]
         sum_rho += float(density.sum())
         mx = float(density.max())
@@ -151,7 +172,7 @@ def fit_and_save(hist_bytes: bytes, total_stats: dict, n_bins: int, codec_name: 
     setup_gcp_creds()
 
     hist = np.load(io.BytesIO(hist_bytes))
-    fine_centers = (np.arange(N_FINE) + 0.5) * FINE_DX  # float64
+    fine_centers = _fine_bin_centers().astype(np.float64)  # log-spaced
     total = hist.sum()
     print(f"[fit] histogram total = {total:,} voxels, n_fine_bins = {N_FINE}")
 
@@ -212,6 +233,9 @@ def fit_and_save(hist_bytes: bytes, total_stats: dict, n_bins: int, codec_name: 
     mean_rho = total_stats["sum_rho"] / max(total_stats["n_voxels"], 1)
     nmae_approx = mae / max(mean_rho, 1e-30)
     print(f"[fit] quantization MAE = {mae:.6e}, mean ρ = {mean_rho:.6e}, NMAE lower-bound = {nmae_approx:.4%}")
+    print(f"[fit] recon range: [{recon.min():.6e}, {recon.max():.6e}]")
+    print(f"[fit] per-bin-count quantiles: p1={np.quantile(per_bin_count,0.01):.1e}, "
+          f"p50={np.quantile(per_bin_count,0.5):.1e}, p99={np.quantile(per_bin_count,0.99):.1e}")
 
     # Save.
     clip_max = LIN_HI
@@ -224,6 +248,8 @@ def fit_and_save(hist_bytes: bytes, total_stats: dict, n_bins: int, codec_name: 
         "lin_hi": np.float32(LIN_HI),
         "per_bin_count": per_bin_count,
         "total_stats": np.array([json.dumps(total_stats)], dtype=object),
+        # v2 marker: log-spaced fine bins used for fitting.
+        "fit_mode": np.array(["log-spaced fine bins, LIN_LO=1e-6, LIN_HI=1e5"], dtype=object),
     }
     buf = io.BytesIO()
     np.savez(buf, **bundle)
