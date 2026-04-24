@@ -60,7 +60,7 @@ app = modal.App("tomat-tokenize-patches", image=image)
 volume = modal.Volume.from_name(VOLUME_NAME)
 
 
-@app.function(volumes={MOUNT: volume}, timeout=14400)  # 4h
+@app.function(volumes={MOUNT: volume}, timeout=28800)  # 8h (M=256 straggler workers can exceed 4h)
 def tokenize(
     label: str,
     split: str,
@@ -74,6 +74,8 @@ def tokenize(
     pad_to: int | None,
     worker_idx: int = 0,
     n_workers: int = 1,
+    shape: str = "cube",
+    r2_max: int = 75,
 ) -> dict:
     """Invoke `scripts/tokenize_patches.py` as a subprocess with the
     Modal volume mount as `--rho-gga-dir`.
@@ -94,6 +96,8 @@ def tokenize(
         "-k", split,
         "-m", str(patches_per_material),
         "-p", str(patch_size),
+        "--shape", shape,
+        "--r2-max", str(r2_max),
         "-c", density_codec,
         "--density-log-min", str(density_log_min),
         "--density-log-max", str(density_log_max),
@@ -136,8 +140,10 @@ def main(
     seed: int = 42,
     pad_to: int = 8192,
     pull: bool = True,
+    shape: str = "cube",
+    r2_max: int = 75,
 ) -> None:
-    err(f"[modal] tokenize → /vol/tokenized/{label} (pad_to={pad_to})")
+    err(f"[modal] tokenize → /vol/tokenized/{label} (pad_to={pad_to}, shape={shape})")
     result = tokenize.remote(
         label=label,
         split=split,
@@ -149,6 +155,8 @@ def main(
         n_materials=n_materials if n_materials > 0 else None,
         seed=seed,
         pad_to=pad_to if pad_to > 0 else None,
+        shape=shape,
+        r2_max=r2_max,
     )
     meta = result["meta"]
     err(f"[modal] done: {meta['total_rows']:,} rows in {meta['n_shards']} shards")
@@ -185,6 +193,8 @@ def parallel(
     n_workers: int = 16,
     worker_indices: str = "",
     pull: bool = False,
+    shape: str = "cube",
+    r2_max: int = 75,
 ) -> None:
     """Parallel tokenize via Modal's ``.map()`` — dispatches ``n_workers``
     containers that each process ``task_ids[i::n_workers]`` and write to
@@ -220,6 +230,7 @@ def parallel(
             n_materials=n_materials if n_materials > 0 else None,
             seed=seed, pad_to=pad_to if pad_to > 0 else None,
             worker_idx=i, n_workers=n_workers,
+            shape=shape, r2_max=r2_max,
         )
         for i in indices
     ]

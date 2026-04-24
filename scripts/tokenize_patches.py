@@ -42,6 +42,8 @@ from click import command, option
 
 from tomat.data.zarr_io import load_rho_gga
 from tomat.float_codec import FP16Codec
+from tomat.tokenizers.ball import BallTokenizer
+from tomat.tokenizers.ball import SPECIAL_TOKENS as BALL_SPECIAL_TOKENS
 from tomat.tokenizers.patch import INT_VOCAB_SIZE, PatchTokenizer, SPECIAL_TOKENS
 
 err = partial(print, file=sys.stderr)
@@ -82,6 +84,12 @@ def _build_schema() -> pa.Schema:
         help='Codec log_min (rho_gga p0.01 with padding).')
 @option('--density-log-max', type=float, default=4.967,
         help='Codec log_max (rho_gga p99.99 with padding).')
+@option('--shape', type=click.Choice(['cube', 'ball']), default='cube',
+        help='Patch shape: cube (P×P×P, default) or ball (voxels with r²≤r2_max of center).')
+@option('--r2-max', type=int, default=75,
+        help='Ball squared-radius threshold (only for --shape=ball). '
+             'Defaults to 75 (2,777 voxels, ≈cube P=14). '
+             'Use 86 for ≈cube P=15 (3,407 voxels), 138 for ≈P=19, 153 for ≈P=20.')
 @option('-p', '--patch-size', type=int, default=14,
         help='Patch edge length (voxels). Default 14.')
 @option('-o', '--output-dir', type=click.Path(path_type=Path), required=True,
@@ -111,6 +119,8 @@ def main(
     density_codec: str,
     density_log_min: float,
     density_log_max: float,
+    shape: str,
+    r2_max: int,
     patch_size: int,
     output_dir: Path,
     seed: int,
@@ -156,14 +166,22 @@ def main(
             )
         task_ids = task_ids[worker_idx::n_workers]
         output_dir = output_dir / f"worker-{worker_idx:02d}"
+    shape_desc = f"shape={shape}"
+    shape_desc += f" r2_max={r2_max}" if shape == 'ball' else f" patch_size={patch_size}"
     err(f"[tokenize] split={split} materials={len(task_ids)}"
         f"{f' (slice {worker_idx}/{n_workers} of {all_count})' if n_workers > 1 else ''} "
-        f"patches/material={patches_per_material} patch_size={patch_size} "
+        f"patches/material={patches_per_material} {shape_desc} "
         f"density_codec={density_codec}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     codec = DENSITY_CODECS[density_codec](log_min=density_log_min, log_max=density_log_max)
-    tokenizer = PatchTokenizer(patch_size=patch_size, density_codec=codec)
+    if shape == 'ball':
+        tokenizer = BallTokenizer(r2_max=r2_max, density_codec=codec)
+        specials = BALL_SPECIAL_TOKENS
+        err(f"[tokenize] ball shape: r²≤{r2_max} ({len(tokenizer.vocab.position_codec.signed_vocabs)} vocab groups)")
+    else:
+        tokenizer = PatchTokenizer(patch_size=patch_size, density_codec=codec)
+        specials = SPECIAL_TOKENS
     # Each worker gets a decorrelated RNG stream via seed XOR worker_idx —
     # identical serial and parallel runs produce different offsets by design;
     # what's reproducible is a single (seed, n_workers) tuple.
@@ -183,6 +201,7 @@ def main(
     total_rows = 0
     missing: list[str] = []
     oversized: list[tuple[str, tuple[int, int, int]]] = []
+    overflowed: list[str] = []
     for mat_idx, task_id in enumerate(task_ids, start=1):
         zarr_path = rho_gga_dir / 'label' / f'{task_id}.zarr'
         if not zarr_path.exists():
@@ -190,20 +209,26 @@ def main(
             continue
 
         sample = load_rho_gga(zarr_path)
-        shape = sample.data['total'].shape
+        density_shape = sample.data['total'].shape
 
         # The int vocab maxes out at INT_VOCAB_SIZE (=1024 by default); any
         # grid dim ≥ that would blow up `vocab.int_token(n)`. Skip + log so
         # a small oversized-tail doesn't kill the whole run. Spec 03/04
         # described rho_gga as 40³–448³ but at least a handful of val-split
         # materials have dims up to ~1400.
-        if any(d >= INT_VOCAB_SIZE for d in shape):
-            oversized.append((task_id, tuple(int(d) for d in shape)))
+        if any(d >= INT_VOCAB_SIZE for d in density_shape):
+            oversized.append((task_id, tuple(int(d) for d in density_shape)))
             continue
 
-        offsets = tokenizer.random_offsets(
-            shape, n=patches_per_material, rng=rng,
-        )
+        # Cube samples random offsets (low corners); ball samples random centers.
+        if shape == 'ball':
+            anchors = tokenizer.random_centers(
+                density_shape, n=patches_per_material, rng=rng,
+            )
+        else:
+            anchors = tokenizer.random_offsets(
+                density_shape, n=patches_per_material, rng=rng,
+            )
 
         batch_task_ids: list[str] = []
         batch_ox: list[int] = []
@@ -211,26 +236,46 @@ def main(
         batch_oz: list[int] = []
         batch_ids: list[list[int]] = []
 
-        for off in offsets:
-            patch = tokenizer.make_sample(
-                task_id=task_id,
-                density=sample.data['total'],
-                structure=sample.structure,
-                offset=tuple(int(x) for x in off),
-            )
+        for anc in anchors:
+            anchor_t = tuple(int(x) for x in anc)
+            if shape == 'ball':
+                patch = tokenizer.make_sample(
+                    task_id=task_id,
+                    density=sample.data['total'],
+                    structure=sample.structure,
+                    center=anchor_t,
+                )
+            else:
+                patch = tokenizer.make_sample(
+                    task_id=task_id,
+                    density=sample.data['total'],
+                    structure=sample.structure,
+                    offset=anchor_t,
+                )
             batch_task_ids.append(task_id)
-            batch_ox.append(int(off[0]))
-            batch_oy.append(int(off[1]))
-            batch_oz.append(int(off[2]))
+            batch_ox.append(anchor_t[0])
+            batch_oy.append(anchor_t[1])
+            batch_oz.append(anchor_t[2])
             ids = tokenizer.tokenize(patch)
             if pad_to is not None:
                 if len(ids) > pad_to:
-                    raise RuntimeError(
-                        f"tokenized sequence length {len(ids)} exceeds --pad-to {pad_to} "
-                        f"for task {task_id} offset {tuple(int(x) for x in off)}"
-                    )
-                ids = ids + [SPECIAL_TOKENS["[PAD]"]] * (pad_to - len(ids))
+                    # Happens when preamble (scales with n_atoms) + density fills
+                    # > pad_to. Rather than crash the whole worker, skip the
+                    # material and log — matches the oversized-grid-dim skip
+                    # pattern. Caller sees meta['n_materials_overflow'] to gauge
+                    # the effective corpus size of the variant.
+                    err(f"[tokenize] SKIP {task_id}: seq_len={len(ids)} > pad_to={pad_to} "
+                        f"(anchor={anchor_t}, n_atoms={len(patch.atomic_numbers)})")
+                    # Mark the whole material as overflow + break out of this mat's loop.
+                    batch_ids = []
+                    break
+                ids = ids + [specials["[PAD]"]] * (pad_to - len(ids))
             batch_ids.append(ids)
+
+        # If the material overflowed pad_to (any patch), skip the whole material.
+        if not batch_ids:
+            overflowed.append(task_id)
+            continue
 
         # Flush the batch (one material) to parquet, starting a new shard
         # whenever rows_per_shard would be exceeded.
@@ -271,8 +316,12 @@ def main(
         "oversized_task_ids": [
             {"task_id": tid, "shape": list(sh)} for tid, sh in oversized[:50]
         ],
+        "n_materials_overflow": len(overflowed),
+        "overflow_task_ids": overflowed[:50],
         "patches_per_material": patches_per_material,
-        "patch_size": patch_size,
+        "shape": shape,
+        "patch_size": patch_size if shape == 'cube' else f"r{r2_max}",
+        "r2_max": r2_max if shape == 'ball' else None,
         "density_codec_name": density_codec,
         "seed": seed,
         "pad_to": pad_to,
@@ -280,7 +329,7 @@ def main(
         "n_shards": shard_idx + 1 if writer is not None or total_rows > 0 else 0,
         "vocab": {
             "total_size": vocab.total_vocab_size,
-            "specials": SPECIAL_TOKENS,
+            "specials": specials,
             "position_codec": {
                 "log_min": vocab.position_codec.log_min,
                 "log_max": vocab.position_codec.log_max,

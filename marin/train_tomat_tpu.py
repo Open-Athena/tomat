@@ -19,6 +19,16 @@ Env-var knobs:
     TOMAT_MODEL           model size preset: "30M" (default) or "200M"
     TOMAT_VAL_SEQS        num validation sequences held out (default 0 = no val)
     TOMAT_STEPS_PER_EVAL  eval cadence; default steps // 4 when val is on
+    TOMAT_LR              peak learning rate (default 3e-4)
+    TOMAT_LR_SCHEDULE     cosine (default) | constant | linear | inv_sqrt | …
+                          Choose constant/linear for runs you might extend:
+                          cosine's decay couples loss trajectory to step budget, so
+                          bumping num_train_steps mid-run causes an LR bump.
+    TOMAT_WARMUP          warmup fraction (default 0.1)
+    TOMAT_COOLDOWN        cooldown fraction (default None; for WSD use with
+                          lr_schedule=constant, e.g. cooldown=0.1)
+    TOMAT_DECAY           decay fraction (default None = full decay; cosine only)
+    TOMAT_MIN_LR_RATIO    min LR / peak LR for cosine floor (default 0.0)
 
 Prereqs:
 - `gs://marin-eu-west4/tomat/tokenized/<label>/worker-*/*.parquet` populated
@@ -91,6 +101,9 @@ MODEL_PRESETS = {
     # 200M: Chinchilla-zone for ~20 B tokens; hidden=1024, head_dim=64, 12 layers.
     # params ≈ embed(7M tied) + 12 × (4·1024² attn + 3·1024·4096 ffn) ≈ 208M.
     "200M": dict(hidden_dim=1024, num_layers=12, num_heads=16, num_kv_heads=16, intermediate_dim=4096),
+    # 1B: hidden=2048, head_dim=128, 20 layers, ffn=5632 (≈2.75×).
+    # params ≈ embed(14M tied) + 20 × (4·2048² + 3·2048·5632) ≈ 1.04 B.
+    "1B": dict(hidden_dim=2048, num_layers=20, num_heads=16, num_kv_heads=16, intermediate_dim=5632),
 }
 
 
@@ -203,14 +216,30 @@ def main():
         mp=mp,
     )
 
-    optimizer = AdamConfig(
-        learning_rate=3e-4,
+    lr = float(os.environ.get("TOMAT_LR", "3e-4"))
+    lr_schedule = os.environ.get("TOMAT_LR_SCHEDULE", "cosine")
+    warmup = float(os.environ.get("TOMAT_WARMUP", "0.1"))
+    min_lr_ratio = float(os.environ.get("TOMAT_MIN_LR_RATIO", "0.0"))
+    cooldown_env = os.environ.get("TOMAT_COOLDOWN")
+    decay_env = os.environ.get("TOMAT_DECAY")
+
+    adam_kwargs: dict = dict(
+        learning_rate=lr,
         weight_decay=0.0,
-        warmup=0.1,
-        min_lr_ratio=0.0,
+        warmup=warmup,
+        min_lr_ratio=min_lr_ratio,
+        lr_schedule=lr_schedule,
         beta1=0.9,
         beta2=0.95,
     )
+    if cooldown_env is not None:
+        adam_kwargs["cooldown"] = float(cooldown_env)
+    if decay_env is not None:
+        adam_kwargs["decay"] = float(decay_env)
+    print(f"[tomat-tpu] optimizer: lr={lr}, schedule={lr_schedule}, warmup={warmup}, "
+          f"cooldown={cooldown_env}, decay={decay_env}, min_lr_ratio={min_lr_ratio}")
+
+    optimizer = AdamConfig(**adam_kwargs)
 
     config = TrainLmConfig(
         data=data,
