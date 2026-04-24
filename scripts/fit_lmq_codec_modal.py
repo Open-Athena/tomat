@@ -73,7 +73,13 @@ def list_mats() -> list[str]:
     return list(entries)
 
 
-@app.function(volumes={MOUNT: volume}, cpu=1, memory=4096, timeout=3600)
+@app.function(
+    volumes={MOUNT: volume},
+    cpu=1,
+    memory=4096,
+    timeout=1800,
+    retries=5,
+)
 def histogram_stripe(mat_ids: list[str]) -> tuple[Any, dict]:
     """Accumulate a (N_FINE,) density histogram + stats across a chunk of mats.
 

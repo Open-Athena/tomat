@@ -333,6 +333,7 @@ def main(
         "patch_size": patch_size if shape == 'cube' else f"r{r2_max}",
         "r2_max": r2_max if shape == 'ball' else None,
         "density_codec_name": density_codec,
+        "lmq_path": lmq_path if density_codec == "lmq" else None,
         "seed": seed,
         "pad_to": pad_to,
         "total_rows": total_rows,
