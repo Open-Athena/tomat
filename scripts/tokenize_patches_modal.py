@@ -47,6 +47,7 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
         "click",
+        "gcsfs",
         "numpy",
         "pyarrow>=15",
         "pymatgen",
@@ -56,11 +57,24 @@ image = (
     .add_local_dir("scripts", remote_path="/root/scripts")
 )
 
+gcp_secret = modal.Secret.from_name("tomat-gcp-sa")
+
 app = modal.App("tomat-tokenize-patches", image=image)
 volume = modal.Volume.from_name(VOLUME_NAME)
 
 
-@app.function(volumes={MOUNT: volume}, timeout=28800)  # 8h (M=256 straggler workers can exceed 4h)
+def setup_gcp_creds():
+    """Write the SA key env-var into a file and point GOOGLE_APPLICATION_CREDENTIALS at it."""
+    raw = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    if not raw:
+        return
+    path = "/tmp/gcp-sa.json"
+    with open(path, "w") as f:
+        f.write(raw)
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
+
+
+@app.function(volumes={MOUNT: volume}, secrets=[gcp_secret], timeout=28800)  # 8h
 def tokenize(
     label: str,
     split: str,
@@ -76,6 +90,7 @@ def tokenize(
     n_workers: int = 1,
     shape: str = "cube",
     r2_max: int = 75,
+    lmq_path: str | None = None,
 ) -> dict:
     """Invoke `scripts/tokenize_patches.py` as a subprocess with the
     Modal volume mount as `--rho-gga-dir`.
@@ -86,6 +101,8 @@ def tokenize(
     """
     import json as _json
     import subprocess as _sp
+
+    setup_gcp_creds()
 
     output_dir = f"{MOUNT}/tokenized/{label}"
 
@@ -106,6 +123,8 @@ def tokenize(
         "-w", str(worker_idx),
         "-W", str(n_workers),
     ]
+    if lmq_path:
+        cmd += ["--lmq-path", lmq_path]
     if n_materials is not None:
         cmd += ["-n", str(n_materials)]
     if pad_to is not None:
@@ -142,6 +161,7 @@ def main(
     pull: bool = True,
     shape: str = "cube",
     r2_max: int = 75,
+    lmq_path: str = "",
 ) -> None:
     err(f"[modal] tokenize → /vol/tokenized/{label} (pad_to={pad_to}, shape={shape})")
     result = tokenize.remote(
@@ -157,6 +177,7 @@ def main(
         pad_to=pad_to if pad_to > 0 else None,
         shape=shape,
         r2_max=r2_max,
+        lmq_path=lmq_path or None,
     )
     meta = result["meta"]
     err(f"[modal] done: {meta['total_rows']:,} rows in {meta['n_shards']} shards")
@@ -195,6 +216,7 @@ def parallel(
     pull: bool = False,
     shape: str = "cube",
     r2_max: int = 75,
+    lmq_path: str = "",
 ) -> None:
     """Parallel tokenize via Modal's ``.map()`` — dispatches ``n_workers``
     containers that each process ``task_ids[i::n_workers]`` and write to
@@ -231,6 +253,7 @@ def parallel(
             seed=seed, pad_to=pad_to if pad_to > 0 else None,
             worker_idx=i, n_workers=n_workers,
             shape=shape, r2_max=r2_max,
+            lmq_path=lmq_path or None,
         )
         for i in indices
     ]

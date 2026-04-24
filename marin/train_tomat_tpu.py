@@ -30,6 +30,17 @@ Env-var knobs:
     TOMAT_DECAY           decay fraction (default None = full decay; cosine only)
     TOMAT_MIN_LR_RATIO    min LR / peak LR for cosine floor (default 0.0)
 
+    TOMAT_DENSITY_L1_WEIGHT float λ on the density-L_1 loss term (default 0 = off).
+                            When >0, at density-target positions the loss becomes
+                            CE + λ·|E[ρ]−ρ_true| ("add" mode) or pure L_1
+                            ("replace" mode). Requires `LMQ` or other known codec
+                            so we can build the decode vector.
+    TOMAT_DENSITY_L1_MODE   "add" (default) or "replace".
+    TOMAT_DENSITY_PENALTY   Float value assigned to non-density tokens in the
+                            decode vector — their probability mass gets penalized
+                            in L_1 units when the model leaks mass outside the
+                            density range. Default: 10 × max(decode_vec).
+
 Prereqs:
 - `gs://marin-eu-west4/tomat/tokenized/<label>/worker-*/*.parquet` populated
 - ADC refreshed for `ryan.williams@openathena.ai` on hai-gcp-models.
@@ -151,7 +162,67 @@ def main():
 
     if model_preset not in MODEL_PRESETS:
         raise ValueError(f"unknown TOMAT_MODEL={model_preset!r}; expected one of {list(MODEL_PRESETS)}")
-    model = Qwen3Config(
+
+    # Density-L_1 loss wiring. If TOMAT_DENSITY_L1_WEIGHT > 0, use the subclass
+    # Qwen3DensityLMHeadModel (via Qwen3DensityConfig) and configure the
+    # decode vector + PENALTY from meta.json.
+    density_l1_weight = float(os.environ.get("TOMAT_DENSITY_L1_WEIGHT", "0.0"))
+    density_l1_mode = os.environ.get("TOMAT_DENSITY_L1_MODE", "add")
+    density_l1_penalty_env = os.environ.get("TOMAT_DENSITY_PENALTY")
+    lmq_path_env = os.environ.get("TOMAT_LMQ_PATH")
+    if density_l1_weight > 0:
+        from qwen3_density import (
+            Qwen3DensityConfig,
+            build_density_loss_args,
+            configure_density_loss,
+        )
+        from tomat.float_codec import LMQCodec
+
+        if not lmq_path_env:
+            raise ValueError(
+                "TOMAT_DENSITY_L1_WEIGHT>0 but TOMAT_LMQ_PATH is unset; need "
+                "the codec to build the decode vector."
+            )
+        model_config_cls = Qwen3DensityConfig
+        print(f"[tomat-tpu] density-L_1 loss: weight={density_l1_weight}, "
+              f"mode={density_l1_mode}, lmq_path={lmq_path_env}")
+        lmq_codec = LMQCodec.load(lmq_path_env)
+
+        # Compute density vocab offsets per PatchVocab layout
+        # (specials=18, atoms=118, ints=1024, pos=pos_total, density=lmq_codec.n_bins)
+        n_specials = 18
+        n_atoms_in_vocab = 118
+        n_ints = 1024
+        pc = meta["vocab"]["position_codec"]
+        p_mag = pc["token_mag_bits"]
+        pos_signed_vocabs = tuple((2 if i == 0 else 1) << b for i, b in enumerate(p_mag))
+        pos_total = sum(pos_signed_vocabs)
+        DENSITY_OFFSET = n_specials + n_atoms_in_vocab + n_ints + pos_total
+        print(f"[tomat-tpu] density offset in vocab = {DENSITY_OFFSET}, "
+              f"density vocab range = [{DENSITY_OFFSET}, {DENSITY_OFFSET + lmq_codec.n_bins})")
+
+        import haliax as hax
+        Vocab = hax.Axis("vocab", vocab_size)
+        penalty_val = (
+            float(density_l1_penalty_env)
+            if density_l1_penalty_env is not None
+            else 10.0 * float(lmq_codec.recon_points.max())
+        )
+        density_loss_args = build_density_loss_args(
+            Vocab=Vocab,
+            density_offset=DENSITY_OFFSET,
+            n_density_bins=lmq_codec.n_bins,
+            codec_recon=lmq_codec.recon_points,
+            penalty=penalty_val,
+            weight=density_l1_weight,
+            mode=density_l1_mode,
+        )
+        configure_density_loss(density_loss_args)
+        print(f"[tomat-tpu] density-L_1 configured with PENALTY={penalty_val:.4f}")
+    else:
+        model_config_cls = Qwen3Config
+
+    model = model_config_cls(
         max_seq_len=8192,
         rope=Llama3RotaryEmbeddingsConfig(),
         tie_word_embeddings=True,

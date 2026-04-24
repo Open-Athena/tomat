@@ -41,7 +41,7 @@ import pyarrow.parquet as pq
 from click import command, option
 
 from tomat.data.zarr_io import load_rho_gga
-from tomat.float_codec import FP16Codec
+from tomat.float_codec import FP16Codec, LMQCodec
 from tomat.tokenizers.ball import BallTokenizer
 from tomat.tokenizers.ball import SPECIAL_TOKENS as BALL_SPECIAL_TOKENS
 from tomat.tokenizers.patch import INT_VOCAB_SIZE, PatchTokenizer, SPECIAL_TOKENS
@@ -77,11 +77,14 @@ def _build_schema() -> pa.Schema:
         help='Key in split file (default: validation).')
 @option('-m', '--patches-per-material', type=int, default=32,
         help='Random patch offsets to sample per material.')
-@option('-c', '--density-codec', type=click.Choice(sorted(DENSITY_CODECS)),
+@option('-c', '--density-codec', type=click.Choice(sorted(DENSITY_CODECS) + ['lmq']),
         default='two_token_9_12',
-        help='FP16 codec variant for density values (affects vocab size + tokens/value).')
+        help='Codec variant for density values. "lmq" = empirical Lloyd-Max; '
+             'pass --lmq-path to point at the saved codec .npz.')
+@option('--lmq-path', type=str, default=None,
+        help='Path (local or gs://) to a fitted LMQ codec. Required when --density-codec=lmq.')
 @option('--density-log-min', type=float, default=-4.127,
-        help='Codec log_min (rho_gga p0.01 with padding).')
+        help='Codec log_min (rho_gga p0.01 with padding). Ignored for LMQ.')
 @option('--density-log-max', type=float, default=4.967,
         help='Codec log_max (rho_gga p99.99 with padding).')
 @option('--shape', type=click.Choice(['cube', 'ball']), default='cube',
@@ -117,6 +120,7 @@ def main(
     split: str,
     patches_per_material: int,
     density_codec: str,
+    lmq_path: str | None,
     density_log_min: float,
     density_log_max: float,
     shape: str,
@@ -174,7 +178,13 @@ def main(
         f"density_codec={density_codec}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    codec = DENSITY_CODECS[density_codec](log_min=density_log_min, log_max=density_log_max)
+    if density_codec == 'lmq':
+        if not lmq_path:
+            raise click.UsageError("--lmq-path is required when --density-codec=lmq")
+        codec = LMQCodec.load(lmq_path)
+        err(f"[tokenize] loaded LMQ codec: n_bins={codec.n_bins}, clip_max={codec.clip_max:.4f}")
+    else:
+        codec = DENSITY_CODECS[density_codec](log_min=density_log_min, log_max=density_log_max)
     if shape == 'ball':
         tokenizer = BallTokenizer(r2_max=r2_max, density_codec=codec)
         specials = BALL_SPECIAL_TOKENS

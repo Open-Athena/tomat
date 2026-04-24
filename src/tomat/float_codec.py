@@ -229,3 +229,142 @@ class FP16Codec:
         with open(path, "w") as f:
             json.dump({"log_min": self.log_min, "log_max": self.log_max}, f, indent=2)
             f.write("\n")
+
+
+# ---- Lloyd-Max Quantizer (empirical, 1-token) ----------------------------
+
+
+@dataclass
+class LMQCodec:
+    """Empirical Lloyd-Max quantizer — 1-token density codec for unsigned values.
+
+    Fit via `scripts/fit_lmq_codec_modal.py` on an empirical PDF (all
+    train-full voxel densities). See `specs/18-lmq-codec.md`.
+
+    Compatible with PatchTokenizer's encode_signed/decode_signed/signed_vocabs
+    interface so it can drop in at the density-codec slot. Though the name
+    "signed" is a misnomer here (density is always ≥ 0), we keep the method
+    names for compatibility.
+    """
+
+    boundaries: np.ndarray   # shape (n_bins - 1,), sorted ascending
+    recon_points: np.ndarray  # shape (n_bins,)
+    clip_max: float          # values > clip_max get the top bin
+    codec_name: str = "lmq"
+
+    def __post_init__(self) -> None:
+        if self.boundaries.ndim != 1:
+            raise ValueError("boundaries must be 1-D")
+        if self.recon_points.ndim != 1:
+            raise ValueError("recon_points must be 1-D")
+        if len(self.recon_points) != len(self.boundaries) + 1:
+            raise ValueError(
+                f"len(recon_points)={len(self.recon_points)} != "
+                f"len(boundaries) + 1 = {len(self.boundaries) + 1}"
+            )
+
+    @property
+    def n_bins(self) -> int:
+        return len(self.recon_points)
+
+    # ---- sizing compatible with FP16Codec --------------------------------
+
+    @property
+    def tokens_per_value_signed(self) -> int:
+        return 1
+
+    @property
+    def tokens_per_value_unsigned(self) -> int:
+        return 1
+
+    @property
+    def signed_vocabs(self) -> tuple[int, ...]:
+        return (self.n_bins,)
+
+    @property
+    def unsigned_vocabs(self) -> tuple[int, ...]:
+        return (self.n_bins,)
+
+    # Kept for shape-compat with FP16Codec callers that peek at mag_bits.
+    @property
+    def token_mag_bits(self) -> tuple[int, ...]:
+        import math
+
+        return (int(math.ceil(math.log2(self.n_bins))),)
+
+    # Not meaningful for a learned quantizer, but callers (meta.json dump)
+    # expect these fields. Store the min/max of the reconstruction range.
+    @property
+    def log_min(self) -> float:
+        import math
+
+        return math.log10(max(float(self.recon_points.min()), 1e-30))
+
+    @property
+    def log_max(self) -> float:
+        import math
+
+        return math.log10(max(float(self.clip_max), 1e-30))
+
+    # ---- encode / decode -------------------------------------------------
+
+    def encode_signed(self, values: np.ndarray) -> np.ndarray:
+        """Map floats → bin indices via boundary search.
+
+        Returns shape ``(N, 1)`` to mirror the FP16Codec's component layout.
+        """
+        values = np.asarray(values, dtype=np.float64)
+        clipped = np.clip(values, 0.0, self.clip_max)
+        bin_idx = np.searchsorted(self.boundaries, clipped, side="right")
+        bin_idx = np.clip(bin_idx, 0, self.n_bins - 1)
+        return bin_idx.astype(np.int32).reshape(-1, 1)
+
+    def decode_signed(self, components: np.ndarray) -> np.ndarray:
+        """Map bin indices (shape (N, 1) or (N,)) → floats (shape (N,))."""
+        components = np.asarray(components, dtype=np.int64)
+        if components.ndim == 2:
+            if components.shape[1] != 1:
+                raise ValueError(f"expected (N, 1) components, got {components.shape}")
+            indices = components[:, 0]
+        else:
+            indices = components
+        indices = np.clip(indices, 0, self.n_bins - 1)
+        return self.recon_points[indices]
+
+    # Same thing for the "unsigned" branch — density is always unsigned, we
+    # just alias to signed versions.
+    def encode_unsigned(self, values: np.ndarray) -> np.ndarray:
+        return self.encode_signed(values)
+
+    def decode_unsigned(self, components: np.ndarray) -> np.ndarray:
+        return self.decode_signed(components)
+
+    # ---- persistence -----------------------------------------------------
+
+    @classmethod
+    def load(cls, path: str) -> "LMQCodec":
+        """Load from a saved .npz (produced by `fit_lmq_codec_modal.py`).
+
+        Supports local paths and gs:// URLs (uses `fsspec` if available).
+        """
+        try:
+            import fsspec  # type: ignore
+            with fsspec.open(path, "rb") as f:
+                data = np.load(f, allow_pickle=True)
+                bounds = data["boundaries"]
+                recon = data["recon_points"]
+                clip_max = float(data["clip_max"])
+        except Exception:
+            data = np.load(path, allow_pickle=True)
+            bounds = data["boundaries"]
+            recon = data["recon_points"]
+            clip_max = float(data["clip_max"])
+        codec_name = "lmq"
+        if path.endswith(".npz"):
+            codec_name = Path(path).stem
+        return cls(
+            boundaries=bounds.astype(np.float32),
+            recon_points=recon.astype(np.float32),
+            clip_max=clip_max,
+            codec_name=codec_name,
+        )
