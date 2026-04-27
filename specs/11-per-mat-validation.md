@@ -1,6 +1,7 @@
 # Per-material validation infrastructure
 
-Status: **proposed**. Written 2026-04-23.
+Status: **partial**. Written 2026-04-23. Updated 2026-04-27 with
+inter-patch consistency sub-metric.
 
 ## Motivation
 
@@ -115,7 +116,9 @@ Per eval run:
     "nmae_mean": 0.019,
     "nmae_median": 0.016,
     "nmae_p99": 0.087,
-    "chi2_mean": 0.00012
+    "chi2_mean": 0.00012,
+    "consistency_mean": 0.0034,
+    "consistency_median": 0.0021
   },
   "per_material": [
     {"mp_id": "mp-XXXXX", "nmae": 0.016, "chi2": 0.00008, "n_patches": 487},
@@ -125,6 +128,81 @@ Per eval run:
 ```
 
 Log to W&B as an artifact so it's pinned to the training step.
+
+## Sub-metric: inter-patch consistency
+
+**Idea (Yael + Ryan, 2026-04-26)**: when we tile a material with
+overlapping patches (stride < P), each voxel ends up inside multiple
+patches. A well-trained model should predict (nearly) the same density
+for that voxel regardless of which patch's context it was decoded from
+— inter-patch agreement is a free supervision-free signal of model
+self-consistency.
+
+Define **per-voxel consistency** as the standard deviation of predictions
+across the patches that cover it:
+
+$$\text{consistency}(v) = \mathrm{std}_{\{p : v \in p\}}\bigl(\hat{\rho}_{p}(v)\bigr)$$
+
+Aggregate **per-mat consistency**:
+
+$$\text{C}_\text{mat} = \frac{\mathrm{mean}_v \, \text{consistency}(v)}{\mathrm{mean}_v |\rho_\text{true}(v)|}$$
+
+(normalized to be comparable across materials, like NMAE).
+
+### Why it's interesting (orthogonal to NMAE)
+
+| metric | what it measures | needs ground truth? |
+|--------|------------------|---------------------|
+| NMAE | absolute error vs GT density | yes |
+| C_mat | self-consistency across overlapping contexts | **no** |
+
+Consistency is a **GT-free signal**. We can compute it on **any** material
+(including ones never seen during training), tracking model-internal
+"settled-ness" over a much larger pool than the held-out NMAE eval set.
+
+### Cheap when overlap stride is already in the eval
+
+If we run mat-NMAE eval at stride < P (per spec 11's "overlapping
+tiling" mode), we already have per-voxel multi-prediction data — the
+consistency metric is just an extra reduction over the same intermediate.
+Zero-cost addition.
+
+### Stride choice
+
+| stride | overlap factor | predictions/voxel | consistency stat strength |
+|--------|---------------|-------------------|---------------------------|
+| P (disjoint) | 1× | 1 | (none — no overlap) |
+| P/2 | 8× | up to 8 | usable |
+| P/4 | 64× | up to 64 | strong but expensive |
+
+Recommend stride = P/2 for consistency tracking — 8 predictions per
+voxel is enough for std stat, 8× compute over disjoint is affordable
+on a small held-out set.
+
+### Training-time tracker
+
+Cheap variant: every N training steps, run consistency eval on
+**a single fixed material** (same one each time, for trajectory
+comparison). At P/2 stride, ~8 × 360 = 2880 patch forwards,
+~10 sec on v6e-8. Logs:
+- `eval/consistency_mean` — overall self-consistency
+- `eval/consistency_p99` — worst-voxel agreement
+
+Should monotonically decrease as training progresses (model converges
+to a self-consistent function). A non-decreasing or noisy trajectory
+flags training instability or mode-collapse.
+
+### Open question: prediction averaging
+
+When stitching predictions for the headline NMAE, how do we combine
+the multiple predictions per voxel?
+- mean: smoothest; might mask one bad prediction with several good ones
+- median: robust to outlier patches
+- model-confidence-weighted: weight by `max(softmax)` per patch. Untested.
+
+For consistency *as a metric*, we use std across raw predictions (no
+combining). For *reconstruction*, mean is the safe default; revisit if
+we see large outlier patches.
 
 ## Visualizations
 
