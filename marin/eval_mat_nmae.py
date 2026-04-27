@@ -351,14 +351,24 @@ def main():
 
         per_mat_results = []
         for mp_id in mp_ids:
-            # Load raw Zarr
+            # Load raw Zarr — download from GCS to local /tmp first to dodge
+            # the gcsfs/aiohttp async-event-loop conflict with JAX's runtime.
             import zarr
+            import subprocess as _sp
+            import tempfile
             zarr_url = f"{zarr_base}/{mp_id}.zarr"
-            err(f"[eval-mat] mat={mp_id}, loading zarr from {zarr_url}")
-            # Wrap GCS as a zarr group
-            gcs_fs = fsspec.filesystem("gs")
-            gcs_store = zarr.storage.FsspecStore(gcs_fs, path=zarr_url.replace("gs://", ""))
-            group = zarr.open_group(gcs_store, mode="r")
+            local_zarr = tempfile.mkdtemp(prefix=f"tomat-eval-{mp_id}-")
+            err(f"[eval-mat] mat={mp_id}, downloading zarr {zarr_url} → {local_zarr}")
+            # gsutil cp -r gs://...zarr /tmp/...
+            rc = _sp.run(
+                ["gsutil", "-q", "-m", "cp", "-r", zarr_url, local_zarr + "/"],
+                check=False,
+            ).returncode
+            if rc != 0:
+                err(f"[eval-mat] gsutil cp failed for {mp_id}, skipping")
+                continue
+            local_zarr_path = f"{local_zarr}/{mp_id}.zarr"
+            group = zarr.open_group(local_zarr_path, mode="r")
             density = np.asarray(group["charge_density_total"][:]).astype(np.float32)
             grid_shape = tuple(density.shape)
             Zs, frac = load_structure_from_zarr_attrs(group)
