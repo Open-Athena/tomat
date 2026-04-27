@@ -383,9 +383,13 @@ def main():
             # numerator; or fill with 0 and report NMAE on covered region only).
             rho_pred = np.zeros(covered_shape, dtype=np.float32)
 
-            # Process in batches
+            # Process in batches. Drop trailing partial batch (TPU mesh
+            # needs batch divisible by mesh size = eval_batch); we lose at
+            # most eval_batch-1 patches per material.
             total = 0
-            for batch_start in range(0, n_patches, eval_batch):
+            n_full_batches = n_patches // eval_batch
+            for bi in range(n_full_batches):
+                batch_start = bi * eval_batch
                 batch_offsets = offsets[batch_start : batch_start + eval_batch]
                 batch_input_ids = []
                 batch_max_len = 0
