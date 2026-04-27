@@ -213,17 +213,48 @@ def fit_and_save(hist_bytes: bytes, total_stats: dict, n_bins: int, codec_name: 
             print(f"[fit] converged at iter {iter_idx}")
             break
 
-    # Final recon computation with stable bounds
+    # Final recon computation with stable bounds.
+    # We compute BOTH mean (L2-optimal Lloyd-Max) and median (L1-optimal) recon
+    # points. Mean is the historical default; median is better for L1/NMAE-targeted
+    # training. See `docs/codec-analysis.md`.
     bin_idx = np.searchsorted(bounds, centers_nz)
     sum_num = np.bincount(bin_idx, weights=centers_nz * counts_nz, minlength=n_bins)
     sum_den = np.bincount(bin_idx, weights=counts_nz, minlength=n_bins)
-    recon = np.where(sum_den > 0, sum_num / np.maximum(sum_den, 1e-30), np.nan)
-    empty = np.isnan(recon)
-    if empty.any():
-        idxs = np.arange(n_bins)
-        ne = ~empty
-        recon[empty] = np.interp(idxs[empty], idxs[ne], recon[ne])
-    # Per-bin counts for diagnostics
+    recon_mean = np.where(sum_den > 0, sum_num / np.maximum(sum_den, 1e-30), np.nan)
+
+    # Median: per output bin, find center where cumulative count crosses 50%.
+    recon_median = np.full(n_bins, np.nan, dtype=np.float64)
+    # Sort fine centers (already in ascending order since they came from a sorted
+    # log-spaced grid); group by output bin.
+    sort_order = np.argsort(bin_idx, kind="stable")
+    sorted_idx = bin_idx[sort_order]
+    sorted_centers = centers_nz[sort_order]
+    sorted_counts = counts_nz[sort_order]
+    # Find segment boundaries
+    seg_change = np.flatnonzero(np.diff(sorted_idx)) + 1
+    seg_starts = np.concatenate([[0], seg_change])
+    seg_ends = np.concatenate([seg_change, [len(sorted_idx)]])
+    for s, e in zip(seg_starts, seg_ends):
+        out_bin = sorted_idx[s]
+        seg_centers = sorted_centers[s:e]
+        seg_counts = sorted_counts[s:e]
+        cum = np.cumsum(seg_counts)
+        target = cum[-1] * 0.5
+        # First center where cumulative >= target
+        med_idx = np.searchsorted(cum, target)
+        med_idx = min(med_idx, len(seg_centers) - 1)
+        recon_median[out_bin] = seg_centers[med_idx]
+
+    # Fill empties for both
+    for arr in (recon_mean, recon_median):
+        empty = np.isnan(arr)
+        if empty.any():
+            idxs = np.arange(n_bins)
+            ne = ~empty
+            arr[empty] = np.interp(idxs[empty], idxs[ne], arr[ne])
+
+    # Default `recon` is mean (back-compat); also save `recon_median` separately.
+    recon = recon_mean
     per_bin_count = sum_den.astype(np.int64)
 
     # Compute diagnostic: expected MAE if we quantize data → closest recon point
@@ -241,7 +272,10 @@ def fit_and_save(hist_bytes: bytes, total_stats: dict, n_bins: int, codec_name: 
     clip_max = LIN_HI
     bundle = {
         "boundaries": bounds.astype(np.float32),
+        # `recon_points` is the L2-optimal mean (back-compat with v2 codecs).
         "recon_points": recon.astype(np.float32),
+        # `recon_points_median` is the L1-optimal median, for NMAE-targeted use.
+        "recon_points_median": recon_median.astype(np.float32),
         "clip_max": np.float32(clip_max),
         "n_bins": np.int32(n_bins),
         "lin_lo": np.float32(LIN_LO),
@@ -249,8 +283,17 @@ def fit_and_save(hist_bytes: bytes, total_stats: dict, n_bins: int, codec_name: 
         "per_bin_count": per_bin_count,
         "total_stats": np.array([json.dumps(total_stats)], dtype=object),
         # v2 marker: log-spaced fine bins used for fitting.
-        "fit_mode": np.array(["log-spaced fine bins, LIN_LO=1e-6, LIN_HI=1e5"], dtype=object),
+        "fit_mode": np.array(["log-spaced fine bins, LIN_LO=1e-6, LIN_HI=1e5; "
+                              "v3+ has both mean + median recon"], dtype=object),
     }
+
+    # Also report the median-based MAE as a separate diagnostic — should be
+    # strictly ≤ the mean-based MAE on right-skewed bins.
+    quant_err_median = np.abs(fine_centers - recon_median[fine_bin_idx])
+    mae_median = (quant_err_median * hist.astype(np.float64)).sum() / max(hist.sum(), 1)
+    nmae_median_approx = mae_median / max(mean_rho, 1e-30)
+    print(f"[fit] (median recon) quantization MAE = {mae_median:.6e}, "
+          f"NMAE lower-bound = {nmae_median_approx:.4%}")
     buf = io.BytesIO()
     np.savez(buf, **bundle)
     buf.seek(0)
