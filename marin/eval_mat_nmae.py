@@ -353,21 +353,20 @@ def main():
         for mp_id in mp_ids:
             # Load raw Zarr — download from GCS to local /tmp first to dodge
             # the gcsfs/aiohttp async-event-loop conflict with JAX's runtime.
+            # fsspec.download works synchronously even when the underlying
+            # filesystem is async (gcsfs).
             import zarr
-            import subprocess as _sp
             import tempfile
             zarr_url = f"{zarr_base}/{mp_id}.zarr"
-            local_zarr = tempfile.mkdtemp(prefix=f"tomat-eval-{mp_id}-")
-            err(f"[eval-mat] mat={mp_id}, downloading zarr {zarr_url} → {local_zarr}")
-            # gsutil cp -r gs://...zarr /tmp/...
-            rc = _sp.run(
-                ["gsutil", "-q", "-m", "cp", "-r", zarr_url, local_zarr + "/"],
-                check=False,
-            ).returncode
-            if rc != 0:
-                err(f"[eval-mat] gsutil cp failed for {mp_id}, skipping")
+            local_dir = tempfile.mkdtemp(prefix=f"tomat-eval-{mp_id}-")
+            local_zarr_path = f"{local_dir}/{mp_id}.zarr"
+            err(f"[eval-mat] mat={mp_id}, downloading {zarr_url} → {local_zarr_path}")
+            try:
+                gcs_fs = fsspec.filesystem("gs")
+                gcs_fs.get(zarr_url.replace("gs://", "") + "/", local_zarr_path, recursive=True)
+            except Exception as e:
+                err(f"[eval-mat] download FAIL {mp_id}: {type(e).__name__}: {e}")
                 continue
-            local_zarr_path = f"{local_zarr}/{mp_id}.zarr"
             group = zarr.open_group(local_zarr_path, mode="r")
             density = np.asarray(group["charge_density_total"][:]).astype(np.float32)
             grid_shape = tuple(density.shape)
