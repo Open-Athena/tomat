@@ -313,10 +313,9 @@ def main():
         tie_word_embeddings=True,
         **MODEL_PRESETS[model_preset],
     )
-    Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), compute_mapping)
-
     key = jax.random.PRNGKey(seed)
     with trainer_cfg.use_device_mesh():
+        Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), compute_mapping)
         with use_cpu_device():
             model = eqx.filter_eval_shape(model_cfg.build, Vocab, key=key)
             err(f"[eval-mat] loading checkpoint")
