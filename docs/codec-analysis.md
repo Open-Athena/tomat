@@ -1,6 +1,6 @@
 # LMQ codec analysis — audit vs Yael's adaptive Gaussian approach
 
-Status: **draft, 2026-04-27**.
+Status: **draft, 2026-04-27**. Verdict at bottom.
 
 ## Yael's reference
 
@@ -73,11 +73,26 @@ output and comparing.
 
 ## Notes / caveats
 
-- Yael's domain (race time prediction) is 1D output per sample. Ours is
-  thousands of voxels per patch, autoregressive. Calibrated PDFs are nice
-  but the autoregressive structure already provides per-token distributions
-  — calibration matters less (we mostly care about the marginal).
-- "Gaussian in value space" assumes the true value's *measurement uncertainty*
-  is Gaussian. For DFT charge density that's a reasonable prior; for race
-  times she argues it captures real noise. For our task it's mostly a
-  smoothing-the-loss-landscape trick.
+- Yael's domain (race time prediction) has **inherently noisy GT** — the same
+  runner has day-to-day variance. Calibrated PDFs matter because she wants
+  predictions like "70% chance the time is in [36, 37] sec."
+- Our domain (DFT charge density) is **deterministic given (structure, DFT
+  functional)**. There's no inherent measurement uncertainty for the model
+  to calibrate against. NMAE is the right metric; calibrated PDFs solve a
+  problem we don't have.
+- L_1-with-expected-value already provides ordinality-aware gradients (the
+  original motivation behind spec-17 design discussion) and directly
+  optimizes our target metric.
+
+## Verdict
+
+**Skip Gaussian-smoothed CE.** Our existing L_1 loss is more direct, has
+fewer hyperparameters, and optimizes the metric we actually care about
+(NMAE on decoded floats).
+
+The audit was useful for confirming we're not missing something — but the
+conclusion is that GSCE solves a different problem (calibration) than ours
+(NMAE).
+
+**Do keep** the median-recon fix (Lloyd-Max-with-mean → Lloyd-Max-with-median)
+since that's a free improvement on our existing path.

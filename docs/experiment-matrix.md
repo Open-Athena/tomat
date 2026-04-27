@@ -32,8 +32,8 @@ Codec quantization floor (lower bound on what any model can reach):
 - vanilla CE (legacy)
 - **CE + λ·L_1** (Formulation X / current; λ ∈ {0.1, 1.0})
 - pure L_1 (`replace` mode, λ=∞)
-- (proposed) value-space Gaussian-smoothed CE (Yael's adaptive σ approach)
-- (proposed) hybrid: `α·L_1 + β·gauss-smooth-CE`
+- ~~Gaussian-smoothed CE (Yael)~~ — **skipped** per `docs/codec-analysis.md`:
+  solves calibration, not NMAE; our domain has deterministic GT.
 
 ### 3. Patch shape
 - **cube P=14** (current default)
@@ -96,7 +96,6 @@ Codec quantization floor (lower bound on what any model can reach):
 
 ## Open infra TODOs
 
-- [ ] Implement Gaussian-smoothed-CE option in `qwen3_density.py` (Yael-style adaptive σ).
 - [ ] Refit codec(s) with median recon points (audit fix).
 - [ ] Wire patch-level NMAE-proxy into training-time eval (free metric — same forward pass already does L_1).
 - [ ] Inter-patch consistency eval (overlap stride > 1 → measure variance at shared voxels).
