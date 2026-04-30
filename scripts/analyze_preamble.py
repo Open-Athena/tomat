@@ -14,14 +14,14 @@ length for each (material × patch-shape) combo and report:
 
 Token accounting (matches src/tomat/tokenizers/{patch,ball}.py):
 
-    cube (P):   28 + 10·n_atoms + 2·P³
+    cube (P):   36 + 10·n_atoms + 2·P³
     ball (R²):  29 + 10·n_atoms + 2·V_ball(R²)
 
 where V_ball(R²) = cumulative integer lattice points with i²+j²+k² ≤ R².
 
-28/29 token overhead = BOS + 7 START/END block pairs (14) + 3 grid +
-3 shape/offset (cube) or 1 radius + 3 center + 6 bounds (ball) + 3 hi
-(cube only) + 2 DENS_START/END + EOS. See preamble_overhead() below.
+Cube overhead = old 28 + 8 (LATTICE block: 2 specials + 6 ints).
+The lattice block holds (a, b, c, α, β, γ) quantized to INT bins. Ball
+tokenizer is unchanged (29 still).
 
 Usage:
     scripts/analyze_preamble.py /tmp/train-full-preamble.csv --P 14 15 16 18 20 --ball-R2 75 86 100 138 153 --CL 8192 16384
@@ -38,13 +38,14 @@ from tabulate import tabulate
 
 
 # Per-atom preamble cost: 1 atom token + 3·3 = 9 position-codec tokens = 10.
-# Shared overhead (cube & ball both include): BOS, GRID(+/-), ATOMS(+/-),
-# POS(+/-), DENS(+/-), EOS = 1 + 2*4 + 1 = 10 specials. Plus 3 grid ints.
-# = 13. Shape-specific:
-#   cube:   SHAPE(+/-) + 3 ints + OFFSET(+/-) + 3 ints + HI(+/-) + 3 ints = 15 more → 28 total.
-#   ball:   RADIUS(+/-) + 1 int + CENTER(+/-) + 3 ints + BOUNDS(+/-) + 6 ints = 16 more → 29 total.
+# Cube overhead: BOS + EOS + 8 START/END pairs (GRID, LATTICE, ATOMS, POS,
+# SHAPE, OFFSET, HI, DENS) + 3 grid + 6 lattice + 3 shape + 3 offset + 3 hi
+# = 2 + 16 + 18 = 36.
+# Ball overhead: BOS + EOS + 7 START/END pairs (GRID, ATOMS, POS, RADIUS,
+# CENTER, BOUNDS, DENS) + 3 grid + 1 radius + 3 center + 6 bounds = 2 + 14
+# + 13 = 29. (Lattice not yet added to ball; if added, bump similarly.)
 PER_ATOM = 10
-CUBE_SHARED = 28
+CUBE_SHARED = 36
 BALL_SHARED = 29
 
 
@@ -104,7 +105,7 @@ def main():
     err(f"n_atoms: min={n_atoms.min()} p1={np.percentile(n_atoms,1):.0f} "
         f"p50={int(np.median(n_atoms))} p75={int(np.percentile(n_atoms,75))} "
         f"p99={int(np.percentile(n_atoms,99))} max={n_atoms.max()}")
-    err(f"preamble-only size (cube, 28+10N): p50={CUBE_SHARED+10*int(np.median(n_atoms))} "
+    err(f"preamble-only size (cube, {CUBE_SHARED}+10N): p50={CUBE_SHARED+10*int(np.median(n_atoms))} "
         f"p99={CUBE_SHARED+10*int(np.percentile(n_atoms,99))} "
         f"max={CUBE_SHARED+10*n_atoms.max()}")
 

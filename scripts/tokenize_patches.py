@@ -212,6 +212,7 @@ def main(
     missing: list[str] = []
     oversized: list[tuple[str, tuple[int, int, int]]] = []
     overflowed: list[str] = []
+    bad_lattice: list[tuple[str, tuple[float, ...]]] = []
     for mat_idx, task_id in enumerate(task_ids, start=1):
         zarr_path = rho_gga_dir / 'label' / f'{task_id}.zarr'
         if not zarr_path.exists():
@@ -229,6 +230,22 @@ def main(
         if any(d >= INT_VOCAB_SIZE for d in density_shape):
             oversized.append((task_id, tuple(int(d) for d in density_shape)))
             continue
+
+        # Lattice quantization range check (cube tokenizer only — ball doesn't
+        # carry lattice yet). Lengths > 51.2 Å or angles ≥ 204.8° overflow
+        # the INT bin range. The set of MP cells that hit this is tiny
+        # (mostly large supercells); skip + log so a few outliers don't kill
+        # the whole run.
+        if shape == 'cube':
+            from tomat.tokenizers.patch import (
+                LATTICE_LENGTH_MAX_A, LATTICE_ANGLE_MAX_DEG,
+            )
+            lat = sample.structure.lattice
+            params = (lat.a, lat.b, lat.c, lat.alpha, lat.beta, lat.gamma)
+            if (any(L >= LATTICE_LENGTH_MAX_A or L < 0 for L in params[:3])
+                    or any(theta >= LATTICE_ANGLE_MAX_DEG or theta < 0 for theta in params[3:])):
+                bad_lattice.append((task_id, params))
+                continue
 
         # Cube samples random offsets (low corners); ball samples random centers.
         if shape == 'ball':
@@ -326,6 +343,10 @@ def main(
         "oversized_task_ids": [
             {"task_id": tid, "shape": list(sh)} for tid, sh in oversized[:50]
         ],
+        "n_materials_bad_lattice": len(bad_lattice),
+        "bad_lattice_task_ids": [
+            {"task_id": tid, "lattice": [float(x) for x in p]} for tid, p in bad_lattice[:50]
+        ],
         "n_materials_overflow": len(overflowed),
         "overflow_task_ids": overflowed[:50],
         "patches_per_material": patches_per_material,
@@ -355,7 +376,8 @@ def main(
     }
     (output_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     err(f"[tokenize] done: {total_rows:,} rows in {meta['n_shards']} shards "
-        f"({len(missing)} missing, {len(oversized)} oversized-skipped)")
+        f"({len(missing)} missing, {len(oversized)} oversized-skipped, "
+        f"{len(bad_lattice)} lattice-overflow, {len(overflowed)} pad-overflow)")
 
 
 if __name__ == '__main__':

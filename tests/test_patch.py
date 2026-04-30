@@ -11,6 +11,8 @@ from tomat.tokenizers.patch import (
     ATOM_END,
     INT_OFFSET,
     INT_VOCAB_SIZE,
+    LATTICE_ANGLE_RES_DEG,
+    LATTICE_LENGTH_RES_A,
     N_SPECIALS,
     PatchTokenizer,
     SPECIAL_TOKENS,
@@ -43,9 +45,9 @@ def test_vocab_layout_is_contiguous(tokenizer):
     assert v.position_vocab_size == 1024
     # Density with 2-token 9+12: 512 + 4096 = 4608
     assert v.density_vocab_size == 4608
-    # Total: specials(18) + atoms(118) + ints(1024) + positions(1024) + density(4608)
-    assert N_SPECIALS == 18
-    assert v.total_vocab_size == 18 + 118 + 1024 + 1024 + 4608
+    # Total: specials(20) + atoms(118) + ints(1024) + positions(1024) + density(4608)
+    assert N_SPECIALS == 20
+    assert v.total_vocab_size == 20 + 118 + 1024 + 1024 + 4608
 
 
 def test_extract_patch_with_pbc_wrap(tokenizer):
@@ -83,6 +85,7 @@ def test_tokenize_structure(tokenizer, fake_structure):
     # Expected count:
     #   BOS                                   1
     #   GRID_START  3 ints  GRID_END          5
+    #   LATTICE_START 6 ints LATTICE_END      8
     #   ATOMS_START  2 atoms  ATOMS_END       4
     #   POS_START  2*3*3tok  POS_END         20
     #   SHAPE_START 3 ints SHAPE_END          5
@@ -90,8 +93,8 @@ def test_tokenize_structure(tokenizer, fake_structure):
     #   HI_START 3 ints HI_END                5
     #   DENS_START 8³ × 2tok DENS_END      1026
     #   EOS                                   1
-    # total                                1072
-    expected = 1 + 5 + 4 + 20 + 5 + 5 + 5 + (2 * tokenizer.patch_size ** 3 + 2) + 1
+    # total                                1080
+    expected = 1 + 5 + 8 + 4 + 20 + 5 + 5 + 5 + (2 * tokenizer.patch_size ** 3 + 2) + 1
     assert len(tokens) == expected
 
     # Special tokens present in the right order
@@ -151,6 +154,12 @@ def test_roundtrip_recovers_sample(tokenizer, fake_structure):
     assert recovered.grid_shape == original.grid_shape
     assert recovered.patch_shape == original.patch_shape
     assert recovered.offset == original.offset
+    # Lattice round-trip within bin resolution
+    for got, want, res in zip(
+        recovered.lattice, original.lattice,
+        (LATTICE_LENGTH_RES_A,) * 3 + (LATTICE_ANGLE_RES_DEG,) * 3,
+    ):
+        assert abs(got - want) <= res
     assert np.array_equal(recovered.atomic_numbers, original.atomic_numbers)
     # Fractional coords through position codec: ~6 sig figs at 3-byte codec.
     assert np.allclose(recovered.frac_coords, original.frac_coords, atol=1e-4)
@@ -203,6 +212,49 @@ def test_detokenize_rejects_inconsistent_hi_corner(tokenizer, fake_structure):
     toks[hi_start + 1] = INT_OFFSET + 999
     with pytest.raises(ValueError, match="hi-corner"):
         tokenizer.detokenize(toks)
+
+
+def test_lattice_block_encodes_parameters(tokenizer, fake_structure):
+    """Lattice block emits 6 INT tokens between GRID and ATOMS, decoded
+    back to within bin resolution of the input parameters."""
+    rng = np.random.default_rng(0)
+    density = rng.uniform(1e-3, 1.0, size=(16, 16, 16)).astype(np.float32)
+    sample = tokenizer.make_sample(
+        task_id="mp-fake",
+        density=density,
+        structure=fake_structure,
+        offset=(0, 0, 0),
+    )
+    # fake_structure has lattice (4, 4, 4) Å, all 90° angles.
+    assert sample.lattice == (4.0, 4.0, 4.0, 90.0, 90.0, 90.0)
+
+    tokens = tokenizer.tokenize(sample)
+    li = tokens.index(SPECIAL_TOKENS["[LATTICE_START]"])
+    lj = tokens.index(SPECIAL_TOKENS["[LATTICE_END]"])
+    assert lj - li - 1 == 6
+    lat_ints = [t - INT_OFFSET for t in tokens[li + 1 : lj]]
+    # 4.0 / 0.05 = 80, 90 / 0.2 = 450
+    assert lat_ints == [80, 80, 80, 450, 450, 450]
+
+    # And the lattice block must precede atoms (geometry → chemistry).
+    ai = tokens.index(SPECIAL_TOKENS["[ATOMS_START]"])
+    assert li < lj < ai
+
+
+def test_lattice_token_rejects_out_of_range(tokenizer, fake_structure):
+    """Lengths ≥ 51.2 Å (and angles ≥ 204.8°) raise — caller decides skip."""
+    from pymatgen.core.structure import Structure
+    big = Structure(
+        lattice=[[100, 0, 0], [0, 4, 0], [0, 0, 4]],  # a = 100 Å
+        species=["C"], coords=[[0, 0, 0]],
+    )
+    rng = np.random.default_rng(0)
+    density = rng.uniform(1e-3, 1.0, size=(16, 16, 16)).astype(np.float32)
+    sample = tokenizer.make_sample(
+        task_id="mp-big", density=density, structure=big, offset=(0, 0, 0),
+    )
+    with pytest.raises(ValueError, match="lattice a"):
+        tokenizer.tokenize(sample)
 
 
 def test_random_offsets_uniform_coverage(tokenizer):

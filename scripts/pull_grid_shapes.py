@@ -8,8 +8,10 @@ label) by reading the first row of each 32-row block in each parquet.
 Each training row's preamble starts with:
     [BOS] [GRID_START] int(nx) int(ny) int(nz) [GRID_END] ...
 
-Int tokens occupy vocab[18+118 : 18+118+1024] = [136, 1160). grid dim =
-token - 136.
+Int tokens occupy vocab[N_SPECIALS+118 : ...+1024]. grid dim = token -
+INT_BASE. Pre-lattice datasets have N_SPECIALS=18 (INT_BASE=136); from
+lat-aware datasets onward N_SPECIALS=20 (INT_BASE=138). Use --int-base
+to override.
 
 Since `patches_per_material = 32` and shards are stored in order, row 0,
 32, 64, ... each correspond to a distinct material's first patch. We read
@@ -17,7 +19,7 @@ only those rows and extract 3 int tokens per material.
 
 Output: CSV with columns `mp_id,nx,ny,nz` to stdout.
 
-Usage: pull_grid_shapes.py --label train-full [--max-mats N]
+Usage: pull_grid_shapes.py --label train-full [--max-mats N] [--int-base 138]
 """
 
 from __future__ import annotations
@@ -30,28 +32,29 @@ import gcsfs  # type: ignore
 import pyarrow.parquet as pq  # type: ignore
 from tqdm import tqdm
 
-INT_BASE = 18 + 118  # 136
 INT_VOCAB = 1024
 GRID_START_TOK = 7
 GRID_END_TOK = 8
 PATCHES_PER_MAT = 32
 
 
-def decode_grid(tokens: list[int]) -> tuple[int, int, int]:
+def decode_grid(tokens: list[int], int_base: int) -> tuple[int, int, int]:
     if tokens[1] != GRID_START_TOK:
         raise ValueError(f"expected GRID_START at pos 1, got {tokens[:6]}")
     dims = []
     for i in range(2, 5):
         t = tokens[i]
-        if not (INT_BASE <= t < INT_BASE + INT_VOCAB):
-            raise ValueError(f"token[{i}]={t} not in int range [{INT_BASE}, {INT_BASE+INT_VOCAB})")
-        dims.append(t - INT_BASE)
+        if not (int_base <= t < int_base + INT_VOCAB):
+            raise ValueError(f"token[{i}]={t} not in int range [{int_base}, {int_base+INT_VOCAB})")
+        dims.append(t - int_base)
     if tokens[5] != GRID_END_TOK:
         raise ValueError(f"expected GRID_END at pos 5, got {tokens[:6]}")
     return (dims[0], dims[1], dims[2])
 
 
-def process_shard(shard: str, fs: gcsfs.GCSFileSystem) -> list[tuple[str, int, int, int]]:
+def process_shard(
+    shard: str, fs: gcsfs.GCSFileSystem, int_base: int,
+) -> list[tuple[str, int, int, int]]:
     """Read only row 0, 32, 64, ... (one per material) from a shard.
 
     Uses parquet's row-group + column selection so we only pull the
@@ -73,7 +76,7 @@ def process_shard(shard: str, fs: gcsfs.GCSFileSystem) -> list[tuple[str, int, i
         else [None] * len(ids)
     )
     for i in range(0, len(ids), PATCHES_PER_MAT):
-        nx, ny, nz = decode_grid(ids[i][:6])
+        nx, ny, nz = decode_grid(ids[i][:6], int_base)
         mpid = mp_ids[i] if mp_ids[i] is not None else f"{shard}:{i}"
         out.append((mpid, nx, ny, nz))
     return out
@@ -86,6 +89,8 @@ def main():
     ap.add_argument("--max-mats", type=int, default=0, help="0 = no cap")
     ap.add_argument("--workers", type=int, default=32, help="concurrent shard downloads")
     ap.add_argument("--sample-every", type=int, default=1, help="read every Nth shard (1 = all)")
+    ap.add_argument("--int-base", type=int, default=138,
+                    help="INT-token offset (138 for lattice-aware datasets, 136 for pre-lattice).")
     args = ap.parse_args()
 
     fs = gcsfs.GCSFileSystem()
@@ -98,7 +103,7 @@ def main():
     print("mp_id,nx,ny,nz")
     mats_seen = 0
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(process_shard, s, fs): s for s in shards}
+        futs = {ex.submit(process_shard, s, fs, args.int_base): s for s in shards}
         for fut in tqdm(as_completed(futs), total=len(futs), file=sys.stderr):
             shard = futs[fut]
             try:

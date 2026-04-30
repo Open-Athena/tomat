@@ -81,12 +81,21 @@ MODEL_PRESETS = {
 }
 
 # Vocab layout (matches src/tomat/tokenizers/patch.py's PatchVocab).
-N_SPECIALS = 18
+# Pre-lat datasets: N_SPECIALS=18, INT_OFFSET=136, no LATTICE block.
+# Lat-aware datasets: N_SPECIALS=20, INT_OFFSET=138, LATTICE block between GRID
+# and ATOMS. Detected from the dataset's meta.json (LATTICE_START key in
+# meta['vocab']['specials']). All offsets shift accordingly; helpers receive
+# a `vocab_offsets["n_specials"]` so they don't need a global.
+N_SPECIALS_PRELAT = 18
+N_SPECIALS_LAT = 20
 N_ATOMS = 118
 N_INTS = 1024
 
+# Lattice quantization (must match src/tomat/tokenizers/patch.py).
+LATTICE_LENGTH_RES_A = 0.05
+LATTICE_ANGLE_RES_DEG = 0.2
 
-# Special token IDs (same as patch.py SPECIAL_TOKENS)
+# Special token IDs (subset; lat datasets add LATTICE_{START,END}=18,19).
 TOK = {
     "PAD": 0, "BOS": 1, "EOS": 2,
     "ATOMS_START": 3, "ATOMS_END": 4,
@@ -97,6 +106,7 @@ TOK = {
     "HI_START": 13, "HI_END": 14,
     "DENS_START": 15, "DENS_END": 16,
     "NL": 17,
+    "LATTICE_START": 18, "LATTICE_END": 19,
 }
 
 
@@ -118,7 +128,9 @@ def lmq_encode(boundaries, clip_max, values):
 
 def load_structure_from_zarr_attrs(zarr_group):
     """Parse pymatgen structure JSON from a zarr group's attrs. Returns
-    (atomic_Zs, frac_coords) — we don't need a full pymatgen Structure."""
+    (atomic_Zs, frac_coords, lattice_params) — lattice = (a, b, c, α, β, γ)
+    in (Å, Å, Å, deg, deg, deg). lat-aware datasets need it; pre-lat code
+    paths just ignore."""
     from pymatgen.core.structure import Structure
     attrs = dict(zarr_group.attrs)
     struct_json = attrs.get("structure")
@@ -127,7 +139,9 @@ def load_structure_from_zarr_attrs(zarr_group):
     s = Structure.from_dict(struct_json)
     Zs = np.array([site.specie.Z for site in s], dtype=np.int32)
     frac = np.array([site.frac_coords for site in s], dtype=np.float64) % 1.0
-    return Zs, frac
+    lat = s.lattice
+    lattice_params = (lat.a, lat.b, lat.c, lat.alpha, lat.beta, lat.gamma)
+    return Zs, frac, lattice_params
 
 
 def tokenize_patch_for_eval(
@@ -137,23 +151,46 @@ def tokenize_patch_for_eval(
     atomic_Zs,       # (N,) int
     frac_coords,     # (N, 3) float
     lmq_codec,       # (boundaries, recon_points, clip_max)
-    vocab_offsets,   # dict with 'density_offset', 'pos_offset', pos_vocabs, pos_log_min, pos_log_max
+    vocab_offsets,   # dict with density_offset, pos_offset, pos_vocabs, pos_log_min, pos_log_max,
+                     #   n_specials, lat_aware
     P=14,
+    lattice_params=None,
 ):
     """Build an input_ids list for one patch — mirrors PatchTokenizer.tokenize()."""
     bounds, recon, clip_max = lmq_codec
+    n_specials = vocab_offsets["n_specials"]
+    int_off = n_specials + N_ATOMS
+    lat_aware = vocab_offsets.get("lat_aware", False)
     tokens = [TOK["BOS"]]
 
     # GRID
     tokens.append(TOK["GRID_START"])
     for d in grid_shape:
-        tokens.append(N_SPECIALS + N_ATOMS + int(d))  # int_token offset = 136 + d
+        tokens.append(int_off + int(d))
     tokens.append(TOK["GRID_END"])
+
+    # LATTICE (lat-aware only)
+    if lat_aware:
+        if lattice_params is None:
+            raise ValueError("lat-aware dataset requires lattice_params")
+        a, b, c, alpha, beta, gamma = lattice_params
+        lat_ints = [
+            int(round(a / LATTICE_LENGTH_RES_A)),
+            int(round(b / LATTICE_LENGTH_RES_A)),
+            int(round(c / LATTICE_LENGTH_RES_A)),
+            int(round(alpha / LATTICE_ANGLE_RES_DEG)),
+            int(round(beta  / LATTICE_ANGLE_RES_DEG)),
+            int(round(gamma / LATTICE_ANGLE_RES_DEG)),
+        ]
+        tokens.append(TOK["LATTICE_START"])
+        for v in lat_ints:
+            tokens.append(int_off + v)
+        tokens.append(TOK["LATTICE_END"])
 
     # ATOMS
     tokens.append(TOK["ATOMS_START"])
     for z in atomic_Zs:
-        tokens.append(N_SPECIALS + int(z - 1))
+        tokens.append(n_specials + int(z - 1))
     tokens.append(TOK["ATOMS_END"])
 
     # POS: each coord → tomol_3byte codec (3 tokens/coord × 3 coords per atom)
@@ -171,13 +208,13 @@ def tokenize_patch_for_eval(
     # SHAPE
     tokens.append(TOK["SHAPE_START"])
     for _ in range(3):
-        tokens.append(N_SPECIALS + N_ATOMS + int(P))
+        tokens.append(int_off + int(P))
     tokens.append(TOK["SHAPE_END"])
 
     # OFFSET
     tokens.append(TOK["OFFSET_START"])
     for o in offset:
-        tokens.append(N_SPECIALS + N_ATOMS + int(o))
+        tokens.append(int_off + int(o))
     tokens.append(TOK["OFFSET_END"])
 
     # HI
@@ -185,7 +222,7 @@ def tokenize_patch_for_eval(
     nx, ny, nz = grid_shape
     hi = tuple((offset[i] + P - 1) % grid_shape[i] for i in range(3))
     for h in hi:
-        tokens.append(N_SPECIALS + N_ATOMS + int(h))
+        tokens.append(int_off + int(h))
     tokens.append(TOK["HI_END"])
 
     # DENS — LMQ 1-token per voxel, row-major flatten
@@ -282,16 +319,22 @@ def build_all_patch_input_ids(
     vocab_offsets,
     P=14,
     pad_to=8192,
+    lattice_params=None,  # (a, b, c, α, β, γ); required when lat-aware
 ):
     """Vectorized: return (n_patches, pad_to) int32 input_ids matrix.
 
     Layout matches tokenize_patch_for_eval; per-mat preamble is identical
-    across patches (BOS, GRID, ATOMS, POS, SHAPE) — only OFFSET, HI, DENS
-    blocks vary per patch. Built once via numpy ops, no Python per-patch loop.
+    across patches (BOS, GRID, [LATTICE,] ATOMS, POS, SHAPE) — only
+    OFFSET, HI, DENS blocks vary per patch. Built once via numpy ops, no
+    Python per-patch loop. ``vocab_offsets["lat_aware"]`` (bool) selects
+    the LATTICE-block-emitting layout; in that case ``lattice_params``
+    must be supplied.
     """
     bounds, recon, clip_max = lmq_codec
-    int_off = N_SPECIALS + N_ATOMS  # 136
+    n_specials = vocab_offsets["n_specials"]
+    int_off = n_specials + N_ATOMS  # 136 (pre-lat) or 138 (lat)
     density_offset = vocab_offsets["density_offset"]
+    lat_aware = vocab_offsets.get("lat_aware", False)
 
     offsets_arr = np.asarray(offsets, dtype=np.int32)  # (n, 3)
     n = offsets_arr.shape[0]
@@ -301,7 +344,25 @@ def build_all_patch_input_ids(
     pre = [TOK["BOS"]]
     pre += [TOK["GRID_START"], int_off + int(grid_shape[0]), int_off + int(grid_shape[1]),
             int_off + int(grid_shape[2]), TOK["GRID_END"]]
-    pre += [TOK["ATOMS_START"]] + [N_SPECIALS + int(z - 1) for z in Zs] + [TOK["ATOMS_END"]]
+    if lat_aware:
+        if lattice_params is None:
+            raise ValueError("lat-aware dataset requires lattice_params")
+        a, b, c, alpha, beta, gamma = lattice_params
+        lat_ints = [
+            int(round(a / LATTICE_LENGTH_RES_A)),
+            int(round(b / LATTICE_LENGTH_RES_A)),
+            int(round(c / LATTICE_LENGTH_RES_A)),
+            int(round(alpha / LATTICE_ANGLE_RES_DEG)),
+            int(round(beta  / LATTICE_ANGLE_RES_DEG)),
+            int(round(gamma / LATTICE_ANGLE_RES_DEG)),
+        ]
+        if any(v < 0 or v >= N_INTS for v in lat_ints):
+            raise ValueError(
+                f"lattice quantization out of range: params={lattice_params} → "
+                f"ints={lat_ints} (must be [0, {N_INTS}))"
+            )
+        pre += [TOK["LATTICE_START"]] + [int_off + v for v in lat_ints] + [TOK["LATTICE_END"]]
+    pre += [TOK["ATOMS_START"]] + [n_specials + int(z - 1) for z in Zs] + [TOK["ATOMS_END"]]
     pre += [TOK["POS_START"]]
     for xyz in frac:
         for c in xyz:
@@ -385,20 +446,30 @@ def main():
         f"recon range=[{recon.min():.3e}, {recon.max():.3e}]")
     lmq_codec = (bounds, recon, clip_max)
 
-    # Vocab offsets
+    # Vocab offsets — detect lat-awareness from meta.json's specials map.
+    # Lat-aware datasets carry [LATTICE_START]/[LATTICE_END] in specials and
+    # bump N_SPECIALS 18 → 20.
+    specials = meta["vocab"].get("specials", {})
+    lat_aware = "[LATTICE_START]" in specials or "LATTICE_START" in specials
+    n_specials = N_SPECIALS_LAT if lat_aware else N_SPECIALS_PRELAT
+    if len(specials) and len(specials) != n_specials:
+        err(f"[eval-mat] WARN: meta specials count {len(specials)} != expected {n_specials}")
     pc = meta["vocab"]["position_codec"]
     p_mag = pc["token_mag_bits"]
     pos_signed_vocabs = tuple((2 if i == 0 else 1) << b for i, b in enumerate(p_mag))
     pos_total = sum(pos_signed_vocabs)
-    density_offset = N_SPECIALS + N_ATOMS + N_INTS + pos_total
+    density_offset = n_specials + N_ATOMS + N_INTS + pos_total
     vocab_offsets = {
         "density_offset": density_offset,
-        "pos_offset": N_SPECIALS + N_ATOMS + N_INTS,
+        "pos_offset": n_specials + N_ATOMS + N_INTS,
         "pos_vocabs": pos_signed_vocabs,
         "pos_log_min": pc["log_min"],
         "pos_log_max": pc["log_max"],
+        "n_specials": n_specials,
+        "lat_aware": lat_aware,
     }
-    err(f"[eval-mat] DENSITY_OFFSET={density_offset}, density_range=[{density_offset}, {vocab_size})")
+    err(f"[eval-mat] lat_aware={lat_aware}, n_specials={n_specials}, "
+        f"DENSITY_OFFSET={density_offset}, density_range=[{density_offset}, {vocab_size})")
 
     # Set up Trainer + model
     mp_policy = jmp.Policy(
@@ -540,8 +611,11 @@ def main():
             group = zarr.open_group(local_zarr_path, mode="r")
             density = np.asarray(group["charge_density_total"][:]).astype(np.float32)
             grid_shape = tuple(density.shape)
-            Zs, frac = load_structure_from_zarr_attrs(group)
-            err(f"[eval-mat] mat={mp_id}: grid={grid_shape}, atoms={len(Zs)}")
+            Zs, frac, lattice_params = load_structure_from_zarr_attrs(group)
+            err(f"[eval-mat] mat={mp_id}: grid={grid_shape}, atoms={len(Zs)}, "
+                f"lattice=({lattice_params[0]:.2f},{lattice_params[1]:.2f},"
+                f"{lattice_params[2]:.2f}) Å α,β,γ=("
+                f"{lattice_params[3]:.1f},{lattice_params[4]:.1f},{lattice_params[5]:.1f})°")
 
             # Tile — full coverage, exactly one patch per voxel.
             offsets, local_slices = tile_full_coverage_offsets(grid_shape, P)
@@ -564,6 +638,7 @@ def main():
             all_ids = build_all_patch_input_ids(
                 density, grid_shape, offsets_arr, Zs, frac,
                 lmq_codec, vocab_offsets, P=P, pad_to=pad_to,
+                lattice_params=lattice_params,
             )  # (n_eval, 8192) int32
             t_tok = time.time() - t_tok0
 

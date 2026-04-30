@@ -18,15 +18,26 @@ Token layout
 ::
 
     [BOS]
-    [GRID_START]  ⟨nx⟩ ⟨ny⟩ ⟨nz⟩                          # grid shape (ints)
-    [ATOMS_START] ⟨Z₁⟩ … ⟨Zₙ⟩ [ATOMS_END]
-    [POS_START]   ⟨x₁ SE M0 M1⟩ ⟨y₁ …⟩ ⟨z₁ …⟩ …          # frac coords, 3-byte codec
+    [GRID_START]    ⟨nx⟩ ⟨ny⟩ ⟨nz⟩                        # grid shape (ints)
+    [LATTICE_START] ⟨qa⟩ ⟨qb⟩ ⟨qc⟩ ⟨qα⟩ ⟨qβ⟩ ⟨qγ⟩         # lattice constants
+    [ATOMS_START]   ⟨Z₁⟩ … ⟨Zₙ⟩ [ATOMS_END]
+    [POS_START]     ⟨x₁ SE M0 M1⟩ ⟨y₁ …⟩ ⟨z₁ …⟩ …        # frac coords, 3-byte codec
     [POS_END]
-    [SHAPE_START] ⟨P⟩ ⟨P⟩ ⟨P⟩                             # patch dims (ints)
-    [OFFSET_START] ⟨ix⟩ ⟨iy⟩ ⟨iz⟩                         # patch anchor (ints)
-    [HI_START]    ⟨hx⟩ ⟨hy⟩ ⟨hz⟩                          # wrapped high corner
-    [DENS_START]  ⟨d₀ SE M⟩ ⟨d₁ SE M⟩ … ⟨d_{P³−1} SE M⟩   # density, 2-token codec
+    [SHAPE_START]   ⟨P⟩ ⟨P⟩ ⟨P⟩                           # patch dims (ints)
+    [OFFSET_START]  ⟨ix⟩ ⟨iy⟩ ⟨iz⟩                        # patch anchor (ints)
+    [HI_START]      ⟨hx⟩ ⟨hy⟩ ⟨hz⟩                        # wrapped high corner
+    [DENS_START]    ⟨d₀ SE M⟩ ⟨d₁ SE M⟩ … ⟨d_{P³−1} SE M⟩ # density, 2-token codec
     [EOS]
+
+The lattice block holds ``(a, b, c, α, β, γ)`` quantized into the shared
+``INT_VOCAB`` space:
+
+* lengths ``a, b, c`` (Å) — bin index = ``round(L / 0.05)`` clipped to
+  ``[0, INT_VOCAB_SIZE)``. Resolution 0.05 Å over [0, 51.2 Å); covers
+  virtually every MP cell. The model gets per-axis voxel scale by
+  combining with the grid block: ``Δ_axis ≈ length_axis / n_axis``.
+* angles ``α, β, γ`` (deg) — bin index = ``round(θ / 0.2)``. Resolution
+  0.2° over [0, 204.8°); all physical lattice angles fit in [0, 180°).
 
 The `[HI_START]` block holds ``(ix + P − 1) mod nx`` etc. — the wrapped
 last-voxel index on each axis. Comparing it to ``(ix, iy, iz)``: on any
@@ -88,16 +99,25 @@ SPECIAL_TOKENS = {
     "[DENS_START]":    15,
     "[DENS_END]":      16,
     "[NL]":            17,
+    "[LATTICE_START]": 18,
+    "[LATTICE_END]":   19,
 }
-N_SPECIALS = 18
+N_SPECIALS = 20
 
-ATOM_OFFSET = N_SPECIALS  # 16
+ATOM_OFFSET = N_SPECIALS  # 20
 MAX_ATOMIC_NUMBER = 118   # Z ≤ 118 (Oganesson) covers all real chemistry
-ATOM_END = ATOM_OFFSET + MAX_ATOMIC_NUMBER  # 134
+ATOM_END = ATOM_OFFSET + MAX_ATOMIC_NUMBER  # 138
 
-INT_OFFSET = ATOM_END     # 134
-INT_VOCAB_SIZE = 1024     # grid dims / offsets / sizes fit in [0, 1024)
-INT_END = INT_OFFSET + INT_VOCAB_SIZE  # 1158
+INT_OFFSET = ATOM_END     # 138
+INT_VOCAB_SIZE = 1024     # grid dims / offsets / sizes / lattice bins fit in [0, 1024)
+INT_END = INT_OFFSET + INT_VOCAB_SIZE  # 1162
+
+# Lattice quantization (linear, fits in INT_VOCAB).
+LATTICE_LENGTH_RES_A = 0.05   # Å per bin for (a, b, c)
+LATTICE_ANGLE_RES_DEG = 0.2   # deg per bin for (α, β, γ)
+# Max representable values; anything beyond is rejected by ``lattice_tokens``.
+LATTICE_LENGTH_MAX_A = INT_VOCAB_SIZE * LATTICE_LENGTH_RES_A   # 51.2 Å
+LATTICE_ANGLE_MAX_DEG = INT_VOCAB_SIZE * LATTICE_ANGLE_RES_DEG  # 204.8°
 
 
 @dataclass(frozen=True)
@@ -143,6 +163,33 @@ class PatchVocab:
             raise ValueError(f"int {n} out of range [0, {INT_VOCAB_SIZE})")
         return INT_OFFSET + n
 
+    def lattice_tokens(
+        self, params: tuple[float, float, float, float, float, float],
+    ) -> list[int]:
+        """Encode (a, b, c, α, β, γ) → 6 INT tokens.
+
+        Lengths in Å bin at ``LATTICE_LENGTH_RES_A`` = 0.05 Å (range
+        [0, 51.2 Å)); angles in deg bin at ``LATTICE_ANGLE_RES_DEG`` = 0.2°
+        (range [0, 204.8°)). Out-of-range values raise — the caller
+        decides whether to skip the material.
+        """
+        a, b, c, alpha, beta, gamma = params
+        out: list[int] = []
+        for L, name in zip((a, b, c), ("a", "b", "c")):
+            if not 0.0 <= L < LATTICE_LENGTH_MAX_A:
+                raise ValueError(
+                    f"lattice {name}={L:.3f} Å out of [0, {LATTICE_LENGTH_MAX_A}) "
+                    f"— bump LATTICE_LENGTH_RES_A or skip material"
+                )
+            out.append(self.int_token(int(round(L / LATTICE_LENGTH_RES_A))))
+        for theta, name in zip((alpha, beta, gamma), ("α", "β", "γ")):
+            if not 0.0 <= theta < LATTICE_ANGLE_MAX_DEG:
+                raise ValueError(
+                    f"lattice {name}={theta:.3f}° out of [0, {LATTICE_ANGLE_MAX_DEG})"
+                )
+            out.append(self.int_token(int(round(theta / LATTICE_ANGLE_RES_DEG))))
+        return out
+
     def position_tokens(self, coord: float) -> list[int]:
         """Encode one fractional coordinate ∈ [0, 1) to position-codec tokens."""
         comps = self.position_codec.encode_signed(np.asarray([coord], dtype=np.float64))[0]
@@ -174,6 +221,7 @@ class PatchSample:
     offset: tuple[int, int, int]
     patch_shape: tuple[int, int, int]
     grid_shape: tuple[int, int, int]
+    lattice: tuple[float, float, float, float, float, float]  # (a, b, c, α, β, γ); Å + deg
     atomic_numbers: np.ndarray    # (N,) int
     frac_coords: np.ndarray       # (N, 3) float in [0, 1)
     patch_density: np.ndarray     # (Px, Py, Pz) float
@@ -219,11 +267,13 @@ class PatchTokenizer:
     ) -> PatchSample:
         P = self.patch_size
         patch = self.extract_patch(density, offset)
+        lat = structure.lattice
         return PatchSample(
             task_id=task_id,
             offset=offset,
             patch_shape=(P, P, P),
             grid_shape=density.shape,  # type: ignore[arg-type]
+            lattice=(lat.a, lat.b, lat.c, lat.alpha, lat.beta, lat.gamma),
             atomic_numbers=np.array([site.specie.Z for site in structure], dtype=np.int32),
             frac_coords=np.array([site.frac_coords for site in structure], dtype=np.float64) % 1.0,
             patch_density=patch,
@@ -251,6 +301,11 @@ class PatchTokenizer:
         tokens.append(S["[GRID_START]"])
         tokens.extend(vocab.int_token(int(n)) for n in sample.grid_shape)
         tokens.append(S["[GRID_END]"])
+
+        # Lattice constants (a, b, c, α, β, γ) — quantized to int bins
+        tokens.append(S["[LATTICE_START]"])
+        tokens.extend(vocab.lattice_tokens(sample.lattice))
+        tokens.append(S["[LATTICE_END]"])
 
         # Atomic inventory
         tokens.append(S["[ATOMS_START]"])
@@ -332,8 +387,22 @@ class PatchTokenizer:
         if len(grid_shape) != 3:
             raise ValueError(f"expected 3 grid dims, got {len(grid_shape)}")
 
+        # LATTICE
+        li, lj = find_block(S["[LATTICE_START]"], S["[LATTICE_END]"], gj + 1)
+        lat_ints = [self._decode_int(t) for t in toks[li:lj]]
+        if len(lat_ints) != 6:
+            raise ValueError(f"expected 6 lattice params, got {len(lat_ints)}")
+        lattice = (
+            lat_ints[0] * LATTICE_LENGTH_RES_A,
+            lat_ints[1] * LATTICE_LENGTH_RES_A,
+            lat_ints[2] * LATTICE_LENGTH_RES_A,
+            lat_ints[3] * LATTICE_ANGLE_RES_DEG,
+            lat_ints[4] * LATTICE_ANGLE_RES_DEG,
+            lat_ints[5] * LATTICE_ANGLE_RES_DEG,
+        )
+
         # ATOMS
-        ai, aj = find_block(S["[ATOMS_START]"], S["[ATOMS_END]"], gj + 1)
+        ai, aj = find_block(S["[ATOMS_START]"], S["[ATOMS_END]"], lj + 1)
         atomic_numbers = np.array([self._decode_atom(t) for t in toks[ai:aj]], dtype=np.int32)
 
         # POSITIONS
@@ -392,6 +461,7 @@ class PatchTokenizer:
             offset=offset,
             patch_shape=patch_shape,
             grid_shape=grid_shape,
+            lattice=lattice,
             atomic_numbers=atomic_numbers,
             frac_coords=frac_coords,
             patch_density=patch_density,
