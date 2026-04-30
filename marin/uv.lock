@@ -1492,8 +1492,8 @@ wheels = [
 
 [[package]]
 name = "marin"
-version = "0.99.dev20260427"
-source = { registry = "https://github.com/marin-community/marin/releases/expanded_assets/marin-latest" }
+version = "0.99"
+source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Fmarin&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c#117de4f18f1ca2b180f93a218d6eb92c517ed88c" }
 dependencies = [
     { name = "braceexpand", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "cryptography", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1535,14 +1535,11 @@ dependencies = [
     { name = "wandb", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "warcio", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
 ]
-wheels = [
-    { url = "https://github.com/marin-community/marin/releases/download/marin-latest/marin-0.99.dev20260427-py3-none-any.whl" },
-]
 
 [[package]]
 name = "marin-fray"
-version = "0.99.dev20260427"
-source = { registry = "https://github.com/marin-community/marin/releases/expanded_assets/marin-fray-latest" }
+version = "0.99"
+source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Ffray&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c#117de4f18f1ca2b180f93a218d6eb92c517ed88c" }
 dependencies = [
     { name = "click", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "cloudpickle", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1560,14 +1557,11 @@ dependencies = [
     { name = "uvicorn", extra = ["standard"], marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "zstandard", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
 ]
-wheels = [
-    { url = "https://github.com/marin-community/marin/releases/download/marin-fray-latest/marin_fray-0.99.dev20260427-py3-none-any.whl" },
-]
 
 [[package]]
 name = "marin-haliax"
-version = "0.99.dev20260427"
-source = { registry = "https://github.com/marin-community/marin/releases/expanded_assets/marin-haliax-latest" }
+version = "0.99"
+source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Fhaliax&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c#117de4f18f1ca2b180f93a218d6eb92c517ed88c" }
 dependencies = [
     { name = "aqtp", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "equinox", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1576,14 +1570,11 @@ dependencies = [
     { name = "jmp", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "safetensors", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
 ]
-wheels = [
-    { url = "https://github.com/marin-community/marin/releases/download/marin-haliax-latest/marin_haliax-0.99.dev20260427-py3-none-any.whl" },
-]
 
 [[package]]
 name = "marin-iris"
-version = "0.99.dev20260427"
-source = { registry = "https://github.com/marin-community/marin/releases/expanded_assets/marin-iris-latest" }
+version = "0.99"
+source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Firis&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c#117de4f18f1ca2b180f93a218d6eb92c517ed88c" }
 dependencies = [
     { name = "click", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "cloudpickle", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1606,14 +1597,11 @@ dependencies = [
     { name = "uvicorn", extra = ["standard"], marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "zstandard", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
 ]
-wheels = [
-    { url = "https://github.com/marin-community/marin/releases/download/marin-iris-latest/marin_iris-0.99.dev20260427-py3-none-any.whl" },
-]
 
 [[package]]
 name = "marin-levanter"
-version = "0.99.dev20260427"
-source = { registry = "https://github.com/marin-community/marin/releases/expanded_assets/marin-levanter-latest" }
+version = "0.99"
+source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Flevanter&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c#117de4f18f1ca2b180f93a218d6eb92c517ed88c" }
 dependencies = [
     { name = "async-lru", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "braceexpand", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1653,9 +1641,6 @@ dependencies = [
     { name = "wandb", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "zstandard", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
 ]
-wheels = [
-    { url = "https://github.com/marin-community/marin/releases/download/marin-levanter-latest/marin_levanter-0.99.dev20260427-py3-none-any.whl" },
-]
 
 [package.optional-dependencies]
 serve = [
@@ -1666,21 +1651,18 @@ serve = [
 
 [[package]]
 name = "marin-rigging"
-version = "0.99.dev20260427"
-source = { registry = "https://github.com/marin-community/marin/releases/expanded_assets/marin-rigging-latest" }
+version = "0.99"
+source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Frigging&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c#117de4f18f1ca2b180f93a218d6eb92c517ed88c" }
 dependencies = [
     { name = "fsspec", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "gcsfs", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "s3fs", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
 ]
-wheels = [
-    { url = "https://github.com/marin-community/marin/releases/download/marin-rigging-latest/marin_rigging-0.99.dev20260427-py3-none-any.whl" },
-]
 
 [[package]]
 name = "marin-zephyr"
-version = "0.99.dev20260427"
-source = { registry = "https://github.com/marin-community/marin/releases/expanded_assets/marin-zephyr-latest" }
+version = "0.99"
+source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Fzephyr&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c#117de4f18f1ca2b180f93a218d6eb92c517ed88c" }
 dependencies = [
     { name = "braceexpand", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "click", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1697,9 +1679,6 @@ dependencies = [
     { name = "vortex-data", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "xxhash", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "zstandard", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
-]
-wheels = [
-    { url = "https://github.com/marin-community/marin/releases/download/marin-zephyr-latest/marin_zephyr-0.99.dev20260427-py3-none-any.whl" },
 ]
 
 [[package]]
@@ -3288,11 +3267,11 @@ requires-dist = [
     { name = "gcsfs" },
     { name = "jax", extras = ["tpu"], marker = "sys_platform == 'linux'", specifier = "==0.8.0" },
     { name = "jax", extras = ["tpu"], marker = "sys_platform == 'linux' and extra == 'tpu'", specifier = "==0.8.0" },
-    { name = "marin" },
-    { name = "marin-iris" },
-    { name = "marin-levanter" },
-    { name = "marin-rigging" },
-    { name = "marin-zephyr" },
+    { name = "marin", git = "https://github.com/marin-community/marin?subdirectory=lib%2Fmarin&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c" },
+    { name = "marin-iris", git = "https://github.com/marin-community/marin?subdirectory=lib%2Firis&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c" },
+    { name = "marin-levanter", git = "https://github.com/marin-community/marin?subdirectory=lib%2Flevanter&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c" },
+    { name = "marin-rigging", git = "https://github.com/marin-community/marin?subdirectory=lib%2Frigging&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c" },
+    { name = "marin-zephyr", git = "https://github.com/marin-community/marin?subdirectory=lib%2Fzephyr&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c" },
     { name = "pymatgen" },
     { name = "torch", marker = "sys_platform == 'linux' and extra == 'tpu'", specifier = "==2.9.0" },
     { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'tpu'", specifier = "==0.24.0" },
