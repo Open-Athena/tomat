@@ -19,7 +19,10 @@ Env vars:
     TOMAT_LABEL             tokenized label (for meta.json vocab layout info)
     TOMAT_LMQ_PATH          gs:// path to LMQ codec
     TOMAT_EVAL_N_MATS       cap number of mats to eval (default 10)
-    TOMAT_EVAL_BATCH        patches per forward (default 8)
+    TOMAT_EVAL_SKIP         skip first N mats (for fan-out across jobs; default 0)
+    TOMAT_EVAL_BATCH        patches per forward (default 8; bump to 64 on v6e-8 for ~8× thpt)
+    TOMAT_EVAL_DECODER      "median" (default; L_1-optimal point estimator),
+                            "argmax" (mode), or "mean" (E[ρ], L_2-optimal).
     TOMAT_ZARR_BASE         gs:// prefix for raw Zarrs (default rho_gga_raw/validation)
 """
 
@@ -29,6 +32,7 @@ import json
 import math
 import os
 import sys
+import time
 from functools import partial
 from pathlib import Path
 
@@ -238,15 +242,113 @@ def _pos_tokens(coord, vocab_offsets):
     return out
 
 
-def tile_disjoint_offsets(grid_shape, P):
-    """Return (list of offsets, valid covered region shape)."""
+def tile_full_coverage_offsets(grid_shape, P):
+    """Return (offsets, local_slices) covering every voxel exactly once.
+
+    Disjoint patches stride by P; for any axis n with n mod P != 0, one extra
+    boundary patch is added at offset (n - P), and only its tail slice
+    (P - tail : P) along that axis is used. Full grid is covered, no overlap.
+    """
+    def axis_specs(n):
+        # (offset, local_start, local_stop) per patch along this axis.
+        positions = list(range(0, n - P + 1, P))
+        specs = [(x, 0, P) for x in positions]
+        if n % P != 0:
+            tail = n - (positions[-1] + P) if positions else n
+            specs.append((n - P, P - tail, P))
+        return specs
+
     nx, ny, nz = grid_shape
-    xs = list(range(0, nx - P + 1, P))
-    ys = list(range(0, ny - P + 1, P))
-    zs = list(range(0, nz - P + 1, P))
-    offsets = [(x, y, z) for x in xs for y in ys for z in zs]
-    covered = (len(xs) * P, len(ys) * P, len(zs) * P)
-    return offsets, covered
+    sx = axis_specs(nx)
+    sy = axis_specs(ny)
+    sz = axis_specs(nz)
+    offsets = []
+    local_slices = []
+    for ox, lx0, lx1 in sx:
+        for oy, ly0, ly1 in sy:
+            for oz, lz0, lz1 in sz:
+                offsets.append((ox, oy, oz))
+                local_slices.append((lx0, lx1, ly0, ly1, lz0, lz1))
+    return offsets, local_slices
+
+
+def build_all_patch_input_ids(
+    density,         # (nx, ny, nz) float
+    grid_shape,      # (nx, ny, nz)
+    offsets,         # (n_patches, 3) array of (ix, iy, iz)
+    Zs,              # (N,) int
+    frac,            # (N, 3) float
+    lmq_codec,
+    vocab_offsets,
+    P=14,
+    pad_to=8192,
+):
+    """Vectorized: return (n_patches, pad_to) int32 input_ids matrix.
+
+    Layout matches tokenize_patch_for_eval; per-mat preamble is identical
+    across patches (BOS, GRID, ATOMS, POS, SHAPE) — only OFFSET, HI, DENS
+    blocks vary per patch. Built once via numpy ops, no Python per-patch loop.
+    """
+    bounds, recon, clip_max = lmq_codec
+    int_off = N_SPECIALS + N_ATOMS  # 136
+    density_offset = vocab_offsets["density_offset"]
+
+    offsets_arr = np.asarray(offsets, dtype=np.int32)  # (n, 3)
+    n = offsets_arr.shape[0]
+    grid_np = np.asarray(grid_shape, dtype=np.int32)
+
+    # ---- Per-mat preamble (constant across patches) ----
+    pre = [TOK["BOS"]]
+    pre += [TOK["GRID_START"], int_off + int(grid_shape[0]), int_off + int(grid_shape[1]),
+            int_off + int(grid_shape[2]), TOK["GRID_END"]]
+    pre += [TOK["ATOMS_START"]] + [N_SPECIALS + int(z - 1) for z in Zs] + [TOK["ATOMS_END"]]
+    pre += [TOK["POS_START"]]
+    for xyz in frac:
+        for c in xyz:
+            pre.extend(_pos_tokens(float(c), vocab_offsets))
+    pre += [TOK["POS_END"]]
+    pre += [TOK["SHAPE_START"], int_off + P, int_off + P, int_off + P, TOK["SHAPE_END"]]
+    preamble = np.array(pre, dtype=np.int32)
+    preamble_len = preamble.shape[0]
+
+    # ---- Per-patch OFFSET / HI tokens (n, 3) ----
+    offset_tokens = int_off + offsets_arr  # (n, 3)
+    his = (offsets_arr + (P - 1)) % grid_np  # (n, 3) PBC wrap
+    hi_tokens = int_off + his  # (n, 3)
+
+    # ---- Per-patch DENS tokens via vectorized fancy-indexing extract ----
+    # Build a (P, P, P) base index grid, broadcast-add each offset.
+    # Result: patches[i] = density[ox[i]:ox[i]+P, oy[i]:oy[i]+P, oz[i]:oz[i]+P]
+    iota = np.arange(P, dtype=np.int32)
+    di, dj, dk = np.meshgrid(iota, iota, iota, indexing='ij')  # (P,P,P)
+    # (n, P, P, P) absolute indices for each axis:
+    idx_x = offsets_arr[:, 0, None, None, None] + di[None]  # (n, P, P, P)
+    idx_y = offsets_arr[:, 1, None, None, None] + dj[None]
+    idx_z = offsets_arr[:, 2, None, None, None] + dk[None]
+    patches = density[idx_x, idx_y, idx_z]  # (n, P, P, P) float
+    flat = patches.reshape(n, P * P * P)
+    clipped = np.clip(flat, 0.0, clip_max)
+    bins = np.searchsorted(bounds, clipped, side="right").astype(np.int32)
+    dens_tokens = bins + density_offset  # (n, P^3)
+
+    # ---- Assemble (n, pad_to) int32 array ----
+    ids = np.full((n, pad_to), TOK["PAD"], dtype=np.int32)
+    p = 0
+    ids[:, p:p + preamble_len] = preamble[None, :]
+    p += preamble_len
+    ids[:, p] = TOK["OFFSET_START"]; p += 1
+    ids[:, p:p + 3] = offset_tokens; p += 3
+    ids[:, p] = TOK["OFFSET_END"]; p += 1
+    ids[:, p] = TOK["HI_START"]; p += 1
+    ids[:, p:p + 3] = hi_tokens; p += 3
+    ids[:, p] = TOK["HI_END"]; p += 1
+    ids[:, p] = TOK["DENS_START"]; p += 1
+    ids[:, p:p + P ** 3] = dens_tokens; p += P ** 3
+    ids[:, p] = TOK["DENS_END"]; p += 1
+    ids[:, p] = TOK["EOS"]; p += 1
+    if p > pad_to:
+        raise ValueError(f"Token sequence too long: {p} > pad_to={pad_to}")
+    return ids
 
 
 def main():
@@ -255,7 +357,14 @@ def main():
     checkpoint_path = os.environ["TOMAT_CHECKPOINT"]
     lmq_path = os.environ["TOMAT_LMQ_PATH"]
     n_mats_cap = int(os.environ.get("TOMAT_EVAL_N_MATS", "10"))
+    n_mats_skip = int(os.environ.get("TOMAT_EVAL_SKIP", "0"))
+    # Optional: pin to a fixed mat-id set from data/eval_mat_ids.json
+    # (e.g. "val_200" or "train_200") for apples-to-apples curves across runs.
+    eval_mat_set = os.environ.get("TOMAT_EVAL_MAT_SET", "").strip()
     eval_batch = int(os.environ.get("TOMAT_EVAL_BATCH", "8"))
+    decoder = os.environ.get("TOMAT_EVAL_DECODER", "median")
+    if decoder not in ("argmax", "median", "mean"):
+        raise ValueError(f"TOMAT_EVAL_DECODER must be argmax/median/mean, got {decoder!r}")
     split = os.environ.get("TOMAT_EVAL_SPLIT", "validation")
     zarr_base = os.environ.get(
         "TOMAT_ZARR_BASE", f"{BUCKET}/rho_gga_raw/{split}"
@@ -324,30 +433,91 @@ def main():
         model = inference_mode(model, True)
         model = mp_policy.cast_to_compute(model)
 
-        @hax.named_jit(axis_resources=compute_mapping)
-        def forward(tokens_in):
-            act = model.activations(tokens_in, key=None, attn_mask=None)
-            head = model.get_lm_head()
-            return hax.dot(act, head, axis=model.Embed)
+        # Decoder lives on-TPU: returns (B, Pos) float density predictions
+        # (not logits / not bin indices). Avoids transferring full vocab dist.
+        # The distribution is restricted to the density range and renormalized
+        # before decoding — non-density-token mass doesn't contribute.
+        DENS_LO = density_offset
+        DENS_HI = density_offset + len(recon)
+        decode_dens = jnp.asarray(recon, dtype=jnp.float32)  # (n_bins,) float
 
-        # Pick mp-IDs from the val parquets for eval.
-        import pyarrow.parquet as pq
-        import gcsfs
-        fs = gcsfs.GCSFileSystem()
-        parquet_glob = f"marin-eu-west4/tomat/tokenized/{label}/worker-*/*.parquet"
-        shard_paths = sorted(fs.glob(parquet_glob))
-        mp_ids = []
-        for shard in shard_paths[:3]:
-            with fs.open(shard, "rb") as f:
-                tbl = pq.ParquetFile(f).read(columns=["task_id"])
-            for tid in tbl.column("task_id").to_pylist():
-                if tid not in mp_ids:
-                    mp_ids.append(tid)
-                if len(mp_ids) >= n_mats_cap:
+        if decoder == "argmax":
+            @hax.named_jit(axis_resources=compute_mapping)
+            def forward_decode(tokens_in):
+                act = model.activations(tokens_in, key=None, attn_mask=None)
+                head = model.get_lm_head()
+                logits = hax.dot(act, head, axis=model.Embed)
+                logits_arr = logits.array.astype(jnp.float32)  # (B, Pos, V)
+                density_logits = logits_arr[..., DENS_LO:DENS_HI]  # (B, Pos, n_bins)
+                bin_idx = jnp.argmax(density_logits, axis=-1)
+                rho = decode_dens[bin_idx]  # (B, Pos)
+                return hax.named(rho, (logits.axes[0], logits.axes[1]))
+        elif decoder == "median":
+            @hax.named_jit(axis_resources=compute_mapping)
+            def forward_decode(tokens_in):
+                act = model.activations(tokens_in, key=None, attn_mask=None)
+                head = model.get_lm_head()
+                logits = hax.dot(act, head, axis=model.Embed)
+                logits_arr = logits.array.astype(jnp.float32)
+                probs = jax.nn.softmax(logits_arr, axis=-1)
+                density_probs = probs[..., DENS_LO:DENS_HI]
+                sum_dens = density_probs.sum(axis=-1, keepdims=True) + 1e-12
+                p_norm = density_probs / sum_dens
+                cumP = jnp.cumsum(p_norm, axis=-1)
+                # smallest bin where cumP >= 0.5
+                bin_idx = jnp.sum(cumP < 0.5, axis=-1).astype(jnp.int32)
+                bin_idx = jnp.clip(bin_idx, 0, len(decode_dens) - 1)
+                rho = decode_dens[bin_idx]
+                return hax.named(rho, (logits.axes[0], logits.axes[1]))
+        else:  # mean
+            @hax.named_jit(axis_resources=compute_mapping)
+            def forward_decode(tokens_in):
+                act = model.activations(tokens_in, key=None, attn_mask=None)
+                head = model.get_lm_head()
+                logits = hax.dot(act, head, axis=model.Embed)
+                logits_arr = logits.array.astype(jnp.float32)
+                probs = jax.nn.softmax(logits_arr, axis=-1)
+                density_probs = probs[..., DENS_LO:DENS_HI]
+                sum_dens = density_probs.sum(axis=-1, keepdims=True) + 1e-12
+                p_norm = density_probs / sum_dens
+                rho = jnp.einsum("bpv,v->bp", p_norm, decode_dens)
+                return hax.named(rho, (logits.axes[0], logits.axes[1]))
+
+        # Pick mp-IDs: either from the pinned JSON snapshot (preferred for
+        # apples-to-apples curves across runs), or from the parquets directly.
+        if eval_mat_set:
+            mat_ids_path = os.environ.get(
+                "TOMAT_EVAL_MAT_IDS_FILE",
+                "gs://marin-eu-west4/tomat/eval/eval_mat_ids.json",
+            )
+            with fsspec.open(mat_ids_path, "r") as f:
+                mat_ids_blob = json.load(f)
+            if eval_mat_set not in mat_ids_blob:
+                raise KeyError(f"set {eval_mat_set!r} not in {mat_ids_path}; have {list(mat_ids_blob)}")
+            all_ids = mat_ids_blob[eval_mat_set]
+            mp_ids = all_ids[n_mats_skip : n_mats_skip + n_mats_cap]
+            err(f"[eval-mat] mat_set={eval_mat_set}, skip={n_mats_skip}, cap={n_mats_cap}; "
+                f"eval on {len(mp_ids)} mats")
+        else:
+            import pyarrow.parquet as pq
+            import gcsfs
+            fs = gcsfs.GCSFileSystem()
+            parquet_glob = f"marin-eu-west4/tomat/tokenized/{label}/worker-*/*.parquet"
+            shard_paths = sorted(fs.glob(parquet_glob))
+            all_ids: list[str] = []
+            target = n_mats_skip + n_mats_cap
+            for shard in shard_paths:
+                with fs.open(shard, "rb") as f:
+                    tbl = pq.ParquetFile(f).read(columns=["task_id"])
+                for tid in tbl.column("task_id").to_pylist():
+                    if tid not in all_ids:
+                        all_ids.append(tid)
+                    if len(all_ids) >= target:
+                        break
+                if len(all_ids) >= target:
                     break
-            if len(mp_ids) >= n_mats_cap:
-                break
-        err(f"[eval-mat] will eval on {len(mp_ids)} mats")
+            mp_ids = all_ids[n_mats_skip : n_mats_skip + n_mats_cap]
+            err(f"[eval-mat] skip={n_mats_skip}, cap={n_mats_cap}; eval on {len(mp_ids)} mats: {mp_ids}")
 
         per_mat_results = []
         for mp_id in mp_ids:
@@ -373,85 +543,82 @@ def main():
             Zs, frac = load_structure_from_zarr_attrs(group)
             err(f"[eval-mat] mat={mp_id}: grid={grid_shape}, atoms={len(Zs)}")
 
-            # Tile
-            offsets, covered_shape = tile_disjoint_offsets(grid_shape, P)
+            # Tile — full coverage, exactly one patch per voxel.
+            offsets, local_slices = tile_full_coverage_offsets(grid_shape, P)
             n_patches = len(offsets)
-            err(f"[eval-mat] tiling: {n_patches} disjoint patches, covered={covered_shape}")
+            err(f"[eval-mat] tiling: {n_patches} patches (full coverage), grid={grid_shape}")
 
-            # Accumulate predicted density (initialize to true density — uncovered
-            # regions stay at true density so they don't contribute to the NMAE
-            # numerator; or fill with 0 and report NMAE on covered region only).
-            rho_pred = np.zeros(covered_shape, dtype=np.float32)
+            rho_pred = np.zeros(grid_shape, dtype=np.float32)
 
-            # Process in batches. Drop trailing partial batch (TPU mesh
-            # needs batch divisible by mesh size = eval_batch); we lose at
-            # most eval_batch-1 patches per material.
-            total = 0
-            n_full_batches = n_patches // eval_batch
-            for bi in range(n_full_batches):
-                batch_start = bi * eval_batch
-                batch_offsets = offsets[batch_start : batch_start + eval_batch]
-                batch_input_ids = []
-                batch_max_len = 0
-                for off in batch_offsets:
-                    patch_data = density[off[0]:off[0]+P, off[1]:off[1]+P, off[2]:off[2]+P]
-                    ids = tokenize_patch_for_eval(
-                        patch_data, grid_shape, off, Zs, frac, lmq_codec,
-                        vocab_offsets, P=P,
-                    )
-                    # Pad to seq len
-                    pad_to = 8192
-                    if len(ids) > pad_to:
-                        err(f"[eval-mat] skip {mp_id} offset {off}: seq_len {len(ids)} > pad_to")
-                        continue
-                    ids = ids + [TOK["PAD"]] * (pad_to - len(ids))
-                    batch_input_ids.append(np.array(ids, dtype=np.int32))
+            # Pad to multiple of eval_batch so every patch is evaluated
+            # (TPU forward needs fixed batch shape).
+            n_full_batches = (n_patches + eval_batch - 1) // eval_batch
+            n_eval = n_full_batches * eval_batch
+            pad_count = n_eval - n_patches
+            offsets_padded = list(offsets) + [offsets[0]] * pad_count
+            offsets_arr = np.asarray(offsets_padded, dtype=np.int32)
 
-                if not batch_input_ids:
-                    continue
-                tokens_np = np.stack(batch_input_ids, axis=0)  # (B, 8192)
-                Batch = hax.Axis("batch", tokens_np.shape[0])
-                Pos = hax.Axis("position", tokens_np.shape[1])
+            # ---- Vectorized pre-tokenize: build all (n_eval, 8192) input_ids in one numpy pass ----
+            t_tok0 = time.time()
+            pad_to = 8192
+            all_ids = build_all_patch_input_ids(
+                density, grid_shape, offsets_arr, Zs, frac,
+                lmq_codec, vocab_offsets, P=P, pad_to=pad_to,
+            )  # (n_eval, 8192) int32
+            t_tok = time.time() - t_tok0
+
+            # Density-token positions are deterministic (same layout per patch).
+            n_bins = len(recon)
+            row0 = all_ids[0]
+            is_dens = (row0 >= density_offset) & (row0 < density_offset + n_bins)
+            dens_positions_t = np.where(is_dens)[0]
+            if len(dens_positions_t) != P ** 3:
+                err(f"[eval-mat] WARN: expected {P**3} density positions, got {len(dens_positions_t)}")
+                continue
+            # For each density INPUT position t, the prediction came from output @ t-1.
+            pred_positions = dens_positions_t - 1  # (P^3,)
+
+            # ---- TPU loop with depth-2 async pipelining ----
+            # forward_decode returns (B, Pos) float32 density predictions on-TPU
+            # (decoder = argmax|median|mean, restricted to density range).
+            t_fwd0 = time.time()
+            Batch = hax.Axis("batch", eval_batch)
+            Pos = hax.Axis("position", pad_to)
+
+            def dispatch(bi):
+                start = bi * eval_batch
+                tokens_np = all_ids[start : start + eval_batch]
                 tokens_ha = hax.named(jnp.asarray(tokens_np), (Batch, Pos))
+                return forward_decode(tokens_ha)  # async; NamedArray (Batch, Pos) float
 
-                logits = forward(tokens_ha)  # NamedArray (B, Pos, Vocab)
-                logits_np = np.array(logits.array).astype(np.float32)
+            inflight = []  # list of (bi, future)
+            depth = 2
+            total = 0
+            for bi in range(n_full_batches):
+                inflight.append((bi, dispatch(bi)))
+                while len(inflight) > depth or (bi == n_full_batches - 1 and inflight):
+                    done_bi, fut = inflight.pop(0)
+                    pred_floats = np.asarray(fut.array, dtype=np.float32)  # (B, Pos)
+                    start = done_bi * eval_batch
+                    pred_dens_floats = pred_floats[:, pred_positions]  # (B, P^3)
+                    pred_blocks = pred_dens_floats.reshape(-1, P, P, P)
+                    for k in range(eval_batch):
+                        global_idx = start + k
+                        if global_idx >= n_patches:  # padded entry, skip
+                            continue
+                        ox, oy, oz = offsets[global_idx]
+                        lx0, lx1, ly0, ly1, lz0, lz1 = local_slices[global_idx]
+                        rho_pred[ox+lx0:ox+lx1, oy+ly0:oy+ly1, oz+lz0:oz+lz1] = \
+                            pred_blocks[k, lx0:lx1, ly0:ly1, lz0:lz1]
+                        total += 1
+            t_fwd = time.time() - t_fwd0
+            err(f"[eval-mat] {mp_id}: processed {total} patches "
+                f"(decoder={decoder}, tokenize={t_tok:.2f}s, "
+                f"forward+decode={t_fwd:.2f}s, "
+                f"{1000 * t_fwd / max(total, 1):.1f}ms/patch)")
 
-                # At density positions: pred_token[t] = argmax(logits[t-1])
-                # Density tokens in range [density_offset, density_offset + n_bins)
-                n_bins = len(recon)
-                is_density_input = (tokens_np >= density_offset) & (tokens_np < density_offset + n_bins)
-                # is_density_target[t] = is_density_input[t+1]; we predict token at t+1
-                # Use shifted mask
-                shift_mask = np.zeros_like(is_density_input)
-                shift_mask[:, :-1] = is_density_input[:, 1:]
-
-                # At each position t where shift_mask[t]=True, predicted token for t+1 = argmax(logits[t])
-                pred_all = logits_np.argmax(axis=-1)  # (B, Pos)
-
-                for bi, off in enumerate(batch_offsets):
-                    if bi >= tokens_np.shape[0]:
-                        break
-                    # density positions in this sequence (in terms of INPUT token index)
-                    dens_positions_t = np.where(is_density_input[bi])[0]
-                    if len(dens_positions_t) != P ** 3:
-                        err(f"[eval-mat] WARN: expected {P**3} density tokens, got {len(dens_positions_t)} at offset {off}")
-                        continue
-                    # For each density input position t, the prediction came from logits[t-1]
-                    pred_dens_tokens = pred_all[bi, dens_positions_t - 1]
-                    # Decode: clip predicted tokens to density range, then bin → float
-                    pred_bins = np.clip(pred_dens_tokens - density_offset, 0, n_bins - 1)
-                    pred_floats = recon[pred_bins]
-
-                    # Reshape to (P, P, P) — row-major C-order (matches tokenizer flatten)
-                    rho_block = pred_floats.reshape(P, P, P)
-                    rho_pred[off[0]:off[0]+P, off[1]:off[1]+P, off[2]:off[2]+P] = rho_block
-                    total += 1
-
-            err(f"[eval-mat] {mp_id}: processed {total} patches")
-
-            # NMAE on covered region
-            rho_true = density[:covered_shape[0], :covered_shape[1], :covered_shape[2]]
+            # NMAE over the full grid (every voxel evaluated exactly once).
+            rho_true = density
             mae = np.mean(np.abs(rho_pred - rho_true))
             denom = np.mean(np.abs(rho_true))
             nmae = mae / max(denom, 1e-30)
@@ -459,7 +626,6 @@ def main():
             per_mat_results.append({
                 "mp_id": mp_id,
                 "grid_shape": list(grid_shape),
-                "covered_shape": list(covered_shape),
                 "n_patches": total,
                 "n_atoms": int(len(Zs)),
                 "mae": float(mae),
@@ -475,17 +641,41 @@ def main():
             err(f"  median NMAE : {np.median(nmaes):.4%}")
             err(f"  p99 NMAE    : {np.percentile(nmaes, 99):.4%}")
 
-        # Machine-readable summary
-        print(json.dumps({
+        # Machine-readable summary (also persists per-mat results to GCS so
+        # downstream noise-calibration / bootstrap analysis can use them
+        # without scraping iris job logs, which truncate per-mat lines).
+        summary = {
             "checkpoint": checkpoint_path,
             "label": label,
             "model": model_preset,
+            "mat_set": eval_mat_set,
             "n_mats": len(per_mat_results),
             "nmae_mean": float(nmaes.mean()) if per_mat_results else None,
             "nmae_median": float(np.median(nmaes)) if per_mat_results else None,
             "nmae_p99": float(np.percentile(nmaes, 99)) if per_mat_results else None,
             "per_mat": per_mat_results,
-        }, indent=2))
+        }
+        print(json.dumps(summary, indent=2))
+
+        # Persist to GCS keyed by checkpoint + mat-set, so bootstrap noise
+        # estimation can read per-mat values for any prior eval.
+        if per_mat_results:
+            # Levanter checkpointer lays out as <base_path>/<run_id>/step-N, where
+            # base_path here is `<BUCKET>/results/<RESULTS_LABEL>/checkpoints` and
+            # run_id == RESULTS_LABEL — so the path doubles the label, e.g.
+            #   .../results/<RL>/checkpoints/<RL>/step-1000
+            # Components from the tail: -1=step, -2=RL, -3=checkpoints, -4=RL.
+            parts = checkpoint_path.rstrip("/").split("/")
+            ckpt_tail = parts[-1]
+            run_label = parts[-4]
+            ms = eval_mat_set or "default"
+            results_path = f"{BUCKET}/eval/results/{run_label}/{ms}/{ckpt_tail}.json"
+            try:
+                with fsspec.open(results_path, "w") as f:
+                    json.dump(summary, f, indent=2)
+                err(f"[eval-mat] persisted per-mat results to {results_path}")
+            except Exception as e:
+                err(f"[eval-mat] WARNING: failed to persist per-mat to GCS: {e}")
 
 
 if __name__ == "__main__":
