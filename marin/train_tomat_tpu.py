@@ -48,6 +48,7 @@ Prereqs:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from datetime import timedelta
@@ -87,7 +88,7 @@ PassthroughTokenizer.encode = _safe_passthrough_encode
 import jax.numpy as jnp
 import jmp
 
-from levanter.checkpoint import CheckpointerConfig
+from levanter.checkpoint import CheckpointerConfig, load_checkpoint as _real_load_checkpoint
 from levanter.data.text import (
     DatasetComponent,
     LmDataConfig,
@@ -98,6 +99,7 @@ from levanter.layers.rotary import Llama3RotaryEmbeddingsConfig
 from levanter.main.train_lm import TrainLmConfig, main as train_lm_main
 from levanter.models.qwen import Qwen3Config
 from levanter.optim import AdamConfig
+from levanter.callbacks.profiler import ProfilerConfig
 from levanter.tracker.json_logger import JsonLoggerConfig
 from levanter.tracker.wandb import WandbConfig
 from levanter.trainer import TrainerConfig
@@ -163,28 +165,26 @@ def main():
     if model_preset not in MODEL_PRESETS:
         raise ValueError(f"unknown TOMAT_MODEL={model_preset!r}; expected one of {list(MODEL_PRESETS)}")
 
-    # Density-L_1 loss wiring. If TOMAT_DENSITY_L1_WEIGHT > 0, use the subclass
-    # Qwen3DensityLMHeadModel (via Qwen3DensityConfig) and configure the
-    # decode vector + PENALTY from meta.json.
-    density_l1_weight = float(os.environ.get("TOMAT_DENSITY_L1_WEIGHT", "0.0"))
+    # Density-loss wiring. Gate on TOMAT_LMQ_PATH presence (the codec is
+    # required for both EMD and L_1 density terms). The weight knob is only
+    # meaningful in CE+L1 ablations ("add" mode); under density_only=True
+    # it's pure LR scaling (vestigial — defaults to 1.0).
+    density_l1_weight = float(os.environ.get("TOMAT_DENSITY_L1_WEIGHT", "1.0"))
     density_l1_mode = os.environ.get("TOMAT_DENSITY_L1_MODE", "add")
+    density_loss_type = os.environ.get("TOMAT_DENSITY_LOSS_TYPE", "l1")
+    density_only_loss = os.environ.get("TOMAT_DENSITY_ONLY_LOSS", "0") == "1"
     density_l1_penalty_env = os.environ.get("TOMAT_DENSITY_PENALTY")
     lmq_path_env = os.environ.get("TOMAT_LMQ_PATH")
-    if density_l1_weight > 0:
+    if lmq_path_env:
         from qwen3_density import (
             Qwen3DensityConfig,
             build_density_loss_args,
             configure_density_loss,
         )
-
-        if not lmq_path_env:
-            raise ValueError(
-                "TOMAT_DENSITY_L1_WEIGHT>0 but TOMAT_LMQ_PATH is unset; need "
-                "the codec to build the decode vector."
-            )
         model_config_cls = Qwen3DensityConfig
-        print(f"[tomat-tpu] density-L_1 loss: weight={density_l1_weight}, "
-              f"mode={density_l1_mode}, lmq_path={lmq_path_env}")
+        print(f"[tomat-tpu] density loss: weight={density_l1_weight}, "
+              f"mode={density_l1_mode}, type={density_loss_type}, "
+              f"density_only={density_only_loss}, lmq_path={lmq_path_env}")
 
         # Inline-load the codec .npz since the `tomat` package isn't on the
         # Marin workspace PYTHONPATH (iris bundles only this directory).
@@ -238,16 +238,21 @@ def main():
             penalty=penalty_val,
             weight=density_l1_weight,
             mode=density_l1_mode,
+            loss_type=density_loss_type,
+            density_only=density_only_loss,
         )
         configure_density_loss(density_loss_args)
         print(f"[tomat-tpu] density-L_1 configured with PENALTY={penalty_val:.4f}")
     else:
         model_config_cls = Qwen3Config
 
+    grad_ckpt = os.environ.get("TOMAT_GRADIENT_CHECKPOINTING", "1") == "1"
+    print(f"[tomat-tpu] gradient_checkpointing={grad_ckpt}")
     model = model_config_cls(
         max_seq_len=8192,
         rope=Llama3RotaryEmbeddingsConfig(),
         tie_word_embeddings=True,
+        gradient_checkpointing=grad_ckpt,
         **MODEL_PRESETS[model_preset],
     )
 
@@ -298,6 +303,11 @@ def main():
         output_dtype=jnp.float32,
     )
 
+    profile_enabled = os.environ.get("TOMAT_PROFILE", "1") == "1"
+    profile_start = int(os.environ.get("TOMAT_PROFILE_START", "20"))
+    profile_num_steps = int(os.environ.get("TOMAT_PROFILE_NUM_STEPS", "25"))
+    print(f"[tomat-tpu] profiler: enabled={profile_enabled} start_step={profile_start} num_steps={profile_num_steps}")
+
     trainer = TrainerConfig(
         id=run_id,
         seed=seed,
@@ -307,6 +317,11 @@ def main():
         tracker=trackers,
         checkpointer=checkpointer,
         mp=mp,
+        profiler=ProfilerConfig(
+            enabled=profile_enabled,
+            start_step=profile_start,
+            num_steps=profile_num_steps,
+        ),
     )
 
     lr = float(os.environ.get("TOMAT_LR", "3e-4"))
@@ -334,12 +349,40 @@ def main():
 
     optimizer = AdamConfig(**adam_kwargs)
 
+    init_from_ckpt = os.environ.get("TOMAT_INIT_FROM_CHECKPOINT")
+    if init_from_ckpt:
+        # `TrainLmConfig.initialize_from_checkpoint_path` calls
+        # `load_checkpoint(state, path)` with no `subpath`, which deserializes
+        # the FULL TrainerState including optimizer state — and the optimizer
+        # state's internal step counter, which the LR schedule reads. The
+        # subsequent `dataclasses.replace(state, step=0)` resets only the outer
+        # step, so the schedule still computes LR from the source ckpt's step,
+        # parking us in the cooldown tail at LR=0. (Symptom: continuation NMAE
+        # identical to source ckpt's NMAE, no weight movement.)
+        #
+        # Fix: monkey-patch the load_checkpoint symbol used by train_lm.main so
+        # it loads ONLY the model subpath onto state.model, leaving the
+        # freshly-init'd optimizer state (and its step=0) untouched. This is
+        # the same pattern eval_mat_nmae.py and train_dpo.py use for warm-start.
+        import levanter.main.train_lm as _train_lm_mod
+
+        def _model_only_load(state, ckpt_path, **kwargs):
+            new_model = _real_load_checkpoint(
+                state.model, ckpt_path, subpath="model", **kwargs,
+            )
+            return dataclasses.replace(state, model=new_model)
+
+        _train_lm_mod.load_checkpoint = _model_only_load
+        print(f"[tomat-tpu] warm-starting from {init_from_ckpt}: model-only load, "
+              f"optimizer state stays fresh (step=0 → LR schedule starts from warmup)")
+
     config = TrainLmConfig(
         data=data,
         trainer=trainer,
         model=model,
         optimizer=optimizer,
         train_seq_len=8192,
+        initialize_from_checkpoint_path=init_from_ckpt,
     )
 
     print("[tomat-tpu] calling levanter.main.train_lm.main …")

@@ -1,31 +1,38 @@
-"""Qwen3 subclass with a density-aware L_1 loss term at density-codec positions.
+"""Qwen3 subclass with a density-aware loss term at density-codec positions.
 
-At each target position whose token falls inside the density-codec vocab range,
-replace (or augment) the standard CE loss with:
+Two density-loss formulations are supported (selected via `loss_type` arg):
 
-    L_1 = | E[ρ] − ρ_true |
+  l1   (legacy):   |E[ρ] − ρ_true|        — degenerate: diffuse distributions
+                                              with correct mean get zero loss.
+  emd  (W₁):       E_v[|ρ − ρ_true|]
+                 = Σ_v softmax(logits)_v · |decode_all[v] − ρ_true|
+                                            — Wasserstein-1 distance from
+                                              predicted distribution to delta-
+                                              at-target. Strictly stronger;
+                                              matched to NMAE (L_1 metric).
 
-where
+`mode` ∈ {add, replace}:
+  add      — loss = CE + λ·density_loss at all positions
+  replace  — loss = CE at non-density tokens + λ·density_loss at density tokens
+             (CE zeroed at density positions; recommended with emd since EMD
+             enforces peakiness on its own).
 
-    E[ρ] = Σ_v  softmax(logits)_v  ·  decode_all_vec[v]
-    decode_all_vec[v] = codec.decode(v - DENSITY_OFFSET)  if v in density range
-                      = PENALTY                             otherwise
-
-This makes the loss aware of:
-    (a) bin ordinality (bin 256 vs 257 is closer than bin 256 vs 10), and
-    (b) non-density-token emissions at density positions (penalized in the
-        same L_1 unit via the PENALTY term).
-
-Paired with the LMQ codec (spec 18), this is Formulation Y. With an old
-2-tok codec, it's a per-token approximation of Formulation X.
+`density_only` (bool):
+  False (default) — CE active at non-density-target positions (atoms, positions,
+                    structure delimiters). Standard NTP loss there.
+  True            — Zero CE at non-density-target positions too; only the EMD
+                    term contributes. Loss is normalized by density-position
+                    count so the per-density-token gradient magnitude is
+                    interpretable. Use this when you don't care about NTP on
+                    preamble tokens (atoms are unordered, patch offset is
+                    chosen, etc.) — no reason to spend gradient there.
 
 Env vars:
-    TOMAT_DENSITY_L1_WEIGHT   float (default 0.0 = pure CE, no change).
-                              1.0 = add L_1 loss at density positions alongside CE.
-    TOMAT_DENSITY_L1_MODE     "add" (default) or "replace". "replace" zeroes
-                              CE at density positions.
-    TOMAT_DENSITY_PENALTY     float (default 10.0 × density max). Used for
-                              non-density tokens at density target positions.
+    TOMAT_DENSITY_L1_WEIGHT     float (default 0.0 = pure CE).
+    TOMAT_DENSITY_L1_MODE       "add" (default) or "replace".
+    TOMAT_DENSITY_LOSS_TYPE     "l1" (default, back-compat) or "emd".
+    TOMAT_DENSITY_ONLY_LOSS     "1" → zero CE on non-density tokens too.
+    TOMAT_DENSITY_PENALTY       float (default 10.0 × density max).
 """
 
 from __future__ import annotations
@@ -57,8 +64,10 @@ class DensityLossArgs:
     decode_all: NamedArray           # (Vocab,) — precomputed
     density_lo: int                  # inclusive start of density vocab range
     density_hi: int                  # exclusive end of density vocab range
-    weight: float                    # λ multiplier on the L_1 term
+    weight: float                    # λ multiplier on the density-loss term
     mode: str                        # "add" or "replace"
+    loss_type: str = "l1"            # "l1" (legacy |E[ρ]−ρ_true|) or "emd" (W₁)
+    density_only: bool = False       # zero CE on non-density tokens, normalize by density count
 
 
 def build_density_loss_args(
@@ -70,10 +79,14 @@ def build_density_loss_args(
     penalty: float,
     weight: float,
     mode: str = "add",
+    loss_type: str = "l1",
+    density_only: bool = False,
 ) -> DensityLossArgs:
     """Build the decode_all NamedArray + other args from codec + config."""
     if mode not in ("add", "replace"):
         raise ValueError(f"mode must be 'add' or 'replace', got {mode!r}")
+    if loss_type not in ("l1", "emd"):
+        raise ValueError(f"loss_type must be 'l1' or 'emd', got {loss_type!r}")
     decode_all_np = np.full(Vocab.size, float(penalty), dtype=np.float32)
     decode_all_np[density_offset : density_offset + n_density_bins] = codec_recon.astype(np.float32)
     decode_all = hax.named(decode_all_np, Vocab)
@@ -83,6 +96,8 @@ def build_density_loss_args(
         density_hi=density_offset + n_density_bins,
         weight=weight,
         mode=mode,
+        loss_type=loss_type,
+        density_only=density_only,
     )
 
 
@@ -121,26 +136,43 @@ def density_aware_loss(
     else:
         lw = loss_weight.astype(jnp.float32).array * not_last
 
-    # CE per position
-    log_probs = jax.nn.log_softmax(logits_arr, axis=-1)  # (B, Pos, V)
-    ce_per_pos = -jnp.take_along_axis(log_probs, targets_arr[..., None], axis=-1).squeeze(-1)  # (B, Pos)
-
-    # Density-L_1
-    probs = jax.nn.softmax(logits_arr, axis=-1)  # (B, Pos, V)
-    e_rho = jnp.einsum("bpv,v->bp", probs, decode_all_arr)  # (B, Pos)
-    rho_true = decode_all_arr[targets_arr]  # (B, Pos)
-    l1_per_pos = jnp.abs(e_rho - rho_true)  # (B, Pos)
-
     is_density_target = (targets_arr >= args.density_lo) & (targets_arr < args.density_hi)
-    l1_per_pos = jnp.where(is_density_target, l1_per_pos, 0.0)
 
-    if args.mode == "replace":
-        ce_per_pos = jnp.where(is_density_target, 0.0, ce_per_pos)
+    # CE per position — skip entirely when density_only=True (would be zeroed).
+    if args.density_only:
+        ce_per_pos = jnp.zeros_like(tokens_arr, dtype=jnp.float32)
+    else:
+        log_probs = jax.nn.log_softmax(logits_arr, axis=-1)  # (B, Pos, V)
+        ce_per_pos = -jnp.take_along_axis(log_probs, targets_arr[..., None], axis=-1).squeeze(-1)
+        if args.mode == "replace":
+            ce_per_pos = jnp.where(is_density_target, 0.0, ce_per_pos)
 
-    combined = ce_per_pos + args.weight * l1_per_pos  # (B, Pos)
+    # Density loss term — two formulations (always L_1 norm; NMAE is L_1):
+    #  l1  (legacy): |E[ρ] − ρ_true|       — degenerate; spread tolerated
+    #  emd (W₁):    E_v[|ρ_v − ρ_true|]    — penalizes distribution spread
+    probs = jax.nn.softmax(logits_arr, axis=-1)  # (B, Pos, V)
+    rho_true = decode_all_arr[targets_arr]  # (B, Pos)
+    if args.loss_type == "emd":
+        # E_v[|dec_v - rho_true|] under predicted distribution.
+        # XLA fuses the abs with the einsum; no (B,P,V) materialization.
+        diff = decode_all_arr[None, None, :] - rho_true[..., None]  # (B, Pos, V)
+        density_per_pos = jnp.einsum("bpv,bpv->bp", probs, jnp.abs(diff))
+    else:  # legacy "l1": |E[ρ] - ρ_true|
+        e_rho = jnp.einsum("bpv,v->bp", probs, decode_all_arr)  # (B, Pos)
+        density_per_pos = jnp.abs(e_rho - rho_true)
+
+    density_per_pos = jnp.where(is_density_target, density_per_pos, 0.0)
+
+    combined = ce_per_pos + args.weight * density_per_pos  # (B, Pos)
     weighted = combined * lw
     total = jnp.sum(weighted)
-    denom = jnp.maximum(jnp.sum(lw), 1.0)
+    if args.density_only:
+        # Normalize by density-position count so per-density-token gradient
+        # magnitude is invariant to seq packing / preamble length.
+        denom_mask = lw * is_density_target.astype(jnp.float32)
+        denom = jnp.maximum(jnp.sum(denom_mask), 1.0)
+    else:
+        denom = jnp.maximum(jnp.sum(lw), 1.0)
     loss_scalar = total / denom
 
     # Wrap back to NamedArray (no-axes scalar)
