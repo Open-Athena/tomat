@@ -104,11 +104,54 @@ Ref: ChargE3Net SOTA 0.53%, electrAI 1.02%, codec floor 0.18% (P=14, V=16k).
   - `TOMAT_PROFILE_START` (default `20`) — first traced step.
   - `TOMAT_PROFILE_NUM_STEPS` (default `25`) — trace window.
 - Trace lands as wandb artifact (no extra plumbing).
-- Likely root causes ranked: small per-chip BS (128/16=8 ex/chip @ 8k tok),
-  gradient checkpointing on (~30% tax, needed to fit), multi-host comm
-  overhead (v6e-16 = 4 hosts), wide LM head (16k codebook).
-- Cheap experiments: BS={64,128,256} × {grad_ckpt on/off}, 200 steps each;
-  v6e={8,16,32} at fixed per-chip BS.
+
+### 200M / v6e-16 trace (jax-profile-step-20-45:v1)
+Per-step compute breakdown on TPU:0 (BS=128, seq=8192, MFU=8.7%, step=2.08 s):
+- Splash MHA (fwd + bwd dQ + dKV): **47%**
+- `fusion` (matmul/activation): 28%
+- `custom-call` (matmul): 21%
+- `bitcast_add_fusion` (bias): 8%
+- `collective-permute*` + `all-reduce` (comm): **5.5%**
+- inter-step gap: 50-90 ms / 2080 ms step → 2-4% wall
+
+Attention compute alone is 6.3 TFLOPs/chip-step, ideal time at 918 TFLOPs/s
+peak = 6.9 ms — actual 458 ms (66× slower). Heavily HBM-bandwidth-bound,
+not compute-bound. Comm headroom ≤ 5.5%, so the lever is bigger model
+(better arithmetic intensity), not comm/pipeline tuning.
+
+### 1B / v6e-32 trace (jax-profile-step-20-45:v2)
+Same window on the 1B run (BS=256, seq=8192, MFU=13.0%, step=5.76 s):
+
+| category | 200M | 1B | Δ |
+|---|---:|---:|---:|
+| attention (splash MHA) | 47% | **17%** | **−30 pp** |
+| custom-call (matmul) | 21% | **40%** | +19 pp |
+| fusion | 28% | 30% | +2 pp |
+| bias (bitcast_add) | 8% | 9.5% | +1.5 pp |
+| comm | 5.5% | **2.1%** | −3.4 pp |
+
+MFU stddev 0.14% (p10/p50/p90 = 12.92 / 13.09 / 13.10) — extremely stable.
+Bigger-model thesis confirmed: attention's share fell by ~30 pp, matmuls
+became the dominant op category, comm became *less* relevant despite host
+count doubling (2 → 4 hosts). 1B is moving toward compute-bound.
+
+### Cheap follow-ups (post-1B)
+13% is still well below healthy TPU territory (~30-50%). Matmuls running
+at ~32% of peak (40% share × 80% matmul-peak utilization) → still partly
+HBM-bound. Likely cheap headroom on 1B/v6e-32:
+- **per-chip BS↑**: bump to BS=512 (per-chip BS=16) for better matmul tile
+  filling. Expect 13% → ~16-18%.
+- **grad_ckpt=0**: 1B + v6e-32 may fit without recomputation (forward is
+  re-run during backward at ~30% tax). 200M w/ grad_ckpt=0 OOM'd on v6e-16
+  at BS=128 in a prior session, so on 1B this is uncertain — but worth a
+  200-step probe. Expect another ~5-8 pp if it fits.
+- **larger hidden in same param budget**: parked, requires recipe change.
+- Don't optimize comm or pipeline (loading_time + hook_time ≈ 0).
+
+Micro-bench script (post-1B): `tmp/launch-microbench-1B-mfu.sh` — fires
+3 short (200-step) probes back-to-back: (a) BS=512 / ckpt=1, (b) BS=256 /
+ckpt=0, (c) BS=512 / ckpt=0 (only if b fits). Logs to wandb under labels
+`mb-1B-bs{256,512}-ckpt{0,1}-tpu32`.
 
 ## Wheel-rotation workaround (unblocked all of the above)
 - Daily marin-* dev wheels rotate; today's marin-iris dev20260429 declares
