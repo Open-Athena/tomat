@@ -27,6 +27,15 @@ err = partial(print, file=sys.stderr)
 
 VOLUME_NAME = "tomat-rho-gga"
 MOUNT = "/vol"
+# Train volume holds train-full-* labels; small `tomat-rho-gga` only has val.
+TRAIN_VOLUME_NAME = "tomat-rho-gga-train"
+
+# Model presets — mirror marin/train_tomat_tpu.py for matched a2a comparison.
+MODEL_PRESETS = {
+    "30M":  dict(hidden_dim=512,  num_layers=6,  num_heads=4,  num_kv_heads=4,  intermediate_dim=2048),
+    "200M": dict(hidden_dim=1024, num_layers=12, num_heads=16, num_kv_heads=16, intermediate_dim=4096),
+    "1B":   dict(hidden_dim=2048, num_layers=20, num_heads=16, num_kv_heads=16, intermediate_dim=5632),
+}
 
 # marin-levanter + friends are NOT on PyPI — they live on GitHub Releases'
 # expanded_assets pages. See `marin-experiments/tiny-stories/pyproject.toml`
@@ -388,5 +397,167 @@ def main_8gpu(
         results_label=results_label,
     )
     err(f"[modal] done: results at {result['results_dir']} on volume {VOLUME_NAME}")
+
+
+# ============================================================================
+# Modal-vs-TPU MFU bakeoff (probe runs on train-full volume; H100 GPUs)
+# ============================================================================
+
+train_volume = modal.Volume.from_name(TRAIN_VOLUME_NAME)
+
+
+def _train_bakeoff_impl(
+    steps: int,
+    batch_size: int,
+    seed: int,
+    label: str,
+    results_label: str,
+    model_preset: str,
+    parquet_root: str,
+) -> dict:
+    """200M-or-other preset training body for the bakeoff probe.
+
+    Diverges from `_train_smoke_impl` in three ways: (1) reads a
+    parameterized model preset, (2) targets a parameterized parquet root
+    (so the train-full volume can be used), (3) keeps eval and BPB
+    machinery off — we want clean MFU numbers without TaggedEvaluator
+    side effects.
+    """
+    import json
+    from levanter.data.text import (
+        DatasetComponent,
+        LmDataConfig,
+        PrebuiltLmDatasetFormat,
+        UrlDatasetSourceConfig,
+    )
+    from datetime import timedelta
+    from levanter.checkpoint import CheckpointerConfig
+    from levanter.layers.rotary import Llama3RotaryEmbeddingsConfig
+    from levanter.main.train_lm import TrainLmConfig, main as train_lm_main
+    from levanter.models.qwen import Qwen3Config
+    from levanter.optim import AdamConfig
+    from levanter.tracker.json_logger import JsonLoggerConfig
+    from levanter.tracker.wandb import WandbConfig
+    from levanter.trainer import TrainerConfig
+
+    train_volume.reload()
+
+    parquet_dir = parquet_root
+    results_dir = f"{MOUNT}/results/{results_label}"
+    cache_dir = f"{results_dir}/cache"
+    Path(results_dir).mkdir(parents=True, exist_ok=True)
+
+    worker_dirs = sorted(Path(parquet_dir).glob("worker-*"))
+    if not worker_dirs:
+        raise FileNotFoundError(f"no worker-*/ shards under {parquet_dir}")
+    parquet_glob = f"{parquet_dir}/worker-*/*.parquet"
+    meta_path = f"{worker_dirs[0]}/meta.json"
+    meta = json.loads(Path(meta_path).read_text())
+    vocab_size = meta["vocab"]["total_size"]
+    err(f"[bakeoff] vocab_size={vocab_size}, patch_size={meta['patch_size']}, "
+        f"codec={meta['density_codec_name']}, model={model_preset}")
+
+    source = UrlDatasetSourceConfig(train_urls=[parquet_glob])
+    prebuilt_fmt = PrebuiltLmDatasetFormat(input_ids_key="input_ids")
+    component = DatasetComponent(
+        source=source, cache_dir=cache_dir, format=prebuilt_fmt,
+    )
+    data = LmDataConfig(
+        tokenizer="passthrough",
+        vocab_size=vocab_size,
+        cache_dir=cache_dir,
+        components={"tomat": component},
+        block_cross_document_attention=False,
+    )
+
+    preset = MODEL_PRESETS[model_preset]
+    model = Qwen3Config(
+        max_seq_len=8192,
+        rope=Llama3RotaryEmbeddingsConfig(),
+        tie_word_embeddings=True,
+        **preset,
+    )
+
+    project = f"tomat-{meta['density_codec_name']}-P{meta['patch_size']}"
+    group = f"bakeoff-modal-{model_preset}"
+    run_id = f"{results_label}-bs{batch_size}-seed{seed}"
+    trackers = (
+        WandbConfig(
+            id=run_id, resume="allow",
+            project=project, group=group,
+            tags=["bakeoff", "modal", f"model{model_preset}",
+                  f"bs{batch_size}", f"seed{seed}"],
+            save_code=False,
+        ),
+        JsonLoggerConfig(),
+    )
+    checkpointer = CheckpointerConfig(
+        base_path=f"{results_dir}/checkpoints",
+        save_interval=timedelta(minutes=10),
+        keep=[{"every": 1000}],
+    )
+    trainer = TrainerConfig(
+        id=run_id, seed=seed,
+        num_train_steps=steps, train_batch_size=batch_size,
+        steps_per_eval=max(steps, 1),  # disable mid-training eval
+        tracker=trackers, checkpointer=checkpointer,
+    )
+    optimizer = AdamConfig(
+        learning_rate=3e-4, weight_decay=0.0,
+        warmup=0.05, min_lr_ratio=0.0,
+        beta1=0.9, beta2=0.95,
+    )
+    config = TrainLmConfig(
+        data=data, trainer=trainer, model=model, optimizer=optimizer,
+        train_seq_len=8192,
+    )
+    err(f"[bakeoff] calling levanter.main.train_lm.main …")
+    train_lm_main(config)
+    err(f"[bakeoff] done")
+
+    train_volume.commit()
+    return {"results_dir": results_dir, "vocab_size": vocab_size}
+
+
+@app.function(
+    gpu="H100:8",
+    volumes={MOUNT: train_volume},
+    secrets=[wandb_secret],
+    timeout=14400,  # 4h — 1k steps at ~1 s/step is < 30 min, plenty of slack
+)
+def train_bakeoff_h100x8(
+    steps: int,
+    batch_size: int,
+    seed: int,
+    label: str,
+    results_label: str,
+    model_preset: str,
+    parquet_root: str,
+) -> dict:
+    """8× H100 SXM5 bakeoff probe; per-GPU BS = batch_size / 8."""
+    return _train_bakeoff_impl(
+        steps, batch_size, seed, label, results_label, model_preset, parquet_root,
+    )
+
+
+@app.local_entrypoint()
+def main_bakeoff_h100x8(
+    steps: int = 1000,
+    batch_size: int = 128,        # matches TPU recipe; per-GPU = 16
+    seed: int = 42,
+    label: str = "train-full-lmq-v2-lat",
+    results_label: str = "bakeoff-200M-h100x8-1k-lat",
+    model_preset: str = "200M",
+) -> None:
+    parquet_root = f"{MOUNT}/tokenized/{label}"
+    err(f"[modal] H100:8 bakeoff: {model_preset} × {steps} steps, "
+        f"bs={batch_size} (per-GPU {batch_size // 8}), label={label}")
+    err(f"[modal] reading parquets from {parquet_root} on volume {TRAIN_VOLUME_NAME}")
+    result = train_bakeoff_h100x8.remote(
+        steps=steps, batch_size=batch_size, seed=seed,
+        label=label, results_label=results_label,
+        model_preset=model_preset, parquet_root=parquet_root,
+    )
+    err(f"[modal] done: {result['results_dir']} (vocab={result['vocab_size']})")
 
 
