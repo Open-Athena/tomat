@@ -414,6 +414,8 @@ def _train_bakeoff_impl(
     results_label: str,
     model_preset: str,
     parquet_root: str,
+    gradient_checkpointing: bool = True,
+    compute_dtype: str = "bfloat16",  # match TPU recipe; FP32 was the v1 trap
 ) -> dict:
     """200M-or-other preset training body for the bakeoff probe.
 
@@ -421,9 +423,12 @@ def _train_bakeoff_impl(
     parameterized model preset, (2) targets a parameterized parquet root
     (so the train-full volume can be used), (3) keeps eval and BPB
     machinery off — we want clean MFU numbers without TaggedEvaluator
-    side effects.
+    side effects. Also exposes ``gradient_checkpointing`` and
+    ``compute_dtype`` knobs for the v2 sweep.
     """
     import json
+    import jax.numpy as jnp
+    import jmp
     from levanter.data.text import (
         DatasetComponent,
         LmDataConfig,
@@ -475,6 +480,7 @@ def _train_bakeoff_impl(
         max_seq_len=8192,
         rope=Llama3RotaryEmbeddingsConfig(),
         tie_word_embeddings=True,
+        gradient_checkpointing=gradient_checkpointing,
         **preset,
     )
 
@@ -496,11 +502,18 @@ def _train_bakeoff_impl(
         save_interval=timedelta(minutes=10),
         keep=[{"every": 1000}],
     )
+    compute_jdtype = {"bfloat16": jnp.bfloat16, "float32": jnp.float32}[compute_dtype]
+    mp_policy = jmp.Policy(
+        param_dtype=jnp.float32,
+        compute_dtype=compute_jdtype,
+        output_dtype=jnp.float32,
+    )
     trainer = TrainerConfig(
         id=run_id, seed=seed,
         num_train_steps=steps, train_batch_size=batch_size,
         steps_per_eval=max(steps, 1),  # disable mid-training eval
         tracker=trackers, checkpointer=checkpointer,
+        mp=mp_policy,
     )
     optimizer = AdamConfig(
         learning_rate=3e-4, weight_decay=0.0,
@@ -533,10 +546,14 @@ def train_bakeoff_h100x8(
     results_label: str,
     model_preset: str,
     parquet_root: str,
+    gradient_checkpointing: bool = True,
+    compute_dtype: str = "bfloat16",
 ) -> dict:
     """8× H100 SXM5 bakeoff probe; per-GPU BS = batch_size / 8."""
     return _train_bakeoff_impl(
         steps, batch_size, seed, label, results_label, model_preset, parquet_root,
+        gradient_checkpointing=gradient_checkpointing,
+        compute_dtype=compute_dtype,
     )
 
 
@@ -548,15 +565,20 @@ def main_bakeoff_h100x8(
     label: str = "train-full-lmq-v2-lat",
     results_label: str = "bakeoff-200M-h100x8-1k-lat",
     model_preset: str = "200M",
+    gradient_checkpointing: bool = True,
+    compute_dtype: str = "bfloat16",
 ) -> None:
     parquet_root = f"{MOUNT}/tokenized/{label}"
     err(f"[modal] H100:8 bakeoff: {model_preset} × {steps} steps, "
-        f"bs={batch_size} (per-GPU {batch_size // 8}), label={label}")
+        f"bs={batch_size} (per-GPU {batch_size // 8}), "
+        f"ckpt={int(gradient_checkpointing)}, dtype={compute_dtype}, label={label}")
     err(f"[modal] reading parquets from {parquet_root} on volume {TRAIN_VOLUME_NAME}")
     result = train_bakeoff_h100x8.remote(
         steps=steps, batch_size=batch_size, seed=seed,
         label=label, results_label=results_label,
         model_preset=model_preset, parquet_root=parquet_root,
+        gradient_checkpointing=gradient_checkpointing,
+        compute_dtype=compute_dtype,
     )
     err(f"[modal] done: {result['results_dir']} (vocab={result['vocab_size']})")
 
