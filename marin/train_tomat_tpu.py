@@ -88,7 +88,45 @@ PassthroughTokenizer.encode = _safe_passthrough_encode
 import jax.numpy as jnp
 import jmp
 
-from levanter.checkpoint import CheckpointerConfig, load_checkpoint as _real_load_checkpoint
+from levanter.checkpoint import CheckpointerConfig
+
+# Levanter's checkpointer schedules OCDBT commits asynchronously; metadata.json
+# is written in the commit_callback after the async commit drains. If the
+# process exits before the final commit drains, the checkpoint dir has the
+# weight `d/` blob but no metadata.json, and `_restore_ocdbt` raises
+# `FileNotFoundError: Missing paths: ['…/q_proj/weight', …]` because OCDBT
+# manifest hasn't been finalized either. Hit on lat-aware step-7999, 1B
+# from-scratch step-4400, and cont-from-4711 step-11288.
+#
+# Fix: track every Checkpointer the trainer creates, and drain them on
+# atexit. wait_until_finished() blocks on the GlobalAsyncCheckpointManager
+# until all in-flight commits land, which is what writes metadata.json.
+import atexit
+import weakref
+
+_active_checkpointers: weakref.WeakSet = weakref.WeakSet()
+_orig_create_checkpointer = CheckpointerConfig.create
+
+
+def _create_checkpointer_and_register(self, *args, **kwargs):
+    ckpt = _orig_create_checkpointer(self, *args, **kwargs)
+    _active_checkpointers.add(ckpt)
+    return ckpt
+
+
+CheckpointerConfig.create = _create_checkpointer_and_register
+
+
+def _flush_active_checkpointers_at_exit():
+    for ckpt in list(_active_checkpointers):
+        try:
+            print("[tomat-tpu] draining async checkpoint commits before exit …")
+            ckpt.wait_until_finished()
+        except Exception as e:
+            print(f"[tomat-tpu] checkpoint drain failed: {e!r}")
+
+
+atexit.register(_flush_active_checkpointers_at_exit)
 from levanter.data.text import (
     DatasetComponent,
     LmDataConfig,
@@ -349,32 +387,16 @@ def main():
 
     optimizer = AdamConfig(**adam_kwargs)
 
-    init_from_ckpt = os.environ.get("TOMAT_INIT_FROM_CHECKPOINT")
-    if init_from_ckpt:
-        # `TrainLmConfig.initialize_from_checkpoint_path` calls
-        # `load_checkpoint(state, path)` with no `subpath`, which deserializes
-        # the FULL TrainerState including optimizer state — and the optimizer
-        # state's internal step counter, which the LR schedule reads. The
-        # subsequent `dataclasses.replace(state, step=0)` resets only the outer
-        # step, so the schedule still computes LR from the source ckpt's step,
-        # parking us in the cooldown tail at LR=0. (Symptom: continuation NMAE
-        # identical to source ckpt's NMAE, no weight movement.)
-        #
-        # Fix: monkey-patch the load_checkpoint symbol used by train_lm.main so
-        # it loads ONLY the model subpath onto state.model, leaving the
-        # freshly-init'd optimizer state (and its step=0) untouched. This is
-        # the same pattern eval_mat_nmae.py and train_dpo.py use for warm-start.
-        import levanter.main.train_lm as _train_lm_mod
-
-        def _model_only_load(state, ckpt_path, **kwargs):
-            new_model = _real_load_checkpoint(
-                state.model, ckpt_path, subpath="model", **kwargs,
-            )
-            return dataclasses.replace(state, model=new_model)
-
-        _train_lm_mod.load_checkpoint = _model_only_load
-        print(f"[tomat-tpu] warm-starting from {init_from_ckpt}: model-only load, "
-              f"optimizer state stays fresh (step=0 → LR schedule starts from warmup)")
+    # Continuation across crashes is handled by Levanter's native checkpoint
+    # auto-discovery: same TOMAT_RESULTS_LABEL → same checkpointer.base_path
+    # → trainer resumes from the latest step-N ckpt with optimizer state and
+    # step counter intact. Use `tomat train --resume LABEL` for that path.
+    # Warm-start (model-only load, fresh optimizer) used to live here under
+    # TOMAT_INIT_FROM_CHECKPOINT; removed because the only times we reached
+    # for it were resume use cases dressed as warm-starts (different job
+    # name → different output_dir → auto-discovery couldn't see the prior
+    # ckpts), and the fresh-Adam-on-trained-weights collision corrupted the
+    # 1B cont-from-4711 run at step ~2000.
 
     config = TrainLmConfig(
         data=data,
@@ -382,7 +404,6 @@ def main():
         model=model,
         optimizer=optimizer,
         train_seq_len=8192,
-        initialize_from_checkpoint_path=init_from_ckpt,
     )
 
     print("[tomat-tpu] calling levanter.main.train_lm.main …")
