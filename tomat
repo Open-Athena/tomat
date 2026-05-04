@@ -1,0 +1,871 @@
+#!/usr/bin/env python3
+"""tomat — project-management CLI.
+
+Wraps wandb + iris + GCS into a single tool for the recurring operations
+in the tomat training project. Subcommands:
+
+  tomat runs ls                      list wandb runs in tomat-lmq-P14
+  tomat runs status [<substr>]       state, MFU, step, loss for one/all runs
+  tomat runs nmae <substr>           mat-NMAE curve as a table
+
+  tomat iris ls                      list /ryan/* iris jobs (filtered)
+  tomat iris kill <substr>           kill matching running jobs
+  tomat iris logs <substr>           tail logs for a job
+  tomat iris summary <substr>        per-task summary
+
+  tomat evals fire <run> -s STEPS    fire mat-NMAE evals against ckpts
+  tomat evals harvest <run>          start watchdog harvesters
+
+  tomat train LABEL [-r] ...         launch (or resume) a training run
+
+  tomat cost                         MSRP-equivalent table for project
+
+Conventions:
+  RUN_LABEL    wandb display name == iris job name == GCS results dir
+  SUBSTR       case-sensitive substring match against RUN_LABEL
+"""
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+import click
+
+
+WANDB_PROJECT = "PrinceOA/tomat-lmq-P14"
+GCS_BUCKET = "gs://marin-eu-west4/tomat"
+LMQ_PATH = f"{GCS_BUCKET}/codecs/lmq-v2-16k.npz"
+PROJECT_ROOT = Path(__file__).resolve().parent
+MARIN_DIR = PROJECT_ROOT / "marin"
+TMP_DIR = PROJECT_ROOT / "tmp"
+
+SPLITS = {
+    "val_200": "validation",
+    "train_200": "train",
+    "val_400b": "validation",
+    "train_400b": "train",
+}
+
+
+def err(*a, **k):
+    print(*a, file=sys.stderr, **k)
+
+
+def fmt(x):
+    return f"{x:5.2f}" if isinstance(x, (int, float)) else "  -  "
+
+
+def match_runs(api, substr: str | None):
+    runs = list(api.runs(WANDB_PROJECT))
+    if substr is None:
+        return runs
+    return [r for r in runs if substr in r.name]
+
+
+def require_one(runs, substr: str):
+    if not runs:
+        err(f"no runs match {substr!r}")
+        sys.exit(1)
+    if len(runs) > 1:
+        err(f"multiple runs match {substr!r}:")
+        for r in runs:
+            err(f"  {r.name}")
+        sys.exit(1)
+    return runs[0]
+
+
+def iris_run(*args: str, capture: bool = True, timeout: int = 180) -> subprocess.CompletedProcess:
+    """Invoke `uv run iris --cluster=marin job <args>` from marin/."""
+    cmd = ["uv", "run", "iris", "--cluster=marin", "job", *args]
+    return subprocess.run(
+        cmd,
+        cwd=str(MARIN_DIR),
+        capture_output=capture,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def strip_iris_log(text: str) -> str:
+    """Drop iris's `I20...` log lines so output is parseable."""
+    return "\n".join(l for l in text.split("\n") if not l.startswith("I20"))
+
+
+# iris requires --prefix to be `/<user>/<jobname>` (2+ segments). We fan
+# out across the conventional job-name prefixes used in tomat work.
+DEFAULT_IRIS_PREFIXES = ("/ryan/tomat", "/ryan/train", "/ryan/eval")
+
+
+def iris_list_lines(prefixes: tuple[str, ...] = DEFAULT_IRIS_PREFIXES, state: str | None = None) -> list[str]:
+    """Pull `iris job list` lines across multiple prefixes, deduped.
+
+    Note: SEQUENTIAL on purpose. Each `iris` invocation establishes its
+    own SSH tunnel on local port 10000; running them concurrently makes
+    them fight for the port and serializes anyway (worse — `iris ls`
+    measured at 49 s parallel vs 6 s sequential).
+    """
+    seen: set[str] = set()
+    out_lines: list[str] = []
+    for p in prefixes:
+        args = ["list", "--prefix", p]
+        if state:
+            args += ["--state", state]
+        res = iris_run(*args)
+        if res.returncode != 0:
+            continue
+        for line in strip_iris_log(res.stdout).split("\n"):
+            if not line.strip() or "JOB ID" in line:
+                continue
+            jid = line.split()[0] if line else ""
+            if not jid.startswith("/") or jid in seen:
+                continue
+            seen.add(jid)
+            out_lines.append(line)
+    return out_lines
+
+
+# ──────────────────────────────────────────────────────────────────────
+# top-level group
+# ──────────────────────────────────────────────────────────────────────
+
+
+@click.group(help=__doc__)
+def cli():
+    pass
+
+
+# ──────────────────────────────────────────────────────────────────────
+# tomat runs
+# ──────────────────────────────────────────────────────────────────────
+
+
+@cli.group()
+def runs():
+    """Inspect wandb runs."""
+
+
+def _summarize(r, keys: list[str]) -> dict:
+    """Touch r.summary once (forces fetch) and pull the keys we need.
+
+    Returns a flat dict including state, name, created_at, url, plus the
+    requested summary keys. Designed to be called in a ThreadPoolExecutor.
+    """
+    s = r.summary
+    out = {
+        "name": r.name,
+        "state": r.state,
+        "created_at": r.created_at,
+        "url": r.url,
+        "_runtime": s.get("_runtime"),
+        "_step": s.get("_step"),
+    }
+    for k in keys:
+        out[k] = s.get(k)
+    return out
+
+
+def _fetch_summaries(rs, keys: list[str], max_workers: int = 16) -> list[dict]:
+    """Fetch summaries for `rs` in parallel."""
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_summarize, r, keys) for r in rs]
+        return [f.result() for f in futures]
+
+
+@runs.command("ls")
+def runs_ls():
+    """List all wandb runs in the project, newest first."""
+    import wandb
+
+    api = wandb.Api()
+    rs = list(api.runs(WANDB_PROJECT))
+    summaries = _fetch_summaries(rs, keys=[])
+    summaries.sort(key=lambda d: d["created_at"], reverse=True)
+    print(f"{len(summaries)} runs in {WANDB_PROJECT}:")
+    for d in summaries:
+        runtime_h = (d["_runtime"] or 0) / 3600
+        step = d["_step"]
+        step_s = f"{step:>6}" if isinstance(step, int) else "     ?"
+        print(f"  [{d['state']:8s}] step={step_s} runtime={runtime_h:5.1f}h  {d['name']}")
+
+
+_STATUS_KEYS = [
+    "throughput/mfu",
+    "throughput/p50_mfu",
+    "throughput/duration",
+    "throughput/tokens_per_second",
+    "train/loss",
+    "eval/loss",
+]
+
+
+@runs.command("status")
+@click.argument("substr", required=False)
+def runs_status(substr: str | None):
+    """Show state/MFU/step/loss for one or all matching runs."""
+    import wandb
+
+    api = wandb.Api()
+    rs = match_runs(api, substr)
+    if not rs:
+        err(f"no runs match {substr!r}")
+        sys.exit(1)
+    summaries = _fetch_summaries(rs, _STATUS_KEYS)
+    summaries.sort(key=lambda d: d["created_at"], reverse=True)
+    one_line = substr is None or len(summaries) > 1
+    for d in summaries:
+        if one_line:
+            mfu = d.get("throughput/mfu")
+            mfu_s = f"{mfu:5.2f}%" if isinstance(mfu, (int, float)) else "   -  "
+            step = d["_step"]
+            step_s = f"{step:>6}" if isinstance(step, int) else "     ?"
+            runtime_h = (d["_runtime"] or 0) / 3600
+            print(f"  [{d['state']:8s}] step={step_s} runtime={runtime_h:5.1f}h mfu={mfu_s}  {d['name']}")
+        else:
+            print(f"name:    {d['name']}")
+            print(f"state:   {d['state']}")
+            print(f"step:    {d['_step']}")
+            print(f"runtime: {(d['_runtime'] or 0)/3600:.2f} hr")
+            for k in _STATUS_KEYS:
+                v = d.get(k)
+                if v is not None:
+                    print(f"  {k}: {v}")
+            print(f"url:     {d['url']}")
+
+
+def _scan_history_key(r, fk: str) -> list[tuple[int, float]]:
+    return [
+        (row["eval/mat_nmae/step"], row[fk])
+        for row in r.scan_history(keys=["eval/mat_nmae/step", fk], page_size=200)
+        if row.get("eval/mat_nmae/step") is not None and row.get(fk) is not None
+    ]
+
+
+@runs.command("nmae")
+@click.argument("substr")
+@click.option("-s", "--sets", default="val_200,train_200", help="comma-sep mat-sets to show")
+def runs_nmae(substr: str, sets: str):
+    """Show mat-NMAE curve as a step×{val,train}×{mean,median,p99} table."""
+    import wandb
+
+    api = wandb.Api()
+    r = require_one(match_runs(api, substr), substr)
+    set_list = sets.split(",")
+    keys = [f"{s}/{m}" for s in set_list for m in ("mean", "median", "p99")]
+    data: dict[int, dict[str, float]] = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(keys))) as ex:
+        futures = {ex.submit(_scan_history_key, r, f"eval/mat_nmae/{k}"): k for k in keys}
+        for fut in as_completed(futures):
+            k = futures[fut]
+            for s, v in fut.result():
+                data.setdefault(s, {})[k] = v
+    if not data:
+        err(f"no eval/mat_nmae/* history for {r.name}")
+        sys.exit(0)
+
+    print(f"mat-NMAE for {r.name} ({len(data)} step points)")
+    header = "  step  "
+    for s in set_list:
+        header += f"  {s:>14} m/med/p99 "
+    print(header)
+    for step in sorted(data):
+        d = data[step]
+        line = f"  {step:>5}  "
+        for s in set_list:
+            line += f"  {fmt(d.get(s + '/mean'))}/{fmt(d.get(s + '/median'))}/{fmt(d.get(s + '/p99'))}  "
+        print(line)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# tomat iris
+# ──────────────────────────────────────────────────────────────────────
+
+
+@cli.group("iris")
+def iris_grp():
+    """iris job mgmt — wraps `uv run iris --cluster=marin job ...`."""
+
+
+def _parent_jids_matching(substr: str) -> list[str]:
+    """Return parent (top-level) iris job IDs whose name contains SUBSTR."""
+    matches = []
+    for line in iris_list_lines():
+        jid = line.split()[0]
+        # Skip child tasks (extra path segments beyond /<user>/<job>)
+        if jid.count("/") > 2:
+            continue
+        if substr in jid:
+            matches.append(jid)
+    return matches
+
+
+@iris_grp.command("ls")
+@click.option("-f", "--filter", "filter_re", default=None, help="extra regex filter on job line")
+@click.option("-s", "--state", default=None, help="filter by state (running, failed, ...)")
+@click.option("--all", "show_all", is_flag=True, help="include child task lines (default: parents only)")
+def iris_ls(filter_re: str | None, state: str | None, show_all: bool):
+    """List tomat-relevant /ryan/* iris jobs (parents only by default).
+
+    Fans across `/ryan/{tomat,train,eval}` prefixes — iris requires --prefix
+    to be a `/<user>/<jobname>` form, not a bare `/<user>`.
+    """
+    pat = re.compile(filter_re) if filter_re else None
+    lines = iris_list_lines(state=state)
+    print("JOB ID                                                                                              STATE      RESOURCES                          SUBMITTED                         REASON")
+    for line in lines:
+        jid = line.split()[0]
+        if not show_all and jid.count("/") > 2:
+            continue
+        if pat and not pat.search(line):
+            continue
+        print(line)
+
+
+@iris_grp.command("kill")
+@click.argument("substr")
+@click.option("-y", "--yes", is_flag=True, help="skip confirmation prompt")
+def iris_kill(substr: str, yes: bool):
+    """Kill iris jobs whose name matches SUBSTR (running ones only)."""
+    matches = []
+    for line in iris_list_lines(state="running"):
+        jid = line.split()[0]
+        if jid.count("/") > 2:
+            continue
+        if substr in jid:
+            matches.append(jid)
+    if not matches:
+        err(f"no running parent jobs match {substr!r}")
+        sys.exit(1)
+    err(f"will kill {len(matches)} jobs:")
+    for j in matches:
+        err(f"  {j}")
+    if not yes:
+        if not click.confirm("proceed?", default=False):
+            err("aborted")
+            sys.exit(1)
+    for j in matches:
+        r = iris_run("kill", j)
+        err(f"  killed {j}: rc={r.returncode}")
+
+
+@iris_grp.command("logs")
+@click.argument("substr")
+@click.option("-n", "--max-lines", default=200, type=int)
+@click.option("-l", "--level", default=None, help="warning|error|info|debug")
+@click.option("--task", default=None, help="task index (e.g. 1); default = parent job")
+def iris_logs(substr: str, max_lines: int, level: str | None, task: str | None):
+    """Tail logs for a job (most recent N lines)."""
+    matches = _parent_jids_matching(substr)
+    if len(matches) != 1:
+        err(f"expected 1 match for {substr!r}, got {len(matches)}: {matches}")
+        sys.exit(1)
+    jid = matches[0]
+    if task is not None:
+        jid = f"{jid}/{task}"
+    args = ["logs", jid, "--tail", "--max-lines", str(max_lines)]
+    if level:
+        args += ["--level", level]
+    r = iris_run(*args, capture=False, timeout=300)
+    sys.exit(r.returncode)
+
+
+@iris_grp.command("summary")
+@click.argument("substr")
+def iris_summary(substr: str):
+    """Show per-task summary (state, exit, peak mem, error)."""
+    matches = _parent_jids_matching(substr)
+    if len(matches) != 1:
+        err(f"expected 1 match for {substr!r}, got {len(matches)}: {matches}")
+        sys.exit(1)
+    r = iris_run("summary", matches[0], capture=False, timeout=120)
+    sys.exit(r.returncode)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# tomat evals
+# ──────────────────────────────────────────────────────────────────────
+
+
+@cli.group()
+def evals():
+    """Mat-NMAE eval firing + harvesting."""
+
+
+@evals.command("fire")
+@click.option("-s", "--steps", required=True, help="comma-sep step list, e.g. 1000,2000,3000")
+@click.option("-S", "--sets", default="val_200,train_200", help="comma-sep mat-sets")
+@click.option("-m", "--model", default="200M", help="TOMAT_MODEL preset")
+@click.option("-n", "--n-mats", default=200, type=int)
+@click.option("-b", "--eval-batch", default=32, type=int)
+@click.option("-t", "--tpu", default="v6e-8")
+@click.option("--decoder", default="median")
+@click.option("-d", "--dry-run", is_flag=True, help="print iris commands without executing")
+@click.argument("run_label")
+def evals_fire(
+    run_label: str,
+    steps: str,
+    sets: str,
+    model: str,
+    n_mats: int,
+    eval_batch: int,
+    tpu: str,
+    decoder: str,
+    dry_run: bool,
+):
+    """Fire mat-NMAE eval jobs against a run's GCS checkpoints.
+
+    Pre-populates the watchdog FIRED files so a subsequent
+    `tomat evals harvest <run>` will pick the harvested numbers up.
+    Use --dry-run to print the iris commands without firing.
+    """
+    step_list = [int(s) for s in steps.split(",")]
+    set_list = sets.split(",")
+    for s in set_list:
+        if s not in SPLITS:
+            err(f"unknown mat-set {s!r}; known: {sorted(SPLITS)}")
+            sys.exit(1)
+
+    if not dry_run:
+        TMP_DIR.mkdir(exist_ok=True)
+        for s in set_list:
+            (TMP_DIR / f"{run_label}-{s}-evals-fired.txt").write_text("")
+
+    wandb_key = os.environ.get("WANDB_API_KEY", "<WANDB_API_KEY>")
+    if not dry_run and wandb_key == "<WANDB_API_KEY>":
+        err("WANDB_API_KEY not set in env")
+        sys.exit(1)
+
+    fired_total = 0
+    for step in step_list:
+        for s in set_list:
+            jn = f"tomat-eval-{run_label}-{s}-step-{step}"
+            split = SPLITS[s]
+            ckpt = f"{GCS_BUCKET}/results/{run_label}/checkpoints/{run_label}/step-{step}"
+            cmd = [
+                "uv", "run", "iris", "--cluster=marin", "job", "run",
+                "--tpu", tpu, "--enable-extra-resources",
+                "--cpu", "32", "--memory", "64GB",
+                "--env-vars", "WANDB_API_KEY", wandb_key,
+                "--env-vars", "TOMAT_LABEL", "val-full-lmq-v2",
+                "--env-vars", "TOMAT_MODEL", model,
+                "--env-vars", "TOMAT_CHECKPOINT", ckpt,
+                "--env-vars", "TOMAT_LMQ_PATH", LMQ_PATH,
+                "--env-vars", "TOMAT_EVAL_N_MATS", str(n_mats),
+                "--env-vars", "TOMAT_EVAL_SKIP", "0",
+                "--env-vars", "TOMAT_EVAL_BATCH", str(eval_batch),
+                "--env-vars", "TOMAT_EVAL_DECODER", decoder,
+                "--env-vars", "TOMAT_EVAL_MAT_SET", s,
+                "--env-vars", "TOMAT_EVAL_SPLIT", split,
+                "--no-wait", "--no-terminate-on-exit",
+                "--job-name", jn,
+                "--", "python", "eval_mat_nmae.py",
+            ]
+            if dry_run:
+                # Print the cmd as a runnable shell line. Mask the actual
+                # WANDB_API_KEY value with a literal placeholder.
+                pretty = " ".join(
+                    "'<WANDB_API_KEY>'" if a == wandb_key else a
+                    for a in cmd
+                )
+                print(f"# {jn}")
+                print(f"  cd {MARIN_DIR}")
+                print(f"  {pretty}")
+                print()
+                fired_total += 1
+                continue
+            r = subprocess.run(cmd, cwd=str(MARIN_DIR), capture_output=True, text=True)
+            if r.returncode != 0:
+                err(f"[FAIL fire {jn}] rc={r.returncode}\n{r.stderr[-500:]}")
+                continue
+            print(f"[fired {jn}]")
+            with open(TMP_DIR / f"{run_label}-{s}-evals-fired.txt", "a") as f:
+                f.write(f"{step}\n")
+            fired_total += 1
+
+    suffix = " (dry-run)" if dry_run else ""
+    print(f"\n[done firing {fired_total}/{len(step_list)*len(set_list)} jobs{suffix}]")
+
+
+@evals.command("harvest")
+@click.option("-S", "--sets", default="val_200,train_200")
+@click.option("-i", "--interval", default=60, type=int, help="poll interval (sec)")
+@click.argument("run_label")
+def evals_harvest(run_label: str, sets: str, interval: int):
+    """Start watchdog harvesters in the background. They post NMAE numbers
+    to wandb under eval/mat_nmae/<set>/<stat> as evals complete."""
+    cwd = str(PROJECT_ROOT)
+    started = []
+    for s in sets.split(","):
+        if s not in SPLITS:
+            err(f"unknown mat-set {s!r}; known: {sorted(SPLITS)}")
+            sys.exit(1)
+        log = f"tmp/watchdog-{run_label}-{s}.log"
+        env = {**os.environ, "EVAL_MAT_SET": s, "EVAL_SPLIT": SPLITS[s]}
+        with open(log, "w") as logf:
+            p = subprocess.Popen(
+                ["bash", "tmp/watchdog-eval-checkpoints.sh", run_label, str(interval)],
+                cwd=cwd,
+                env=env,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            started.append((s, p.pid, log))
+    for s, pid, log in started:
+        print(f"[{s} watchdog pid={pid} log={log}]")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# tomat preempts
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _parse_preempts(summary_text: str) -> tuple[int, int] | None:
+    """Parse preemption + failure counts from `iris job summary` output.
+
+    Looks for a line like: `State: running  exit=0  failures=N  preemptions=M`
+    Returns (preemptions, failures) or None if not found.
+    """
+    m = re.search(r"failures=(\d+)\s+preemptions=(\d+)", summary_text)
+    if not m:
+        return None
+    return int(m.group(2)), int(m.group(1))
+
+
+@cli.group()
+def preempts():
+    """Preempt-count tracking: pull from iris, post to wandb."""
+
+
+@preempts.command("show")
+@click.argument("substr")
+def preempts_show(substr: str):
+    """Show current preempt + failure counts for a job."""
+    matches = _parent_jids_matching(substr)
+    if len(matches) != 1:
+        err(f"expected 1 match for {substr!r}, got {len(matches)}: {matches}")
+        sys.exit(1)
+    res = iris_run("summary", matches[0])
+    out = strip_iris_log(res.stdout)
+    parsed = _parse_preempts(out)
+    if parsed is None:
+        err("couldn't parse preempt/failure counts from summary")
+        print(out)
+        sys.exit(1)
+    p, f = parsed
+    print(f"job: {matches[0]}")
+    print(f"  preemptions: {p}")
+    print(f"  failures: {f}")
+
+
+@preempts.command("watch")
+@click.argument("substr")
+@click.option("-i", "--interval", default=60, type=int, help="poll interval (sec)")
+@click.option("--max-iters", default=0, type=int, help="stop after N iters (0 = run forever)")
+def preempts_watch(substr: str, interval: int, max_iters: int):
+    """Poll iris every INTERVAL sec and post preempt/failure counts to wandb.
+
+    Logged to the matching wandb run under:
+      cluster/preemptions   — cumulative preempt count
+      cluster/failures      — cumulative task failure count
+      cluster/preempts_per_hour  — derived rate over the watch window
+
+    Designed to run as a background process, e.g.:
+      ./tomat preempts watch cont-from-4711 > tmp/preempts.log 2>&1 &
+
+    Uses a custom 'cluster/elapsed_min' as the wandb step axis so values
+    can be back-filled into a long-running training run without colliding
+    with its main step counter.
+    """
+    import time
+    import wandb
+
+    iris_matches = _parent_jids_matching(substr)
+    if len(iris_matches) != 1:
+        err(f"expected 1 iris match for {substr!r}, got {len(iris_matches)}: {iris_matches}")
+        sys.exit(1)
+    jid = iris_matches[0]
+    # Run name == iris job name (without /ryan/ prefix).
+    run_name = jid.split("/", 2)[-1]
+
+    api = wandb.Api()
+    wb_runs = match_runs(api, run_name)
+    if not wb_runs:
+        err(f"no wandb run named {run_name!r} (the job may not have started logging yet)")
+        err("will retry every iter until it appears")
+    else:
+        err(f"watching iris={jid}, wandb={wb_runs[0].url}")
+
+    # Use wandb's resumed run init to write into the existing run.
+    run = wandb.init(
+        project=WANDB_PROJECT.split("/")[-1],
+        entity=WANDB_PROJECT.split("/")[0],
+        id=run_name,
+        resume="allow",
+        # Don't sync the implicit step; we're appending out-of-band metrics.
+    )
+    run.define_metric("cluster/elapsed_min")
+    run.define_metric("cluster/*", step_metric="cluster/elapsed_min")
+
+    t_start = time.time()
+    last_p = -1
+    last_f = -1
+    n = 0
+    while True:
+        elapsed_min = (time.time() - t_start) / 60.0
+        res = iris_run("summary", jid)
+        out = strip_iris_log(res.stdout)
+        parsed = _parse_preempts(out)
+        if parsed is not None:
+            p, f = parsed
+            rate = (p / (elapsed_min / 60.0)) if elapsed_min > 0.5 else 0.0
+            run.log(
+                {
+                    "cluster/preemptions": p,
+                    "cluster/failures": f,
+                    "cluster/preempts_per_hour": rate,
+                    "cluster/elapsed_min": elapsed_min,
+                }
+            )
+            if p != last_p or f != last_f:
+                err(f"[{elapsed_min:5.1f} min] preempts={p} failures={f} rate={rate:.2f}/hr")
+                last_p, last_f = p, f
+        else:
+            err(f"[{elapsed_min:5.1f} min] couldn't parse summary; retrying")
+
+        n += 1
+        if max_iters and n >= max_iters:
+            break
+        time.sleep(interval)
+
+    run.finish()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# tomat cost
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _gcs_ls(path: str) -> list[str]:
+    """Return `gsutil ls <path>` lines, or empty list if path doesn't exist."""
+    r = subprocess.run(
+        ["gsutil", "ls", path], capture_output=True, text=True, timeout=60,
+    )
+    if r.returncode != 0:
+        return []
+    return [l.strip() for l in r.stdout.split("\n") if l.strip()]
+
+
+def _latest_ckpt_step(run_label: str) -> int | None:
+    """Return the latest step-N under the run's checkpoint dir, or None."""
+    base = f"{GCS_BUCKET}/results/{run_label}/checkpoints/{run_label}"
+    steps = []
+    for line in _gcs_ls(f"{base}/"):
+        m = re.search(r"/step-(\d+)/?$", line)
+        if m:
+            steps.append(int(m.group(1)))
+    return max(steps) if steps else None
+
+
+@cli.command("train")
+@click.option("-r", "--resume", "resume_mode", is_flag=True,
+              help="resume existing run (same LABEL → Levanter auto-discovers latest ckpt + continues with intact optimizer state)")
+@click.option("-D", "--data-label", default="train-full-lmq-v2-lat",
+              help="TOMAT_LABEL (data subdir under tokenized/)")
+@click.option("-m", "--model", default="200M", help="TOMAT_MODEL preset")
+@click.option("-T", "--tpu", default="v6e-16", help="iris --tpu")
+@click.option("-s", "--steps", required=True, type=int, help="TOMAT_STEPS")
+@click.option("-b", "--batch-size", default=128, type=int, help="TOMAT_BATCH_SIZE")
+@click.option("--seed", default=42, type=int, help="TOMAT_SEED")
+@click.option("--lmq-path", default=None, help="TOMAT_LMQ_PATH (default = repo LMQ_PATH constant)")
+@click.option("--lr", default=3e-4, type=float, help="TOMAT_LR")
+@click.option("--lr-schedule", "lr_schedule", default="constant",
+              help="TOMAT_LR_SCHEDULE (constant|cosine|linear|inv_sqrt)")
+@click.option("--warmup", default=0.05, type=float, help="TOMAT_WARMUP fraction")
+@click.option("--cooldown", default=None, type=float, help="TOMAT_COOLDOWN fraction (WSD)")
+@click.option("--val-seqs", default=256, type=int, help="TOMAT_VAL_SEQS")
+@click.option("--steps-per-eval", default=None, type=int, help="TOMAT_STEPS_PER_EVAL")
+@click.option("--grad-ckpt", is_flag=True, help="TOMAT_GRADIENT_CHECKPOINTING=1")
+@click.option("--profile/--no-profile", default=True, help="TOMAT_PROFILE")
+@click.option("--density-loss", default="emd", help="TOMAT_DENSITY_LOSS_TYPE (emd|l1)")
+@click.option("--density-only/--density-add", default=True, help="TOMAT_DENSITY_ONLY_LOSS")
+@click.option("--cpu", default=32, type=int, help="iris --cpu")
+@click.option("--memory", default="64GB", help="iris --memory")
+@click.option("-e", "--env", "extra_env", multiple=True, help="extra env var KEY=VAL (repeatable)")
+@click.option("-f", "--force", is_flag=True, help="allow from-scratch overwrite of existing results dir")
+@click.option("-d", "--dry-run", is_flag=True, help="print iris cmd without firing")
+@click.argument("label")
+def train(
+    label: str,
+    resume_mode: bool,
+    data_label: str,
+    model: str,
+    tpu: str,
+    steps: int,
+    batch_size: int,
+    seed: int,
+    lmq_path: str | None,
+    lr: float,
+    lr_schedule: str,
+    warmup: float,
+    cooldown: float | None,
+    val_seqs: int,
+    steps_per_eval: int | None,
+    grad_ckpt: bool,
+    profile: bool,
+    density_loss: str,
+    density_only: bool,
+    cpu: int,
+    memory: str,
+    extra_env: tuple[str, ...],
+    force: bool,
+    dry_run: bool,
+):
+    """Launch (or resume) a tomat training run.
+
+    Modes:
+      from-scratch (default)   new run with LABEL; errors if results dir exists
+      --resume / -r            continue existing run (same LABEL); errors if
+                               no checkpoints found. Native Levanter auto-
+                               discovery loads the latest ckpt + optimizer
+                               state intact.
+
+    Warm-start (model-only load, fresh optimizer) is NOT a supported mode —
+    it caused the 1B cont-from-4711 spike. If you want it back, add it as
+    an explicit flag with safer LR defaults.
+    """
+    latest = _latest_ckpt_step(label)
+    if resume_mode:
+        if latest is None:
+            err(f"--resume {label}: no step-* ckpts under "
+                f"{GCS_BUCKET}/results/{label}/checkpoints/{label}/")
+            sys.exit(1)
+        print(f"[tomat train] resume mode: latest ckpt step-{latest} → "
+              f"continuing to step {steps}")
+    else:
+        if latest is not None and not force:
+            err(f"results dir for {label!r} already has step-{latest} ckpt; "
+                f"use --resume to continue, or --force to overwrite")
+            sys.exit(1)
+
+    wandb_key = os.environ.get("WANDB_API_KEY", "<WANDB_API_KEY>")
+    if not dry_run and wandb_key == "<WANDB_API_KEY>":
+        err("WANDB_API_KEY not set in env")
+        sys.exit(1)
+
+    env_vars: list[tuple[str, str]] = [
+        ("WANDB_API_KEY", wandb_key),
+        ("TOMAT_LABEL", data_label),
+        ("TOMAT_RESULTS_LABEL", label),
+        ("TOMAT_MODEL", model),
+        ("TOMAT_STEPS", str(steps)),
+        ("TOMAT_BATCH_SIZE", str(batch_size)),
+        ("TOMAT_SEED", str(seed)),
+        ("TOMAT_LMQ_PATH", lmq_path or LMQ_PATH),
+        ("TOMAT_DENSITY_LOSS_TYPE", density_loss),
+        ("TOMAT_DENSITY_ONLY_LOSS", "1" if density_only else "0"),
+        ("TOMAT_LR", str(lr)),
+        ("TOMAT_LR_SCHEDULE", lr_schedule),
+        ("TOMAT_WARMUP", str(warmup)),
+        ("TOMAT_VAL_SEQS", str(val_seqs)),
+        ("TOMAT_PROFILE", "1" if profile else "0"),
+    ]
+    if cooldown is not None:
+        env_vars.append(("TOMAT_COOLDOWN", str(cooldown)))
+    if steps_per_eval is not None:
+        env_vars.append(("TOMAT_STEPS_PER_EVAL", str(steps_per_eval)))
+    if grad_ckpt:
+        env_vars.append(("TOMAT_GRADIENT_CHECKPOINTING", "1"))
+    for kv in extra_env:
+        if "=" not in kv:
+            err(f"--env {kv!r}: expected KEY=VAL")
+            sys.exit(1)
+        k, v = kv.split("=", 1)
+        env_vars.append((k, v))
+
+    cmd = [
+        "uv", "run", "iris", "--cluster=marin", "job", "run",
+        "--tpu", tpu, "--enable-extra-resources",
+        "--cpu", str(cpu), "--memory", memory,
+    ]
+    for k, v in env_vars:
+        cmd += ["--env-vars", k, v]
+    cmd += [
+        "--no-wait", "--no-terminate-on-exit",
+        "--job-name", label,
+        "--", "python", "train_tomat_tpu.py",
+    ]
+
+    if dry_run:
+        pretty = " ".join(
+            "'<WANDB_API_KEY>'" if a == wandb_key else a for a in cmd
+        )
+        print(f"# {label} ({'resume' if resume_mode else 'from-scratch'})")
+        print(f"  cd {MARIN_DIR}")
+        print(f"  {pretty}")
+        return
+
+    r = subprocess.run(cmd, cwd=str(MARIN_DIR), capture_output=True, text=True)
+    if r.returncode != 0:
+        err(f"[FAIL launch {label}] rc={r.returncode}\n{r.stderr[-1000:]}")
+        sys.exit(r.returncode)
+    print(f"[launched {label} on {tpu}, {steps} steps"
+          f"{f' (resume from step-{latest})' if resume_mode else ''}]")
+    print(f"  wandb: https://wandb.ai/{WANDB_PROJECT}/runs/{label}")
+
+
+# v6e public TPU rates ($/chip-hr). Preempt is the rate marin's spot pool
+# pulls from; on-demand for context only.
+PRICE_PREEMPT = 1.15
+PRICE_ONDEMAND = 2.83
+
+
+@cli.command("cost")
+@click.option("-p", "--prefix", default="/ryan", help="iris job prefix to inspect")
+@click.option("-f", "--filter", "filter_re", default="tomat|train-full|train-cont", help="regex on job name")
+def cost(prefix: str, filter_re: str):
+    """Estimate MSRP-equivalent compute spend across matching iris jobs.
+
+    Sums chip-hours (TPU × duration) across visible parent jobs and prints
+    preempt-rate and on-demand-rate equivalents. Public-rate, not actual.
+    """
+    # Parent jobs only — children inherit their parent's slice, would double-count.
+    res = iris_run("list", "--prefix", prefix)
+    out = strip_iris_log(res.stdout)
+    pat = re.compile(filter_re)
+    rows = []
+    for line in out.split("\n"):
+        if not line.strip() or "JOB ID" in line:
+            continue
+        jid = line.split()[0]
+        if not jid.startswith("/") or jid.count("/") > 2:
+            continue
+        if not pat.search(jid):
+            continue
+        # Pull TPU + duration from the line — parsing is fragile, so summary
+        # call would be more robust; defer until we build a json list option.
+        m = re.search(r"v6e-(\d+)", line)
+        chips = int(m.group(1)) if m else 0
+        rows.append((jid, chips, line))
+    if not rows:
+        err(f"no matching jobs under {prefix!r}")
+        sys.exit(0)
+
+    print(f"# Jobs (prefix={prefix}, filter={filter_re}):")
+    print(f"  found {len(rows)} parent jobs (chip-hour estimates require `iris job summary` per-job)")
+    for jid, chips, _ in rows:
+        print(f"  v6e-{chips:<3d}  {jid}")
+    print()
+    print(f"# Public TPU rates (v6e):")
+    print(f"  preempt   ${PRICE_PREEMPT:.2f}/chip-hr")
+    print(f"  on-demand ${PRICE_ONDEMAND:.2f}/chip-hr")
+    print()
+    print("(For per-job chip-hour totals, run `tomat iris summary <jid>` and")
+    print(" multiply chips × wall-clock manually. Auto-summing TBD.)")
+
+
+if __name__ == "__main__":
+    cli()
