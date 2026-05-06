@@ -492,8 +492,9 @@ def evals_fire(
 @evals.command("harvest")
 @click.option("-S", "--sets", default="val_200,train_200")
 @click.option("-i", "--interval", default=60, type=int, help="poll interval (sec)")
+@click.option("-m", "--model", default="200M", help="TOMAT_MODEL preset for the eval jobs the watchdog will fire")
 @click.argument("run_label")
-def evals_harvest(run_label: str, sets: str, interval: int):
+def evals_harvest(run_label: str, sets: str, interval: int, model: str):
     """Start watchdog harvesters in the background. They post NMAE numbers
     to wandb under eval/mat_nmae/<set>/<stat> as evals complete."""
     cwd = str(PROJECT_ROOT)
@@ -503,7 +504,7 @@ def evals_harvest(run_label: str, sets: str, interval: int):
             err(f"unknown mat-set {s!r}; known: {sorted(SPLITS)}")
             sys.exit(1)
         log = f"tmp/watchdog-{run_label}-{s}.log"
-        env = {**os.environ, "EVAL_MAT_SET": s, "EVAL_SPLIT": SPLITS[s]}
+        env = {**os.environ, "EVAL_MAT_SET": s, "EVAL_SPLIT": SPLITS[s], "EVAL_MODEL": model}
         with open(log, "w") as logf:
             p = subprocess.Popen(
                 ["bash", "tmp/watchdog-eval-checkpoints.sh", run_label, str(interval)],
