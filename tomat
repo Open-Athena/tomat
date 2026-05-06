@@ -692,7 +692,7 @@ def _latest_ckpt_step(run_label: str) -> int | None:
 @click.option("--cooldown", default=None, type=float, help="TOMAT_COOLDOWN fraction (WSD)")
 @click.option("--val-seqs", default=256, type=int, help="TOMAT_VAL_SEQS")
 @click.option("--steps-per-eval", default=None, type=int, help="TOMAT_STEPS_PER_EVAL")
-@click.option("--grad-ckpt", is_flag=True, help="TOMAT_GRADIENT_CHECKPOINTING=1")
+@click.option("--grad-ckpt/--no-grad-ckpt", default=True, help="TOMAT_GRADIENT_CHECKPOINTING (default True; pass --no-grad-ckpt to disable for MFU experiments)")
 @click.option("--profile/--no-profile", default=True, help="TOMAT_PROFILE")
 @click.option("--density-loss", default="emd", help="TOMAT_DENSITY_LOSS_TYPE (emd|l1)")
 @click.option("--density-only/--density-add", default=True, help="TOMAT_DENSITY_ONLY_LOSS")
@@ -785,8 +785,7 @@ def train(
         env_vars.append(("TOMAT_COOLDOWN", str(cooldown)))
     if steps_per_eval is not None:
         env_vars.append(("TOMAT_STEPS_PER_EVAL", str(steps_per_eval)))
-    if grad_ckpt:
-        env_vars.append(("TOMAT_GRADIENT_CHECKPOINTING", "1"))
+    env_vars.append(("TOMAT_GRADIENT_CHECKPOINTING", "1" if grad_ckpt else "0"))
     if shuffle_window_blocks > 0:
         env_vars.append(("TOMAT_SHUFFLE_WINDOW_BLOCKS", str(shuffle_window_blocks)))
         if shuffle_io_block_size > 0:
