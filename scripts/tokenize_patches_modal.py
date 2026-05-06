@@ -91,6 +91,7 @@ def tokenize(
     shape: str = "cube",
     r2_max: int = 75,
     lmq_path: str | None = None,
+    tokenizer_version: str = "v2",
 ) -> dict:
     """Invoke `scripts/tokenize_patches.py` as a subprocess with the
     Modal volume mount as `--rho-gga-dir`.
@@ -122,6 +123,7 @@ def tokenize(
         "-S", str(seed),
         "-w", str(worker_idx),
         "-W", str(n_workers),
+        "-V", tokenizer_version,
     ]
     if lmq_path:
         cmd += ["--lmq-path", lmq_path]
@@ -162,8 +164,9 @@ def main(
     shape: str = "cube",
     r2_max: int = 75,
     lmq_path: str = "",
+    tokenizer_version: str = "v2",
 ) -> None:
-    err(f"[modal] tokenize → /vol/tokenized/{label} (pad_to={pad_to}, shape={shape})")
+    err(f"[modal] tokenize → /vol/tokenized/{label} (pad_to={pad_to}, shape={shape}, tk={tokenizer_version})")
     result = tokenize.remote(
         label=label,
         split=split,
@@ -178,6 +181,7 @@ def main(
         shape=shape,
         r2_max=r2_max,
         lmq_path=lmq_path or None,
+        tokenizer_version=tokenizer_version,
     )
     meta = result["meta"]
     err(f"[modal] done: {meta['total_rows']:,} rows in {meta['n_shards']} shards")
@@ -217,6 +221,7 @@ def parallel(
     shape: str = "cube",
     r2_max: int = 75,
     lmq_path: str = "",
+    tokenizer_version: str = "v2",
 ) -> None:
     # NB: default bumped 16 → 256 per Ryan's 2026-04-24 observation that Modal
     # has plenty of headroom. Volume read throughput is the ceiling around this
@@ -257,6 +262,7 @@ def parallel(
             worker_idx=i, n_workers=n_workers,
             shape=shape, r2_max=r2_max,
             lmq_path=lmq_path or None,
+            tokenizer_version=tokenizer_version,
         )
         for i in indices
     ]

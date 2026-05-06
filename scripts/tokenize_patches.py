@@ -45,6 +45,7 @@ from tomat.float_codec import FP16Codec, LMQCodec
 from tomat.tokenizers.ball import BallTokenizer
 from tomat.tokenizers.ball import SPECIAL_TOKENS as BALL_SPECIAL_TOKENS
 from tomat.tokenizers.patch import INT_VOCAB_SIZE, PatchTokenizer, SPECIAL_TOKENS
+from tomat.tokenizers.patch_v3 import PatchTokenizerV3
 
 err = partial(print, file=sys.stderr)
 
@@ -89,6 +90,9 @@ def _build_schema() -> pa.Schema:
         help='Codec log_max (rho_gga p99.99 with padding).')
 @option('--shape', type=click.Choice(['cube', 'ball']), default='cube',
         help='Patch shape: cube (P×P×P, default) or ball (voxels with r²≤r2_max of center).')
+@option('-V', '--tokenizer-version', type=click.Choice(['v2', 'v3']), default='v2',
+        help='v2 = global atom positions + SHAPE/OFFSET/HI blocks. v3 = patch-frame translated atoms, '
+             'no SHAPE/OFFSET/HI in default case. v3 only valid with --shape=cube.')
 @option('--r2-max', type=int, default=75,
         help='Ball squared-radius threshold (only for --shape=ball). '
              'Defaults to 75 (2,777 voxels, ≈cube P=14). '
@@ -124,6 +128,7 @@ def main(
     density_log_min: float,
     density_log_max: float,
     shape: str,
+    tokenizer_version: str,
     r2_max: int,
     patch_size: int,
     output_dir: Path,
@@ -186,9 +191,15 @@ def main(
     else:
         codec = DENSITY_CODECS[density_codec](log_min=density_log_min, log_max=density_log_max)
     if shape == 'ball':
+        if tokenizer_version != 'v2':
+            raise click.UsageError("--tokenizer-version v3 only valid with --shape=cube")
         tokenizer = BallTokenizer(r2_max=r2_max, density_codec=codec)
         specials = BALL_SPECIAL_TOKENS
         err(f"[tokenize] ball shape: r²≤{r2_max} ({len(tokenizer.vocab.position_codec.signed_vocabs)} vocab groups)")
+    elif tokenizer_version == 'v3':
+        tokenizer = PatchTokenizerV3(patch_size=patch_size, density_codec=codec)
+        specials = SPECIAL_TOKENS
+        err(f"[tokenize] v3 cube tokenizer: P={patch_size} translated atoms, no SHAPE/OFFSET/HI")
     else:
         tokenizer = PatchTokenizer(patch_size=patch_size, density_codec=codec)
         specials = SPECIAL_TOKENS
@@ -351,6 +362,7 @@ def main(
         "overflow_task_ids": overflowed[:50],
         "patches_per_material": patches_per_material,
         "shape": shape,
+        "tokenizer_version": tokenizer_version,
         "patch_size": patch_size if shape == 'cube' else f"r{r2_max}",
         "r2_max": r2_max if shape == 'ball' else None,
         "density_codec_name": density_codec,
