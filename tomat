@@ -699,6 +699,8 @@ def _latest_ckpt_step(run_label: str) -> int | None:
 @click.option("--cpu", default=32, type=int, help="iris --cpu")
 @click.option("--memory", default="64GB", help="iris --memory")
 @click.option("-e", "--env", "extra_env", multiple=True, help="extra env var KEY=VAL (repeatable)")
+@click.option("--shuffle-window-blocks", type=int, default=0, help="TOMAT_SHUFFLE_WINDOW_BLOCKS; 0 = no shuffle (default), >0 = BlockShuffle window radius")
+@click.option("--shuffle-io-block-size", type=int, default=0, help="TOMAT_SHUFFLE_IO_BLOCK_SIZE; 0 = auto from meta (M)")
 @click.option("-f", "--force", is_flag=True, help="allow from-scratch overwrite of existing results dir")
 @click.option("-d", "--dry-run", is_flag=True, help="print iris cmd without firing")
 @click.argument("label")
@@ -725,6 +727,8 @@ def train(
     cpu: int,
     memory: str,
     extra_env: tuple[str, ...],
+    shuffle_window_blocks: int,
+    shuffle_io_block_size: int,
     force: bool,
     dry_run: bool,
 ):
@@ -783,6 +787,10 @@ def train(
         env_vars.append(("TOMAT_STEPS_PER_EVAL", str(steps_per_eval)))
     if grad_ckpt:
         env_vars.append(("TOMAT_GRADIENT_CHECKPOINTING", "1"))
+    if shuffle_window_blocks > 0:
+        env_vars.append(("TOMAT_SHUFFLE_WINDOW_BLOCKS", str(shuffle_window_blocks)))
+        if shuffle_io_block_size > 0:
+            env_vars.append(("TOMAT_SHUFFLE_IO_BLOCK_SIZE", str(shuffle_io_block_size)))
     for kv in extra_env:
         if "=" not in kv:
             err(f"--env {kv!r}: expected KEY=VAL")

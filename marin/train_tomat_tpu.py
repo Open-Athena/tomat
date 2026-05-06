@@ -138,6 +138,7 @@ from levanter.main.train_lm import TrainLmConfig, main as train_lm_main
 from levanter.models.qwen import Qwen3Config
 from levanter.optim import AdamConfig
 from levanter.callbacks.profiler import ProfilerConfig
+from levanter.data.text.datasets import BlockShuffleConfig
 from levanter.tracker.json_logger import JsonLoggerConfig
 from levanter.tracker.wandb import WandbConfig
 from levanter.trainer import TrainerConfig
@@ -188,12 +189,37 @@ def main():
         cache_dir=f"{BUCKET}/results/{results_label}/cache",
         format=prebuilt,
     )
+    # Shuffle config. By default Levanter's `LmDataConfig.shuffle=False` —
+    # batches are read in cache order, which for tomat means consecutive
+    # patches from the same material (M=32 or 64 sequences/mat). That gives
+    # batches with only ~BS/M unique mats, hurting gradient quality.
+    # `TOMAT_SHUFFLE_WINDOW_BLOCKS > 0` enables `BlockShuffleConfig`:
+    #   - `io_block_size` (rows per IO chunk; default = M from meta) keeps
+    #     each block as one mat's patches — cache-friendly sequential reads.
+    #   - `window_blocks` (default 0 = off) is the within-window mixing
+    #     radius; 1024 blocks × M rows ≈ 32–65k rows per shuffle window.
+    shuffle_window_blocks = int(os.environ.get("TOMAT_SHUFFLE_WINDOW_BLOCKS", "0"))
+    shuffle_io_block_size = int(
+        os.environ.get("TOMAT_SHUFFLE_IO_BLOCK_SIZE", "0")
+    ) or int(meta.get("patches_per_material", 32))
+    if shuffle_window_blocks > 0:
+        shuffle_cfg: bool | int | BlockShuffleConfig = BlockShuffleConfig(
+            io_block_size=shuffle_io_block_size,
+            window_blocks=shuffle_window_blocks,
+        )
+        print(f"[tomat-tpu] shuffle: BlockShuffle(io_block_size={shuffle_io_block_size}, "
+              f"window_blocks={shuffle_window_blocks})")
+    else:
+        shuffle_cfg = False
+        print(f"[tomat-tpu] shuffle: OFF (set TOMAT_SHUFFLE_WINDOW_BLOCKS>0 to enable)")
+
     data = LmDataConfig(
         tokenizer="passthrough",
         vocab_size=vocab_size,
         cache_dir=f"{BUCKET}/results/{results_label}/cache",
         components={"tomat": component},
         block_cross_document_attention=False,
+        shuffle=shuffle_cfg,
         # Hold out TOMAT_VAL_SEQS sequences from train for validation. Levanter
         # types this as `dict[str, int]` keyed by component name — one entry per
         # DatasetComponent. We have a single "tomat" component. val_seqs=0 skips.
