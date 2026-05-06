@@ -175,9 +175,12 @@ def main():
     with fsspec.open(meta_url, "r") as f:
         meta = json.load(f)
     vocab_size = meta["vocab"]["total_size"]
+    # Sequence length is the dataset's pad_to (drives both model max_seq_len
+    # and trainer train_seq_len). v3-p15 uses 4608 vs v3 baseline's 8192.
+    seq_len = int(meta.get("pad_to") or 8192)
     print(f"[tomat-tpu] label={label}, vocab_size={vocab_size}, "
           f"patch={meta['patch_size']}, codec={meta['density_codec_name']}, "
-          f"model={model_preset}, val_seqs={val_seqs}")
+          f"model={model_preset}, val_seqs={val_seqs}, seq_len={seq_len}")
 
     results_label = results_label_env or f"{label}-tpu-{model_preset}-bs{batch_size}-seed{seed}"
     run_id = results_label
@@ -313,7 +316,7 @@ def main():
     grad_ckpt = os.environ.get("TOMAT_GRADIENT_CHECKPOINTING", "1") == "1"
     print(f"[tomat-tpu] gradient_checkpointing={grad_ckpt}")
     model = model_config_cls(
-        max_seq_len=8192,
+        max_seq_len=seq_len,
         rope=Llama3RotaryEmbeddingsConfig(),
         tie_word_embeddings=True,
         gradient_checkpointing=grad_ckpt,
@@ -429,7 +432,7 @@ def main():
         trainer=trainer,
         model=model,
         optimizer=optimizer,
-        train_seq_len=8192,
+        train_seq_len=seq_len,
     )
 
     print("[tomat-tpu] calling levanter.main.train_lm.main …")
