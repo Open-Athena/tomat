@@ -10,14 +10,19 @@ SQLite at data/mpdb.sqlite. Schema:
        split TEXT,              -- "train" | "val" | "test" | NULL
        nx, ny, nz INTEGER,
        n_atoms INTEGER,
+       n_electrons INTEGER,     -- sum of Z across atoms; v2+
        n_voxels INTEGER GENERATED ALWAYS AS (nx*ny*nz),
        cube_seq_pN INTEGER GENERATED ALWAYS AS (28 + 10*n_atoms + 2*N^3) for N in 14..20,
        ball_seq_rN INTEGER GENERATED ALWAYS AS (29 + 10*n_atoms + 2*V_ball(N))     for R² in {75,86,100,138,153}
   )
 
+Schema versions (PRAGMA user_version):
+  0/unset — original schema (no n_electrons)
+  2       — adds n_electrons; val rows backfilled with n_atoms
+
 Usage:
   scripts/build_mpdb.py ingest --csv /tmp/train-full-preamble-clean.csv --split train
-  scripts/build_mpdb.py ingest --csv /tmp/val-full-shapes-clean.csv    --split val  (no atom counts yet; filled NULL)
+  scripts/build_mpdb.py ingest --csv /tmp/val-full-shapes-clean.csv    --split val
   scripts/build_mpdb.py query   --filter 'n_atoms > 100'                 # sample query
 """
 
@@ -34,6 +39,7 @@ import click
 err = partial(print, file=sys.stderr)
 
 DEFAULT_DB = Path("data/mpdb.sqlite")
+SCHEMA_VERSION = 2  # bumped to 2 when n_electrons was added
 
 # V_ball(R²) — precomputed cumulative voxel counts for the R² values we care about.
 BALL_VOXELS = {75: 2777, 86: 3407, 100: 4169, 138: 6859, 153: 8025}
@@ -75,6 +81,7 @@ CREATE TABLE IF NOT EXISTS mats (
   ny           INTEGER,
   nz           INTEGER,
   n_atoms      INTEGER,
+  n_electrons  INTEGER,
   n_voxels     INTEGER GENERATED ALWAYS AS (nx * ny * nz) VIRTUAL,
   max_dim      INTEGER GENERATED ALWAYS AS (MAX(nx, ny, nz)) VIRTUAL,
   {cube_cols},
@@ -94,6 +101,11 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 def ensure_schema(conn: sqlite3.Connection, ball_r2s: list[int]) -> None:
     conn.executescript(_schema(ball_r2s))
+    # ALTER TABLE for upgrade from v1 (no n_electrons) → v2.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(mats)").fetchall()}
+    if "n_electrons" not in cols:
+        conn.execute("ALTER TABLE mats ADD COLUMN n_electrons INTEGER")
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 
 
@@ -130,10 +142,11 @@ def ingest(db: Path, csv: Path, split: str, replace: bool):
             except (KeyError, ValueError):
                 continue
             n_atoms = int(r["n_atoms"]) if r.get("n_atoms") else None
-            rows.append((mp_id, split, nx, ny, nz, n_atoms))
+            n_electrons = int(r["n_electrons"]) if r.get("n_electrons") else None
+            rows.append((mp_id, split, nx, ny, nz, n_atoms, n_electrons))
 
     cur = conn.executemany(
-        "INSERT OR REPLACE INTO mats (mp_id, split, nx, ny, nz, n_atoms) VALUES (?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO mats (mp_id, split, nx, ny, nz, n_atoms, n_electrons) VALUES (?,?,?,?,?,?,?)",
         rows,
     )
     conn.commit()

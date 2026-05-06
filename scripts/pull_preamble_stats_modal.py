@@ -1,10 +1,15 @@
 #!/usr/bin/env python
-"""Pull (mp_id, nx, ny, nz, n_atoms) for every material in a tokenized label.
+"""Pull (mp_id, nx, ny, nz, n_atoms, n_electrons) for every material in a tokenized label.
 
 Extracts from the parquet preambles: grid shape (first 3 ints after
-[GRID_START]) and atom count (tokens between [ATOMS_START]=3 and
-[ATOMS_END]=4). One material = one 32-row block in the parquet;
-we read only row 0 of each block.
+[GRID_START]), atom count + atomic numbers (tokens between [ATOMS_START]=3
+and [ATOMS_END]=4). n_electrons is computed as sum of atomic numbers.
+One material = one 32-row block in the parquet; we read only row 0
+of each block.
+
+Atom tokens encode Z as ``ATOM_OFFSET + (Z - 1)`` where ``ATOM_OFFSET``
+is the number of specials = 20 (lat-aware vocab; pre-lat datasets used
+``ATOM_OFFSET = 18``). Pass ``--atom-offset 18`` for those.
 
 Datasets tokenized after the lattice-aware change use INT_BASE=138 and
 include a [LATTICE_START]…[LATTICE_END] block between [GRID_END] and
@@ -31,6 +36,7 @@ gcp_secret = modal.Secret.from_name("tomat-gcp-sa")
 app = modal.App("tomat-pull-preamble-stats", image=image)
 
 INT_BASE_DEFAULT = 20 + 118    # 138 for lattice-aware datasets
+ATOM_OFFSET_DEFAULT = 20       # specials count for lat-aware datasets
 INT_VOCAB = 1024
 GRID_START, GRID_END = 7, 8
 ATOMS_START, ATOMS_END = 3, 4
@@ -49,13 +55,18 @@ def setup_gcp_creds():
 
 
 def parse_preamble(
-    tokens: list[int], int_base: int = INT_BASE_DEFAULT,
-) -> tuple[int, int, int, int]:
-    """Return (nx, ny, nz, n_atoms) from the preamble of one row.
+    tokens: list[int],
+    int_base: int = INT_BASE_DEFAULT,
+    atom_offset: int = ATOM_OFFSET_DEFAULT,
+) -> tuple[int, int, int, int, int]:
+    """Return (nx, ny, nz, n_atoms, n_electrons) from the preamble of one row.
 
     Layout: [BOS] [GRID_START] nx ny nz [GRID_END]
             [LATTICE_START] qa qb qc qα qβ qγ [LATTICE_END]?  (lat-aware datasets)
             [ATOMS_START] atoms… [ATOMS_END] …
+
+    Atom tokens encode Z = atom_token - atom_offset + 1. n_electrons is
+    the sum of Z values across the atom block.
     """
     if tokens[1] != GRID_START:
         raise ValueError(f"expected GRID_START at pos 1, got {tokens[:6]}")
@@ -80,24 +91,32 @@ def parse_preamble(
     # Find ATOMS_END in the next few tokens; atoms are one token each.
     for j in range(atoms_start_pos + 1, min(len(tokens), atoms_start_pos + 1 + 10000)):
         if tokens[j] == ATOMS_END:
-            return nx, ny, nz, j - (atoms_start_pos + 1)
+            atom_tokens = tokens[atoms_start_pos + 1:j]
+            n_atoms = len(atom_tokens)
+            n_electrons = sum(t - atom_offset + 1 for t in atom_tokens)
+            return nx, ny, nz, n_atoms, n_electrons
     raise ValueError(f"no ATOMS_END found within window")
 
 
 @app.function(cpu=1, memory=2048, timeout=600, secrets=[gcp_secret])
-def process_shard(shard: str) -> list[tuple[str, int, int, int, int]]:
+def process_shard(shard: str) -> list[tuple[str, int, int, int, int, int]]:
     import gcsfs  # type: ignore
     import pyarrow.parquet as pq  # type: ignore
 
     setup_gcp_creds()
     fs = gcsfs.GCSFileSystem()
     out = []
-    with fs.open(shard, "rb") as f:
-        pf = pq.ParquetFile(f)
-        cols = [c for c in pf.schema_arrow.names if c in ("task_id", "input_ids", "mp_id")]
-        if "input_ids" not in cols:
-            return out
-        tbl = pf.read(columns=cols)
+    try:
+        with fs.open(shard, "rb") as f:
+            pf = pq.ParquetFile(f)
+            cols = [c for c in pf.schema_arrow.names if c in ("task_id", "input_ids", "mp_id")]
+            if "input_ids" not in cols:
+                return out
+            tbl = pf.read(columns=cols)
+    except Exception as e:
+        # Corrupt or unreadable shard — skip and warn (visible only in stderr).
+        print(f"[modal-preamble] skipping {shard}: {type(e).__name__}: {e}", file=__import__('sys').stderr)
+        return out
     ids = tbl.column("input_ids").to_pylist()
     id_col = "task_id" if "task_id" in tbl.column_names else "mp_id"
     mp_ids = tbl.column(id_col).to_pylist() if id_col in tbl.column_names else [None] * len(ids)
@@ -107,13 +126,13 @@ def process_shard(shard: str) -> list[tuple[str, int, int, int, int]]:
         # Typical mat: <50 atoms → window of ~500 is plenty.
         window = row[:1024]
         try:
-            nx, ny, nz, n_atoms = parse_preamble(window)
+            nx, ny, nz, n_atoms, n_electrons = parse_preamble(window)
         except ValueError:
             # Try a bigger window for dense-atom mats
             window = row[:4096]
-            nx, ny, nz, n_atoms = parse_preamble(window)
+            nx, ny, nz, n_atoms, n_electrons = parse_preamble(window)
         mpid = mp_ids[i] if mp_ids[i] is not None else f"{shard}:{i}"
-        out.append((mpid, nx, ny, nz, n_atoms))
+        out.append((mpid, nx, ny, nz, n_atoms, n_electrons))
     return out
 
 
@@ -134,10 +153,10 @@ def run(label: str = "train-full", bucket: str = "gs://marin-eu-west4/tomat"):
     shards = list_shards.remote(label, bucket)
     print(f"[modal-preamble] {len(shards)} shards under {bucket}/tokenized/{label}", file=sys.stderr)
 
-    print("mp_id,nx,ny,nz,n_atoms")
+    print("mp_id,nx,ny,nz,n_atoms,n_electrons")
     seen = 0
     for rows in process_shard.map(shards, order_outputs=False):
-        for mpid, nx, ny, nz, n_atoms in rows:
-            print(f"{mpid},{nx},{ny},{nz},{n_atoms}")
+        for mpid, nx, ny, nz, n_atoms, n_electrons in rows:
+            print(f"{mpid},{nx},{ny},{nz},{n_atoms},{n_electrons}")
         seen += len(rows)
     print(f"[modal-preamble] total mats: {seen}", file=sys.stderr)
