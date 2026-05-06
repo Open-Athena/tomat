@@ -238,6 +238,53 @@ def tokenize_patch_for_eval(
     return tokens
 
 
+def _pos_tokens_vec(coords, vocab_offsets):
+    """Vectorized version of `_pos_tokens` — accepts any-shape numpy array of
+    coords, returns array of shape ``(*coords.shape, 3)`` of absolute token IDs.
+
+    Used by the v3 builder where atom positions are translated per-patch and
+    we need to emit position tokens for shape ``(n_patches, n_atoms, 3)``
+    coords in one numpy pass.
+    """
+    pos_off = vocab_offsets["pos_offset"]
+    pos_vocabs = vocab_offsets["pos_vocabs"]  # (512, 256, 256)
+    log_min = vocab_offsets["pos_log_min"]
+    log_max = vocab_offsets["pos_log_max"]
+
+    # Match FP16Codec._log_bin_index exactly: clip log_vals (not normalized),
+    # truncate via .astype, force bin_index=0 when mag < floor. The canonical
+    # codec truncates rather than rounds — `_pos_tokens` (the v2 sibling) uses
+    # round, which is an off-by-one bug carried over; we fix it here.
+    MAGNITUDE_FLOOR = 1e-15
+    coords = np.asarray(coords, dtype=np.float64)
+    mag = np.abs(coords)
+    safe_mag = np.maximum(mag, MAGNITUDE_FLOOR)
+    log_mag = np.log10(safe_mag)
+    log_clipped = np.clip(log_mag, log_min, log_max)
+    total_bins = 1 << 24
+    normalized = (log_clipped - log_min) / (log_max - log_min)
+    bin_index = (normalized * (total_bins - 1)).astype(np.int64)
+    bin_index = np.clip(bin_index, 0, total_bins - 1)
+    bin_index = np.where(mag < MAGNITUDE_FLOOR, 0, bin_index)
+
+    # Three 8-bit chunks, MSB first.
+    chunks = np.stack([
+        (bin_index >> 16) & 0xff,
+        (bin_index >> 8) & 0xff,
+        bin_index & 0xff,
+    ], axis=-1)  # (*coords.shape, 3)
+
+    # First chunk gets sign bit (negative coords → add 256).
+    first_half = 1 << 8
+    signs_positive = coords >= 0
+    chunks_first = np.where(signs_positive, chunks[..., 0], first_half + chunks[..., 0])
+    chunks = np.concatenate([chunks_first[..., None], chunks[..., 1:]], axis=-1)
+
+    # Cumulative offsets within position-codec vocab.
+    cum = np.array([0, pos_vocabs[0], pos_vocabs[0] + pos_vocabs[1]], dtype=np.int64)
+    return (pos_off + cum + chunks).astype(np.int32)  # (*coords.shape, 3)
+
+
 def _pos_tokens(coord, vocab_offsets):
     """tomol_3byte codec for position: 3 tokens per coord, log-uniform [1e-4, 1).
     Matches FP16Codec.tomol_3byte(log_min=-4.0, log_max=0.0).encode_signed([coord])[0].
@@ -412,6 +459,107 @@ def build_all_patch_input_ids(
     return ids
 
 
+def build_all_patch_input_ids_v3(
+    density,         # (nx, ny, nz) float
+    grid_shape,      # (nx, ny, nz)
+    offsets,         # (n_patches, 3) array of (ix, iy, iz)
+    Zs,              # (N,) int
+    frac,            # (N, 3) float — global frac coords
+    lmq_codec,
+    vocab_offsets,
+    P=19,
+    pad_to=8192,
+    lattice_params=None,
+):
+    """v3 builder: vectorized (n_patches, pad_to) int32 input_ids matrix.
+
+    Differences from `build_all_patch_input_ids` (v2):
+    - Atom positions are translated to each patch's frame (subtract
+      ``offset / grid_shape`` and re-mod 1).
+    - Drops SHAPE / OFFSET / HI blocks.
+    - POS block now varies per patch — vectorized via `_pos_tokens_vec`.
+
+    Layout:
+        BOS | GRID | LATTICE | ATOMS | POS_translated | DENS | EOS
+    """
+    bounds, recon, clip_max = lmq_codec
+    n_specials = vocab_offsets["n_specials"]
+    int_off = n_specials + N_ATOMS
+    density_offset = vocab_offsets["density_offset"]
+    lat_aware = vocab_offsets.get("lat_aware", False)
+
+    offsets_arr = np.asarray(offsets, dtype=np.int32)  # (n, 3)
+    n = offsets_arr.shape[0]
+    grid_np = np.asarray(grid_shape, dtype=np.int32)
+    n_atoms = len(Zs)
+
+    # ---- Static prefix (BOS, GRID, LATTICE, ATOMS): same across patches ----
+    pre = [TOK["BOS"]]
+    pre += [TOK["GRID_START"], int_off + int(grid_shape[0]), int_off + int(grid_shape[1]),
+            int_off + int(grid_shape[2]), TOK["GRID_END"]]
+    if not lat_aware:
+        # v3 expects lat-aware (LMQ-era) tokenizer; fall back loud.
+        raise ValueError("v3 builder requires lat_aware=True (LATTICE block in vocab)")
+    if lattice_params is None:
+        raise ValueError("v3 / lat-aware needs lattice_params")
+    a, b, c, alpha, beta, gamma = lattice_params
+    lat_ints = [
+        int(round(a / LATTICE_LENGTH_RES_A)),
+        int(round(b / LATTICE_LENGTH_RES_A)),
+        int(round(c / LATTICE_LENGTH_RES_A)),
+        int(round(alpha / LATTICE_ANGLE_RES_DEG)),
+        int(round(beta  / LATTICE_ANGLE_RES_DEG)),
+        int(round(gamma / LATTICE_ANGLE_RES_DEG)),
+    ]
+    if any(v < 0 or v >= N_INTS for v in lat_ints):
+        raise ValueError(
+            f"lattice quantization out of range: params={lattice_params} → ints={lat_ints}"
+        )
+    pre += [TOK["LATTICE_START"]] + [int_off + v for v in lat_ints] + [TOK["LATTICE_END"]]
+    pre += [TOK["ATOMS_START"]] + [n_specials + int(z - 1) for z in Zs] + [TOK["ATOMS_END"]]
+    static_pre = np.array(pre, dtype=np.int32)
+    static_pre_len = static_pre.shape[0]
+
+    # ---- Per-patch translated POS tokens ----
+    # delta: (n, 3) fractional shift
+    delta = offsets_arr.astype(np.float64) / grid_np.astype(np.float64)
+    # translated coords: (n, n_atoms, 3) = (frac[None] - delta[:, None, :]) % 1
+    translated = (np.asarray(frac, dtype=np.float64)[None, :, :]
+                  - delta[:, None, :]) % 1.0
+    # _pos_tokens_vec → (n, n_atoms, 3, 3): one extra trailing dim of 3 tokens.
+    pos_tok = _pos_tokens_vec(translated, vocab_offsets)
+    # Flatten to (n, n_atoms * 9): per-patch row of position tokens.
+    pos_block = pos_tok.reshape(n, n_atoms * 9)
+
+    # ---- Per-patch DENS tokens (vectorized fancy-indexing extract) ----
+    iota = np.arange(P, dtype=np.int32)
+    di, dj, dk = np.meshgrid(iota, iota, iota, indexing='ij')
+    idx_x = (offsets_arr[:, 0, None, None, None] + di[None]) % grid_np[0]
+    idx_y = (offsets_arr[:, 1, None, None, None] + dj[None]) % grid_np[1]
+    idx_z = (offsets_arr[:, 2, None, None, None] + dk[None]) % grid_np[2]
+    patches = density[idx_x, idx_y, idx_z]  # (n, P, P, P)
+    flat = patches.reshape(n, P * P * P)
+    clipped = np.clip(flat, 0.0, clip_max)
+    bins = np.searchsorted(bounds, clipped, side="right").astype(np.int32)
+    dens_tokens = bins + density_offset  # (n, P^3)
+
+    # ---- Assemble ----
+    ids = np.full((n, pad_to), TOK["PAD"], dtype=np.int32)
+    p = 0
+    ids[:, p:p + static_pre_len] = static_pre[None, :]
+    p += static_pre_len
+    ids[:, p] = TOK["POS_START"]; p += 1
+    ids[:, p:p + n_atoms * 9] = pos_block; p += n_atoms * 9
+    ids[:, p] = TOK["POS_END"]; p += 1
+    ids[:, p] = TOK["DENS_START"]; p += 1
+    ids[:, p:p + P ** 3] = dens_tokens; p += P ** 3
+    ids[:, p] = TOK["DENS_END"]; p += 1
+    ids[:, p] = TOK["EOS"]; p += 1
+    if p > pad_to:
+        raise ValueError(f"v3 token sequence too long: {p} > pad_to={pad_to}")
+    return ids
+
+
 def main():
     label = os.environ.get("TOMAT_LABEL", "val-full-lmq-v2")
     model_preset = os.environ.get("TOMAT_MODEL", "200M")
@@ -438,7 +586,9 @@ def main():
     vocab_size = meta["vocab"]["total_size"]
     patch_size_meta = meta.get("patch_size")
     P = int(patch_size_meta) if isinstance(patch_size_meta, int) else 14
-    err(f"[eval-mat] label={label}, model={model_preset}, P={P}, vocab={vocab_size}")
+    tokenizer_version = meta.get("tokenizer_version", "v2")
+    err(f"[eval-mat] label={label}, model={model_preset}, P={P}, vocab={vocab_size}, "
+        f"tokenizer={tokenizer_version}")
 
     # LMQ codec
     bounds, recon, clip_max = load_lmq_codec(lmq_path)
@@ -635,7 +785,12 @@ def main():
             # ---- Vectorized pre-tokenize: build all (n_eval, 8192) input_ids in one numpy pass ----
             t_tok0 = time.time()
             pad_to = 8192
-            all_ids = build_all_patch_input_ids(
+            builder = (
+                build_all_patch_input_ids_v3
+                if tokenizer_version == "v3"
+                else build_all_patch_input_ids
+            )
+            all_ids = builder(
                 density, grid_shape, offsets_arr, Zs, frac,
                 lmq_codec, vocab_offsets, P=P, pad_to=pad_to,
                 lattice_params=lattice_params,
