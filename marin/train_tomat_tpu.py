@@ -117,16 +117,29 @@ def _create_checkpointer_and_register(self, *args, **kwargs):
 CheckpointerConfig.create = _create_checkpointer_and_register
 
 
-def _flush_active_checkpointers_at_exit():
+def _flush_active_checkpointers(label: str = "atexit"):
+    """Drain every active checkpointer's async commit thread.
+
+    Called from two places:
+      * `main()` right before returning, after `train_lm_main()` finishes,
+        as a deterministic save-point. This is the preferred path —
+        runs while the interpreter is fully alive and we can log
+        success/failure to wandb cleanly.
+      * `atexit` as a last-ditch safety net for crashes / non-clean
+        exits (`train_lm_main` raises, signal handler fires, etc.).
+        Some shutdown paths run partial cleanup before atexit, so this
+        is best-effort.
+    """
     for ckpt in list(_active_checkpointers):
         try:
-            print("[tomat-tpu] draining async checkpoint commits before exit …")
+            print(f"[tomat-tpu] draining async checkpoint commits ({label}) …", flush=True)
             ckpt.wait_until_finished()
+            print(f"[tomat-tpu] drain ({label}) done", flush=True)
         except Exception as e:
-            print(f"[tomat-tpu] checkpoint drain failed: {e!r}")
+            print(f"[tomat-tpu] checkpoint drain ({label}) failed: {e!r}", flush=True)
 
 
-atexit.register(_flush_active_checkpointers_at_exit)
+atexit.register(_flush_active_checkpointers)
 
 
 # Signal-event telemetry. iris's `preemption_count` is a cumulative scalar
@@ -473,6 +486,10 @@ def main():
     print("[tomat-tpu] calling levanter.main.train_lm.main …")
     _log_lifecycle_event("trainer_started", label=results_label, steps=steps)
     train_lm_main(config)
+    # Drain ckpt commits at a deterministic point (before atexit, before
+    # interpreter teardown can race with tensorstore HTTP callbacks). The
+    # atexit handler still runs as a safety net for crash paths.
+    _flush_active_checkpointers(label="post-train")
     _log_lifecycle_event("trainer_finished")
     print("[tomat-tpu] done")
 
