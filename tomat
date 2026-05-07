@@ -626,16 +626,24 @@ def preempts_watch(substr: str, interval: int, max_iters: int):
         if parsed is not None:
             p, f = parsed
             rate = (p / (elapsed_min / 60.0)) if elapsed_min > 0.5 else 0.0
+            # `*_delta` are per-poll increments — non-zero entries on the
+            # wandb time-series mark *when* preempt/failure events landed,
+            # which the cumulative count obscures.
+            dp = max(0, p - last_p) if last_p >= 0 else 0
+            df = max(0, f - last_f) if last_f >= 0 else 0
             run.log(
                 {
                     "cluster/preemptions": p,
                     "cluster/failures": f,
+                    "cluster/preempts_delta": dp,
+                    "cluster/failures_delta": df,
                     "cluster/preempts_per_hour": rate,
                     "cluster/elapsed_min": elapsed_min,
                 }
             )
             if p != last_p or f != last_f:
-                err(f"[{elapsed_min:5.1f} min] preempts={p} failures={f} rate={rate:.2f}/hr")
+                err(f"[{elapsed_min:5.1f} min] preempts={p} (+{dp}) "
+                    f"failures={f} (+{df}) rate={rate:.2f}/hr")
                 last_p, last_f = p, f
         else:
             err(f"[{elapsed_min:5.1f} min] couldn't parse summary; retrying")
@@ -701,6 +709,7 @@ def _latest_ckpt_step(run_label: str) -> int | None:
 @click.option("-e", "--env", "extra_env", multiple=True, help="extra env var KEY=VAL (repeatable)")
 @click.option("--shuffle-window-blocks", type=int, default=0, help="TOMAT_SHUFFLE_WINDOW_BLOCKS; 0 = no shuffle (default), >0 = BlockShuffle window radius")
 @click.option("--shuffle-io-block-size", type=int, default=0, help="TOMAT_SHUFFLE_IO_BLOCK_SIZE; 0 = auto from meta (M)")
+@click.option("--watch-preempts/--no-watch-preempts", default=True, help="auto-fire `tomat preempts watch <LABEL>` in the background after launch (default on)")
 @click.option("-f", "--force", is_flag=True, help="allow from-scratch overwrite of existing results dir")
 @click.option("-d", "--dry-run", is_flag=True, help="print iris cmd without firing")
 @click.argument("label")
@@ -729,6 +738,7 @@ def train(
     extra_env: tuple[str, ...],
     shuffle_window_blocks: int,
     shuffle_io_block_size: int,
+    watch_preempts: bool,
     force: bool,
     dry_run: bool,
 ):
@@ -826,6 +836,20 @@ def train(
     print(f"[launched {label} on {tpu}, {steps} steps"
           f"{f' (resume from step-{latest})' if resume_mode else ''}]")
     print(f"  wandb: https://wandb.ai/{WANDB_PROJECT}/runs/{label}")
+
+    if watch_preempts:
+        # Background-fire `tomat preempts watch <label>` so the wandb run
+        # carries cluster/preemptions + cluster/preempts_delta from the
+        # start. Per-run log file lives at tmp/preempts-<label>.log.
+        Path("tmp").mkdir(exist_ok=True)
+        watch_log = Path("tmp") / f"preempts-{label}.log"
+        watch_proc = subprocess.Popen(
+            [str(Path(__file__).resolve()), "preempts", "watch", label],
+            stdout=open(watch_log, "ab"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        print(f"[preempts watch pid={watch_proc.pid} log={watch_log}]")
 
 
 # v6e public TPU rates ($/chip-hr). Preempt is the rate marin's spot pool

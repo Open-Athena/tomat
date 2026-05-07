@@ -127,6 +127,41 @@ def _flush_active_checkpointers_at_exit():
 
 
 atexit.register(_flush_active_checkpointers_at_exit)
+
+
+# Signal-event telemetry. iris's `preemption_count` is a cumulative scalar
+# polled out-of-band; it doesn't tell us *when* the trainer received a
+# SIGTERM or whether the gang shutdown barrier completed. We log timestamped
+# events to stdout (and best-effort to wandb if a run is live) so we can
+# correlate per-event activity with iris's count.
+import datetime
+import signal as _signal
+
+
+def _log_lifecycle_event(event: str, **fields):
+    """Print a one-line tag the iris log harvester can grep, and best-effort
+    log the same event to wandb. Both paths are robust to in-flight teardown
+    (wandb may already be finishing when SIGTERM lands)."""
+    ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    extras = " ".join(f"{k}={v}" for k, v in fields.items())
+    print(f"[tomat-tpu lifecycle] {ts} event={event} {extras}", flush=True)
+    try:
+        import wandb
+        if wandb.run is not None:
+            wandb.run.log({f"lifecycle/{event}": 1, **{f"lifecycle/{k}": v for k, v in fields.items()}})
+    except Exception:
+        pass
+
+
+def _handle_sigterm(signum, _frame):
+    _log_lifecycle_event("sigterm_received", signum=signum)
+    # Re-raise default-handler behavior so the JAX coordination service
+    # gets the shutdown signal it expects (don't swallow).
+    _signal.signal(signum, _signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+_signal.signal(_signal.SIGTERM, _handle_sigterm)
 from levanter.data.text import (
     DatasetComponent,
     LmDataConfig,
@@ -436,7 +471,9 @@ def main():
     )
 
     print("[tomat-tpu] calling levanter.main.train_lm.main …")
+    _log_lifecycle_event("trainer_started", label=results_label, steps=steps)
     train_lm_main(config)
+    _log_lifecycle_event("trainer_finished")
     print("[tomat-tpu] done")
 
 
