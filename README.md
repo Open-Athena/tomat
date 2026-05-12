@@ -10,73 +10,81 @@ the 3D ResUNet over voxel grids.
 [electrAI]: https://github.com/Quantum-Accelerators/electrai
 [tomol]: https://huggingface.co/ihxds/ToMol-marin-1B
 
-## Patch tokenization
+## Patch tokenization (v3, current)
 
 Each training example is one P × P × P sub-cube of a material's
 native-resolution density, prefixed with:
 
 - The full grid shape `(nx, ny, nz)`.
-- The material's atomic inventory (Z + fractional coordinates).
-- The patch's low-corner anchor `(ix, iy, iz)`, its shape `(P, P, P)`,
-  and the wrapped **high corner** `(hx, hy, hz) = (ix+P−1) mod nx`. On
-  any axis where `hi < lo` the patch crossed a PBC boundary — the model
-  sees that as a direct observation rather than having to learn
-  modular arithmetic.
+- The material's lattice `(a, b, c, α, β, γ)` (added 2026-04-30; v3-lat).
+- The material's atomic inventory (Z + per-atom *patch-translated*
+  fractional coordinates — v3 wraps atoms relative to the patch's
+  anchor so the model never has to learn PBC modular arithmetic).
 
-At `P = 14` with a 2-token-per-voxel density codec, each sequence is
-`14³ × 2 = 5,488` density tokens plus a ~200-token preamble — fits 8k
-context with headroom for a 100-atom structure. Vocab is **6,792 tokens**
-(18 specials + 118 atomic Z + 1,024 ints + 1,024 position-codec +
-4,608 density-codec).
+At `P = 19` with the LMQ-v2 1-token-per-voxel density codec, each
+sequence is `19³ = 6,859` density tokens plus a small preamble — fits
+8k context. Vocab is **~18.5k tokens** (20 specials + 118 atomic Z +
+ints for grid/positions/lattice + 16,384 LMQ density bins). Each
+material gets **M = 64** randomly-sampled patches (one patch per
+sequence).
 
-## Example training sequence
+Earlier eras: v2 (P=14, 2-token density codec, vocab ~6.8k, SHAPE/OFFSET/HI
+preamble blocks) is archived in
+[`docs/2026-04-30-overview-snapshot.md`](docs/2026-04-30-overview-snapshot.md).
 
-Real row from `train-full` — [mp-2282417](https://elvis.oa.dev/?m=mp-2282417)
-(Y₃Si₃Ag₃, grid 64×108×108), P=14 patch at offset (5, 9, 44):
+## Example training sequence (v3)
+
+Schematic of one v3 row (real rows live in `data/tokenized/train-full-v3/`):
 
 ```
 [BOS]
-[GRID_START]   64 108 108                             [GRID_END]
-[ATOMS_START]  Y Y Y Si Si Si Ag Ag Ag                [ATOMS_END]
-[POS_START]    (p236 p699 p1003  p240 p767 p1005  p0 p512 p768)  …  (+7 more atoms)  [POS_END]
-[SHAPE_START]  14 14 14                               [SHAPE_END]
-[OFFSET_START] 5 9 44                                 [OFFSET_END]
-[HI_START]     18 22 57                               [HI_END]
-[DENS_START]   d172 d909  d169 d4175  d168 d525  …  d158 d2204    # 5,488 density tokens = 2 × 14³
+[GRID_START]    nx ny nz                              [GRID_END]
+[LATTICE_START] a b c α β γ                           [LATTICE_END]
+[ATOMS_START]   Z₁ Z₂ … Z_N                           [ATOMS_END]
+[POS_START]     (x₁ y₁ z₁  x₂ y₂ z₂  …) (patch-translated coords)  [POS_END]
+[DENS_START]    d₁ d₂ … d_{19³}    # 6,859 density tokens = 1 × 19³
 [DENS_END]
 [EOS]
-[PAD] × 2,586                                         # right-padded to 8,192
+[PAD] × …                                             # right-padded to 8,192
 ```
 
-Atom Zs render as element symbols (`Y`, `Si`, `Ag`). Position codec =
-3 tokens/coord × 3 coords → 9 tokens/atom. Density codec emits 2 tokens
-per voxel. [`scripts/show_tokens.py`](./scripts/show_tokens.py) renders
-any parquet row in this form.
+Atom Zs render as element symbols. LMQ density codec emits one token
+per voxel (Lloyd-Max quantized — see
+[`docs/lmq-vs-equal-mass.md`](docs/lmq-vs-equal-mass.md)).
+[`scripts/show_tokens.py`](./scripts/show_tokens.py) renders any parquet
+row in this form.
+
+For the current state of experiments, ckpts, and NMAE numbers, see
+[`OVERVIEW.md`](./OVERVIEW.md).
 
 ## Tokenized datasets
 
-All `two_token_9_12` density codec, P=14, pad_to=8192, seed 42. Full
-table + storage layout in [`docs/datasets.md`](./docs/datasets.md).
+Current default: **`train-full-v3` / `val-full-v3`** — LMQ-v2 1-token
+density codec, P=19, M=64 patches/mat, lattice-aware preamble, pad_to=8192,
+seed 42. ~77 k train mats × 64 = ~2.5 M sequences; ~4.3 k val mats × 64 =
+~277 k sequences. Stored at `gs://marin-eu-west4/tomat/tokenized/{train,val}-full-v3/`.
 
-| label | split | mats | patches/mat | rows | tokens (pad) | on-disk (GCS) |
-|---|---|---:|---:|---:|---:|---:|
-| `val-smoke` | val | 128 | 32 | 4,096 | 34 M | ~33 MB |
-| `val-full` | val | 4,305 | 32 | 137,696 | 1.13 B | 1.49 GB |
-| `val-full-m128` | val | 4,305 | 128 | 549,664 | 4.50 B | 1.44 GB |
-| **`train-full`** | train | **77,498** | 32 | **2,478,912** | **20.31 B** | **21.1 GB** |
+Just-tokenized (2026-05-10): `train-full-v3-m128` / `val-full-v3-m128`
+(same recipe, M=128) — enables 2-epoch training without repeating tokens.
+Awaiting GCS sync from the Modal volumes.
 
 Raw Zarrs live on Princeton della (`/scratch/gpfs/…/rho_gga/`, ~412 GB
 total); staged onto two Modal volumes (`tomat-rho-gga` val, 22 GB;
 `tomat-rho-gga-train` train, 370 GB) where tokenize runs and emits
 parquet, which syncs to `gs://marin-eu-west4/tomat/tokenized/`.
 
-Note on naming: `val-full` is MP's validation split (~4 k mats); we
-used it as early compute-scaling training data because it was seeded
-to Modal first. `train-full` (77 k mats) is the proper train split.
-"4 k mats" / "77 k mats" are the semantic descriptions if the val/train
-labels get confusing.
+Full historical table + v2-era datasets (P=14, 2-token codec) lives in
+[`docs/datasets.md`](./docs/datasets.md) (partially out-of-date pending
+v3 refresh).
 
 ## Scale training runs
+
+Current runs (200M / 1B v3): see [`OVERVIEW.md`](./OVERVIEW.md) for the
+live table + best NMAE/NEMD numbers. `./tomat runs links` regenerates a
+slack-paste-ready markdown table.
+
+The original v2-era 30M/208M/1B scaling-study (P=14, two-token codec)
+is archived below for reference.
 
 ![scaling loss curves](./site/public/scaling-loss.png)
 
@@ -121,14 +129,16 @@ Headlines:
   confirming the small-model-under-saturates-chip hypothesis. 1 B at
   4 tok/param is still ~5× under Chinchilla — clean "more tokens" headroom.
 
-> **Caveat:** these train/eval *losses* and *BPB* are token-space
-> cross-entropy, **not** directly comparable to electrAI / charg3net's
-> voxel-space NMAE (2 % / 0.5 %). Proper NMAE eval is in progress — see
-> [`specs/17-density-loss-design.md`](./specs/17-density-loss-design.md).
+> **v2-era caveat (still archived in
+> [`docs/2026-04-30-overview-snapshot.md`](./docs/2026-04-30-overview-snapshot.md)):**
+> these train/eval *losses* and *BPB* are token-space cross-entropy,
+> not directly comparable to electrAI / ChargE3Net's voxel-space NMAE.
+> Mat-NMAE + mat-NEMD eval is now in place and reported in OVERVIEW;
+> current best is 1.73% / 1.76% (200M cont7k-ext).
 
 ## Running
 
-Python (tokenize + training):
+Setup:
 
 ```bash
 spd                                 # direnv + versioned venv
@@ -136,32 +146,28 @@ uv sync                             # install deps
 uv run pytest tests/                # tokenizer roundtrip tests
 ```
 
-Modal-side tokenize (laptop → Modal A100 volume → GCS):
+Tokenize on Modal:
 
 ```bash
-TOMAT_VOLUME=tomat-rho-gga modal run \
+TOMAT_VOLUME=tomat-rho-gga-train modal run \
   scripts/tokenize_patches_modal.py::parallel \
-  --label val-full --split validation --n-workers 16
+  --label train-full-v3 --split train \
+  --patches-per-material 64 --patch-size 19 --tokenizer-version v3 \
+  --lmq-path gs://marin-eu-west4/tomat/codecs/lmq-v2-16k.npz \
+  --n-workers 256 --seed 42 --pad-to 8192
 ```
 
-Marin/TPU training (from `marin/`):
+Train on Marin TPU (via the `tomat` CLI; wraps iris):
 
 ```bash
-cd marin
-uv run iris --cluster=marin job run \
-  --tpu v6e-8 --enable-extra-resources --cpu 32 --memory 64GB \
-  --env-vars WANDB_API_KEY "$WANDB_API_KEY" \
-  --env-vars TOMAT_LABEL train-full --env-vars TOMAT_MODEL 30M \
-  -- python train_tomat_tpu.py
+./tomat train -m 200M -T v6e-16 -b 128 -s 8000 -D train-full-v3 \
+    --shuffle-window-blocks 1024 --share-cache \
+    -e MARIN_I_WILL_PAY_FOR_ALL_FEES=1 \
+    train-full-v3-200M-bs128-emd-do-8k-tpu16
 ```
 
-Env-var knobs on the TPU script: `TOMAT_LABEL`, `TOMAT_STEPS`,
-`TOMAT_BATCH_SIZE`, `TOMAT_SEED`, `TOMAT_MODEL` (`30M` or `200M`),
-`TOMAT_VAL_SEQS`, `TOMAT_RESULTS_LABEL`.
-
-Static-PNG plot regeneration: `scripts/make_scaling_plot_png.py`. Data
-pull from W&B: `scripts/pull_wandb_runs.py`. Token-row decoder:
-`scripts/show_tokens.py`.
+See `./tomat --help` for subcommands (`runs`, `iris`, `evals`, `train`,
+`runs links`).
 
 ## Layout
 
