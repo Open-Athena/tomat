@@ -11,11 +11,11 @@ interface Props {
 }
 
 const COLORS = {
-  step: '#1f77b4',
-  loss: '#d62728',
-  start: '#ff7f0e',
-  sigterm: '#7f7f7f',
-  preempt: '#9467bd',
+  step: '#2196f3',           // brighter blue
+  loss: '#ef5350',           // brighter red
+  start: '#ffa726',          // brighter orange
+  sigterm: '#bdbdbd',        // lighter gray (more visible than 7f7f7f on dark)
+  preempt: '#ba68c8',        // brighter purple
 } as const
 
 export function WallclockPlot({ history, runId }: Props) {
@@ -23,15 +23,21 @@ export function WallclockPlot({ history, runId }: Props) {
   const { timestamps, steps, cols } = history
   const toIso = (ts: number) => new Date(ts * 1000).toISOString()
 
-  // Step curve (every row that has a step + a timestamp).
+  // Step curve: running-max of _step over _timestamp.
+  // Why: wandb's `_step` is monotone in log-order, but events from our
+  // lifecycle daemon-thread interleave out-of-order on the wall-time axis.
+  // Plot the honest "how much training has been completed at time T".
+  const indices = timestamps
+    .map((ts, i) => ({ ts, s: steps[i], i }))
+    .filter((r) => r.ts !== null && r.s !== null)
+    .sort((a, b) => (a.ts as number) - (b.ts as number))
   const stepXs: string[] = []
   const stepYs: number[] = []
-  for (let i = 0; i < timestamps.length; i++) {
-    const ts = timestamps[i]
-    const s = steps[i]
-    if (ts === null || s === null) continue
-    stepXs.push(toIso(ts))
-    stepYs.push(s)
+  let runningMax = -Infinity
+  for (const { ts, s } of indices) {
+    runningMax = Math.max(runningMax, s as number)
+    stepXs.push(toIso(ts as number))
+    stepYs.push(runningMax)
   }
 
   // train/loss (sparse).
@@ -46,10 +52,14 @@ export function WallclockPlot({ history, runId }: Props) {
     lossYs.push(v)
   }
 
-  // Lifecycle events → vertical shapes.
-  const eventXs = (key: keyof Map<string, unknown> | string): string[] => {
+  // Lifecycle events → as scatter "fake-vline" traces so they get legend
+  // entries (shapes don't). Each event becomes a small null-separated
+  // [x,x,null] segment with y in paper-coords via a dedicated invisible axis.
+  const eventXs = (
+    key: 'lifecycle/trainer_started' | 'lifecycle/sigterm_received',
+  ): string[] => {
     const xs: string[] = []
-    const col = cols.get(key as never) ?? []
+    const col = cols.get(key) ?? []
     for (let i = 0; i < col.length; i++) {
       if (col[i] === 1) {
         const ts = timestamps[i]
@@ -61,7 +71,7 @@ export function WallclockPlot({ history, runId }: Props) {
   const startXs = eventXs('lifecycle/trainer_started')
   const sigtermXs = eventXs('lifecycle/sigterm_received')
 
-  // cluster/preemptions jumps.
+  // cluster/preemptions jumps (sparse).
   const preemptCol = cols.get('cluster/preemptions') ?? []
   const preemptXs: string[] = []
   let prev: number | null = null
@@ -75,11 +85,33 @@ export function WallclockPlot({ history, runId }: Props) {
     prev = v
   }
 
-  const eventShapes = [
-    ...startXs.map((x) => vshape(x, COLORS.start, 'dash')),
-    ...sigtermXs.map((x) => vshape(x, COLORS.sigterm, 'dot')),
-    ...preemptXs.map((x) => vshape(x, COLORS.preempt, 'solid')),
-  ]
+  // Helper: build a single scatter trace that draws N vertical lines on
+  // the hidden `yaxis3` (paper-anchored 0→1) so they don't fight with
+  // the step/loss y-scales.
+  const vlinesTrace = (xs: string[], name: string, color: string, dash: 'dash' | 'dot' | 'solid'):
+    Partial<Plotly.PlotData> => {
+    const xArr: (string | null)[] = []
+    const yArr: (number | null)[] = []
+    for (const x of xs) {
+      xArr.push(x, x, null)
+      yArr.push(0, 1, null)
+    }
+    return {
+      x: xArr as string[],
+      y: yArr as number[],
+      mode: 'lines',
+      type: 'scatter',
+      name: `${name} (${xs.length})`,
+      line: { color, width: dash === 'solid' ? 1 : 1.2, dash },
+      yaxis: 'y3',
+      hoverinfo: 'skip',
+      showlegend: true,
+      opacity: 0.85,
+    }
+  }
+
+  const gridcolor = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'
+  const zerolinecolor = isDark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.15)'
 
   return (
     <Plot
@@ -90,9 +122,9 @@ export function WallclockPlot({ history, runId }: Props) {
           name: 'step',
           type: 'scatter',
           mode: 'lines',
-          line: { color: COLORS.step, width: 1.5 },
+          line: { color: COLORS.step, width: 2.2, shape: 'hv' },
           yaxis: 'y',
-          hovertemplate: '%{x}<br>step %{y}<extra></extra>',
+          hovertemplate: '%{x|%Y-%m-%d %H:%M:%S}<br>step %{y}<extra></extra>',
         },
         {
           x: lossXs,
@@ -100,11 +132,14 @@ export function WallclockPlot({ history, runId }: Props) {
           name: 'train/loss',
           type: 'scatter',
           mode: 'lines',
-          opacity: 0.4,
-          line: { color: COLORS.loss, width: 0.6 },
+          line: { color: COLORS.loss, width: 1.2 },
+          opacity: 0.9,
           yaxis: 'y2',
           hovertemplate: 'loss %{y:.3f}<extra></extra>',
         },
+        vlinesTrace(startXs, 'trainer_started', COLORS.start, 'dash'),
+        vlinesTrace(sigtermXs, 'sigterm', COLORS.sigterm, 'dot'),
+        vlinesTrace(preemptXs, 'cluster preempt', COLORS.preempt, 'solid'),
       ]}
       layout={{
         title: {
@@ -113,10 +148,24 @@ export function WallclockPlot({ history, runId }: Props) {
         },
         autosize: true,
         height: 460,
-        xaxis: { title: { text: 'UTC' }, type: 'date' },
+        // Gridlines: render BEHIND traces + dim color.
+        // Plotly draws gridlines in the order axes are declared; setting
+        // layer='below traces' keeps them out of the way.
+        xaxis: {
+          title: { text: 'UTC' },
+          type: 'date',
+          gridcolor,
+          zerolinecolor,
+          linecolor: gridcolor,
+          layer: 'below traces',
+        },
         yaxis: {
           title: { text: 'step', font: { color: COLORS.step } },
           tickfont: { color: COLORS.step },
+          gridcolor,
+          zerolinecolor,
+          linecolor: gridcolor,
+          layer: 'below traces',
         },
         yaxis2: {
           title: { text: 'train/loss', font: { color: COLORS.loss } },
@@ -124,27 +173,25 @@ export function WallclockPlot({ history, runId }: Props) {
           overlaying: 'y',
           side: 'right',
           type: 'log',
+          gridcolor: 'rgba(0,0,0,0)',     // y2 doesn't draw its own grid (avoid double lines)
+          zerolinecolor: 'rgba(0,0,0,0)',
+          layer: 'below traces',
         },
-        shapes: eventShapes,
-        margin: { t: 50, l: 60, r: 60, b: 40 },
+        // Hidden axis for event vlines so they span 0→1 paper-coords
+        // without affecting the visible y-axes.
+        yaxis3: {
+          overlaying: 'y',
+          range: [0, 1],
+          showgrid: false,
+          showticklabels: false,
+          zeroline: false,
+          visible: false,
+        },
+        margin: { t: 50, l: 60, r: 60, b: 50 },
         hovermode: 'x unified',
         hoverlabel: themedHoverlabel(isDark),
-        legend: { x: 1.05, y: 1 },
+        legend: { x: 1.04, y: 1, bgcolor: 'rgba(0,0,0,0)' },
       }}
     />
   )
-}
-
-function vshape(x: string, color: string, dash: 'solid' | 'dash' | 'dot') {
-  return {
-    type: 'line' as const,
-    xref: 'x' as const,
-    yref: 'paper' as const,
-    x0: x,
-    x1: x,
-    y0: 0,
-    y1: 1,
-    line: { color, width: dash === 'solid' ? 0.6 : 0.9, dash },
-    opacity: dash === 'dot' ? 0.5 : 0.7,
-  }
 }
