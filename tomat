@@ -20,6 +20,12 @@ in the tomat training project. Subcommands:
 
   tomat train LABEL [-r] ...         launch (or resume) a training run
 
+  tomat wb projects [-e ENT]         list wandb projects + access level
+  tomat wb access <project> [--set]  get/set project access via upsertModel
+  tomat wb mutations [<filter>]      list GraphQL mutations
+  tomat wb type <name>               introspect a GraphQL type
+  tomat wb gql <query> [-v K=V]      raw GraphQL execution
+
   tomat cost                         MSRP-equivalent table for project
 
 Conventions:
@@ -1097,6 +1103,243 @@ def runs_lifecycle_plot(substr: str, out: str | None, upload: bool,
         run.summary["summary/lifecycle_overlay"] = wandb.Image(str(out_path))
         run.finish()
         print(f"  uploaded to wandb run {name} as summary/lifecycle_overlay")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# tomat wb — wandb GraphQL helpers
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _wb_exec(query: str, **variables):
+    """Execute a raw GraphQL query against wandb.
+
+    Uses `requests` directly (wandb's bundled `wandb_gql` has a fragile
+    transitive vendor layout that doesn't survive being imported by an
+    external script). API key resolution mirrors `wandb.Api()` — env var,
+    then `~/.netrc`.
+    """
+    import netrc
+    import requests
+    key = os.environ.get("WANDB_API_KEY")
+    host = os.environ.get("WANDB_BASE_URL", "https://api.wandb.ai")
+    if not key:
+        try:
+            auths = netrc.netrc().authenticators(host.split("//", 1)[-1])
+            if auths:
+                key = auths[2]
+        except (FileNotFoundError, netrc.NetrcParseError):
+            pass
+    if not key:
+        err("set WANDB_API_KEY or `wandb login`")
+        sys.exit(1)
+    r = requests.post(
+        f"{host}/graphql",
+        json={"query": query, "variables": variables or {}},
+        auth=("api", key),
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(json.dumps(body["errors"], indent=2))
+    return body["data"]
+
+
+@cli.group("wb")
+def wb_grp():
+    """Wandb GraphQL helpers: introspect, list projects, manipulate access."""
+
+
+@wb_grp.command("whoami")
+@click.option("-k", "--key", default=None,
+              help="api key to probe (default: $WANDB_API_KEY)")
+@click.option("--list-keys", is_flag=True, help="also list this user's other API keys")
+def wb_whoami(key: str | None, list_keys: bool):
+    """Identify the user + default entity + teams behind an API key.
+
+    Useful when juggling multiple `WANDB_API_KEY` values in .envrc — wandb
+    keys are per-user, NOT per-org, so this also surfaces what's reachable
+    rather than what's "scoped".
+    """
+    prev_key = os.environ.get("WANDB_API_KEY")
+    if key:
+        os.environ["WANDB_API_KEY"] = key
+    try:
+        q = """{ viewer {
+          username email
+          defaultEntity { name }
+          organizations { name }
+          teams(first: 50) { edges { node { name organization { name } } } }
+        """ + ("apiKeys { edges { node { name } } } " if list_keys else "") + "} }"
+        out = _wb_exec(q)
+        v = out["viewer"]
+    finally:
+        if key:
+            if prev_key is None:
+                os.environ.pop("WANDB_API_KEY", None)
+            else:
+                os.environ["WANDB_API_KEY"] = prev_key
+    print(f"user:          {v['username']} <{v['email']}>")
+    de = (v.get("defaultEntity") or {}).get("name")
+    print(f"defaultEntity: {de}")
+    print("orgs:")
+    for o in v.get("organizations") or []:
+        print(f"  {o['name']}")
+    print("teams:")
+    for e in v.get("teams", {}).get("edges", []):
+        n = e["node"]
+        org = (n.get("organization") or {}).get("name") or "-"
+        print(f"  {n['name']:30s}  org={org}")
+    if list_keys:
+        keys = [e["node"]["name"] for e in v.get("apiKeys", {}).get("edges", [])]
+        print(f"keys: {len(keys)}")
+        for k in keys:
+            print(f"  {k}")
+
+
+@wb_grp.command("projects")
+@click.option("-e", "--entity", default="PrinceOA", help="wandb entity")
+@click.option("-f", "--filter", "filt", default=None, help="case-insensitive substring filter on project name")
+def wb_projects(entity: str, filt: str | None):
+    """List projects under ENTITY with current access level."""
+    out = _wb_exec(
+        "query Q($e: String!) { models(entityName: $e, first: 500) "
+        "{ edges { node { name access createdAt id } } } }",
+        e=entity,
+    )
+    rows = [e["node"] for e in out["models"]["edges"]]
+    if filt:
+        rows = [r for r in rows if filt.lower() in r["name"].lower()]
+    rows.sort(key=lambda r: r["createdAt"], reverse=True)
+    print(f"# {len(rows)} projects in {entity}" + (f" matching {filt!r}" if filt else ""))
+    for r in rows:
+        print(f"  {r['access']:8s}  {r['name']}")
+
+
+@wb_grp.command("access")
+@click.option("-e", "--entity", default="PrinceOA")
+@click.option("--set", "set_to", default=None,
+              help="if given, attempt to upsert access (e.g. USER_READ, PRIVATE)")
+@click.argument("project")
+def wb_access(entity: str, project: str, set_to: str | None):
+    """Get or set a single project's `access` field via upsertModel."""
+    out = _wb_exec(
+        "query Q($e: String!, $n: String!) { project(entityName: $e, name: $n) "
+        "{ name access entityName id } }",
+        e=entity, n=project,
+    )
+    p = out["project"]
+    if p is None:
+        err(f"project {entity}/{project} not found (or no access)")
+        sys.exit(1)
+    print(f"current: {p['access']}  ({entity}/{project})")
+    if set_to is None:
+        return
+    try:
+        res = _wb_exec(
+            "mutation M($n: String!, $e: String!, $a: String!) "
+            "{ upsertModel(input: { name: $n, entityName: $e, access: $a }) "
+            "{ project { name access } } }",
+            n=project, e=entity, a=set_to,
+        )
+        new = res["upsertModel"]["project"]
+        print(f"new:     {new['access']}  ({entity}/{new['name']})")
+    except Exception as e:
+        err(f"upsertModel failed: {e}")
+        sys.exit(2)
+
+
+@wb_grp.command("move")
+@click.option("-s", "--src", default="PrinceOA", help="source entity")
+@click.option("-d", "--dst", default="open-athena", help="destination entity")
+@click.option("-n", "--dry-run", is_flag=True, help="print mutation without executing")
+@click.argument("projects", nargs=-1, required=True)
+def wb_move(src: str, dst: str, projects: tuple[str, ...], dry_run: bool):
+    """Move PROJECTS from `--src` entity to `--dst` entity via moveProjects."""
+    print(f"# moveProjects: {src} → {dst}")
+    for p in projects:
+        print(f"  {p}")
+    if dry_run:
+        print("# (dry-run; not executing)")
+        return
+    try:
+        res = _wb_exec(
+            "mutation M($i: MoveProjectsInput!) "
+            "{ moveProjects(input: $i) { clientMutationId } }",
+            i={
+                "sourceEntityName": src,
+                "destinationEntityName": dst,
+                "projectNames": list(projects),
+                "ownerUsername": _wb_exec("{ viewer { username } }")["viewer"]["username"],
+            },
+        )
+        print(f"# done: {res}")
+    except Exception as e:
+        err(f"moveProjects failed: {e}")
+        sys.exit(2)
+
+
+@wb_grp.command("mutations")
+@click.argument("filt", required=False)
+def wb_mutations(filt: str | None):
+    """List GraphQL mutations, optionally filtered by substring."""
+    out = _wb_exec(
+        "{ __schema { mutationType { fields { name args { name } } } } }"
+    )
+    muts = out["__schema"]["mutationType"]["fields"]
+    if filt:
+        muts = [m for m in muts if filt.lower() in m["name"].lower()]
+    print(f"# {len(muts)} mutations" + (f" matching {filt!r}" if filt else ""))
+    for m in muts:
+        args = ", ".join(a["name"] for a in m["args"])
+        print(f"  {m['name']}({args})")
+
+
+@wb_grp.command("type")
+@click.argument("type_name")
+def wb_type(type_name: str):
+    """Introspect a GraphQL type or input object's fields."""
+    out = _wb_exec(
+        "query Q($n: String!) { __type(name: $n) { name kind "
+        "fields { name type { name kind ofType { name kind } } } "
+        "inputFields { name type { name kind ofType { name kind } } } } }",
+        n=type_name,
+    )
+    t = out["__type"]
+    if not t:
+        err(f"type {type_name!r} not found")
+        sys.exit(1)
+    fields = t.get("fields") or t.get("inputFields") or []
+    print(f"# {t['kind']} {t['name']}  ({len(fields)} fields)")
+    for f in fields:
+        ty = f["type"]
+        nm = ty["name"] or (ty["ofType"] and ty["ofType"]["name"]) or ty["kind"]
+        print(f"  {f['name']}: {nm}")
+
+
+@wb_grp.command("gql")
+@click.option("-v", "--var", multiple=True, metavar="KEY=VAL",
+              help="GraphQL variable (repeatable); VAL is parsed as JSON, falling back to string")
+@click.argument("query")
+def wb_gql(query: str, var: tuple[str, ...]):
+    """Execute a raw GraphQL query/mutation against wandb.
+
+    QUERY may be `-` to read from stdin, or a path to a `.graphql` file,
+    or the literal query string.
+    """
+    if query == "-":
+        query = sys.stdin.read()
+    elif query.endswith(".graphql") and Path(query).exists():
+        query = Path(query).read_text()
+    variables = {}
+    for kv in var:
+        k, _, v = kv.partition("=")
+        try:
+            variables[k] = json.loads(v)
+        except json.JSONDecodeError:
+            variables[k] = v
+    out = _wb_exec(query, **variables)
+    print(json.dumps(out, indent=2))
 
 
 @cli.command("cost")
