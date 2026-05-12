@@ -1,0 +1,15 @@
+{
+  "name": "tomat-runs-api",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240909.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.0.0"
+  }
+}

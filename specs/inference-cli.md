@@ -139,6 +139,77 @@ and computing a per-voxel diff. Our endpoint just needs to return:
 - predicted zarr URL (this material, this ckpt)
 - target zarr URL (already in `gs://.../tomat/rho_gga_raw/...`)
 
+## Phase 2 addendum: Modal as a persistent inference *server* (2026-05-12)
+
+Originally framed as "Modal as a sub-minute one-shot job per material."
+Discussion with Betsy reframed this: what we actually want is a
+**persistent HTTP endpoint** that Elvis (and humans) can hit ad-hoc,
+with a lazy per-(ckpt, mat) cache, instead of:
+
+- (a) firing a fresh Modal job per `(ckpt, mat)` request (cold-start
+  overhead each time), or
+- (b) pre-emitting Zarrs for every (ckpt, mat) pair from the /1k-step
+  eval pipeline (decided against — see below).
+
+Server shape:
+
+    @app.cls(
+        image=infer_image,
+        gpu="H100", keep_warm=1,   # always-on; cold-start ~30s on first hit
+        timeout=300,
+    )
+    class Predictor:
+        @modal.enter()
+        def load(self):
+            self.ckpt_cache = {}   # (run_label, step) → loaded model
+            self.density_cache = R2Cache("openathena", "tomat/predictions/")
+
+        @modal.method()
+        def predict(self, run_label: str, step: int, mp_id: str,
+                    decoder: str = "median") -> dict:
+            cache_key = f"{run_label}/step-{step}/{mp_id}/{decoder}.zarr"
+            if zarr_url := self.density_cache.get(cache_key):
+                return {"zarr_url": zarr_url, "hit": True, "preview": …}
+            model = self.ckpt_cache.setdefault((run_label, step),
+                _load_ckpt_from_gcs(run_label, step))
+            rho = _forward_decode_stitch(model, _structure(mp_id), decoder)
+            zarr_url = self.density_cache.put(cache_key, rho)
+            return {"zarr_url": zarr_url, "hit": False, "preview": …,
+                    "elapsed_s": …}
+
+        @modal.web_endpoint(method="POST")
+        def http(self, req): return self.predict(**req.json())
+
+R2 cache layout (mirrors `specs/23-runs-dashboard.md`'s pattern):
+
+    s3://openathena/tomat/predictions/
+        <run_label>/step-<N>/<mp_id>/<decoder>.zarr/   ← zarr v2 dir layout
+
+Cache invalidation: never. (ckpt, mat, decoder) tuples are immutable;
+re-deriving costs the inference time anyway, so cache-as-side-effect
+is essentially free.
+
+### Why NOT pre-emit Zarrs from /1k-step mat-evals
+
+Tempting alternative: have `eval_mat_nmae.py` also write the predicted
+density Zarr for each (ckpt, mat) pair as it computes NMAE. Rejected
+(decided 2026-05-12 with ryan):
+
+- **Storage**: 200 mats × ~5 MB each (200³ float16 grid) × ~5 "interesting"
+  ckpts per run ≈ 5 GB per run. Bearable but mostly waste — most
+  intermediate ckpts get inspected zero times.
+- **Indistinguishable from waste at write time**: we don't know which
+  ckpts will turn out to be "best" until later. Writing all ckpts'
+  predictions to disk is paying the IO cost upfront for a value
+  realized on at most a few of them.
+- **Live-inference path is needed anyway** for any mat outside the
+  200-val/200-train snapshot, and for ad-hoc "what does this ckpt do on
+  this material" exploration. Once that path exists, on-demand
+  inference + lazy server-side cache strictly dominates pre-emit.
+- **Compromise if pain emerges**: emit Zarrs only at
+  `lifecycle/trainer_finished` and at post-hoc-identified best-NMAE
+  ckpts. Handful of ckpts per run, not all of them.
+
 ## Open questions
 
 1. Grid shape for prediction-without-target: do we need the user to
@@ -150,3 +221,8 @@ and computing a per-voxel diff. Our endpoint just needs to return:
    `median`, expose all.
 3. ZarrCAR format: do we follow Elvis's expected layout, or write a
    simpler `.zarr` and let Elvis adapt? Need to check Elvis's reader.
+4. `keep_warm` cost: even with no traffic, `keep_warm=1` on H100 is
+   ~$2/h × 24 × 30 ≈ $1.4k/mo on Modal's pricing. Probably want
+   `keep_warm=0` initially (~30s cold-start per first request after
+   idle), revisit if traffic warrants. Or scale-to-zero with snapshot
+   restore once Modal supports it for our image.

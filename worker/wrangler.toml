@@ -1,0 +1,12 @@
+name = "tomat-runs-api"
+main = "src/index.ts"
+compatibility_date = "2026-05-01"
+account_id = "43a6f2d588b1483733189d39418ec5be"
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "openathena"
+
+[vars]
+CORS_ORIGIN = "*"
+R2_RUNS_PREFIX = "tomat/runs"
