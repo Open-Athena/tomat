@@ -4,9 +4,11 @@
 Wraps wandb + iris + GCS into a single tool for the recurring operations
 in the tomat training project. Subcommands:
 
-  tomat runs ls                      list wandb runs in tomat-lmq-P14
+  tomat runs ls                      list wandb runs in tomat-lmq-P19
   tomat runs status [<substr>]       state, MFU, step, loss for one/all runs
   tomat runs nmae <substr>           mat-NMAE curve as a table
+  tomat runs links [<substr>]        markdown table: state, step, mfu, NMAE/NEMD,
+                                     wandb + iris dashboard URLs (slack-paste-ready)
 
   tomat iris ls                      list /ryan/* iris jobs (filtered)
   tomat iris kill <substr>           kill matching running jobs
@@ -26,6 +28,7 @@ Conventions:
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -36,7 +39,10 @@ from pathlib import Path
 import click
 
 
-WANDB_PROJECT = "PrinceOA/tomat-lmq-P14"
+WANDB_PROJECT = "PrinceOA/tomat-lmq-P19"
+WANDB_BASE = "https://wandb.ai"
+IRIS_DASHBOARD = "https://iris.oa.dev"
+IRIS_USER = "ryan"
 GCS_BUCKET = "gs://marin-eu-west4/tomat"
 LMQ_PATH = f"{GCS_BUCKET}/codecs/lmq-v2-16k.npz"
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -244,11 +250,44 @@ def _scan_history_key(r, fk: str) -> list[tuple[int, float]]:
     ]
 
 
+def _per_mat_nemd(run_label: str, mat_set: str) -> dict[int, float]:
+    """Pull nemd_mean per ckpt from GCS per-mat result JSONs.
+
+    Returns mapping step → NEMD as a percentage (matching the wandb-side
+    NMAE values, which are already in %).
+    """
+    import fsspec
+    out: dict[int, float] = {}
+    fs = fsspec.filesystem("gcs")
+    base = f"marin-eu-west4/tomat/eval/results/{run_label}/{mat_set}"
+    if not fs.exists(base):
+        return out
+    for path in fs.ls(base):
+        name = path.rsplit("/", 1)[-1]
+        if not (name.startswith("step-") and name.endswith(".json")):
+            continue
+        step = int(name[len("step-") : -len(".json")])
+        try:
+            with fs.open(path, "r") as f:
+                d = json.load(f)
+            v = d.get("nemd_mean")
+            if v is not None:
+                out[step] = float(v) * 100.0
+        except Exception:
+            pass
+    return out
+
+
 @runs.command("nmae")
 @click.argument("substr")
 @click.option("-s", "--sets", default="val_200,train_200", help="comma-sep mat-sets to show")
 def runs_nmae(substr: str, sets: str):
-    """Show mat-NMAE curve as a step×{val,train}×{mean,median,p99} table."""
+    """Show mat-NMAE + (when available) mat-NEMD curve as a step × {set} table.
+
+    NMAE comes from wandb (`eval/mat_nmae/...` logged by the eval watchdog).
+    NEMD comes from per-mat result JSONs in GCS (eval_mat_nmae.py writes both
+    when the eval is re-fired with the post-EMD-patch evaluator).
+    """
     import wandb
 
     api = wandb.Api()
@@ -262,21 +301,109 @@ def runs_nmae(substr: str, sets: str):
             k = futures[fut]
             for s, v in fut.result():
                 data.setdefault(s, {})[k] = v
-    if not data:
-        err(f"no eval/mat_nmae/* history for {r.name}")
+
+    nemd_by_set: dict[str, dict[int, float]] = {s: _per_mat_nemd(r.name, s) for s in set_list}
+
+    if not data and not any(nemd_by_set.values()):
+        err(f"no eval/mat_nmae/* history or NEMD JSONs for {r.name}")
         sys.exit(0)
 
-    print(f"mat-NMAE for {r.name} ({len(data)} step points)")
+    print(f"mat-NMAE+NEMD for {r.name} ({len(data)} step points; NEMD where avail)")
     header = "  step  "
     for s in set_list:
-        header += f"  {s:>14} m/med/p99 "
+        header += f"  {s:>20} NMAE m/med/p99  NEMD"
     print(header)
-    for step in sorted(data):
-        d = data[step]
+    all_steps = sorted(set(data) | set().union(*[set(d) for d in nemd_by_set.values()]))
+    for step in all_steps:
+        d = data.get(step, {})
         line = f"  {step:>5}  "
         for s in set_list:
-            line += f"  {fmt(d.get(s + '/mean'))}/{fmt(d.get(s + '/median'))}/{fmt(d.get(s + '/p99'))}  "
+            ne = nemd_by_set.get(s, {}).get(step)
+            ne_s = fmt(ne) if ne is not None else "  -  "
+            line += f"  {fmt(d.get(s + '/mean'))}/{fmt(d.get(s + '/median'))}/{fmt(d.get(s + '/p99'))}  {ne_s}"
         print(line)
+
+
+def _wandb_url(run_name: str) -> str:
+    return f"{WANDB_BASE}/{WANDB_PROJECT}/runs/{run_name}"
+
+
+def _iris_url(run_name: str) -> str:
+    """Iris dashboard URL — path-encodes the leading / and any others."""
+    from urllib.parse import quote
+    return f"{IRIS_DASHBOARD}/#/job/{quote(f'/{IRIS_USER}/{run_name}', safe='')}"
+
+
+def _latest_metric(r, key: str) -> tuple[int | None, float | None]:
+    """Latest (step, value) for a given wandb metric key, or (None, None)."""
+    pts = _scan_history_key(r, key)
+    if not pts:
+        return (None, None)
+    return max(pts, key=lambda p: p[0])
+
+
+@runs.command("links")
+@click.argument("substr", required=False)
+@click.option("-n", "--limit", type=int, default=20, help="max runs to show (most recent first)")
+@click.option("--md/--no-md", default=True, help="markdown table (default; --no-md for plain text)")
+def runs_links(substr: str | None, limit: int, md: bool):
+    """Markdown table of recent runs with state, step, mfu, val NMAE/NEMD,
+    and direct links to wandb + iris dashboard (slack-paste-ready)."""
+    import wandb
+
+    api = wandb.Api()
+    rs = match_runs(api, substr)
+    summaries = _fetch_summaries(rs, _STATUS_KEYS)
+    summaries.sort(key=lambda d: d["created_at"], reverse=True)
+    summaries = summaries[:limit]
+
+    # Look up latest val NMAE + NEMD from wandb history per run.
+    name_to_run = {r.name: r for r in rs}
+    rows = []
+    for d in summaries:
+        name = d["name"]
+        r = name_to_run.get(name)
+        nmae_step, nmae = _latest_metric(r, "eval/mat_nmae/val_200/mean") if r else (None, None)
+        nemd_step, nemd = _latest_metric(r, "eval/mat_nemd/val_200/mean") if r else (None, None)
+        mfu = d.get("throughput/mfu")
+        rows.append({
+            "name": name,
+            "state": d["state"],
+            "step": d["_step"] if isinstance(d["_step"], int) else None,
+            "runtime_h": (d["_runtime"] or 0) / 3600,
+            "mfu": mfu if isinstance(mfu, (int, float)) else None,
+            "nmae": nmae,
+            "nmae_step": nmae_step,
+            "nemd": nemd,
+            "nemd_step": nemd_step,
+        })
+
+    if md:
+        # Slack renders markdown tables; keep cells terse.
+        print("| run | state | step | runtime | MFU | val NMAE | val NEMD | wandb | iris |")
+        print("|---|---|---|---|---|---|---|---|---|")
+        for r in rows:
+            step_s = f"{r['step']}" if r["step"] is not None else "-"
+            rt_s = f"{r['runtime_h']:.1f}h"
+            mfu_s = f"{r['mfu']:.1f}%" if r["mfu"] is not None else "-"
+            # Use ` @ ` (with spaces) so GitHub doesn't render "@<step>" as a user mention.
+            nmae_s = f"{r['nmae']:.2f}% @ {r['nmae_step']}" if r["nmae"] is not None else "-"
+            nemd_s = f"{r['nemd']:.2f}% @ {r['nemd_step']}" if r["nemd"] is not None else "-"
+            wb = f"[wb]({_wandb_url(r['name'])})"
+            ir = f"[iris]({_iris_url(r['name'])})"
+            print(f"| `{r['name']}` | {r['state']} | {step_s} | {rt_s} | {mfu_s} | {nmae_s} | {nemd_s} | {wb} | {ir} |")
+    else:
+        for r in rows:
+            print(f"name:    {r['name']}")
+            print(f"  state:   {r['state']}")
+            print(f"  step:    {r['step']}    runtime: {r['runtime_h']:.2f}h    mfu: {r['mfu']}")
+            if r["nmae"] is not None:
+                print(f"  val NMAE: {r['nmae']:.3f}% @ step {r['nmae_step']}")
+            if r["nemd"] is not None:
+                print(f"  val NEMD: {r['nemd']:.3f}% @ step {r['nemd_step']}")
+            print(f"  wandb:   {_wandb_url(r['name'])}")
+            print(f"  iris:    {_iris_url(r['name'])}")
+            print()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -397,6 +524,7 @@ def evals():
 @evals.command("fire")
 @click.option("-s", "--steps", required=True, help="comma-sep step list, e.g. 1000,2000,3000")
 @click.option("-S", "--sets", default="val_200,train_200", help="comma-sep mat-sets")
+@click.option("-l", "--eval-label", default="val-full-lmq-v2", help="TOMAT_LABEL for eval jobs (must match ckpt's tokenization, e.g. val-full-v3)")
 @click.option("-m", "--model", default="200M", help="TOMAT_MODEL preset")
 @click.option("-n", "--n-mats", default=200, type=int)
 @click.option("-b", "--eval-batch", default=32, type=int)
@@ -408,6 +536,7 @@ def evals_fire(
     run_label: str,
     steps: str,
     sets: str,
+    eval_label: str,
     model: str,
     n_mats: int,
     eval_batch: int,
@@ -449,7 +578,7 @@ def evals_fire(
                 "--tpu", tpu, "--enable-extra-resources",
                 "--cpu", "32", "--memory", "64GB",
                 "--env-vars", "WANDB_API_KEY", wandb_key,
-                "--env-vars", "TOMAT_LABEL", "val-full-lmq-v2",
+                "--env-vars", "TOMAT_LABEL", eval_label,
                 "--env-vars", "TOMAT_MODEL", model,
                 "--env-vars", "TOMAT_CHECKPOINT", ckpt,
                 "--env-vars", "TOMAT_LMQ_PATH", LMQ_PATH,
@@ -641,6 +770,10 @@ def preempts_watch(substr: str, interval: int, max_iters: int):
                     "cluster/elapsed_min": elapsed_min,
                 }
             )
+            # Surface cumulative counters to the run's summary so the runs
+            # table (and `tomat runs status`) can see them without a chart.
+            run.summary["cluster/preempts_total"] = p
+            run.summary["cluster/failures_total"] = f
             if p != last_p or f != last_f:
                 err(f"[{elapsed_min:5.1f} min] preempts={p} (+{dp}) "
                     f"failures={f} (+{df}) rate={rate:.2f}/hr")
@@ -709,6 +842,7 @@ def _latest_ckpt_step(run_label: str) -> int | None:
 @click.option("-e", "--env", "extra_env", multiple=True, help="extra env var KEY=VAL (repeatable)")
 @click.option("--shuffle-window-blocks", type=int, default=0, help="TOMAT_SHUFFLE_WINDOW_BLOCKS; 0 = no shuffle (default), >0 = BlockShuffle window radius")
 @click.option("--shuffle-io-block-size", type=int, default=0, help="TOMAT_SHUFFLE_IO_BLOCK_SIZE; 0 = auto from meta (M)")
+@click.option("--share-cache/--no-share-cache", default=False, help="Share the levanter cache across runs over the same data (TOMAT_CACHE_DIR=gs://.../cache/<data_label>/). Default per-run for back-compat.")
 @click.option("--watch-preempts/--no-watch-preempts", default=True, help="auto-fire `tomat preempts watch <LABEL>` in the background after launch (default on)")
 @click.option("-f", "--force", is_flag=True, help="allow from-scratch overwrite of existing results dir")
 @click.option("-d", "--dry-run", is_flag=True, help="print iris cmd without firing")
@@ -738,6 +872,7 @@ def train(
     extra_env: tuple[str, ...],
     shuffle_window_blocks: int,
     shuffle_io_block_size: int,
+    share_cache: bool,
     watch_preempts: bool,
     force: bool,
     dry_run: bool,
@@ -800,6 +935,8 @@ def train(
         env_vars.append(("TOMAT_SHUFFLE_WINDOW_BLOCKS", str(shuffle_window_blocks)))
         if shuffle_io_block_size > 0:
             env_vars.append(("TOMAT_SHUFFLE_IO_BLOCK_SIZE", str(shuffle_io_block_size)))
+    if share_cache:
+        env_vars.append(("TOMAT_CACHE_DIR", f"{GCS_BUCKET}/cache/{data_label}/"))
     for kv in extra_env:
         if "=" not in kv:
             err(f"--env {kv!r}: expected KEY=VAL")
@@ -856,6 +993,110 @@ def train(
 # pulls from; on-demand for context only.
 PRICE_PREEMPT = 1.15
 PRICE_ONDEMAND = 2.83
+
+
+@runs.command("lifecycle-plot")
+@click.argument("substr")
+@click.option("-o", "--out", default=None,
+              help="output PNG path (default: plots/lifecycle/<run>.png)")
+@click.option("-u", "--upload", is_flag=True,
+              help="also wandb.log({summary/lifecycle_overlay: Image(out)})")
+@click.option("--show-loss/--no-show-loss", default=True)
+@click.option("--show-nmae/--no-show-nmae", default=True)
+def runs_lifecycle_plot(substr: str, out: str | None, upload: bool,
+                        show_loss: bool, show_nmae: bool):
+    """Plot loss + NMAE curves with vertical markers at every restart event.
+
+    Reads `lifecycle/trainer_started` and `lifecycle/sigterm_received` from
+    wandb history. Each `trainer_started` ≥ step 1 is a resume (the first
+    is a fresh start). Output PNG is saved locally; pass --upload to also
+    attach it to the wandb run as a Media artifact.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import wandb
+
+    api = wandb.Api()
+    r = require_one(match_runs(api, substr), substr)
+    name = r.name
+
+    # Pull history. wandb's history is keyed by `_step`; we ask for each
+    # metric explicitly so it returns just the rows where that key is set.
+    def hist(key: str) -> list[tuple[int, float]]:
+        try:
+            return [(int(row["_step"]), float(row[key]))
+                    for row in r.scan_history(keys=["_step", key])
+                    if row.get(key) is not None]
+        except Exception:
+            return []
+
+    train_loss = hist("train/loss") if show_loss else []
+    eval_loss = hist("eval/loss") if show_loss else []
+    val_nmae = hist("eval/mat_nmae/val_200/mean") if show_nmae else []
+    starts = hist("lifecycle/trainer_started")
+    sigterms = hist("lifecycle/sigterm_received")
+
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    if train_loss:
+        xs, ys = zip(*train_loss)
+        ax.plot(xs, ys, lw=0.8, color="#1f77b4", label="train/loss", alpha=0.85)
+    if eval_loss:
+        xs, ys = zip(*eval_loss)
+        ax.plot(xs, ys, lw=1.4, color="#d62728", marker="o", ms=3, label="eval/loss")
+    ax.set_xlabel("step")
+    ax.set_ylabel("loss")
+    ax.set_yscale("log")
+    ax.grid(alpha=0.3)
+
+    if val_nmae:
+        ax2 = ax.twinx()
+        xs, ys = zip(*val_nmae)
+        ax2.plot(xs, [y * 100 if y < 1 else y for y in ys],
+                 lw=1.6, color="#2ca02c", marker="s", ms=4, label="val NMAE (%)")
+        ax2.set_ylabel("val NMAE (%)", color="#2ca02c")
+        ax2.tick_params(axis="y", labelcolor="#2ca02c")
+
+    # Lifecycle overlay: dashed lines at every trainer_started step,
+    # dotted lines at every sigterm. The first trainer_started is at
+    # step 0 (fresh init) — skip it so we only see *resumes*.
+    resume_steps = sorted({s for s, _ in starts if s > 0})
+    sigterm_steps = sorted({s for s, _ in sigterms})
+    for s in resume_steps:
+        ax.axvline(s, color="#ff7f0e", ls="--", lw=0.9, alpha=0.7)
+    for s in sigterm_steps:
+        ax.axvline(s, color="#7f7f7f", ls=":", lw=0.7, alpha=0.5)
+
+    ax.set_title(f"{name}  ·  {len(resume_steps)} resumes, "
+                 f"{len(sigterm_steps)} sigterms")
+    handles = [
+        plt.Line2D([], [], color="#ff7f0e", ls="--", label=f"resume ({len(resume_steps)})"),
+        plt.Line2D([], [], color="#7f7f7f", ls=":", label=f"sigterm ({len(sigterm_steps)})"),
+    ]
+    if train_loss: handles.insert(0, plt.Line2D([], [], color="#1f77b4", label="train/loss"))
+    if eval_loss: handles.insert(1 if train_loss else 0, plt.Line2D([], [], color="#d62728", marker="o", ms=4, label="eval/loss"))
+    if val_nmae: handles.append(plt.Line2D([], [], color="#2ca02c", marker="s", ms=4, label="val NMAE (%)"))
+    ax.legend(handles=handles, loc="upper right", fontsize=9, framealpha=0.85)
+
+    out_path = Path(out) if out else PROJECT_ROOT / "plots" / "lifecycle" / f"{name}.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+    print(f"wrote: {out_path}")
+    print(f"  resumes: {len(resume_steps)}  sigterms: {len(sigterm_steps)}")
+    if resume_steps:
+        print(f"  resume steps: {resume_steps[:10]}{' …' if len(resume_steps) > 10 else ''}")
+
+    if upload:
+        run = wandb.init(
+            entity=WANDB_PROJECT.split("/")[0],
+            project=WANDB_PROJECT.split("/")[-1],
+            id=name, resume="allow",
+        )
+        run.summary["summary/lifecycle_overlay"] = wandb.Image(str(out_path))
+        run.finish()
+        print(f"  uploaded to wandb run {name} as summary/lifecycle_overlay")
 
 
 @cli.command("cost")

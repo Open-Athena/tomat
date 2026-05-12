@@ -154,16 +154,45 @@ import signal as _signal
 def _log_lifecycle_event(event: str, **fields):
     """Print a one-line tag the iris log harvester can grep, and best-effort
     log the same event to wandb. Both paths are robust to in-flight teardown
-    (wandb may already be finishing when SIGTERM lands)."""
+    (wandb may already be finishing when SIGTERM lands).
+
+    `trainer_started` typically fires *before* `wandb.init` completes (it's
+    emitted from `main()` right before calling into Levanter), so we defer
+    the wandb side to a daemon thread that polls until `wandb.run` is live,
+    then logs the spike + bumps a cumulative `lifecycle/resumes` summary
+    counter. SIGTERM-path calls run inline (wandb is live by then and the
+    process is about to die)."""
     ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     extras = " ".join(f"{k}={v}" for k, v in fields.items())
     print(f"[tomat-tpu lifecycle] {ts} event={event} {extras}", flush=True)
-    try:
-        import wandb
-        if wandb.run is not None:
-            wandb.run.log({f"lifecycle/{event}": 1, **{f"lifecycle/{k}": v for k, v in fields.items()}})
-    except Exception:
-        pass
+
+    def _log_to_wandb():
+        import time
+        try:
+            import wandb
+        except ImportError:
+            return
+        # Wait up to 60 s for wandb.init to complete (it typically takes 5-10 s
+        # post-trainer_started, longer on cold caches).
+        for _ in range(120):
+            if wandb.run is not None:
+                break
+            time.sleep(0.5)
+        else:
+            return
+        try:
+            payload = {f"lifecycle/{event}": 1, **{f"lifecycle/{k}": v for k, v in fields.items()}}
+            wandb.run.log(payload)
+            if event == "trainer_started":
+                cur = wandb.run.summary.get("lifecycle/trainer_starts", 0)
+                wandb.run.summary["lifecycle/trainer_starts"] = cur + 1
+                wandb.run.summary["lifecycle/resumes"] = cur  # = starts - 1
+                wandb.run.summary["lifecycle/last_started_at"] = ts
+        except Exception:
+            pass
+
+    import threading
+    threading.Thread(target=_log_to_wandb, daemon=True).start()
 
 
 def _handle_sigterm(signum, _frame):
@@ -233,11 +262,28 @@ def main():
     results_label = results_label_env or f"{label}-tpu-{model_preset}-bs{batch_size}-seed{seed}"
     run_id = results_label
 
+    # cache_dir resolution. Default: per-results-label, so each run rebuilds.
+    # Override via TOMAT_CACHE_DIR to share a cache across runs over the same
+    # parquet inputs (avoids the Zephyr cache-build crashloop seen on v6e-32
+    # under heavy preempt pressure — see marin GH "cache-build-brittleness").
+    # Convention for sharing: TOMAT_CACHE_DIR=gs://.../cache/<label>/ keyed on
+    # the data label, since cache contents depend only on input parquets +
+    # cache_options (currently fixed batch_size=128). Caller is responsible
+    # for using the same dir across runs that should share, and a different
+    # dir if any cache-determining knob (parquet glob, batch_size) changes.
+    cache_dir_env = os.environ.get("TOMAT_CACHE_DIR")
+    if cache_dir_env:
+        cache_dir = cache_dir_env
+        print(f"[tomat-tpu] cache_dir=SHARED {cache_dir}")
+    else:
+        cache_dir = f"{BUCKET}/results/{results_label}/cache"
+        print(f"[tomat-tpu] cache_dir=PER-RUN {cache_dir}")
+
     source = UrlDatasetSourceConfig(train_urls=[parquet_glob])
     prebuilt = PrebuiltLmDatasetFormat(input_ids_key="input_ids")
     component = DatasetComponent(
         source=source,
-        cache_dir=f"{BUCKET}/results/{results_label}/cache",
+        cache_dir=cache_dir,
         format=prebuilt,
     )
     # Shuffle config. By default Levanter's `LmDataConfig.shuffle=False` —
@@ -267,7 +313,7 @@ def main():
     data = LmDataConfig(
         tokenizer="passthrough",
         vocab_size=vocab_size,
-        cache_dir=f"{BUCKET}/results/{results_label}/cache",
+        cache_dir=cache_dir,
         components={"tomat": component},
         block_cross_document_attention=False,
         shuffle=shuffle_cfg,
