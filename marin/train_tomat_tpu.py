@@ -220,7 +220,7 @@ from levanter.tracker.json_logger import JsonLoggerConfig
 from levanter.tracker.wandb import WandbConfig
 from levanter.trainer import TrainerConfig
 
-BUCKET = "gs://marin-eu-west4/tomat"
+BUCKET = os.environ.get("TOMAT_BUCKET", "gs://marin-eu-west4/tomat")
 
 
 MODEL_PRESETS = {

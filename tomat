@@ -412,6 +412,130 @@ def runs_links(substr: str | None, limit: int, md: bool):
             print()
 
 
+@runs.command("wallclock-plot")
+@click.argument("substr")
+@click.option("-o", "--out", default=None,
+              help="output PNG path (default: plots/wallclock/<run>.png)")
+@click.option("-u", "--upload", is_flag=True,
+              help="also wandb.log({summary/wallclock_overlay: Image(out)})")
+def runs_wallclock_plot(substr: str, out: str | None, upload: bool):
+    """Plot step count + loss over WALLCLOCK time, with markers at every
+    sigterm / restart event.
+
+    Useful for visualizing the cost of preempts: gaps in the step curve =
+    time spent re-initing rather than training. Sigterm markers (gray) +
+    cluster preempt-count steps (purple) show when each iris-side event
+    landed in real time, regardless of where on the global step axis they
+    fell.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+    from datetime import datetime, timezone
+    import wandb
+
+    api = wandb.Api()
+    r = require_one(match_runs(api, substr), substr)
+    name = r.name
+
+    def hist(key: str) -> list[tuple[float, float]]:
+        """Return [(unix_ts, value)] pairs for KEY. wandb's `_timestamp`
+        is absolute Unix epoch seconds (not relative to run start)."""
+        out: list[tuple[float, float]] = []
+        try:
+            for row in r.scan_history(keys=["_timestamp", "_step", key]):
+                v = row.get(key)
+                if v is None:
+                    continue
+                ts = row.get("_timestamp")
+                if ts is None:
+                    continue
+                out.append((float(ts), float(v)))
+        except Exception:
+            pass
+        return out
+
+    step_pts = hist("_step")        # treat _step itself as a "metric" — gives (ts, step)
+    train_loss = hist("train/loss")
+    preempts_total = hist("cluster/preemptions")
+    starts = hist("lifecycle/trainer_started")
+    sigterms = hist("lifecycle/sigterm_received")
+
+    def to_dt(ts: float):
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+    fig, ax = plt.subplots(figsize=(12, 5.5))
+
+    if step_pts:
+        xs = [to_dt(t) for t, _ in step_pts]
+        ys = [s for _, s in step_pts]
+        ax.plot(xs, ys, lw=1.4, color="#1f77b4", label="step")
+        ax.set_ylabel("step", color="#1f77b4")
+        ax.tick_params(axis="y", labelcolor="#1f77b4")
+
+    if train_loss:
+        ax2 = ax.twinx()
+        xs = [to_dt(t) for t, _ in train_loss]
+        ys = [v for _, v in train_loss]
+        ax2.plot(xs, ys, lw=0.6, color="#d62728", alpha=0.4, label="train/loss")
+        ax2.set_ylabel("train/loss", color="#d62728")
+        ax2.tick_params(axis="y", labelcolor="#d62728")
+        ax2.set_yscale("log")
+
+    # Vertical markers at sigterm + trainer_started events.
+    for ts, _ in sigterms:
+        ax.axvline(to_dt(ts), color="#7f7f7f", ls=":", lw=0.7, alpha=0.5)
+    for ts, _ in starts:
+        ax.axvline(to_dt(ts), color="#ff7f0e", ls="--", lw=0.9, alpha=0.7)
+    # Mark each new value of cluster/preemptions (jumps in iris's count).
+    last_p: float | None = None
+    for ts, p in preempts_total:
+        if last_p is not None and p > last_p:
+            ax.axvline(to_dt(ts), color="#9467bd", ls="-", lw=0.6, alpha=0.4)
+        last_p = p
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M\n%m-%d"))
+    ax.grid(alpha=0.3)
+    n_sig = len(sigterms)
+    n_start = len(starts)
+    n_pre = sum(1 for i in range(1, len(preempts_total))
+                if preempts_total[i][1] > preempts_total[i - 1][1]) if preempts_total else 0
+    ax.set_title(f"{name}  ·  {n_sig} sigterms, {n_start} starts, "
+                 f"{n_pre} cluster-preempt jumps")
+
+    handles = []
+    if step_pts: handles.append(plt.Line2D([], [], color="#1f77b4", label="step"))
+    if train_loss: handles.append(plt.Line2D([], [], color="#d62728", alpha=0.6, label="train/loss"))
+    handles += [
+        plt.Line2D([], [], color="#ff7f0e", ls="--", label=f"trainer_started ({n_start})"),
+        plt.Line2D([], [], color="#7f7f7f", ls=":", label=f"sigterm ({n_sig})"),
+        plt.Line2D([], [], color="#9467bd", ls="-", alpha=0.5, label=f"cluster preempt ({n_pre})"),
+    ]
+    ax.legend(handles=handles, loc="lower right", fontsize=9, framealpha=0.85)
+    fig.autofmt_xdate()
+
+    out_path = Path(out) if out else PROJECT_ROOT / "plots" / "wallclock" / f"{name}.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+    print(f"wrote: {out_path}")
+    print(f"  steps logged: {len(step_pts)}  range: "
+          f"{step_pts[0][1] if step_pts else '-'} → {step_pts[-1][1] if step_pts else '-'}")
+    print(f"  events: {n_start} starts, {n_sig} sigterms, {n_pre} cluster-preempt jumps")
+
+    if upload:
+        run = wandb.init(
+            entity=WANDB_PROJECT.split("/")[0],
+            project=WANDB_PROJECT.split("/")[-1],
+            id=name, resume="allow",
+        )
+        run.summary["summary/wallclock_overlay"] = wandb.Image(str(out_path))
+        run.finish()
+        print(f"  uploaded to wandb run {name} as summary/wallclock_overlay")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # tomat iris
 # ──────────────────────────────────────────────────────────────────────
@@ -810,9 +934,9 @@ def _gcs_ls(path: str) -> list[str]:
     return [l.strip() for l in r.stdout.split("\n") if l.strip()]
 
 
-def _latest_ckpt_step(run_label: str) -> int | None:
+def _latest_ckpt_step(run_label: str, bucket: str = GCS_BUCKET) -> int | None:
     """Return the latest step-N under the run's checkpoint dir, or None."""
-    base = f"{GCS_BUCKET}/results/{run_label}/checkpoints/{run_label}"
+    base = f"{bucket}/results/{run_label}/checkpoints/{run_label}"
     steps = []
     for line in _gcs_ls(f"{base}/"):
         m = re.search(r"/step-(\d+)/?$", line)
@@ -896,17 +1020,31 @@ def train(
     it caused the 1B cont-from-4711 spike. If you want it back, add it as
     an explicit flag with safer LR defaults.
     """
-    latest = _latest_ckpt_step(label)
+    # Pick a region-local bucket to avoid cross-region transfer budget
+    # blowups (rigging's MARIN_MIRROR_BUDGET_GB=10 default trips at the
+    # first ckpt save for a v5p job writing back to marin-eu-west4).
+    # v5p lives in us-central1/us-east5; v6e-preemptible-16 currently in
+    # us-east1; everything else stays on eu-west4.
+    if tpu.startswith("v5p"):
+        bucket = "gs://marin-us-central1/tomat"
+    elif tpu.startswith("v5e") or tpu.startswith("v6e"):
+        bucket = "gs://marin-eu-west4/tomat"
+    else:
+        bucket = "gs://marin-eu-west4/tomat"  # default
+    if bucket != GCS_BUCKET:
+        print(f"[tomat train] bucket: {bucket} (tpu={tpu}; default would have been {GCS_BUCKET})")
+
+    latest = _latest_ckpt_step(label, bucket=bucket)
     if resume_mode:
         if latest is None:
             err(f"--resume {label}: no step-* ckpts under "
-                f"{GCS_BUCKET}/results/{label}/checkpoints/{label}/")
+                f"{bucket}/results/{label}/checkpoints/{label}/")
             sys.exit(1)
         print(f"[tomat train] resume mode: latest ckpt step-{latest} → "
               f"continuing to step {steps}")
     else:
         if latest is not None and not force:
-            err(f"results dir for {label!r} already has step-{latest} ckpt; "
+            err(f"results dir for {label!r} already has step-{latest} ckpt at {bucket}; "
                 f"use --resume to continue, or --force to overwrite")
             sys.exit(1)
 
@@ -915,15 +1053,20 @@ def train(
         err("WANDB_API_KEY not set in env")
         sys.exit(1)
 
+    # Bucket-relative LMQ codec path: assume the codec was mirrored into
+    # the same prefix under the target bucket (e.g. via
+    # `gsutil cp gs://marin-eu-west4/tomat/codecs/* gs://marin-us-central1/tomat/codecs/`).
+    default_lmq_path = f"{bucket}/codecs/lmq-v2-16k.npz"
     env_vars: list[tuple[str, str]] = [
         ("WANDB_API_KEY", wandb_key),
+        ("TOMAT_BUCKET", bucket),
         ("TOMAT_LABEL", data_label),
         ("TOMAT_RESULTS_LABEL", label),
         ("TOMAT_MODEL", model),
         ("TOMAT_STEPS", str(steps)),
         ("TOMAT_BATCH_SIZE", str(batch_size)),
         ("TOMAT_SEED", str(seed)),
-        ("TOMAT_LMQ_PATH", lmq_path or LMQ_PATH),
+        ("TOMAT_LMQ_PATH", lmq_path or default_lmq_path),
         ("TOMAT_DENSITY_LOSS_TYPE", density_loss),
         ("TOMAT_DENSITY_ONLY_LOSS", "1" if density_only else "0"),
         ("TOMAT_LR", str(lr)),
@@ -942,7 +1085,7 @@ def train(
         if shuffle_io_block_size > 0:
             env_vars.append(("TOMAT_SHUFFLE_IO_BLOCK_SIZE", str(shuffle_io_block_size)))
     if share_cache:
-        env_vars.append(("TOMAT_CACHE_DIR", f"{GCS_BUCKET}/cache/{data_label}/"))
+        env_vars.append(("TOMAT_CACHE_DIR", f"{bucket}/cache/{data_label}/"))
     for kv in extra_env:
         if "=" not in kv:
             err(f"--env {kv!r}: expected KEY=VAL")
