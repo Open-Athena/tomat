@@ -539,8 +539,9 @@ def runs_sync(substr: str, bucket: str, prefix: str, dry_run: bool, out_dir: str
         table = pa.Table.from_pylist([], schema=schema)
 
     buf = io.BytesIO()
-    pq.write_table(table, buf, compression="zstd", compression_level=6,
-                   row_group_size=10**7)
+    # snappy not zstd: hyparquet's default build doesn't include the ZSTD
+    # codec, and these files are < 1 MB so the compression-ratio diff is moot.
+    pq.write_table(table, buf, compression="snappy", row_group_size=10**7)
     parquet_bytes = buf.getvalue()
     err(f"[sync] parquet: {len(parquet_bytes)/1e6:.2f} MB"
         f" ({table.num_rows} rows × {len(schema)} cols)")

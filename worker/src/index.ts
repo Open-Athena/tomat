@@ -38,8 +38,14 @@ function jsonResponse(data: unknown, env: Env, init?: ResponseInit): Response {
 	});
 }
 
-async function serveR2Object(env: Env, key: string): Promise<Response> {
-	const obj = await env.R2.get(key);
+async function serveR2Object(req: Request, env: Env, key: string): Promise<Response> {
+	// Honor Range requests — required for hyparquet, which fetches the
+	// parquet footer first before issuing typed-column reads.
+	const rangeHeader = req.headers.get('Range');
+	const r2Range = parseRangeHeader(rangeHeader);
+	const obj = r2Range
+		? await env.R2.get(key, { range: r2Range })
+		: await env.R2.get(key);
 	if (!obj) {
 		return new Response(`Not found: ${key}`, {
 			status: 404,
@@ -50,10 +56,55 @@ async function serveR2Object(env: Env, key: string): Promise<Response> {
 	obj.writeHttpMetadata(headers);
 	headers.set('etag', obj.httpEtag);
 	headers.set('Cache-Control', 'public, max-age=60');
+	headers.set('Accept-Ranges', 'bytes');
+	const totalSize = obj.size;
+	let status = 200;
+	if (r2Range) {
+		// R2 returned a partial body; compute the actual byte range.
+		let start: number, end: number;
+		if ('suffix' in r2Range && typeof r2Range.suffix === 'number') {
+			start = Math.max(0, totalSize - r2Range.suffix);
+			end = totalSize - 1;
+		} else {
+			const offsetRange = r2Range as { offset?: number; length?: number };
+			start = offsetRange.offset ?? 0;
+			end = start + (offsetRange.length ?? totalSize - start) - 1;
+		}
+		headers.set('Content-Range', `bytes ${start}-${end}/${totalSize}`);
+		headers.set('Content-Length', `${end - start + 1}`);
+		status = 206;
+	} else {
+		headers.set('Content-Length', `${totalSize}`);
+	}
 	for (const [k, v] of Object.entries(corsHeaders(env))) {
 		headers.set(k, v as string);
 	}
-	return new Response(obj.body, { headers });
+	// For HEAD requests, the runtime drops the body automatically.
+	return new Response(obj.body, { status, headers });
+}
+
+/** Parse an HTTP Range header into the R2.get options shape. Supports
+ * `bytes=START-END`, `bytes=START-`, `bytes=-SUFFIX`. Returns undefined
+ * if no header or unparseable (caller falls back to full-object read). */
+function parseRangeHeader(h: string | null): R2Range | undefined {
+	if (!h) return undefined;
+	const m = h.match(/^bytes=(\d*)-(\d*)$/);
+	if (!m) return undefined;
+	const [, startS, endS] = m;
+	if (startS === '' && endS !== '') {
+		// suffix range: bytes=-N (last N bytes)
+		return { suffix: parseInt(endS, 10) };
+	}
+	if (startS !== '' && endS === '') {
+		// open-ended: bytes=START-
+		return { offset: parseInt(startS, 10) };
+	}
+	if (startS !== '' && endS !== '') {
+		const start = parseInt(startS, 10);
+		const end = parseInt(endS, 10);
+		return { offset: start, length: end - start + 1 };
+	}
+	return undefined;
 }
 
 async function listRuns(env: Env): Promise<string[]> {
@@ -79,7 +130,7 @@ export default {
 		if (req.method === 'OPTIONS') {
 			return new Response(null, { status: 204, headers: corsHeaders(env) });
 		}
-		if (req.method !== 'GET') {
+		if (req.method !== 'GET' && req.method !== 'HEAD') {
 			return new Response('Method not allowed', {
 				status: 405,
 				headers: corsHeaders(env),
@@ -103,7 +154,7 @@ export default {
 		if (runFileMatch) {
 			const [, runId, file] = runFileMatch;
 			const key = `${env.R2_RUNS_PREFIX}/${runId}/${file}`;
-			return serveR2Object(env, key);
+			return serveR2Object(req, env, key);
 		}
 
 		return new Response(`Not found: ${path}`, {
