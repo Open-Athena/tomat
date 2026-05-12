@@ -568,6 +568,24 @@ wheels = [
 ]
 
 [[package]]
+name = "duckdb"
+version = "1.6.0.dev12"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/13/84/03ae58a2454c9a5d9e5ce77463b1e644727c0ce1036e58ee80ec6126b96d/duckdb-1.6.0.dev12.tar.gz", hash = "sha256:8f89ca33f5cd5821108b174eb58692c36252614478644033be112944bea40a15", size = 17979744, upload-time = "2026-03-20T12:06:35.581Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/08/88/84e4f868ffa52100ef3774f054804f8802c997f6b68a381f45ec97943d63/duckdb-1.6.0.dev12-cp311-cp311-macosx_10_9_universal2.whl", hash = "sha256:8cc5b224427141943177de67134d7a88273d393bfdc5111453784688bf5c0af7", size = 29050739, upload-time = "2026-03-20T12:05:09.76Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/b2/30688fcd69e4f64068255297509cc3dc954d4234e379166b3f5a8becb719/duckdb-1.6.0.dev12-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:41c2ac29caf69053ea9b17a11c87c9a96a0a715be36bd6570b8a9b93bdeb4da1", size = 15448638, upload-time = "2026-03-20T12:05:12.519Z" },
+    { url = "https://files.pythonhosted.org/packages/24/3c/c3a1fc3842db38e7521977aced84c58e58f6b950b82efed864d3b0a04f85/duckdb-1.6.0.dev12-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:172b76ed0c15fcf7a38fda5c9537716a4e0c0b7210422a0f20eb59263a5b9bda", size = 13725567, upload-time = "2026-03-20T12:05:15Z" },
+    { url = "https://files.pythonhosted.org/packages/27/dc/670d0f55efa6d2147baefdc73851fdf4cb31e83c5e9c7669ecf4a4793e36/duckdb-1.6.0.dev12-cp311-cp311-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:bc3ca7825de1d3c1be7b5ef97b4e1012ce8154474af3c9b4478a3a5ed1c9a42d", size = 18927911, upload-time = "2026-03-20T12:05:17.927Z" },
+    { url = "https://files.pythonhosted.org/packages/1f/55/16b5b299d920340bd48588660f931febced67f56270f937cc506f0f4a8e5/duckdb-1.6.0.dev12-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ac05b330ea96c7cfc3f48f22fc17ffad3039854035e669cea5a9a89926ce1d29", size = 20976812, upload-time = "2026-03-20T12:05:21.445Z" },
+    { url = "https://files.pythonhosted.org/packages/4e/aa/7b7f8728499e52d7ca7edad44af21364b5128b7595247fe5ce759be1579f/duckdb-1.6.0.dev12-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:fa89fc52d8248fadfe210ce8452d0d842d789c8821fb49c8f3e3643bbf479ab2", size = 29097346, upload-time = "2026-03-20T12:05:30.381Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/31/f08e40c9d84324773698899a6ed8b5f3159a7100c1d977fcab40e214cac4/duckdb-1.6.0.dev12-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:e1f4cbf17c432752e7cd571667f5eadb8fe74cc8e6d699bd0070da5e5b598add", size = 15473280, upload-time = "2026-03-20T12:05:33.511Z" },
+    { url = "https://files.pythonhosted.org/packages/58/c4/410761a85ba7d1e5867863e153c626480bf85d68b630171b6f9a0dab1832/duckdb-1.6.0.dev12-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:1f4fb584c00da67528baccd4ea6811bd123afc5666cfa90779b9ab83f8efaf27", size = 13750349, upload-time = "2026-03-20T12:05:36.21Z" },
+    { url = "https://files.pythonhosted.org/packages/96/8c/59226ee21f7d788d4a734458f0cd3f8da723c92a6fc4cb55028886eb2f2d/duckdb-1.6.0.dev12-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:20725806e6fb2282304570489aa05a238b2d99c68d47442e208502e7b6a33130", size = 18945769, upload-time = "2026-03-20T12:05:39.137Z" },
+    { url = "https://files.pythonhosted.org/packages/de/ae/94004809aae5a2637581e5515b3045b7bf251bef3956f5daa293768cf454/duckdb-1.6.0.dev12-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c7ce571230208f479b508b5a1bdf93948c519a782e283336688db75bb37a851f", size = 21006239, upload-time = "2026-03-20T12:05:41.989Z" },
+]
+
+[[package]]
 name = "einops"
 version = "0.8.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1027,16 +1045,16 @@ wheels = [
 
 [[package]]
 name = "hf-xet"
-version = "1.5.0.dev1"
+version = "1.5.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/c9/b5/73db543ba19129c23b2ca52d837373eb4243f0332130093f31b3ecc6739f/hf_xet-1.5.0.dev1.tar.gz", hash = "sha256:a21c9c85869ee122747543dd93471826cc0e9b5f61b11411aabd4adf72e345b1", size = 823729, upload-time = "2026-04-17T08:22:19.349Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/74/d8/5c06fc76461418326a7decf8367480c35be11a41fd938633929c60a9ec6b/hf_xet-1.5.0.tar.gz", hash = "sha256:e0fb0a34d9f406eed88233e829a67ec016bec5af19e480eac65a233ea289a948", size = 837196, upload-time = "2026-05-06T06:18:15.583Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/85/fa/6c404999f13892e8ef2b75ec07af0b118fa1241a7bd278f6b93d61063746/hf_xet-1.5.0.dev1-cp37-abi3-macosx_10_12_x86_64.whl", hash = "sha256:5a180160a120357cabc0cd60167864f110bb8f0b1c38b71e0a93cde13839475e", size = 6907817, upload-time = "2026-04-17T08:21:42.228Z" },
-    { url = "https://files.pythonhosted.org/packages/ad/d1/6c828e215079a436d6e916d30248093b7b3ea911e4e6d40b954d21089fc8/hf_xet-1.5.0.dev1-cp37-abi3-macosx_11_0_arm64.whl", hash = "sha256:8701d2e1268c78a1c3cd0e4480b74c0a505cfa864269308efae9d73d0e2203f9", size = 6577425, upload-time = "2026-04-17T08:21:40.097Z" },
-    { url = "https://files.pythonhosted.org/packages/e3/c9/2b93ba287824948450ddf64e2596220b58633d019dda278c12abadbf7bb5/hf_xet-1.5.0.dev1-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:e5480448001f9e59046ac4c463f2e25fb652066605dd183a82d2b5625b939487", size = 63137387, upload-time = "2026-04-17T08:21:21.775Z" },
-    { url = "https://files.pythonhosted.org/packages/dc/b5/c74899d4da67155db8b4f9d8b21110a919d969a15b75aceaec9502c8e7c3/hf_xet-1.5.0.dev1-cp37-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:14e9773ade3fb48dcfa9f493c8ed065704dd3031d29a5a289fed58b8223f2409", size = 58503933, upload-time = "2026-04-17T08:21:17.434Z" },
-    { url = "https://files.pythonhosted.org/packages/27/42/d9d511d425696a8b54cf67af0d3de0f8564f81f81e046b107a967f35f00e/hf_xet-1.5.0.dev1-cp37-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:21accf171949d78b18099bf57a4e8490db1ad88c0a4e907f8930c78ffe21f47d", size = 59035994, upload-time = "2026-04-17T08:22:01.526Z" },
-    { url = "https://files.pythonhosted.org/packages/8c/b6/49afbe73752f8d176231e49bc02b8b3fe96284ba82d856481c598b5343f4/hf_xet-1.5.0.dev1-cp37-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:07d8ec5c300a7ce3a39fa8598024992f6d2fcfa167b71cc0cde07abdcd05ca01", size = 60139405, upload-time = "2026-04-17T08:22:06.759Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/fb/69ff198a82cae7eb1a69fb84d93b3a3e4816564d76817fe541ddc96874eb/hf_xet-1.5.0-cp37-abi3-macosx_10_12_x86_64.whl", hash = "sha256:dad0dc84e941b8ba3c860659fe1fdc35c049d47cce293f003287757e971a8f56", size = 4030814, upload-time = "2026-05-06T06:17:57.933Z" },
+    { url = "https://files.pythonhosted.org/packages/9b/ff/edcc2b40162bef3ff78e14ab637e5f3b89243d6aee72f5949d3bb6a5af83/hf_xet-1.5.0-cp37-abi3-macosx_11_0_arm64.whl", hash = "sha256:fd6e5a9b0fdac4ed03ed45ef79254a655b1aaab514a02202617fbf643f5fdf7a", size = 3798444, upload-time = "2026-05-06T06:17:55.79Z" },
+    { url = "https://files.pythonhosted.org/packages/49/4d/103f76b04310e5e57656696cc184690d20c466af0bca3ca88f8c8ea5d4f3/hf_xet-1.5.0-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:3531b1823a0e6d77d80f9ed15ca0e00f0d115094f8ac033d5cae88f4564cc949", size = 4465986, upload-time = "2026-05-06T06:17:44.886Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/a2/546f47f464737b3edbab6f8ddb57f2599b93d2cbb66f06abb475ccb48651/hf_xet-1.5.0-cp37-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:9a0ee58cd18d5ea799f7ed11290bbccbe56bdd8b1d97ca74b9cc49a3945d7a3b", size = 4259865, upload-time = "2026-05-06T06:17:42.639Z" },
+    { url = "https://files.pythonhosted.org/packages/95/7f/1be593c1f28613be2e196473481cd81bfc5910795e30a34e8f744f6cac4f/hf_xet-1.5.0-cp37-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:1e60df5a42e9bed8628b6416af2cba4cba57ae9f02de226a06b020d98e1aab18", size = 4459835, upload-time = "2026-05-06T06:18:08.026Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/b2/703569fc881f3284487e68cda7b42179978480da3c438042a6bbbb4a671c/hf_xet-1.5.0-cp37-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:4b35549ce62601b84da4ff9b24d970032ace3d4430f52d91bcbb26c901d6c690", size = 4672414, upload-time = "2026-05-06T06:18:09.864Z" },
 ]
 
 [[package]]
@@ -1493,7 +1511,7 @@ wheels = [
 [[package]]
 name = "marin"
 version = "0.99"
-source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Fmarin&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c#117de4f18f1ca2b180f93a218d6eb92c517ed88c" }
+source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Fmarin&rev=674eb2a4f#674eb2a4f06ab6daf5478ebdceddcd76a277a5eb" }
 dependencies = [
     { name = "braceexpand", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "cryptography", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1537,9 +1555,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "marin-finelog"
+version = "0.1.0"
+source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Ffinelog&rev=674eb2a4f#674eb2a4f06ab6daf5478ebdceddcd76a277a5eb" }
+dependencies = [
+    { name = "click", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "connect-python", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "duckdb", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "fsspec", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "marin-rigging", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "protobuf", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "pyarrow", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "pyyaml", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "starlette", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "uvicorn", extra = ["standard"], marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+]
+
+[[package]]
 name = "marin-fray"
 version = "0.99"
-source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Ffray&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c#117de4f18f1ca2b180f93a218d6eb92c517ed88c" }
+source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Ffray&rev=674eb2a4f#674eb2a4f06ab6daf5478ebdceddcd76a277a5eb" }
 dependencies = [
     { name = "click", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "cloudpickle", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1561,7 +1596,7 @@ dependencies = [
 [[package]]
 name = "marin-haliax"
 version = "0.99"
-source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Fhaliax&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c#117de4f18f1ca2b180f93a218d6eb92c517ed88c" }
+source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Fhaliax&rev=674eb2a4f#674eb2a4f06ab6daf5478ebdceddcd76a277a5eb" }
 dependencies = [
     { name = "aqtp", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "equinox", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1574,7 +1609,7 @@ dependencies = [
 [[package]]
 name = "marin-iris"
 version = "0.99"
-source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Firis&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c#117de4f18f1ca2b180f93a218d6eb92c517ed88c" }
+source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Firis&rev=674eb2a4f#674eb2a4f06ab6daf5478ebdceddcd76a277a5eb" }
 dependencies = [
     { name = "click", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "cloudpickle", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1586,6 +1621,7 @@ dependencies = [
     { name = "grpcio", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "httpx", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "humanfriendly", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "marin-finelog", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "marin-rigging", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "pydantic", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "pyjwt", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1601,7 +1637,7 @@ dependencies = [
 [[package]]
 name = "marin-levanter"
 version = "0.99"
-source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Flevanter&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c#117de4f18f1ca2b180f93a218d6eb92c517ed88c" }
+source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Flevanter&rev=674eb2a4f#674eb2a4f06ab6daf5478ebdceddcd76a277a5eb" }
 dependencies = [
     { name = "async-lru", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "braceexpand", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1652,7 +1688,7 @@ serve = [
 [[package]]
 name = "marin-rigging"
 version = "0.99"
-source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Frigging&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c#117de4f18f1ca2b180f93a218d6eb92c517ed88c" }
+source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Frigging&rev=674eb2a4f#674eb2a4f06ab6daf5478ebdceddcd76a277a5eb" }
 dependencies = [
     { name = "fsspec", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "gcsfs", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1662,7 +1698,7 @@ dependencies = [
 [[package]]
 name = "marin-zephyr"
 version = "0.99"
-source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Fzephyr&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c#117de4f18f1ca2b180f93a218d6eb92c517ed88c" }
+source = { git = "https://github.com/marin-community/marin?subdirectory=lib%2Fzephyr&rev=674eb2a4f#674eb2a4f06ab6daf5478ebdceddcd76a277a5eb" }
 dependencies = [
     { name = "braceexpand", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "click", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -3267,11 +3303,11 @@ requires-dist = [
     { name = "gcsfs" },
     { name = "jax", extras = ["tpu"], marker = "sys_platform == 'linux'", specifier = "==0.8.0" },
     { name = "jax", extras = ["tpu"], marker = "sys_platform == 'linux' and extra == 'tpu'", specifier = "==0.8.0" },
-    { name = "marin", git = "https://github.com/marin-community/marin?subdirectory=lib%2Fmarin&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c" },
-    { name = "marin-iris", git = "https://github.com/marin-community/marin?subdirectory=lib%2Firis&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c" },
-    { name = "marin-levanter", git = "https://github.com/marin-community/marin?subdirectory=lib%2Flevanter&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c" },
-    { name = "marin-rigging", git = "https://github.com/marin-community/marin?subdirectory=lib%2Frigging&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c" },
-    { name = "marin-zephyr", git = "https://github.com/marin-community/marin?subdirectory=lib%2Fzephyr&rev=117de4f18f1ca2b180f93a218d6eb92c517ed88c" },
+    { name = "marin", git = "https://github.com/marin-community/marin?subdirectory=lib%2Fmarin&rev=674eb2a4f" },
+    { name = "marin-iris", git = "https://github.com/marin-community/marin?subdirectory=lib%2Firis&rev=674eb2a4f" },
+    { name = "marin-levanter", git = "https://github.com/marin-community/marin?subdirectory=lib%2Flevanter&rev=674eb2a4f" },
+    { name = "marin-rigging", git = "https://github.com/marin-community/marin?subdirectory=lib%2Frigging&rev=674eb2a4f" },
+    { name = "marin-zephyr", git = "https://github.com/marin-community/marin?subdirectory=lib%2Fzephyr&rev=674eb2a4f" },
     { name = "pymatgen" },
     { name = "torch", marker = "sys_platform == 'linux' and extra == 'tpu'", specifier = "==2.9.0" },
     { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'tpu'", specifier = "==0.24.0" },

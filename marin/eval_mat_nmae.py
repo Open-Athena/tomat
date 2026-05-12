@@ -672,7 +672,21 @@ def main():
                 density_logits = logits_arr[..., DENS_LO:DENS_HI]  # (B, Pos, n_bins)
                 bin_idx = jnp.argmax(density_logits, axis=-1)
                 rho = decode_dens[bin_idx]  # (B, Pos)
-                return hax.named(rho, (logits.axes[0], logits.axes[1]))
+                # mat-EMD via softmax (same as median path).
+                probs = jax.nn.softmax(logits_arr, axis=-1)
+                density_probs = probs[..., DENS_LO:DENS_HI]
+                sum_dens = density_probs.sum(axis=-1, keepdims=True) + 1e-12
+                p_norm = density_probs / sum_dens
+                tokens_arr = tokens_in.array
+                target_bins = jnp.clip(tokens_arr - DENS_LO, 0, len(decode_dens) - 1)
+                target_dens = decode_dens[target_bins]
+                def _emd1(p_v, t_d):
+                    return jnp.dot(p_v, jnp.abs(decode_dens - t_d))
+                emd = jax.vmap(jax.vmap(_emd1))(p_norm, target_dens)
+                return (
+                    hax.named(rho, (logits.axes[0], logits.axes[1])),
+                    hax.named(emd, (logits.axes[0], logits.axes[1])),
+                )
         elif decoder == "median":
             @hax.named_jit(axis_resources=compute_mapping)
             def forward_decode(tokens_in):
@@ -689,7 +703,31 @@ def main():
                 bin_idx = jnp.sum(cumP < 0.5, axis=-1).astype(jnp.int32)
                 bin_idx = jnp.clip(bin_idx, 0, len(decode_dens) - 1)
                 rho = decode_dens[bin_idx]
-                return hax.named(rho, (logits.axes[0], logits.axes[1]))
+                # mat-EMD: per-voxel Wasserstein-1 vs delta target.
+                # Target bin = the input token at the NEXT position (since
+                # logits at position t predict token at t+1). Caller pulls
+                # `pred_positions = dens_positions - 1`; here we recover the
+                # corresponding target token from the input sequence.
+                # Logits at output position p predict input token at p+1, so
+                # the EMD target at output p must be tokens_in[..., p+1]. Shift
+                # left and pad the last column (it's irrelevant — the inference
+                # loop only reads emd at pred_positions = dens_positions - 1,
+                # which never includes the last position).
+                tokens_arr = tokens_in.array  # (B, Pos)
+                tokens_next = jnp.concatenate(
+                    [tokens_arr[..., 1:], tokens_arr[..., -1:]], axis=-1,
+                )
+                target_bins = jnp.clip(tokens_next - DENS_LO, 0, len(decode_dens) - 1)
+                target_dens = decode_dens[target_bins]  # (B, Pos)
+                # E_P[|v - v_target|] per voxel, computed via vmap to avoid
+                # materializing (B, Pos, n_bins) abs-diff tensor.
+                def _emd1(p_v, t_d):
+                    return jnp.dot(p_v, jnp.abs(decode_dens - t_d))
+                emd = jax.vmap(jax.vmap(_emd1))(p_norm, target_dens)  # (B, Pos)
+                return (
+                    hax.named(rho, (logits.axes[0], logits.axes[1])),
+                    hax.named(emd, (logits.axes[0], logits.axes[1])),
+                )
         else:  # mean
             @hax.named_jit(axis_resources=compute_mapping)
             def forward_decode(tokens_in):
@@ -702,7 +740,16 @@ def main():
                 sum_dens = density_probs.sum(axis=-1, keepdims=True) + 1e-12
                 p_norm = density_probs / sum_dens
                 rho = jnp.einsum("bpv,v->bp", p_norm, decode_dens)
-                return hax.named(rho, (logits.axes[0], logits.axes[1]))
+                tokens_arr = tokens_in.array
+                target_bins = jnp.clip(tokens_arr - DENS_LO, 0, len(decode_dens) - 1)
+                target_dens = decode_dens[target_bins]
+                def _emd1(p_v, t_d):
+                    return jnp.dot(p_v, jnp.abs(decode_dens - t_d))
+                emd = jax.vmap(jax.vmap(_emd1))(p_norm, target_dens)
+                return (
+                    hax.named(rho, (logits.axes[0], logits.axes[1])),
+                    hax.named(emd, (logits.axes[0], logits.axes[1])),
+                )
 
         # Pick mp-IDs: either from the pinned JSON snapshot (preferred for
         # apples-to-apples curves across runs), or from the parquets directly.
@@ -824,14 +871,18 @@ def main():
             inflight = []  # list of (bi, future)
             depth = 2
             total = 0
+            emd_grid = np.zeros(grid_shape, dtype=np.float32)
             for bi in range(n_full_batches):
                 inflight.append((bi, dispatch(bi)))
                 while len(inflight) > depth or (bi == n_full_batches - 1 and inflight):
-                    done_bi, fut = inflight.pop(0)
-                    pred_floats = np.asarray(fut.array, dtype=np.float32)  # (B, Pos)
+                    done_bi, (rho_fut, emd_fut) = inflight.pop(0)
+                    pred_floats = np.asarray(rho_fut.array, dtype=np.float32)  # (B, Pos)
+                    emd_floats = np.asarray(emd_fut.array, dtype=np.float32)  # (B, Pos)
                     start = done_bi * eval_batch
                     pred_dens_floats = pred_floats[:, pred_positions]  # (B, P^3)
+                    emd_dens_floats = emd_floats[:, pred_positions]
                     pred_blocks = pred_dens_floats.reshape(-1, P, P, P)
+                    emd_blocks = emd_dens_floats.reshape(-1, P, P, P)
                     for k in range(eval_batch):
                         global_idx = start + k
                         if global_idx >= n_patches:  # padded entry, skip
@@ -840,6 +891,8 @@ def main():
                         lx0, lx1, ly0, ly1, lz0, lz1 = local_slices[global_idx]
                         rho_pred[ox+lx0:ox+lx1, oy+ly0:oy+ly1, oz+lz0:oz+lz1] = \
                             pred_blocks[k, lx0:lx1, ly0:ly1, lz0:lz1]
+                        emd_grid[ox+lx0:ox+lx1, oy+ly0:oy+ly1, oz+lz0:oz+lz1] = \
+                            emd_blocks[k, lx0:lx1, ly0:ly1, lz0:lz1]
                         total += 1
             t_fwd = time.time() - t_fwd0
             err(f"[eval-mat] {mp_id}: processed {total} patches "
@@ -852,24 +905,32 @@ def main():
             mae = np.mean(np.abs(rho_pred - rho_true))
             denom = np.mean(np.abs(rho_true))
             nmae = mae / max(denom, 1e-30)
-            err(f"[eval-mat] {mp_id}: MAE={mae:.4e}, mean|ρ_true|={denom:.4e}, NMAE={nmae:.4%}")
+            # mat-EMD: per-voxel Wasserstein-1 vs delta target, normalized by
+            # mean |ρ_true| (same denominator as NMAE → directly comparable).
+            mean_emd = float(np.mean(emd_grid))
+            nemd = mean_emd / max(denom, 1e-30)
+            err(f"[eval-mat] {mp_id}: MAE={mae:.4e}, EMD={mean_emd:.4e}, "
+                f"mean|ρ_true|={denom:.4e}, NMAE={nmae:.4%}, NEMD={nemd:.4%}")
             per_mat_results.append({
                 "mp_id": mp_id,
                 "grid_shape": list(grid_shape),
                 "n_patches": total,
                 "n_atoms": int(len(Zs)),
                 "mae": float(mae),
+                "mean_emd": mean_emd,
                 "mean_abs_true": float(denom),
                 "nmae": float(nmae),
+                "nemd": float(nemd),
             })
 
         # Aggregate
         if per_mat_results:
             nmaes = np.array([r["nmae"] for r in per_mat_results])
+            nemds = np.array([r["nemd"] for r in per_mat_results])
             err(f"[eval-mat] AGGREGATE over {len(nmaes)} mats:")
-            err(f"  mean NMAE   : {nmaes.mean():.4%}")
-            err(f"  median NMAE : {np.median(nmaes):.4%}")
-            err(f"  p99 NMAE    : {np.percentile(nmaes, 99):.4%}")
+            err(f"  mean NMAE   : {nmaes.mean():.4%}    mean NEMD   : {nemds.mean():.4%}")
+            err(f"  median NMAE : {np.median(nmaes):.4%}    median NEMD : {np.median(nemds):.4%}")
+            err(f"  p99 NMAE    : {np.percentile(nmaes, 99):.4%}    p99 NEMD    : {np.percentile(nemds, 99):.4%}")
 
         # Machine-readable summary (also persists per-mat results to GCS so
         # downstream noise-calibration / bootstrap analysis can use them
@@ -883,6 +944,9 @@ def main():
             "nmae_mean": float(nmaes.mean()) if per_mat_results else None,
             "nmae_median": float(np.median(nmaes)) if per_mat_results else None,
             "nmae_p99": float(np.percentile(nmaes, 99)) if per_mat_results else None,
+            "nemd_mean": float(nemds.mean()) if per_mat_results else None,
+            "nemd_median": float(np.median(nemds)) if per_mat_results else None,
+            "nemd_p99": float(np.percentile(nemds, 99)) if per_mat_results else None,
             "per_mat": per_mat_results,
         }
         print(json.dumps(summary, indent=2))
