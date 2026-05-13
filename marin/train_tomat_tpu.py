@@ -197,6 +197,16 @@ def _log_lifecycle_event(event: str, **fields):
 
 def _handle_sigterm(signum, _frame):
     _log_lifecycle_event("sigterm_received", signum=signum)
+    # Best-effort wandb finish so the run state flips to "finished" (with
+    # the sigterm flagged) rather than lingering "running" → "failed" after
+    # heartbeat timeout. Wrapped: we're about to re-raise SIGTERM and don't
+    # want to mask the original signal if wandb is misbehaving.
+    try:
+        import wandb
+        if wandb.run is not None:
+            wandb.finish(exit_code=143, quiet=True)  # 128 + 15 (SIGTERM)
+    except Exception:
+        pass
     # Re-raise default-handler behavior so the JAX coordination service
     # gets the shutdown signal it expects (don't swallow).
     _signal.signal(signum, _signal.SIG_DFL)
@@ -231,11 +241,27 @@ def _maybe_spawn_pyspy_daemon():
     import threading
     import time as _t
     pyspy = shutil.which("py-spy")
+    gsutil = shutil.which("gsutil")
+    # Diagnostic prints unconditional — easy to grep in worker logs when
+    # debugging "pyspy was supposed to be on but produced nothing in GCS".
+    print(f"[pyspy] enable check: which(py-spy)={pyspy} which(gsutil)={gsutil}", flush=True)
     if pyspy is None:
-        print("[pyspy] TOMAT_PYSPY=1 set but py-spy not on PATH; skipping")
-        return
+        print("[pyspy] TOMAT_PYSPY=1 set but py-spy not on PATH; skipping. "
+              "Add `py-spy` to the deps that the iris worker installs, or "
+              "set TOMAT_PYSPY_INSTALL=1 to `uv pip install` it inline.",
+              flush=True)
+        if os.environ.get("TOMAT_PYSPY_INSTALL") == "1":
+            print("[pyspy] TOMAT_PYSPY_INSTALL=1 → attempting `uv pip install py-spy` …", flush=True)
+            try:
+                _sp.run(["uv", "pip", "install", "py-spy"], check=True, timeout=60)
+                pyspy = shutil.which("py-spy")
+                print(f"[pyspy] post-install which(py-spy)={pyspy}", flush=True)
+            except Exception as e:
+                print(f"[pyspy] install failed: {e}", flush=True)
+        if pyspy is None:
+            return
     pid = os.getpid()
-    print(f"[pyspy] enabled: pid={pid} interval={interval}s record={duration}s → {out_prefix}/")
+    print(f"[pyspy] enabled: pid={pid} interval={interval}s record={duration}s → {out_prefix}/", flush=True)
 
     def _loop():
         while True:
@@ -604,6 +630,16 @@ def main():
     # atexit handler still runs as a safety net for crash paths.
     _flush_active_checkpointers(label="post-train")
     _log_lifecycle_event("trainer_finished")
+    # Explicit wandb.finish() — otherwise the wandb run state lingers as
+    # "running" until heartbeat times out, then flips to "failed/crashed"
+    # even on a clean exit (v5p-pyspy-3 showed this).
+    try:
+        import wandb
+        if wandb.run is not None:
+            print("[tomat-tpu] wandb.finish() …", flush=True)
+            wandb.finish(exit_code=0, quiet=True)
+    except Exception as e:
+        print(f"[tomat-tpu] wandb.finish() failed: {e}", flush=True)
     print("[tomat-tpu] done")
 
 
