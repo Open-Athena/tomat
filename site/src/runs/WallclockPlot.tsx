@@ -26,24 +26,28 @@ export function WallclockPlot({ history, runId }: Props) {
   const { isDark } = useTheme()
   const [eventMode, setEventMode] = useState<EventMode>('vlines')
 
-  const { timestamps, steps, cols } = history
+  const { timestamps, cols } = history
   const toIso = (ts: number) => new Date(ts * 1000).toISOString()
 
   // Build a time-ordered index used by every series — wandb history rows
   // can be timestamp-out-of-order because the lifecycle daemon-thread logs
-  // interleave with the trainer's main thread (issue surfaced by the
-  // step-reversion zigzag + the train/loss "phantom horizontal line").
+  // interleave with the trainer's main thread.
   const ordered = timestamps
     .map((ts, i) => ({ ts, i }))
     .filter((r) => r.ts !== null)
     .sort((a, b) => (a.ts as number) - (b.ts as number))
 
-  // Step curve: running max of `_step` along ascending `_timestamp`.
+  // Step curve: running max of `global_step` (Levanter's actual training
+  // step) along ascending `_timestamp`. Was previously `_step` (wandb's
+  // log-call counter) which leaps non-physically during restart-burst
+  // log-sync. global_step may be null on rows that aren't from the
+  // trainer's main loop (e.g. lifecycle/sigterm logs) — skip those.
+  const globalStep = cols.get('global_step') ?? []
   const stepXs: string[] = []
   const stepYs: number[] = []
   let runningMax = -Infinity
   for (const { ts, i } of ordered) {
-    const s = steps[i]
+    const s = globalStep[i]
     if (s === null) continue
     runningMax = Math.max(runningMax, s)
     stepXs.push(toIso(ts as number))

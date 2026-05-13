@@ -60,6 +60,9 @@ R2_RUNS_PREFIX = "tomat/runs"
 _RUN_PARQUET_SCHEMA_VERSION = 1
 _RUN_PARQUET_KEYS = [
     "_step", "_timestamp", "_runtime",
+    "global_step",   # Levanter's training step (true progress) — separate
+                     # from `_step` which is wandb's log-call counter and can
+                     # leap during restart churn.
     "train/loss", "eval/loss",
     "throughput/mfu", "throughput/tokens_per_second", "throughput/duration",
     "eval/mat_nmae/val_200/mean", "eval/mat_nmae/val_200/median", "eval/mat_nmae/val_200/p99",
@@ -441,6 +444,7 @@ def _run_parquet_arrow_schema():
         ("_step",                            pa.int64()),
         ("_timestamp",                       pa.float64()),
         ("_runtime",                         pa.float64()),
+        ("global_step",                      pa.int64()),
         ("train/loss",                       pa.float32()),
         ("eval/loss",                        pa.float32()),
         ("throughput/mfu",                   pa.float32()),

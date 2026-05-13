@@ -9,6 +9,7 @@ export type RunHistoryRow = {
   _step: bigint | null
   _timestamp: number | null
   _runtime: number | null
+  global_step: bigint | null
   'train/loss': number | null
   'eval/loss': number | null
   'throughput/mfu': number | null

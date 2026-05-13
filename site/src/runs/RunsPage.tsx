@@ -13,6 +13,11 @@ const navigate = (path: string) => {
   window.location.hash = `#/${path}`
 }
 
+// Let cmd/ctrl/shift/middle-click fall through to the browser so it can open
+// the link in a new tab / window.
+const isModifiedClick = (e: React.MouseEvent) =>
+  e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0
+
 export function RunsPage({ parts }: Props) {
   const runId = parts[0]
   return runId ? <RunDetail runId={runId} /> : <RunsIndex />
@@ -49,6 +54,7 @@ function RunsIndex() {
               <a
                 href={`#/runs/${id}`}
                 onClick={(e) => {
+                  if (isModifiedClick(e)) return
                   e.preventDefault()
                   navigate(`runs/${id}`)
                 }}
@@ -86,6 +92,7 @@ function RunDetail({ runId }: { runId: string }) {
         <a
           href="#/runs"
           onClick={(e) => {
+            if (isModifiedClick(e)) return
             e.preventDefault()
             navigate('runs')
           }}
