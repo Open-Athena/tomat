@@ -357,6 +357,47 @@ def _pick_cache_bucket(default: str) -> str:
     return default
 
 
+def _bucket_region(cache_dir: str) -> str | None:
+    """Best-effort 'gs://marin-<short>/...' → GCE region. None if unparseable.
+
+    Bucket-name region suffixes use 'eu-' shorthand (e.g. 'marin-eu-west4')
+    while GCE region names spell it 'europe-'; normalize so comparisons
+    against `_detect_gce_region()` work.
+    """
+    import re
+    m = re.match(r"gs://marin-([a-z]+-[a-z]+\d+)/", cache_dir)
+    if not m:
+        return None
+    short = m.group(1)
+    return "europe-" + short[3:] if short.startswith("eu-") else short
+
+
+def _assert_cache_local(cache_dir: str) -> None:
+    """Fail loud on cross-region cache reads; previously these silently
+    halved MFU (the 65 s/step v5p host stall we just spent a week on).
+
+    Compares the bucket's region (parsed from `cache_dir`) against this
+    worker's region (GCE metadata). Skipped if either side is undetermined
+    or `TOMAT_ALLOW_XREG_CACHE=1` is set.
+    """
+    if os.environ.get("TOMAT_ALLOW_XREG_CACHE") == "1":
+        print(f"[tomat-tpu] TOMAT_ALLOW_XREG_CACHE=1 → skipping x-reg check", flush=True)
+        return
+    cache_region = _bucket_region(cache_dir)
+    worker_region = _detect_gce_region()
+    if not cache_region or not worker_region:
+        print(f"[tomat-tpu] x-reg check skipped (cache_region={cache_region} "
+              f"worker_region={worker_region})", flush=True)
+        return
+    if cache_region != worker_region:
+        raise RuntimeError(
+            f"cross-region cache read: cache_dir={cache_dir} (region={cache_region}) "
+            f"≠ worker region={worker_region}. Mirror the cache to this region with "
+            f"`tomat cache mirror`, or set TOMAT_ALLOW_XREG_CACHE=1 to override."
+        )
+    print(f"[tomat-tpu] x-reg check: cache+worker both in {worker_region} ✓", flush=True)
+
+
 MODEL_PRESETS = {
     # (hidden, layers, heads, kv_heads, ffn) — head_dim = hidden // heads
     # 30M: what all earlier runs used (hidden=512, head_dim=128, 6 layers).
@@ -417,6 +458,7 @@ def main():
     else:
         cache_dir = f"{BUCKET}/results/{results_label}/cache"
         print(f"[tomat-tpu] cache_dir=PER-RUN {cache_dir}")
+    _assert_cache_local(cache_dir)
 
     source = UrlDatasetSourceConfig(train_urls=[parquet_glob])
     prebuilt = PrebuiltLmDatasetFormat(input_ids_key="input_ids")
