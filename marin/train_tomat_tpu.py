@@ -315,6 +315,47 @@ from levanter.trainer import TrainerConfig
 
 BUCKET = os.environ.get("TOMAT_BUCKET", "gs://marin-eu-west4/tomat")
 
+# Map: GCE region → mirrored cache bucket. Kept in sync with `_CACHE_TARGETS`
+# in the `tomat` CLI's `cache mirror` command. When `TOMAT_SHARE_CACHE=1` is
+# set, the trainer detects its own GCE zone via the metadata server and reads
+# the cache from the local-region bucket — keeps results/ckpts canonical on
+# TOMAT_BUCKET while avoiding the cross-region IO that halves MFU on v5p.
+_REGION_TO_CACHE_BUCKET = {
+    "us-central1":  "gs://marin-us-central1/tomat",
+    "us-east1":     "gs://marin-us-east1/tomat",
+    "us-east5":     "gs://marin-us-east5/tomat",
+    "europe-west4": "gs://marin-eu-west4/tomat",
+}
+
+
+def _detect_gce_region() -> str | None:
+    """GCE region (e.g. 'us-east5') from the metadata server; None on failure."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "http://metadata.google.internal/computeMetadata/v1/instance/zone",
+            headers={"Metadata-Flavor": "Google"},
+        )
+        with urllib.request.urlopen(req, timeout=2.0) as r:
+            zone_path = r.read().decode("utf-8")  # 'projects/123/zones/us-east5-a'
+        zone = zone_path.rsplit("/", 1)[-1]
+        return zone.rsplit("-", 1)[0]
+    except Exception as e:
+        print(f"[tomat-tpu] WARN: GCE zone detect failed: {e}", flush=True)
+        return None
+
+
+def _pick_cache_bucket(default: str) -> str:
+    """Region-local cache bucket. Falls back to `default` if region unknown."""
+    region = _detect_gce_region()
+    if region and region in _REGION_TO_CACHE_BUCKET:
+        b = _REGION_TO_CACHE_BUCKET[region]
+        print(f"[tomat-tpu] zone-local cache: region={region} → {b}", flush=True)
+        return b
+    print(f"[tomat-tpu] WARN: no zone-local cache bucket (region={region}); "
+          f"falling back to {default}", flush=True)
+    return default
+
 
 MODEL_PRESETS = {
     # (hidden, layers, heads, kv_heads, ffn) — head_dim = hidden // heads
@@ -356,19 +397,23 @@ def main():
     results_label = results_label_env or f"{label}-tpu-{model_preset}-bs{batch_size}-seed{seed}"
     run_id = results_label
 
-    # cache_dir resolution. Default: per-results-label, so each run rebuilds.
-    # Override via TOMAT_CACHE_DIR to share a cache across runs over the same
-    # parquet inputs (avoids the Zephyr cache-build crashloop seen on v6e-32
-    # under heavy preempt pressure — see marin GH "cache-build-brittleness").
-    # Convention for sharing: TOMAT_CACHE_DIR=gs://.../cache/<label>/ keyed on
-    # the data label, since cache contents depend only on input parquets +
-    # cache_options (currently fixed batch_size=128). Caller is responsible
-    # for using the same dir across runs that should share, and a different
-    # dir if any cache-determining knob (parquet glob, batch_size) changes.
+    # cache_dir resolution. Three modes, in priority order:
+    #   1. TOMAT_CACHE_DIR — explicit full path, used as-is.
+    #   2. TOMAT_SHARE_CACHE=1 — detect this worker's GCE region and read the
+    #      mirrored cache from the region-local bucket (cache is RO at train
+    #      time; we mirrored it across {us-central1, us-east1, us-east5,
+    #      eu-west4} so any zone iris picks has a local copy).
+    #   3. Per-run default under TOMAT_BUCKET — rebuilds each run.
+    # Results/ckpts always go to TOMAT_BUCKET regardless of which mode is
+    # used, so resumes across zone changes still find their checkpoints.
     cache_dir_env = os.environ.get("TOMAT_CACHE_DIR")
     if cache_dir_env:
         cache_dir = cache_dir_env
-        print(f"[tomat-tpu] cache_dir=SHARED {cache_dir}")
+        print(f"[tomat-tpu] cache_dir=SHARED (explicit) {cache_dir}")
+    elif os.environ.get("TOMAT_SHARE_CACHE") == "1":
+        cache_bucket = _pick_cache_bucket(default=BUCKET)
+        cache_dir = f"{cache_bucket}/cache/{label}/"
+        print(f"[tomat-tpu] cache_dir=SHARED (zone-local) {cache_dir}")
     else:
         cache_dir = f"{BUCKET}/results/{results_label}/cache"
         print(f"[tomat-tpu] cache_dir=PER-RUN {cache_dir}")

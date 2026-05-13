@@ -1158,7 +1158,7 @@ def _latest_ckpt_step(run_label: str, bucket: str = GCS_BUCKET) -> int | None:
 @click.option("-e", "--env", "extra_env", multiple=True, help="extra env var KEY=VAL (repeatable)")
 @click.option("--shuffle-window-blocks", type=int, default=0, help="TOMAT_SHUFFLE_WINDOW_BLOCKS; 0 = no shuffle (default), >0 = BlockShuffle window radius")
 @click.option("--shuffle-io-block-size", type=int, default=0, help="TOMAT_SHUFFLE_IO_BLOCK_SIZE; 0 = auto from meta (M)")
-@click.option("--share-cache/--no-share-cache", default=False, help="Share the levanter cache across runs over the same data (TOMAT_CACHE_DIR=gs://.../cache/<data_label>/). Default per-run for back-compat.")
+@click.option("--share-cache/--no-share-cache", default=True, help="Trainer reads the mirrored cache at `<bucket>/cache/<data_label>/` (default on). With TOMAT_SHARE_CACHE=1, the trainer detects its actual GCE zone at startup and picks the local-region mirror — drop `--zone` to let iris park the slice wherever has capacity. `--no-share-cache` falls back to per-run rebuild under the canonical bucket.")
 @click.option("--watch-preempts/--no-watch-preempts", default=True, help="auto-fire `tomat preempts watch <LABEL>` in the background after launch (default on)")
 @click.option("--pyspy/--no-pyspy", default=False, help="TOMAT_PYSPY=1 → trainer daemon-dumps py-spy stacks to GCS every TOMAT_PYSPY_INTERVAL s (default 60). Use for diagnosing host-side stalls (the 65s/step v5p issue).")
 @click.option("--pyspy-interval", default=60, type=int, help="TOMAT_PYSPY_INTERVAL seconds between py-spy dumps (default 60).")
@@ -1279,7 +1279,9 @@ def train(
         if shuffle_io_block_size > 0:
             env_vars.append(("TOMAT_SHUFFLE_IO_BLOCK_SIZE", str(shuffle_io_block_size)))
     if share_cache:
-        env_vars.append(("TOMAT_CACHE_DIR", f"{bucket}/cache/{data_label}/"))
+        # Trainer detects its actual GCE region at startup and picks the
+        # matching mirror — no submit-time bucket pinning needed.
+        env_vars.append(("TOMAT_SHARE_CACHE", "1"))
     if pyspy:
         env_vars.append(("TOMAT_PYSPY", "1"))
         env_vars.append(("TOMAT_PYSPY_INTERVAL", str(pyspy_interval)))
