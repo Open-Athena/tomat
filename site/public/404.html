@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>tomat</title>
+<script>
+  // GH Pages serves this when a path 404s. The site uses hash-routing
+  // (`#/runs`, `#/runs/<id>`), so a bare path like `/runs` 404s without
+  // this redirect. Reflect the path+search into a hash and bounce home.
+  var pathAfterRoot = location.pathname.replace(/^\/+/, '') + location.search
+  location.replace(location.origin + '/#/' + pathAfterRoot)
+</script>
+</head>
+<body>
+<noscript>
+  Site uses hash routing.
+  Try <a href="/#/">/#/</a> or <a href="/#/runs">/#/runs</a>.
+</noscript>
+</body>
+</html>

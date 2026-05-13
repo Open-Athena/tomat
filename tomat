@@ -1136,6 +1136,8 @@ def _latest_ckpt_step(run_label: str, bucket: str = GCS_BUCKET) -> int | None:
               help="TOMAT_LABEL (data subdir under tokenized/)")
 @click.option("-m", "--model", default="200M", help="TOMAT_MODEL preset")
 @click.option("-T", "--tpu", default="v6e-16", help="iris --tpu")
+@click.option("--zone", default=None, help="iris --zone (e.g. europe-west4-a); pins the slice to one zone so it doesn't end up in a starved region. Repeatable via comma-separated list.")
+@click.option("--region", default=None, help="iris --region (e.g. europe-west4); broader pin than --zone.")
 @click.option("-s", "--steps", required=True, type=int, help="TOMAT_STEPS")
 @click.option("-b", "--batch-size", default=128, type=int, help="TOMAT_BATCH_SIZE")
 @click.option("--seed", default=42, type=int, help="TOMAT_SEED")
@@ -1167,6 +1169,8 @@ def train(
     data_label: str,
     model: str,
     tpu: str,
+    zone: str | None,
+    region: str | None,
     steps: int,
     batch_size: int,
     seed: int,
@@ -1282,6 +1286,12 @@ def train(
         "--tpu", tpu, "--enable-extra-resources",
         "--cpu", str(cpu), "--memory", memory,
     ]
+    for z in (zone or "").split(","):
+        if z := z.strip():
+            cmd += ["--zone", z]
+    for r in (region or "").split(","):
+        if r := r.strip():
+            cmd += ["--region", r]
     for k, v in env_vars:
         cmd += ["--env-vars", k, v]
     cmd += [
