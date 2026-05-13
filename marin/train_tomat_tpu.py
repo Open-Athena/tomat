@@ -51,6 +51,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import sys
 from datetime import timedelta
 from pathlib import Path
 
@@ -415,6 +416,19 @@ def main():
         # DatasetComponent. We have a single "tomat" component. val_seqs=0 skips.
         num_validation_sequences={"tomat": val_seqs} if val_seqs > 0 else None,
     )
+
+    # Cache-build-only short-circuit. Wired via `tomat cache build <label>` —
+    # decouples cache materialization from training so a build failure doesn't
+    # leave a half-built cache the trainer then trips over (the missing
+    # `shard_ledger.json` + `input_ids/` in us-central1 cost us a day).
+    if os.environ.get("TOMAT_BUILD_CACHE_ONLY") == "1":
+        print("[tomat-tpu] TOMAT_BUILD_CACHE_ONLY=1 → building caches, will exit before trainer")
+        for split in ("train", "validation"):
+            print(f"[tomat-tpu] data.build_caches({split!r}) → {cache_dir}{split}/", flush=True)
+            data.build_caches(split)
+            print(f"[tomat-tpu] build_caches({split!r}) done", flush=True)
+        print("[tomat-tpu] all caches built; exiting")
+        sys.exit(0)
 
     if model_preset not in MODEL_PRESETS:
         raise ValueError(f"unknown TOMAT_MODEL={model_preset!r}; expected one of {list(MODEL_PRESETS)}")

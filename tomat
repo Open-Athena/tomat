@@ -1493,6 +1493,161 @@ def _wb_exec(query: str, **variables):
     return body["data"]
 
 
+@cli.group("cache")
+def cache_grp():
+    """Manage Levanter caches: build, mirror across regions, list."""
+
+
+# Canonical source bucket (where cache-build originally produces the cache).
+_CACHE_SRC_DEFAULT = "gs://marin-eu-west4/tomat"
+# Target buckets we mirror the cache to so we have region-local data in
+# every zone iris might schedule us into. Avoids the "cross-region IO
+# halves MFU" problem when iris picks a zone we don't have cache in.
+# Map: bucket → zone(s) it serves.
+_CACHE_TARGETS = {
+    "gs://marin-us-central1/tomat": ["us-central1-a (v5p)"],
+    "gs://marin-us-east1/tomat":    ["us-east1-d (v6e)"],
+    "gs://marin-us-east5/tomat":    ["us-east5-a (v5p)", "us-east5-b (v6e)"],
+}
+
+
+@cache_grp.command("mirror")
+@click.option("-l", "--data-label", default="train-full-v3", help="data label whose cache to mirror")
+@click.option("-s", "--source", default=_CACHE_SRC_DEFAULT, show_default=True, help="canonical source bucket")
+@click.option("-t", "--targets", default=None, help="comma-separated target bucket prefixes (default: all known regional targets)")
+@click.option("--splits", default="train,validation", show_default=True, help="comma-separated split names under the cache root")
+@click.option("-d", "--dry-run", is_flag=True, help="print rsync commands without running")
+def cache_mirror(data_label: str, source: str, targets: str | None, splits: str, dry_run: bool):
+    """Mirror `<source>/cache/<data_label>/{split}/` to each target via `gsutil rsync`.
+
+    Idempotent — re-running skips files that already exist with matching size+md5.
+    Sizes are typically dominated by `<split>/input_ids/` (~50 GB for train-full-v3).
+    """
+    tgt_list = (
+        [t.strip() for t in targets.split(",") if t.strip()]
+        if targets else list(_CACHE_TARGETS.keys())
+    )
+    split_list = [s.strip() for s in splits.split(",") if s.strip()]
+    print(f"[cache mirror] data_label={data_label} source={source}")
+    for tgt in tgt_list:
+        note = _CACHE_TARGETS.get(tgt, ["(custom)"])
+        print(f"  → {tgt}  ({', '.join(note)})")
+    print(f"  splits: {split_list}")
+
+    for tgt in tgt_list:
+        for split in split_list:
+            src = f"{source}/cache/{data_label}/{split}/"
+            dst = f"{tgt}/cache/{data_label}/{split}/"
+            cmd = ["gsutil", "-m", "rsync", "-r", src, dst]
+            print()
+            print(f"# {src} → {dst}")
+            print(" ", " ".join(cmd))
+            if dry_run:
+                continue
+            r = subprocess.run(cmd)
+            if r.returncode != 0:
+                err(f"[FAIL] gsutil rsync rc={r.returncode}; aborting mirror")
+                sys.exit(r.returncode)
+
+
+@cache_grp.command("build")
+@click.option("-l", "--data-label", default="train-full-v3", help="data label whose cache to build")
+@click.option("--bucket", default=None, help=f"bucket where the cache should land (default: {GCS_BUCKET})")
+@click.option("--lmq-path", default=None, help="TOMAT_LMQ_PATH (default = {bucket}/codecs/lmq-v2-16k.npz)")
+@click.option("--cpu", default=16, type=int, help="iris --cpu")
+@click.option("--memory", default="64GB", show_default=True, help="iris --memory")
+@click.option("--zone", default=None, help="iris --zone (e.g. europe-west4-a); pin to keep the build local to the cache region.")
+@click.option("--region", default=None, help="iris --region (e.g. europe-west4).")
+@click.option("-e", "--env", "extra_env", multiple=True, help="extra env var KEY=VAL")
+@click.option("-d", "--dry-run", is_flag=True, help="print iris cmd without firing")
+def cache_build(
+    data_label: str,
+    bucket: str | None,
+    lmq_path: str | None,
+    cpu: int,
+    memory: str,
+    zone: str | None,
+    region: str | None,
+    extra_env: tuple[str, ...],
+    dry_run: bool,
+):
+    """Build a Levanter cache from tokenized parquets without burning TPU time.
+
+    Fires a CPU-only iris job that runs `train_tomat_tpu.py` with
+    `TOMAT_BUILD_CACHE_ONLY=1` — short-circuits before `train_lm_main`,
+    materializes `cache/<data_label>/{train,validation}/`, exits.
+
+    Use this once per (data_label, bucket) — chains naturally after the
+    Modal tokenize pipeline, decouples build from train, avoids the
+    "trainer dies mid-build and leaves the cache half-built" failure mode.
+    """
+    bucket = bucket or GCS_BUCKET
+    lmq_path = lmq_path or f"{bucket}/codecs/lmq-v2-16k.npz"
+    wandb_key = os.environ.get("WANDB_API_KEY", "<WANDB_API_KEY>")
+    job_name = f"cache-build-{data_label}-{bucket.rsplit('/', 1)[0].rsplit('-', 1)[-1]}"
+
+    env_vars: list[tuple[str, str]] = [
+        ("WANDB_API_KEY", wandb_key),
+        ("TOMAT_BUCKET", bucket),
+        ("TOMAT_LABEL", data_label),
+        ("TOMAT_RESULTS_LABEL", job_name),
+        ("TOMAT_MODEL", "200M"),       # only used to build the LmDataConfig; doesn't affect cache contents
+        ("TOMAT_STEPS", "1"),          # ditto
+        ("TOMAT_BATCH_SIZE", "128"),
+        ("TOMAT_SEED", "42"),
+        ("TOMAT_LMQ_PATH", lmq_path),
+        ("TOMAT_DENSITY_LOSS_TYPE", "emd"),
+        ("TOMAT_DENSITY_ONLY_LOSS", "1"),
+        ("TOMAT_LR", "3e-4"),
+        ("TOMAT_LR_SCHEDULE", "constant"),
+        ("TOMAT_WARMUP", "0.05"),
+        ("TOMAT_VAL_SEQS", "256"),
+        ("TOMAT_PROFILE", "0"),
+        ("TOMAT_GRADIENT_CHECKPOINTING", "1"),
+        ("TOMAT_CACHE_DIR", f"{bucket}/cache/{data_label}/"),
+        ("TOMAT_BUILD_CACHE_ONLY", "1"),
+        ("MARIN_I_WILL_PAY_FOR_ALL_FEES", "1"),
+    ]
+    for kv in extra_env:
+        if "=" not in kv:
+            err(f"--env {kv!r}: expected KEY=VAL")
+            sys.exit(1)
+        k, v = kv.split("=", 1)
+        env_vars.append((k, v))
+
+    cmd = [
+        "uv", "run", "iris", "--cluster=marin", "job", "run",
+        "--cpu", str(cpu), "--memory", memory,
+    ]
+    for z in (zone or "").split(","):
+        if z := z.strip():
+            cmd += ["--zone", z]
+    for r in (region or "").split(","):
+        if r := r.strip():
+            cmd += ["--region", r]
+    for k, v in env_vars:
+        cmd += ["--env-vars", k, v]
+    cmd += [
+        "--no-wait", "--no-terminate-on-exit",
+        "--job-name", job_name,
+        "--", "python", "train_tomat_tpu.py",
+    ]
+    if dry_run:
+        pretty = " ".join("'<WANDB_API_KEY>'" if a == wandb_key else a for a in cmd)
+        print(f"# {job_name} (cache-build only)")
+        print(f"  cd {MARIN_DIR}")
+        print(f"  {pretty}")
+        return
+    if wandb_key == "<WANDB_API_KEY>":
+        err("WANDB_API_KEY not set in env")
+        sys.exit(1)
+    r = subprocess.run(cmd, cwd=str(MARIN_DIR), capture_output=True, text=True)
+    if r.returncode != 0:
+        err(f"[FAIL launch {job_name}] rc={r.returncode}\n{r.stderr[-1000:]}")
+        sys.exit(r.returncode)
+    print(f"[launched cache-build {job_name} → {bucket}/cache/{data_label}/]")
+
+
 @cli.group("wb")
 def wb_grp():
     """Wandb GraphQL helpers: introspect, list projects, manipulate access."""
