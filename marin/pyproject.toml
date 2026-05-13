@@ -18,6 +18,9 @@ dependencies = [
     # eval_mat_nmae.py needs Zarr to read raw densities + pymatgen for structure parsing.
     "zarr>=3",
     "pymatgen",
+    # py-spy attaches via ptrace from a daemon thread when TOMAT_PYSPY=1.
+    # Zero overhead when unset.
+    "py-spy",
     # Always-install jax[tpu] on linux. Proper fix would be to mirror
     # tiny-stories' `dispatch_grug_training_run` pattern (coordinator → TPU
     # worker with --extra tpu), but for a direct `iris job run` this keeps

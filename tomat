@@ -1160,6 +1160,9 @@ def _latest_ckpt_step(run_label: str, bucket: str = GCS_BUCKET) -> int | None:
 @click.option("--shuffle-io-block-size", type=int, default=0, help="TOMAT_SHUFFLE_IO_BLOCK_SIZE; 0 = auto from meta (M)")
 @click.option("--share-cache/--no-share-cache", default=False, help="Share the levanter cache across runs over the same data (TOMAT_CACHE_DIR=gs://.../cache/<data_label>/). Default per-run for back-compat.")
 @click.option("--watch-preempts/--no-watch-preempts", default=True, help="auto-fire `tomat preempts watch <LABEL>` in the background after launch (default on)")
+@click.option("--pyspy/--no-pyspy", default=False, help="TOMAT_PYSPY=1 → trainer daemon-dumps py-spy stacks to GCS every TOMAT_PYSPY_INTERVAL s (default 60). Use for diagnosing host-side stalls (the 65s/step v5p issue).")
+@click.option("--pyspy-interval", default=60, type=int, help="TOMAT_PYSPY_INTERVAL seconds between py-spy dumps (default 60).")
+@click.option("--pyspy-record-seconds", default=0, type=int, help="TOMAT_PYSPY_RECORD_SECONDS > 0 switches from `py-spy dump` (text) to `py-spy record` (flame-graph SVG) of that length per cycle.")
 @click.option("-f", "--force", is_flag=True, help="allow from-scratch overwrite of existing results dir")
 @click.option("-d", "--dry-run", is_flag=True, help="print iris cmd without firing")
 @click.argument("label")
@@ -1192,6 +1195,9 @@ def train(
     shuffle_io_block_size: int,
     share_cache: bool,
     watch_preempts: bool,
+    pyspy: bool,
+    pyspy_interval: int,
+    pyspy_record_seconds: int,
     force: bool,
     dry_run: bool,
 ):
@@ -1274,6 +1280,11 @@ def train(
             env_vars.append(("TOMAT_SHUFFLE_IO_BLOCK_SIZE", str(shuffle_io_block_size)))
     if share_cache:
         env_vars.append(("TOMAT_CACHE_DIR", f"{bucket}/cache/{data_label}/"))
+    if pyspy:
+        env_vars.append(("TOMAT_PYSPY", "1"))
+        env_vars.append(("TOMAT_PYSPY_INTERVAL", str(pyspy_interval)))
+        if pyspy_record_seconds > 0:
+            env_vars.append(("TOMAT_PYSPY_RECORD_SECONDS", str(pyspy_record_seconds)))
     for kv in extra_env:
         if "=" not in kv:
             err(f"--env {kv!r}: expected KEY=VAL")

@@ -204,6 +204,72 @@ def _handle_sigterm(signum, _frame):
 
 
 _signal.signal(_signal.SIGTERM, _handle_sigterm)
+
+
+def _maybe_spawn_pyspy_daemon():
+    """If TOMAT_PYSPY=1, dump the trainer's Python stacks to GCS periodically.
+
+    Why: throughput/duration says JAX-side step is fast, but wall-clock is
+    much higher (~65 s/step on the v5p run that started this). Want to see
+    where the host process is during the gap. Uses `py-spy dump` (text
+    snapshot of current stacks across all threads), cheap enough to run
+    every TOMAT_PYSPY_INTERVAL seconds without disturbing training.
+
+    Output: `{BUCKET}/results/{results_label}/pyspy/{timestamp}.txt` so
+    Rafal / anyone else can grab them without ssh.
+    """
+    if os.environ.get("TOMAT_PYSPY") != "1":
+        return
+    interval = int(os.environ.get("TOMAT_PYSPY_INTERVAL", "60"))
+    duration = int(os.environ.get("TOMAT_PYSPY_RECORD_SECONDS", "0"))  # 0 = dumps only; >0 = `record` flame graphs of that length
+    bucket = os.environ.get("TOMAT_BUCKET", "gs://marin-eu-west4/tomat")
+    label = os.environ.get("TOMAT_RESULTS_LABEL") or os.environ.get("TOMAT_LABEL", "unknown")
+    out_prefix = f"{bucket}/results/{label}/pyspy"
+
+    import shutil
+    import subprocess as _sp
+    import threading
+    import time as _t
+    pyspy = shutil.which("py-spy")
+    if pyspy is None:
+        print("[pyspy] TOMAT_PYSPY=1 set but py-spy not on PATH; skipping")
+        return
+    pid = os.getpid()
+    print(f"[pyspy] enabled: pid={pid} interval={interval}s record={duration}s → {out_prefix}/")
+
+    def _loop():
+        while True:
+            ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            try:
+                if duration > 0:
+                    # Flame-graph SVG over a fixed window. `record` blocks
+                    # for the duration; that's fine — we're in a daemon
+                    # thread. Use `--idle` so blocked-on-IO frames show up.
+                    local = f"/tmp/pyspy-{label}-{ts}.svg"
+                    _sp.run(
+                        [pyspy, "record", "-p", str(pid), "-o", local, "-d", str(duration), "--idle"],
+                        check=False, capture_output=True, timeout=duration + 30,
+                    )
+                    remote = f"{out_prefix}/{ts}.svg"
+                else:
+                    # Text snapshot of all threads. Fast (<1 s).
+                    local = f"/tmp/pyspy-{label}-{ts}.txt"
+                    with open(local, "wb") as f:
+                        _sp.run(
+                            [pyspy, "dump", "-p", str(pid)],
+                            check=False, stdout=f, stderr=_sp.STDOUT, timeout=30,
+                        )
+                    remote = f"{out_prefix}/{ts}.txt"
+                # Upload to GCS via gsutil so Rafal/others can grab without ssh.
+                _sp.run(["gsutil", "-q", "cp", local, remote], check=False, timeout=120)
+                print(f"[pyspy] {remote}")
+            except Exception as e:
+                print(f"[pyspy] iteration failed: {e}")
+            _t.sleep(interval)
+
+    threading.Thread(target=_loop, name="pyspy-daemon", daemon=True).start()
+
+
 from levanter.data.text import (
     DatasetComponent,
     LmDataConfig,
@@ -237,6 +303,7 @@ MODEL_PRESETS = {
 
 
 def main():
+    _maybe_spawn_pyspy_daemon()
     label = os.environ.get("TOMAT_LABEL", "val-full")
     steps = int(os.environ.get("TOMAT_STEPS", "1000"))
     batch_size = int(os.environ.get("TOMAT_BATCH_SIZE", "128"))
