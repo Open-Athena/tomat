@@ -64,16 +64,43 @@ def _best_step(d: dict, key: str) -> tuple[int, float] | None:
 
 
 @click.command()
-@click.option("-o", "--out", required=True, type=click.Path(), help="output PNG path")
+@click.option("-o", "--out", default=None, type=click.Path(), help="output PNG path")
+@click.option("-j", "--json-out", default=None, type=click.Path(), help="also dump aggregated trajectory data as JSON (for the React TrajectoryPlot component).")
 @click.option("--title", default=None)
 @click.option("--annotate-best/--no-annotate-best", default=True,
               help="mark min-val-NEMD ckpt of each run with a star.")
 @click.option("--reference-lines/--no-reference-lines", default=True,
               help="draw vertical lines at Chinchilla-optimal step + 1-epoch boundary.")
 @click.argument("short_labels", nargs=-1, required=True)
-def main(out: str, title: str | None, annotate_best: bool, reference_lines: bool,
+def main(out: str | None, json_out: str | None, title: str | None, annotate_best: bool, reference_lines: bool,
          short_labels: tuple[str, ...]):
     runs = [load_run(lab) for lab in short_labels]
+    if json_out:
+        # Emit a compact, web-friendly shape: one entry per (run, split) with parallel arrays.
+        out_data: dict = {
+            "schema_version": 1,
+            "chinchilla_step": CHINCHILLA_STEP,
+            "epoch_step": EPOCH_STEP,
+            "runs": [],
+        }
+        for r in runs:
+            entry: dict = {"label": r["label"], "full": r["full"], "splits": {}}
+            for split in ("val", "train"):
+                d = r[split]
+                steps = sorted(d.keys())
+                entry["splits"][split] = {
+                    "steps": steps,
+                    "nmae": [d[s]["nmae"] for s in steps],
+                    "nemd": [d[s]["nemd"] for s in steps],
+                    "nmae_p99": [d[s].get("nmae_p99") for s in steps],
+                }
+            out_data["runs"].append(entry)
+        Path(json_out).parent.mkdir(parents=True, exist_ok=True)
+        with open(json_out, "w") as f:
+            json.dump(out_data, f, indent=1)
+        print(f"wrote {json_out}")
+        if not out:
+            return  # JSON-only mode
 
     fig, (ax_nmae, ax_nemd) = plt.subplots(2, 1, figsize=(12, 9), sharex=True)
     colors = plt.cm.tab10(np.linspace(0, 1, len(runs)))
