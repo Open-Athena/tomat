@@ -743,6 +743,65 @@ def _parent_jids_matching(substr: str) -> list[str]:
     return matches
 
 
+def _walk_pools(node, parent_name=None):
+    """Yield `{name, status, ready, reason, counts}` for every autoscaler pool."""
+    if isinstance(node, dict):
+        nm = node.get("name", parent_name)
+        if "availability_status" in node:
+            counts = node.get("slice_state_counts") or {}
+            yield {
+                "name": nm,
+                "status": node.get("availability_status"),
+                "ready": counts.get("ready", 0),
+                "counts": counts,
+                "reason": (node.get("availability_reason") or "").strip(),
+            }
+        for v in node.values():
+            yield from _walk_pools(v, nm)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _walk_pools(v, parent_name)
+
+
+@iris_grp.command("avail")
+@click.option("-a", "--all", "show_all", is_flag=True, help="show every pool, including empty/`available` ones")
+@click.option("-j", "--json", "as_json", is_flag=True, help="emit JSON instead of the human table")
+@click.option("-t", "--tpu", default=None, help="substring filter on pool name (e.g. 'v5p', 'v6e', 'v4-')")
+def iris_avail(show_all: bool, as_json: bool, tpu: str | None):
+    """Show TPU pool availability via `iris rpc controller get-autoscaler-status`.
+
+    Default view: pools with non-zero `ready` slices or a non-`available`
+    status (quota_exceeded, backoff, requesting, cooldown). Use `-a` for the
+    full dump (~150 pools).
+    """
+    cmd = ["uv", "run", "iris", "--cluster=marin", "rpc", "controller", "get-autoscaler-status"]
+    r = subprocess.run(cmd, cwd=str(MARIN_DIR), capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        err(f"iris rpc failed: rc={r.returncode}\n{r.stderr}")
+        sys.exit(r.returncode)
+    out = strip_iris_log(r.stdout).strip()
+    data = json.loads(out)
+    pools = [p for p in _walk_pools(data) if p["name"]]
+    if tpu:
+        pools = [p for p in pools if tpu in p["name"]]
+    pools.sort(key=lambda p: (p["status"] != "available", -p["ready"], p["name"]))
+
+    def interesting(p):
+        return show_all or p["ready"] > 0 or p["status"] != "available"
+
+    pools = [p for p in pools if interesting(p)]
+    if as_json:
+        print(json.dumps(pools, indent=1, default=str))
+        return
+    if not pools:
+        print("(no pools matched)")
+        return
+    print(f"{'STATUS':18s}  {'READY':>5s}  POOL")
+    for p in pools:
+        suffix = f"  {p['reason'][:50]}" if p["reason"] else ""
+        print(f"{p['status']:18s}  {p['ready']:>5d}  {p['name']}{suffix}")
+
+
 @iris_grp.command("ls")
 @click.option("-f", "--filter", "filter_re", default=None, help="extra regex filter on job line")
 @click.option("-s", "--state", default=None, help="filter by state (running, failed, ...)")
