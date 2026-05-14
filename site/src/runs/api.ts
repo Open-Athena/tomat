@@ -66,3 +66,34 @@ export async function fetchManifest(runId: string): Promise<RunManifest> {
 export function parquetUrl(runId: string): string {
   return `${API_BASE}/api/runs/${encodeURIComponent(runId)}/raw.parquet`
 }
+
+export interface IrisJob {
+  state: string
+  state_code: number
+  preempts: number
+  failures: number
+  error: string | null
+  exit_code: number | null
+  submitted_at_ms: number | null
+  started_at_ms: number | null
+  finished_at_ms: number | null
+  num_tasks: number
+}
+
+export interface IrisState {
+  schema_version: number
+  synced_at: string
+  count: number
+  jobs: Record<string, IrisJob>
+}
+
+export async function fetchIrisState(): Promise<IrisState> {
+  const r = await fetch(`${API_BASE}/api/iris-state.json`)
+  if (!r.ok) throw new Error(`fetchIrisState ${r.status}`)
+  return r.json()
+}
+
+/** wandb run name → iris job id. Our convention: iris job is `/ryan/<name>`. */
+export function irisJobIdForRun(runName: string): string {
+  return `/ryan/${runName}`
+}

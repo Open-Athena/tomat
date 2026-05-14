@@ -34,6 +34,7 @@ Conventions:
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -800,6 +801,86 @@ def iris_avail(show_all: bool, as_json: bool, tpu: str | None):
     for p in pools:
         suffix = f"  {p['reason'][:50]}" if p["reason"] else ""
         print(f"{p['status']:18s}  {p['ready']:>5d}  {p['name']}{suffix}")
+
+
+# iris job-state codes (from marin/lib/iris/docs/task-states.md).
+_IRIS_JOB_STATE = {
+    1: "PENDING",
+    2: "BUILDING",
+    3: "RUNNING",
+    4: "SUCCEEDED",
+    5: "FAILED",
+    6: "KILLED",
+    7: "WORKER_FAILED",
+    8: "UNSCHEDULABLE",
+}
+
+
+def _iris_query_json(sql: str, timeout: int = 60) -> list[dict]:
+    """Run a controller SQL query and parse the JSON result."""
+    cmd = ["uv", "run", "iris", "--cluster=marin", "query", sql, "-f", "json"]
+    r = subprocess.run(cmd, cwd=str(MARIN_DIR), capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        err(f"iris query failed: rc={r.returncode}\n{r.stderr[-500:]}")
+        sys.exit(r.returncode)
+    return json.loads(strip_iris_log(r.stdout).strip())
+
+
+@iris_grp.command("sync")
+@click.option("-b", "--bucket", default=R2_BUCKET, help="R2 bucket")
+@click.option("-k", "--key", default="tomat/iris-state.json", help="R2 key")
+@click.option("-l", "--limit", default=200, type=int, help="how many recent /ryan/* jobs to include")
+@click.option("-d", "--dry-run", is_flag=True, help="print the JSON without uploading")
+def iris_sync(bucket: str, key: str, limit: int, dry_run: bool):
+    """Snapshot iris job state for our recent /ryan/* parent jobs → R2.
+
+    Powers the iris-state column on tomat.oa.dev/runs. Manual invocation
+    for now; consider `watch -n 60 tomat iris sync` while babysitting
+    a fleet of training jobs, or cron from a small GCE box later.
+    """
+    sql = f"""
+        SELECT
+          j.job_id, j.name, j.state, j.error, j.exit_code,
+          j.submitted_at_ms, j.started_at_ms, j.finished_at_ms,
+          j.num_tasks,
+          COALESCE(MAX(t.preemption_count), 0) AS preempts,
+          COALESCE(MAX(t.failure_count), 0)    AS failures
+        FROM jobs j
+        LEFT JOIN tasks t ON t.job_id = j.job_id
+        WHERE j.job_id LIKE '/ryan/%' AND (j.parent_job_id IS NULL OR j.parent_job_id = '')
+        GROUP BY j.job_id
+        ORDER BY j.submitted_at_ms DESC
+        LIMIT {limit}
+    """
+    rows = _iris_query_json(sql)
+    jobs: dict[str, dict] = {}
+    for row in rows:
+        state_code = int(row.get("state") or 0)
+        jobs[row["job_id"]] = {
+            "state": _IRIS_JOB_STATE.get(state_code, f"UNKNOWN_{state_code}"),
+            "state_code": state_code,
+            "preempts": int(row.get("preempts") or 0),
+            "failures": int(row.get("failures") or 0),
+            "error": row.get("error") or None,
+            "exit_code": row.get("exit_code"),
+            "submitted_at_ms": int(row["submitted_at_ms"]) if row.get("submitted_at_ms") else None,
+            "started_at_ms": int(row["started_at_ms"]) if row.get("started_at_ms") else None,
+            "finished_at_ms": int(row["finished_at_ms"]) if row.get("finished_at_ms") else None,
+            "num_tasks": int(row.get("num_tasks") or 0),
+        }
+    payload = {
+        "schema_version": 1,
+        "synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "count": len(jobs),
+        "jobs": jobs,
+    }
+    data = json.dumps(payload, indent=1).encode("utf-8")
+    print(f"[iris sync] {len(jobs)} jobs → s3://{bucket}/{key} ({len(data)} bytes)")
+    if dry_run:
+        print(data.decode())
+        return
+    _r2_put_bytes(bucket, key, data, "application/json")
+    print(f"[iris sync] {R2_ENDPOINT}/{bucket}/{key}")
 
 
 @iris_grp.command("ls")

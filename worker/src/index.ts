@@ -149,6 +149,11 @@ export default {
 			return jsonResponse({ runs, count: runs.length }, env);
 		}
 
+		if (path === '/api/iris-state.json') {
+			// Static R2 object updated out-of-band by `tomat iris sync`.
+			return serveR2Object(req, env, 'tomat/iris-state.json');
+		}
+
 		// /api/runs/:id/<file>
 		const runFileMatch = path.match(/^\/api\/runs\/([^/]+)\/(raw\.parquet|manifest\.json)$/);
 		if (runFileMatch) {

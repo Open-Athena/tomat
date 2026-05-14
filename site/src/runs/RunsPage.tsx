@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import { fetchManifest, fetchRuns, parquetUrl } from './api'
-import type { RunManifest } from './api'
+import { fetchIrisState, fetchManifest, fetchRuns, irisJobIdForRun, parquetUrl } from './api'
+import type { IrisJob, IrisState, RunManifest } from './api'
 import { fetchRunHistory } from './parquet'
 import type { RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
@@ -23,14 +23,47 @@ export function RunsPage({ parts }: Props) {
   return runId ? <RunDetail runId={runId} /> : <RunsIndex />
 }
 
+const IRIS_STATE_STYLES: Record<string, { bg: string; fg: string }> = {
+  RUNNING:       { bg: '#22863a', fg: '#fff' },
+  PENDING:       { bg: '#d4a017', fg: '#fff' },
+  BUILDING:      { bg: '#d4a017', fg: '#fff' },
+  SUCCEEDED:     { bg: '#0366d6', fg: '#fff' },
+  FAILED:        { bg: '#cb2431', fg: '#fff' },
+  KILLED:        { bg: '#6a737d', fg: '#fff' },
+  WORKER_FAILED: { bg: '#cb2431', fg: '#fff' },
+  UNSCHEDULABLE: { bg: '#cb2431', fg: '#fff' },
+}
+
+function IrisBadge({ job }: { job: IrisJob }) {
+  const style = IRIS_STATE_STYLES[job.state] ?? { bg: '#888', fg: '#fff' }
+  const tail = job.preempts > 0 || job.failures > 0
+    ? ` (p=${job.preempts}, f=${job.failures})` : ''
+  return (
+    <span
+      title={job.error || `iris state=${job.state} preempts=${job.preempts} failures=${job.failures}`}
+      style={{
+        backgroundColor: style.bg, color: style.fg,
+        padding: '1px 6px', borderRadius: 3,
+        fontSize: '0.75rem', fontFamily: 'monospace',
+      }}
+    >
+      {job.state}{tail}
+    </span>
+  )
+}
+
 function RunsIndex() {
   const [runs, setRuns] = useState<string[] | null>(null)
+  const [iris, setIris] = useState<IrisState | null>(null)
   const [err, setErr] = useState<string | null>(null)
 
   useEffect(() => {
     fetchRuns()
       .then((r) => setRuns(r.runs))
       .catch((e) => setErr(String(e)))
+    fetchIrisState()
+      .then(setIris)
+      .catch(() => {}) // soft-fail; iris-state is optional info
   }, [])
 
   return (
@@ -38,31 +71,39 @@ function RunsIndex() {
       <h1>tomat runs</h1>
       <p style={{ color: '#666' }}>
         Synced from wandb (PrinceOA/tomat-lmq-P19) → R2 via{' '}
-        <code>tomat runs sync</code>. See{' '}
+        <code>tomat runs sync</code>. iris state via{' '}
+        <code>tomat iris sync</code>. See{' '}
         <a href="https://github.com/Open-Athena/tomat/blob/main/specs/23-runs-dashboard.md">
           spec
         </a>
         .
+        {iris && <span style={{ marginLeft: 8 }}>
+          iris snapshot: {new Date(iris.synced_at).toLocaleString()}
+        </span>}
       </p>
       {err && <p style={{ color: 'crimson' }}>error: {err}</p>}
       {!runs && !err && <p>loading…</p>}
       {runs && runs.length === 0 && <p>(none synced yet)</p>}
       {runs && runs.length > 0 && (
-        <ul>
-          {runs.map((id) => (
-            <li key={id}>
-              <a
-                href={`#/runs/${id}`}
-                onClick={(e) => {
-                  if (isModifiedClick(e)) return
-                  e.preventDefault()
-                  navigate(`runs/${id}`)
-                }}
-              >
-                {id}
-              </a>
-            </li>
-          ))}
+        <ul style={{ listStyle: 'none', padding: 0 }}>
+          {runs.map((id) => {
+            const job = iris?.jobs[irisJobIdForRun(id)]
+            return (
+              <li key={id} style={{ marginBottom: '0.3rem' }}>
+                {job && <IrisBadge job={job} />}{' '}
+                <a
+                  href={`#/runs/${id}`}
+                  onClick={(e) => {
+                    if (isModifiedClick(e)) return
+                    e.preventDefault()
+                    navigate(`runs/${id}`)
+                  }}
+                >
+                  {id}
+                </a>
+              </li>
+            )
+          })}
         </ul>
       )}
     </div>
