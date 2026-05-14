@@ -636,7 +636,11 @@ def main():
     checkpointer = CheckpointerConfig(
         base_path=f"{BUCKET}/results/{results_label}/checkpoints",
         save_interval=timedelta(minutes=10),
-        keep=[{"every": 1000}],
+        # Retain every-1000 ckpts long-term + every-100 for recent-resume.
+        # Prior `keep=[{"every": 1000}]` lost the v5p smoke (step 588) when
+        # a preempt cascade killed the job before reaching step 1000.
+        # Save itself runs every 10 min regardless; this is retention-only.
+        keep=[{"every": 100, "until": 1000}, {"every": 1000}],
     )
 
     # Eval cadence: if val is on, every steps // 4 by default (so 4 evals in a
