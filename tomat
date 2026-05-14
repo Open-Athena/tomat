@@ -1214,6 +1214,7 @@ def _latest_ckpt_step(run_label: str, bucket: str = GCS_BUCKET) -> int | None:
 @click.option("--density-only/--density-add", default=True, help="TOMAT_DENSITY_ONLY_LOSS")
 @click.option("--cpu", default=32, type=int, help="iris --cpu")
 @click.option("--memory", default="64GB", help="iris --memory")
+@click.option("--max-retries", default=20, show_default=True, type=int, help="iris --max-retries (failure budget; iris default is 0, which classifies JAX-distributed leader-preempt cascades as fatal failures. 20 buys us ~20 sibling-cascade survivals before terminal.)")
 @click.option("-e", "--env", "extra_env", multiple=True, help="extra env var KEY=VAL (repeatable)")
 @click.option("--shuffle-window-blocks", type=int, default=0, help="TOMAT_SHUFFLE_WINDOW_BLOCKS; 0 = no shuffle (default), >0 = BlockShuffle window radius")
 @click.option("--shuffle-io-block-size", type=int, default=0, help="TOMAT_SHUFFLE_IO_BLOCK_SIZE; 0 = auto from meta (M)")
@@ -1249,6 +1250,7 @@ def train(
     density_only: bool,
     cpu: int,
     memory: str,
+    max_retries: int,
     extra_env: tuple[str, ...],
     shuffle_window_blocks: int,
     shuffle_io_block_size: int,
@@ -1357,6 +1359,7 @@ def train(
         "uv", "run", "iris", "--cluster=marin", "job", "run",
         "--tpu", tpu, "--enable-extra-resources",
         "--cpu", str(cpu), "--memory", memory,
+        "--max-retries", str(max_retries),
     ]
     for z in (zone or "").split(","):
         if z := z.strip():
