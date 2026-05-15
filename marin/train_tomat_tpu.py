@@ -614,6 +614,11 @@ def main():
     # W&B conventions mirror the Modal side so filters/overlays are consistent.
     trackers = (
         WandbConfig(
+            # New TPU runs go to OA's corporate team. Resumes of pre-2026-05-15
+            # runs in PrinceOA will keep landing there (wandb resume=allow honors
+            # the run's original entity if `id` already exists). Override via
+            # TOMAT_WANDB_ENTITY env if needed (e.g. local-only smokes).
+            entity=os.environ.get("TOMAT_WANDB_ENTITY", "open-athena"),
             id=run_id,
             resume="allow",
             project=f"tomat-{meta['density_codec_name']}-P{meta['patch_size']}",
@@ -640,7 +645,11 @@ def main():
         # Prior `keep=[{"every": 1000}]` lost the v5p smoke (step 588) when
         # a preempt cascade killed the job before reaching step 1000.
         # Save itself runs every 10 min regardless; this is retention-only.
-        keep=[{"every": 100, "until": 1000}, {"every": 1000}],
+        # NOTE: Levanter's CheckpointerConfig.__post_init__ does
+        # `interval["until"]` (not `.get`), so the trailing/unbounded entry
+        # MUST include `"until": None` explicitly — omitting it raises
+        # KeyError at task startup. See marin/lib/levanter/.../checkpoint.py:1076.
+        keep=[{"every": 100, "until": 1000}, {"every": 1000, "until": None}],
     )
 
     # Eval cadence: if val is on, every steps // 4 by default (so 4 evals in a
