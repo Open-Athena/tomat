@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { Tooltip } from '../Tooltip'
-import { fetchIrisState, fetchManifest, fetchRuns, irisJobIdForRun, parquetUrl } from './api'
-import type { IrisJob, RunManifest } from './api'
+import { evalJobsByRun, evalPhase, fetchIrisState, fetchManifest, fetchRuns, irisJobIdForRun, parquetUrl } from './api'
+import type { EvalJob, IrisJob, RunManifest } from './api'
 import { fetchRunHistory } from './parquet'
 import type { RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
@@ -262,6 +262,37 @@ function StatusDots({ job, manifest, incomplete, lastLogTs }: {
   )
 }
 
+// ── m-eval jobs ─────────────────────────────────────────────────────────────
+// m-eval (mat-NMAE) jobs are iris jobs named `tomat-eval-<run>-<set>-step-<N>`;
+// `evalJobsByRun` (api.ts) groups them per run. The chip surfaces only the
+// actionable states — in-flight or failed. Once every eval has finished, the
+// MT/MV numbers themselves are the signal, so the chip hides.
+function EvalChip({ jobs }: { jobs: EvalJob[] }) {
+  if (jobs.length === 0) return null
+  let flight = 0, failed = 0, done = 0
+  for (const ej of jobs) {
+    const p = evalPhase(ej.job)
+    if (p === 'flight') flight++
+    else if (p === 'failed') failed++
+    else done++
+  }
+  if (flight === 0 && failed === 0) return null
+  const label = flight > 0
+    ? `⏳ ${flight} m-eval${flight > 1 ? 's' : ''}`
+    : `⚠ ${failed} m-eval${failed > 1 ? 's' : ''} failed`
+  return (
+    <Tooltip content={`${jobs.length} m-eval job(s): ${flight} in flight · ${done} done · ${failed} failed`}>
+      <span style={{
+        backgroundColor: flight > 0 ? '#d4a017' : '#cb2431', color: '#fff',
+        padding: '1px 6px', borderRadius: 3,
+        fontSize: '0.75rem', fontFamily: 'monospace',
+      }}>
+        {label}
+      </span>
+    </Tooltip>
+  )
+}
+
 // Parse run name into structured fields. Tolerant of unknown patterns: anything
 // we can't recognize lands in `extra`.
 interface RunMeta {
@@ -330,6 +361,7 @@ interface RunCardData {
   manifest: RunManifest | null
   job: IrisJob | null
   history: RunHistory | null
+  evalJobs: EvalJob[]
   color: string
   err: string | null
 }
@@ -344,7 +376,7 @@ interface CardProps {
 }
 
 function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTargetRef }: CardProps) {
-  const { id, manifest, job, history, color, err } = data
+  const { id, manifest, job, history, evalJobs, color, err } = data
   // `color` matches the run's timeline-plot trace. Used as a left accent bar
   // (and active-state border) so the card is visually tied to its plot line.
   const isActive = activeRunId === id
@@ -393,7 +425,10 @@ function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTar
   const trainLoss = manifest?.summary['train/loss']
   const evalLoss = manifest?.summary['eval/loss']
   const mfu = manifest?.summary['throughput/mfu']
-  const matNmae = manifest?.summary['eval/mat_nmae/val_200/mean']
+  // MT/MV — latest mat-NMAE on the {train,val}_200 snapshots. Stored already
+  // as a percentage (cont7k-ext logs 1.73 = 1.73%), so display as-is — no ×100.
+  const mtNmae = manifest?.summary['eval/mat_nmae/train_200/mean']
+  const mvNmae = manifest?.summary['eval/mat_nmae/val_200/mean']
 
   const sparkPts = useMemo(() => history ? recentStepPoints(history) : [], [history])
   const lastTs = sparkPts.length > 0 ? sparkPts[sparkPts.length - 1].x : null
@@ -504,6 +539,7 @@ function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTar
               </a>
             </Tooltip>
           )}
+          <EvalChip jobs={evalJobs} />
         </div>
         <div style={{ marginTop: '0.4rem', fontSize: '0.8rem', color: '#ccc',
                       display: 'flex', flexWrap: 'wrap', gap: '0.4rem 0.9rem' }}>
@@ -598,7 +634,8 @@ function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTar
           {typeof trainLoss === 'number' && <>tr {trainLoss.toFixed(3)}</>}
           {typeof evalLoss === 'number' && <> · ev {evalLoss.toFixed(3)}</>}
           {typeof mfu === 'number' && <> · MFU {mfu.toFixed(1)}%</>}
-          {typeof matNmae === 'number' && <> · NMAE {(matNmae * 100).toFixed(2)}%</>}
+          {typeof mtNmae === 'number' && <> · MT {mtNmae.toFixed(2)}%</>}
+          {typeof mvNmae === 'number' && <> · MV {mvNmae.toFixed(2)}%</>}
         </div>
       </div>
     </div>
@@ -734,6 +771,8 @@ function RunsIndex() {
   })
 
   const iris = irisQ.data ?? null
+  // m-eval jobs grouped by the run they evaluate (parsed from iris job names).
+  const evalByRun = useMemo(() => evalJobsByRun(iris ?? undefined), [iris])
   const err = runsQ.error ? String(runsQ.error) : null
   // One card per visible run, assembled from the per-run queries; each field
   // fills in as its query resolves. A failed history fetch is non-fatal (the
@@ -746,6 +785,7 @@ function RunsIndex() {
           manifest: manifestQs[idx]?.data ?? null,
           job: iris?.jobs[irisJobIdForRun(id)] ?? null,
           history: historyQs[idx]?.data ?? null,
+          evalJobs: evalByRun.get(id) ?? [],
           color: colorForIndex(idx),
           err: mqErr ? String(mqErr) : null,
         }
@@ -943,6 +983,61 @@ function StickyActiveBanner({
   )
 }
 
+// ── run-detail: m-eval jobs table ───────────────────────────────────────────
+const EVAL_PHASE_COLOR: Record<string, string> = {
+  flight: DOT.amber, done: DOT.blue, failed: DOT.red,
+}
+
+/** iris-dashboard URL for a job id (`/ryan/<job>`) — the marin-eng share form. */
+function irisJobUrl(jobId: string): string {
+  return `https://iris.oa.dev/#/job/${encodeURIComponent(jobId)}`
+}
+
+// One row per checkpoint step, a cell per mat-set — each cell the eval job's
+// iris state, linked to its iris-dashboard page.
+function EvalJobsTable({ jobs }: { jobs: EvalJob[] }) {
+  const steps = [...new Set(jobs.map((j) => j.step))].sort((a, b) => a - b)
+  const sets = ['val_200', 'train_200']
+  const cell: React.CSSProperties = {
+    padding: '3px 14px 3px 0', textAlign: 'left',
+  }
+  return (
+    <div style={{ marginBottom: '1.4rem' }}>
+      <h2 style={{ fontSize: '1rem', marginBottom: '0.3rem' }}>
+        m-eval jobs ({jobs.length})
+      </h2>
+      <table style={{ borderCollapse: 'collapse', fontSize: '0.8rem',
+                      fontFamily: 'monospace' }}>
+        <thead>
+          <tr style={{ color: '#888' }}>
+            <th style={cell}>step</th>
+            {sets.map((s) => <th key={s} style={cell}>{s}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {steps.map((step) => (
+            <tr key={step}>
+              <td style={cell}>{step.toLocaleString()}</td>
+              {sets.map((set) => {
+                const ej = jobs.find((j) => j.step === step && j.matSet === set)
+                if (!ej) return <td key={set} style={{ ...cell, color: '#555' }}>–</td>
+                return (
+                  <td key={set} style={cell}>
+                    <a href={irisJobUrl(ej.jobId)} target="_blank" rel="noreferrer"
+                       style={{ color: EVAL_PHASE_COLOR[evalPhase(ej.job)] }}>
+                      {ej.job.state.toLowerCase()}
+                    </a>
+                  </td>
+                )
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
 function RunDetail({ runId }: { runId: string }) {
   // Same query keys as RunsIndex, so arriving from the index renders the
   // cached manifest/history instantly while a fresh fetch runs underneath.
@@ -956,8 +1051,15 @@ function RunDetail({ runId }: { runId: string }) {
     queryFn: () => fetchRunHistory(parquetUrl(runId)),
     refetchInterval: REFETCH_MS.history,
   })
+  const irisQ = useQuery({
+    queryKey: ['iris'], queryFn: fetchIrisState, refetchInterval: REFETCH_MS.iris,
+  })
   const manifest = manifestQ.data ?? null
   const history = historyQ.data ?? null
+  const evalJobs = useMemo(
+    () => evalJobsByRun(irisQ.data ?? undefined).get(runId) ?? [],
+    [irisQ.data, runId],
+  )
   const errObj = manifestQ.error || historyQ.error
   const err = errObj ? String(errObj) : null
 
@@ -987,6 +1089,7 @@ function RunDetail({ runId }: { runId: string }) {
           <a href={manifest.run.url} target="_blank" rel="noreferrer">wandb ↗</a>
         </div>
       )}
+      {evalJobs.length > 0 && <EvalJobsTable jobs={evalJobs} />}
       {!history && !err && <p>loading parquet…</p>}
       {history && <WallclockPlot history={history} runId={runId} />}
     </div>

@@ -97,3 +97,53 @@ export async function fetchIrisState(): Promise<IrisState> {
 export function irisJobIdForRun(runName: string): string {
   return `/ryan/${runName}`
 }
+
+/**
+ * An m-eval (mat-NMAE) job — an iris job that evaluates one checkpoint of one
+ * run against one mat-set. `tomat evals fire` names them
+ * `tomat-eval-<run_label>-<mat_set>-step-<N>`, so the name fully encodes which
+ * run + checkpoint + split the job evaluates.
+ */
+export interface EvalJob {
+  runLabel: string
+  matSet: string  // 'val_200' | 'train_200'
+  step: number
+  jobId: string
+  job: IrisJob
+}
+
+const EVAL_JOB_RE = /^\/ryan\/tomat-eval-(.+)-(val_200|train_200)-step-(\d+)$/
+
+/** Group the iris snapshot's m-eval jobs by the run they evaluate. */
+export function evalJobsByRun(iris: IrisState | undefined): Map<string, EvalJob[]> {
+  const byRun = new Map<string, EvalJob[]>()
+  if (!iris) return byRun
+  for (const [jobId, job] of Object.entries(iris.jobs)) {
+    const m = EVAL_JOB_RE.exec(jobId)
+    if (!m) continue
+    const [, runLabel, matSet, stepStr] = m
+    const arr = byRun.get(runLabel) ?? []
+    arr.push({ runLabel, matSet, step: Number(stepStr), jobId, job })
+    byRun.set(runLabel, arr)
+  }
+  for (const arr of byRun.values()) {
+    arr.sort((a, b) => a.step - b.step || a.matSet.localeCompare(b.matSet))
+  }
+  return byRun
+}
+
+export type EvalPhase = 'flight' | 'done' | 'failed'
+
+/** Coarse lifecycle bucket for an m-eval job's iris state. */
+export function evalPhase(job: IrisJob): EvalPhase {
+  switch (job.state) {
+    case 'SUCCEEDED':
+      return 'done'
+    case 'FAILED':
+    case 'WORKER_FAILED':
+    case 'CANCELLED':
+      return 'failed'
+    default:  // QUEUED, RUNNING, PENDING, SUBMITTED, UNKNOWN, …
+      return 'flight'
+  }
+}
