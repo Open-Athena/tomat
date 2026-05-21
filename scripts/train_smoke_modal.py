@@ -67,11 +67,16 @@ image = (
         "'jax[cuda12]' 'pyarrow>=15' fsspec",
     )
     .add_local_python_source("tomat")
+    # marin/ contains qwen3_density (density-loss config used for real
+    # tomat training); iris bundles it flat on TPU, here we mount it as a
+    # proper package so `from marin.qwen3_density import ...` works.
+    .add_local_python_source("marin")
 )
 
 app = modal.App("tomat-train-smoke", image=image)
 volume = modal.Volume.from_name(VOLUME_NAME)
 wandb_secret = modal.Secret.from_name("wandb-credentials")
+gcp_secret = modal.Secret.from_name("tomat-gcp-sa")  # for reading LMQ codec from gs://
 
 
 @app.function(gpu="A100", volumes={MOUNT: volume}, secrets=[wandb_secret], timeout=28800)  # 8h (5k bs=32 at 3.2 s/step ≈ 4.4 h; leaves slack)
@@ -416,6 +421,9 @@ def _train_bakeoff_impl(
     parquet_root: str,
     gradient_checkpointing: bool = True,
     compute_dtype: str = "bfloat16",  # match TPU recipe; FP32 was the v1 trap
+    lmq_path: str | None = None,  # gs://...codec.npz; enables EMD-density loss
+    density_loss_type: str = "emd",  # "emd" (W₁) or "l1" (legacy)
+    density_only: bool = True,
 ) -> dict:
     """200M-or-other preset training body for the bakeoff probe.
 
@@ -425,10 +433,18 @@ def _train_bakeoff_impl(
     machinery off — we want clean MFU numbers without TaggedEvaluator
     side effects. Also exposes ``gradient_checkpointing`` and
     ``compute_dtype`` knobs for the v2 sweep.
+
+    When ``lmq_path`` is provided, mirrors train_tomat_tpu.py's
+    density-loss wiring: loads the LMQ codec, builds density_loss_args,
+    runs configure_density_loss, and swaps Qwen3Config →
+    Qwen3DensityConfig. This is what real (non-MFU-probe) training
+    needs.
     """
     import json
+    import os
     import jax.numpy as jnp
     import jmp
+    import numpy as np
     from levanter.data.text import (
         DatasetComponent,
         LmDataConfig,
@@ -444,6 +460,22 @@ def _train_bakeoff_impl(
     from levanter.tracker.json_logger import JsonLoggerConfig
     from levanter.tracker.wandb import WandbConfig
     from levanter.trainer import TrainerConfig
+
+    # Write GCP service-account JSON from env to a file + point ADC at it.
+    # No-op if the secret isn't in env (e.g. tests).
+    sa_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    if sa_json:
+        sa_path = "/tmp/gcp-sa.json"
+        with open(sa_path, "w") as f:
+            f.write(sa_json)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = sa_path
+
+    # Install gcsfs at runtime (skipped in image build because adding it to the
+    # image-level pip line busts the layer cache and re-resolves the marin-*
+    # wheels — currently broken on the latest tags with a version cycle).
+    # ~5-10s; needed for the gs:// codec read *and* GCS checkpoint writes.
+    import subprocess
+    subprocess.run(["pip", "install", "--quiet", "gcsfs"], check=True)
 
     train_volume.reload()
 
@@ -476,7 +508,53 @@ def _train_bakeoff_impl(
     )
 
     preset = MODEL_PRESETS[model_preset]
-    model = Qwen3Config(
+    if lmq_path:
+        # Mirror train_tomat_tpu.py:523-600 density-loss setup.
+        from marin.qwen3_density import (
+            Qwen3DensityConfig,
+            build_density_loss_args,
+            configure_density_loss,
+        )
+        import fsspec
+        with fsspec.open(lmq_path, "rb") as f:
+            codec_data = np.load(f, allow_pickle=True)
+            codec_boundaries = np.asarray(codec_data["boundaries"], dtype=np.float32)
+            codec_recon = np.asarray(codec_data["recon_points"], dtype=np.float32)
+            codec_clip = float(codec_data["clip_max"])
+
+        # Compute density vocab offset per PatchVocab layout
+        # (specials=18, atoms=118, ints=1024, pos=pos_total, density=n_bins).
+        n_specials = 18
+        n_atoms = 118
+        n_ints = 1024
+        pc = meta["vocab"]["position_codec"]
+        p_mag = pc["token_mag_bits"]
+        pos_signed_vocabs = tuple((2 if i == 0 else 1) << b for i, b in enumerate(p_mag))
+        pos_total = sum(pos_signed_vocabs)
+        density_offset = n_specials + n_atoms + n_ints + pos_total
+        n_density_bins = len(codec_recon)
+
+        import haliax as hax
+        Vocab = hax.Axis("vocab", vocab_size)
+        penalty = 10.0 * float(codec_recon.max())
+        density_loss_args = build_density_loss_args(
+            Vocab=Vocab,
+            density_offset=density_offset,
+            n_density_bins=n_density_bins,
+            codec_recon=codec_recon,
+            penalty=penalty,
+            weight=1.0,
+            mode="add",
+            loss_type=density_loss_type,
+            density_only=density_only,
+        )
+        configure_density_loss(density_loss_args)
+        err(f"[bakeoff] density loss: type={density_loss_type} only={density_only} "
+            f"offset={density_offset} bins={n_density_bins} penalty={penalty:.3f}")
+        model_config_cls = Qwen3DensityConfig
+    else:
+        model_config_cls = Qwen3Config
+    model = model_config_cls(
         max_seq_len=8192,
         rope=Llama3RotaryEmbeddingsConfig(),
         tie_word_embeddings=True,
@@ -489,6 +567,7 @@ def _train_bakeoff_impl(
     run_id = f"{results_label}-bs{batch_size}-seed{seed}"
     trackers = (
         WandbConfig(
+            entity="open-athena",  # corporate team; new tomat runs go here.
             id=run_id, resume="allow",
             project=project, group=group,
             tags=["bakeoff", "modal", f"model{model_preset}",
@@ -497,8 +576,13 @@ def _train_bakeoff_impl(
         ),
         JsonLoggerConfig(),
     )
+    # Checkpoints → GCS, not the Modal volume: durable across abrupt container
+    # death (a volume only persists writes on a clean exit / explicit commit),
+    # and readable by the NMAE eval watchdog without Modal-volume access. Same
+    # `<results>/<RL>/checkpoints/<run_id>/step-N` layout the TPU runs use.
+    ckpt_base = f"gs://marin-eu-west4/tomat/results/{results_label}/checkpoints"
     checkpointer = CheckpointerConfig(
-        base_path=f"{results_dir}/checkpoints",
+        base_path=ckpt_base,
         save_interval=timedelta(minutes=10),
         keep=[{"every": 1000}],
     )
@@ -535,8 +619,8 @@ def _train_bakeoff_impl(
 @app.function(
     gpu="H100:8",
     volumes={MOUNT: train_volume},
-    secrets=[wandb_secret],
-    timeout=14400,  # 4h — 1k steps at ~1 s/step is < 30 min, plenty of slack
+    secrets=[wandb_secret, gcp_secret],
+    timeout=72000,  # 20h — 10k bs=256 at ~6 s/step ≈ 16.7h (+ slack). Don't exceed Modal's 24h cap.
 )
 def train_bakeoff_h100x8(
     steps: int,
@@ -548,12 +632,18 @@ def train_bakeoff_h100x8(
     parquet_root: str,
     gradient_checkpointing: bool = True,
     compute_dtype: str = "bfloat16",
+    lmq_path: str | None = None,
+    density_loss_type: str = "emd",
+    density_only: bool = True,
 ) -> dict:
     """8× H100 SXM5 bakeoff probe; per-GPU BS = batch_size / 8."""
     return _train_bakeoff_impl(
         steps, batch_size, seed, label, results_label, model_preset, parquet_root,
         gradient_checkpointing=gradient_checkpointing,
         compute_dtype=compute_dtype,
+        lmq_path=lmq_path,
+        density_loss_type=density_loss_type,
+        density_only=density_only,
     )
 
 
@@ -562,23 +652,154 @@ def main_bakeoff_h100x8(
     steps: int = 1000,
     batch_size: int = 128,        # matches TPU recipe; per-GPU = 16
     seed: int = 42,
-    label: str = "train-full-lmq-v2-lat",
-    results_label: str = "bakeoff-200M-h100x8-1k-lat",
+    label: str = "train-full-v3",
+    results_label: str = "bakeoff-200M-h100x8-1k-v3",
     model_preset: str = "200M",
     gradient_checkpointing: bool = True,
     compute_dtype: str = "bfloat16",
+    lmq_path: str = "",  # empty = vanilla CE; otherwise gs://.../lmq-v2-16k.npz
+    density_loss_type: str = "emd",
+    density_only: bool = True,
 ) -> None:
     parquet_root = f"{MOUNT}/tokenized/{label}"
     err(f"[modal] H100:8 bakeoff: {model_preset} × {steps} steps, "
         f"bs={batch_size} (per-GPU {batch_size // 8}), "
         f"ckpt={int(gradient_checkpointing)}, dtype={compute_dtype}, label={label}")
     err(f"[modal] reading parquets from {parquet_root} on volume {TRAIN_VOLUME_NAME}")
-    result = train_bakeoff_h100x8.remote(
+    # Use .spawn() so the function survives local disconnects under `modal run
+    # --detach`. With .remote() the function is canceled when the local
+    # subprocess exits (Modal warns about this). .spawn() returns a
+    # FunctionCall handle and detaches immediately.
+    call = train_bakeoff_h100x8.spawn(
         steps=steps, batch_size=batch_size, seed=seed,
         label=label, results_label=results_label,
         model_preset=model_preset, parquet_root=parquet_root,
         gradient_checkpointing=gradient_checkpointing,
         compute_dtype=compute_dtype,
+        lmq_path=lmq_path or None,
+        density_loss_type=density_loss_type,
+        density_only=density_only,
+    )
+    err(f"[modal] spawned call_id={call.object_id} — function runs independently of this process")
+
+
+@app.function(
+    gpu="H200:8",
+    volumes={MOUNT: train_volume},
+    secrets=[wandb_secret, gcp_secret],
+    timeout=14400,
+)
+def train_bakeoff_h200x8(
+    steps: int,
+    batch_size: int,
+    seed: int,
+    label: str,
+    results_label: str,
+    model_preset: str,
+    parquet_root: str,
+    gradient_checkpointing: bool = True,
+    compute_dtype: str = "bfloat16",
+    lmq_path: str | None = None,
+    density_loss_type: str = "emd",
+    density_only: bool = True,
+) -> dict:
+    """8× H200 bakeoff probe; same SM as H100, 1.4× HBM bandwidth."""
+    return _train_bakeoff_impl(
+        steps, batch_size, seed, label, results_label, model_preset, parquet_root,
+        gradient_checkpointing=gradient_checkpointing,
+        compute_dtype=compute_dtype,
+        lmq_path=lmq_path,
+        density_loss_type=density_loss_type,
+        density_only=density_only,
+    )
+
+
+@app.local_entrypoint()
+def main_bakeoff_h200x8(
+    steps: int = 500,
+    batch_size: int = 128,
+    seed: int = 42,
+    label: str = "train-full-v3",
+    results_label: str = "bakeoff-200M-h200x8-500-v3",
+    model_preset: str = "200M",
+    gradient_checkpointing: bool = True,
+    compute_dtype: str = "bfloat16",
+    lmq_path: str = "",  # empty = vanilla CE; otherwise gs://.../lmq-v2-16k.npz
+    density_loss_type: str = "emd",
+    density_only: bool = True,
+) -> None:
+    parquet_root = f"{MOUNT}/tokenized/{label}"
+    err(f"[modal] H200:8 bakeoff: {model_preset} × {steps} steps, "
+        f"bs={batch_size} (per-GPU {batch_size // 8}), "
+        f"ckpt={int(gradient_checkpointing)}, dtype={compute_dtype}, label={label}")
+    result = train_bakeoff_h200x8.remote(
+        steps=steps, batch_size=batch_size, seed=seed,
+        label=label, results_label=results_label,
+        model_preset=model_preset, parquet_root=parquet_root,
+        gradient_checkpointing=gradient_checkpointing,
+        compute_dtype=compute_dtype,
+        lmq_path=lmq_path or None,
+        density_loss_type=density_loss_type,
+        density_only=density_only,
+    )
+    err(f"[modal] done: {result['results_dir']} (vocab={result['vocab_size']})")
+
+
+@app.function(
+    gpu="B200:8",
+    volumes={MOUNT: train_volume},
+    secrets=[wandb_secret, gcp_secret],
+    timeout=14400,
+)
+def train_bakeoff_b200x8(
+    steps: int,
+    batch_size: int,
+    seed: int,
+    label: str,
+    results_label: str,
+    model_preset: str,
+    parquet_root: str,
+    gradient_checkpointing: bool = True,
+    compute_dtype: str = "bfloat16",
+    lmq_path: str | None = None,
+    density_loss_type: str = "emd",
+    density_only: bool = True,
+) -> dict:
+    """8× B200 bakeoff probe; Blackwell, ~2.3× H100 BF16 FLOPS + larger HBM."""
+    return _train_bakeoff_impl(
+        steps, batch_size, seed, label, results_label, model_preset, parquet_root,
+        gradient_checkpointing=gradient_checkpointing,
+        compute_dtype=compute_dtype,
+        lmq_path=lmq_path,
+        density_loss_type=density_loss_type,
+        density_only=density_only,
+    )
+
+
+@app.local_entrypoint()
+def main_bakeoff_b200x8(
+    steps: int = 500,
+    batch_size: int = 256,
+    seed: int = 42,
+    label: str = "train-full-v3",
+    results_label: str = "bakeoff-200M-b200x8-500-v3",
+    model_preset: str = "200M",
+    gradient_checkpointing: bool = False,
+    compute_dtype: str = "bfloat16",
+) -> None:
+    parquet_root = f"{MOUNT}/tokenized/{label}"
+    err(f"[modal] B200:8 bakeoff: {model_preset} × {steps} steps, "
+        f"bs={batch_size} (per-GPU {batch_size // 8}), "
+        f"ckpt={int(gradient_checkpointing)}, dtype={compute_dtype}, label={label}")
+    result = train_bakeoff_b200x8.remote(
+        steps=steps, batch_size=batch_size, seed=seed,
+        label=label, results_label=results_label,
+        model_preset=model_preset, parquet_root=parquet_root,
+        gradient_checkpointing=gradient_checkpointing,
+        compute_dtype=compute_dtype,
+        lmq_path=lmq_path or None,
+        density_loss_type=density_loss_type,
+        density_only=density_only,
     )
     err(f"[modal] done: {result['results_dir']} (vocab={result['vocab_size']})")
 
