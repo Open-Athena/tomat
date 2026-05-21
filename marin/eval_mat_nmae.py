@@ -63,6 +63,7 @@ from haliax.partitioning import round_axis_for_partitioning
 
 import levanter
 from levanter.checkpoint import load_checkpoint
+from levanter.layers.attention import AttentionBackend
 from levanter.layers.rotary import Llama3RotaryEmbeddingsConfig
 from levanter.models.qwen import Qwen3Config
 from levanter.trainer import TrainerConfig
@@ -571,6 +572,11 @@ def main():
     # (e.g. "val_200" or "train_200") for apples-to-apples curves across runs.
     eval_mat_set = os.environ.get("TOMAT_EVAL_MAT_SET", "").strip()
     eval_batch = int(os.environ.get("TOMAT_EVAL_BATCH", "8"))
+    # Attention backend: default (None) tries NVTE → falls back to the slow
+    # reference impl when transformer_engine is absent. Set TOMAT_ATTN_BACKEND
+    # =JAX_FLASH for the GPU eval path (pure-Pallas flash, ~5-10× faster, same
+    # math). Flash is exact — differs from reference only by fp-rounding.
+    attn_backend = os.environ.get("TOMAT_ATTN_BACKEND", "").strip()
     decoder = os.environ.get("TOMAT_EVAL_DECODER", "median")
     if decoder not in ("argmax", "median", "mean"):
         raise ValueError(f"TOMAT_EVAL_DECODER must be argmax/median/mean, got {decoder!r}")
@@ -641,6 +647,7 @@ def main():
         max_seq_len=8192,
         rope=Llama3RotaryEmbeddingsConfig(),
         tie_word_embeddings=True,
+        attn_backend=AttentionBackend[attn_backend] if attn_backend else None,
         **MODEL_PRESETS[model_preset],
     )
     key = jax.random.PRNGKey(seed)
