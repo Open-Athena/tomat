@@ -1,9 +1,125 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useQueries, useQuery } from '@tanstack/react-query'
 import { fetchIrisState, fetchManifest, fetchRuns, irisJobIdForRun, parquetUrl } from './api'
-import type { IrisJob, IrisState, RunManifest } from './api'
+import type { IrisJob, RunManifest } from './api'
 import { fetchRunHistory } from './parquet'
 import type { RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
+import { RunsTimelinePlot, colorForIndex, shortLabel } from './RunsTimelinePlot'
+import type { RunTimelineSeries } from './RunsTimelinePlot'
+import { useTraceHighlight } from 'pltly/react'
+
+/** Small SVG line chart (no plotly). `pts` is xs/ys in raw values; we scale. */
+function Sparkline({
+  pts, width = 160, height = 36, color = '#22863a',
+}: {
+  pts: { x: number; y: number }[]
+  width?: number
+  height?: number
+  color?: string
+}) {
+  if (pts.length < 2) {
+    return <svg width={width} height={height} />
+  }
+  const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y)
+  const xmin = Math.min(...xs), xmax = Math.max(...xs)
+  const ymin = Math.min(...ys), ymax = Math.max(...ys)
+  const xspan = xmax - xmin || 1, yspan = ymax - ymin || 1
+  const pad = 2
+  const scaledX = (x: number) => pad + ((x - xmin) / xspan) * (width - 2 * pad)
+  const scaledY = (y: number) => height - pad - ((y - ymin) / yspan) * (height - 2 * pad)
+  const d = pts.map((p, i) => `${i === 0 ? 'M' : 'L'} ${scaledX(p.x).toFixed(1)} ${scaledY(p.y).toFixed(1)}`).join(' ')
+  return (
+    <svg width={width} height={height} style={{ display: 'block' }}>
+      <path d={d} fill="none" stroke={color} strokeWidth={1.5} />
+    </svg>
+  )
+}
+
+const LOOKBACK_HOURS = 6
+const LOOKBACK_SEC = LOOKBACK_HOURS * 3600
+
+/**
+ * Compute steps completed within a wallclock window ending at the latest log.
+ * Returns `null` if we don't have enough samples — common right after a fresh
+ * resume, when the parquet's latest row was logged < windowSec ago.
+ *
+ * Step = `global_step` (Levanter's actual training step), not `_step` (wandb's
+ * log-call counter) — the latter inflates 5–10× per row and isn't what users
+ * mean when they ask "how many steps in the last hour?"
+ */
+function stepsInWindow(history: RunHistory, windowSec: number): number | null {
+  const tsCol = history.timestamps
+  const gsCol = history.cols.get('global_step') ?? []
+  let latestTs: number | null = null
+  let latestStep: number | null = null
+  for (let i = 0; i < history.rowCount; i++) {
+    const t = tsCol[i], s = gsCol[i]
+    if (t == null || s == null) continue
+    if (latestTs == null || t > latestTs) { latestTs = t; latestStep = s }
+  }
+  if (latestTs == null || latestStep == null) return null
+  const cutoff = latestTs - windowSec
+  // Earliest step at-or-before the cutoff (so we measure exact window).
+  let baseStep: number | null = null
+  let baseTs: number | null = null
+  for (let i = 0; i < history.rowCount; i++) {
+    const t = tsCol[i], s = gsCol[i]
+    if (t == null || s == null) continue
+    if (t <= cutoff && (baseTs == null || t > baseTs)) { baseTs = t; baseStep = s }
+  }
+  if (baseStep == null) return null
+  return latestStep - baseStep
+}
+
+/** Filter history to last N seconds + downsample (max ~120 points for sparkline). */
+function recentStepPoints(history: RunHistory): { x: number; y: number }[] {
+  const tsCol = history.timestamps, stepCol = history.steps
+  const now = Date.now() / 1000
+  const cutoff = now - LOOKBACK_SEC
+  const all: { x: number; y: number }[] = []
+  for (let i = 0; i < history.rowCount; i++) {
+    const t = tsCol[i], s = stepCol[i]
+    if (t != null && s != null && t >= cutoff) {
+      all.push({ x: t, y: s })
+    }
+  }
+  if (all.length <= 120) return all
+  // Downsample by stride
+  const stride = Math.ceil(all.length / 120)
+  const out: { x: number; y: number }[] = []
+  for (let i = 0; i < all.length; i += stride) out.push(all[i])
+  if (out[out.length - 1] !== all[all.length - 1]) out.push(all[all.length - 1])
+  return out
+}
+
+/** "Xs ago" / "Xm ago" / "Xh ago" / "Xd ago"; nullable for unknown. */
+function secsAgo(unixSec: number): string {
+  const ago = Date.now() / 1000 - unixSec
+  if (ago < 60) return `${Math.round(ago)}s ago`
+  if (ago < 3600) return `${Math.round(ago / 60)}m ago`
+  if (ago < 86400) return `${(ago / 3600).toFixed(1)}h ago`
+  return `${(ago / 86400).toFixed(1)}d ago`
+}
+
+/** Freshness color: green < 2 min, yellow < 30 min, red older. */
+function freshnessColor(secAgo: number): string {
+  if (secAgo < 120) return '#22863a'
+  if (secAgo < 1800) return '#d4a017'
+  return '#cb2431'
+}
+
+// Auto-refresh cadences (ms) for the react-query polling on the runs
+// dashboard. The `tomat-iris-cron` VM re-syncs R2 roughly every minute;
+// manifests are small JSON so we poll them faster than the ~2MB parquet
+// histories (which also carry an R2 max-age=60, so refetches mostly hit
+// cache). Polling pauses automatically while the tab is backgrounded.
+const REFETCH_MS = {
+  runs: 60_000,
+  iris: 30_000,
+  manifest: 30_000,
+  history: 90_000,
+}
 
 interface Props {
   parts: string[]
@@ -13,14 +129,24 @@ const navigate = (path: string) => {
   window.location.hash = `#/${path}`
 }
 
-// Let cmd/ctrl/shift/middle-click fall through to the browser so it can open
-// the link in a new tab / window.
 const isModifiedClick = (e: React.MouseEvent) =>
   e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0
 
 export function RunsPage({ parts }: Props) {
   const runId = parts[0]
   return runId ? <RunDetail runId={runId} /> : <RunsIndex />
+}
+
+// Fallback for runs not in the iris snapshot (e.g. Modal runs, or runs created
+// after the last `tomat iris sync`). State here comes from wandb's view —
+// "running" / "finished" / "crashed" / "failed" — and is laggier than iris.
+// Italic styling marks it as lower-trust.
+const WANDB_STATE_BG: Record<string, string> = {
+  running: '#22863a',
+  finished: '#0366d6',
+  crashed: '#cb2431',
+  failed: '#cb2431',
+  killed: '#6a737d',
 }
 
 const IRIS_STATE_STYLES: Record<string, { bg: string; fg: string }> = {
@@ -34,101 +160,684 @@ const IRIS_STATE_STYLES: Record<string, { bg: string; fg: string }> = {
   UNSCHEDULABLE: { bg: '#cb2431', fg: '#fff' },
 }
 
-function IrisBadge({ job }: { job: IrisJob }) {
-  const style = IRIS_STATE_STYLES[job.state] ?? { bg: '#888', fg: '#fff' }
+function IrisBadge({ job, incomplete }: { job: IrisJob; incomplete?: boolean }) {
+  // `incomplete`: iris says SUCCEEDED but the run stopped well short of its
+  // step target — almost always a preemption whose clean SIGTERM exit (0)
+  // iris mis-buckets as success. Show it as its own burnt-orange state so the
+  // card doesn't read as a healthy finish (iris won't re-enqueue it).
+  const showIncomplete = incomplete && job.state === 'SUCCEEDED'
+  const style = showIncomplete
+    ? { bg: '#b4632a', fg: '#fff' }
+    : IRIS_STATE_STYLES[job.state] ?? { bg: '#888', fg: '#fff' }
   const tail = job.preempts > 0 || job.failures > 0
     ? ` (p=${job.preempts}, f=${job.failures})` : ''
   return (
     <span
-      title={job.error || `iris state=${job.state} preempts=${job.preempts} failures=${job.failures}`}
+      title={showIncomplete
+        ? `iris reported SUCCEEDED, but the run ended early — likely preempted with a clean SIGTERM exit. `
+          + `iris will not re-enqueue it. preempts=${job.preempts} failures=${job.failures}`
+        : (job.error || `iris state=${job.state} preempts=${job.preempts} failures=${job.failures}`)}
       style={{
         backgroundColor: style.bg, color: style.fg,
         padding: '1px 6px', borderRadius: 3,
         fontSize: '0.75rem', fontFamily: 'monospace',
       }}
     >
-      {job.state}{tail}
+      {showIncomplete ? 'INCOMPLETE' : job.state}{tail}
     </span>
   )
 }
 
-function RunsIndex() {
-  const [runs, setRuns] = useState<string[] | null>(null)
-  const [iris, setIris] = useState<IrisState | null>(null)
-  const [err, setErr] = useState<string | null>(null)
+// Parse run name into structured fields. Tolerant of unknown patterns: anything
+// we can't recognize lands in `extra`.
+interface RunMeta {
+  model: string | null      // "200M", "1B"
+  batchSize: number | null
+  lossType: string | null   // "emd-do", "ce"
+  targetSteps: string | null // "10k", "500"
+  hardware: string | null   // "v5p-16", "v6e-16", "H100×8"
+  hardwareKind: 'tpu-v5p' | 'tpu-v6e' | 'modal-gpu' | null
+  suffix: string | null     // "z3", "cont7k-ext", etc.
+}
 
+function parseRunName(name: string): RunMeta {
+  // train-full-<dataset>-<model>-bs<n>-<loss>-do-<steps>-<hw>-shuf1k-<suffix>
+  const m = name.match(
+    /^train-(?:full|cont)-(?:[a-z0-9-]+?-)?(\d+[MBK])-bs(\d+)-([a-z-]+?)-(?:do-)?(\d+k?|\d+)-([a-z0-9]+)(?:-shuf\d+k)?(?:-(.+))?$/i,
+  )
+  if (!m) {
+    return {
+      model: null, batchSize: null, lossType: null, targetSteps: null,
+      hardware: null, hardwareKind: null, suffix: name,
+    }
+  }
+  const [, model, bs, loss, steps, hwRaw, suffix] = m
+  let hw: string | null = null
+  let kind: RunMeta['hardwareKind'] = null
+  const hwLower = hwRaw.toLowerCase()
+  if (hwLower.startsWith('v5p')) { hw = `v5p-${hwLower.slice(3)}`; kind = 'tpu-v5p' }
+  else if (hwLower.startsWith('v6e')) { hw = `v6e-${hwLower.slice(3)}`; kind = 'tpu-v6e' }
+  else if (hwLower.startsWith('tpu')) { hw = `v6e-${hwLower.slice(3)}`; kind = 'tpu-v6e' }
+  // slice(5) skips e.g. "h100x" (5 chars) — slice(4) leaked the 'x' through
+  // giving "H100×x8" instead of "H100×8".
+  else if (hwLower.startsWith('h100x')) { hw = `H100×${hwLower.slice(5)}`; kind = 'modal-gpu' }
+  else if (hwLower.startsWith('h200x')) { hw = `H200×${hwLower.slice(5)}`; kind = 'modal-gpu' }
+  else if (hwLower.startsWith('b200x')) { hw = `B200×${hwLower.slice(5)}`; kind = 'modal-gpu' }
+  return {
+    model, batchSize: parseInt(bs, 10),
+    lossType: loss === 'emd-do' ? 'EMD density-only'
+      : loss === 'l1-do' ? 'L1 density-only'
+      : loss === 'ce' ? 'CE'
+      : loss,
+    targetSteps: steps,
+    hardware: hw, hardwareKind: kind,
+    suffix: suffix ?? null,
+  }
+}
+
+const HW_COLORS: Record<NonNullable<RunMeta['hardwareKind']>, string> = {
+  'tpu-v5p': '#7c4dff',
+  'tpu-v6e': '#00838f',
+  'modal-gpu': '#f57c00',
+}
+
+function timeAgo(iso: string): string {
+  const t = new Date(iso).getTime()
+  if (!isFinite(t)) return ''
+  const sec = (Date.now() - t) / 1000
+  if (sec < 60) return `${Math.round(sec)}s ago`
+  if (sec < 3600) return `${Math.round(sec / 60)}m ago`
+  if (sec < 86400) return `${(sec / 3600).toFixed(1)}h ago`
+  return `${(sec / 86400).toFixed(1)}d ago`
+}
+
+interface RunCardData {
+  id: string
+  manifest: RunManifest | null
+  job: IrisJob | null
+  history: RunHistory | null
+  color: string
+  err: string | null
+}
+
+interface CardProps {
+  data: RunCardData
+  activeRunId: string | null
+  pinnedRunId: string | null
+  onHover: (id: string | null) => void
+  onClick: (id: string) => void
+  onScrollTargetRef: (id: string, el: HTMLDivElement | null) => void
+}
+
+function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTargetRef }: CardProps) {
+  const { id, manifest, job, history, color, err } = data
+  // `color` matches the run's timeline-plot trace. Used as a left accent bar
+  // (and active-state border) so the card is visually tied to its plot line.
+  const isActive = activeRunId === id
+  const isPinned = pinnedRunId === id
+  const otherActive = activeRunId != null && !isActive
+  const cardRef = useRef<HTMLDivElement | null>(null)
   useEffect(() => {
-    fetchRuns()
-      .then((r) => setRuns(r.runs))
-      .catch((e) => setErr(String(e)))
-    fetchIrisState()
-      .then(setIris)
-      .catch(() => {}) // soft-fail; iris-state is optional info
-  }, [])
+    onScrollTargetRef(id, cardRef.current)
+    return () => onScrollTargetRef(id, null)
+  }, [id, onScrollTargetRef])
+
+  const meta = parseRunName(id)
+  const hwColor = meta.hardwareKind ? HW_COLORS[meta.hardwareKind] : '#888'
+  const wbUrl = manifest?.run.url
+  const steps = manifest?.history
+  // Prefer `trainer.num_train_steps` from the manifest config (authoritative,
+  // reflects most-recent resume target) over the run-name parse (which freezes
+  // the *original* target — e.g. cont7k-ext was named …-8k but is now resumed
+  // to 80k, so the name says "8k" while the trainer is targeting 80k).
+  const trainerNumSteps = numTrainStepsOf(manifest)
+  const targetSteps = trainerNumSteps ?? (meta.targetSteps ? parseTargetSteps(meta.targetSteps) : null)
+  const targetLabel = trainerNumSteps != null
+    ? formatStepCount(trainerNumSteps)
+    : (meta.targetSteps ?? null)
+  const progressPct = steps?.step_max != null && targetSteps != null
+    ? Math.min(100, (steps.step_max / targetSteps) * 100)
+    : null
+  const trainLoss = manifest?.summary['train/loss']
+  const evalLoss = manifest?.summary['eval/loss']
+  const mfu = manifest?.summary['throughput/mfu']
+  const matNmae = manifest?.summary['eval/mat_nmae/val_200/mean']
+
+  const sparkPts = useMemo(() => history ? recentStepPoints(history) : [], [history])
+  const lastTs = sparkPts.length > 0 ? sparkPts[sparkPts.length - 1].x : null
+  const lastStep = sparkPts.length > 0 ? sparkPts[sparkPts.length - 1].y : null
+  const freshSec = lastTs != null ? Math.max(0, Date.now() / 1000 - lastTs) : null
+
+  // "Steps in last 1m / 1h / 6h" — anchored to the latest log timestamp (so a
+  // run that logged its last step 2 min ago still reports its 1m rate from
+  // when it was actually stepping).
+  const rate1m = useMemo(() => history ? stepsInWindow(history, 60) : null, [history])
+  const rate1h = useMemo(() => history ? stepsInWindow(history, 3600) : null, [history])
+  const rate6h = useMemo(() => history ? stepsInWindow(history, 6 * 3600) : null, [history])
 
   return (
-    <div style={{ maxWidth: 960, margin: '2rem auto', padding: '0 1rem' }}>
+    <div
+      ref={cardRef}
+      data-runcard={id}
+      onMouseEnter={() => onHover(id)}
+      onMouseLeave={() => onHover(null)}
+      onClick={(e) => {
+        // Links/buttons inside the card keep their own behaviour; clicking
+        // anywhere else pins this run (plot solos + rescales to it).
+        if ((e.target as HTMLElement).closest('a, button')) return
+        onClick(id)
+      }}
+      style={{
+        position: 'relative',
+        border: isActive ? `1px solid ${color}` : '1px solid #2a2a2a',
+        borderRadius: 6,
+        padding: '0.8rem 1rem',
+        marginBottom: '0.6rem',
+        backgroundColor: '#181818',
+        cursor: 'pointer',
+        display: 'grid',
+        gridTemplateColumns: '1fr auto',
+        gap: '0.5rem 1rem',
+        overflow: 'hidden',
+        transition: 'border-color 100ms, box-shadow 100ms',
+        boxShadow: isPinned ? `0 0 0 2px ${color}`
+          : isActive ? `0 0 0 1px ${color}` : 'none',
+      }}>
+      {/* Left identity accent — a real element, not a `borderLeft`. A `border`
+          shorthand + a `borderLeft` longhand in one style object don't mix:
+          React re-applies the shorthand when `isActive` toggles (resetting all
+          4 sides to 1px) but skips the unchanged longhand, so the 4px accent
+          vanished after hovering. A div is immune. Greys out when another run
+          is highlighted, so faded cards de-emphasize fully. */}
+      <div style={{
+        position: 'absolute', left: 0, top: 0, bottom: 0, width: 4,
+        backgroundColor: otherActive ? '#555' : color, zIndex: 3,
+        transition: 'background-color 100ms',
+      }} />
+      {/* Dim overlay when another run is highlighted — inset past the accent
+          (and below it in z-order) so the identity color stays full-strength
+          even while the card is faded. */}
+      <div style={{
+        position: 'absolute', top: 0, right: 0, bottom: 0, left: 4,
+        backgroundColor: 'rgba(24,24,24,0.6)', pointerEvents: 'none', zIndex: 2,
+        opacity: otherActive ? 1 : 0, transition: 'opacity 100ms',
+      }} />
+      <div style={{ minWidth: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+          {isPinned && (
+            <span title="pinned — the plot is soloed + rescaled to this run; click the card again to unpin">
+              📌
+            </span>
+          )}
+          {job && <IrisBadge job={job} incomplete={isIncomplete(data)} />}
+          {!job && manifest && (
+            // No iris job (e.g. a Modal run) → fall back to wandb's run state.
+            // Uppercased to match the iris badges; italic marks it as the
+            // laggier wandb-derived state (lower-trust than iris).
+            <span
+              title={`wandb state (no iris job): ${manifest.run.state}`}
+              style={{
+                backgroundColor: WANDB_STATE_BG[manifest.run.state] ?? '#555',
+                color: '#fff', padding: '1px 6px', borderRadius: 3,
+                fontSize: '0.75rem', fontFamily: 'monospace',
+                fontStyle: 'italic',
+              }}>
+              {manifest.run.state.toUpperCase()}
+            </span>
+          )}
+          <a
+            href={`#/runs/${id}`}
+            onClick={(e) => {
+              if (isModifiedClick(e)) return
+              e.preventDefault()
+              navigate(`runs/${id}`)
+            }}
+            style={{ fontFamily: 'monospace', fontSize: '0.9rem' }}
+          >
+            {id}
+          </a>
+          {wbUrl && (
+            <a href={wbUrl} target="_blank" rel="noreferrer"
+              style={{ fontSize: '0.75rem', color: '#888' }}
+              title="wandb">
+              wandb ↗
+            </a>
+          )}
+        </div>
+        <div style={{ marginTop: '0.4rem', fontSize: '0.8rem', color: '#ccc',
+                      display: 'flex', flexWrap: 'wrap', gap: '0.4rem 0.9rem' }}>
+          {meta.hardware && (
+            <span><span style={{ color: hwColor, fontWeight: 600 }}>{meta.hardware}</span></span>
+          )}
+          {meta.model && <span>{meta.model}</span>}
+          {meta.batchSize && <span>BS={meta.batchSize}</span>}
+          {meta.lossType && <span>{meta.lossType}</span>}
+          {targetLabel && <span title={trainerNumSteps != null ? 'trainer.num_train_steps (authoritative)' : 'parsed from run name'}>target {targetLabel}</span>}
+          {meta.suffix && <span style={{ color: '#888' }}>· {meta.suffix}</span>}
+        </div>
+        <div style={{ marginTop: '0.3rem', fontSize: '0.75rem', color: '#888' }}>
+          {manifest && (
+            <>
+              created {timeAgo(manifest.run.created_at)} ·{' '}
+              synced {timeAgo(manifest.synced_at)}
+              {manifest.run.entity && manifest.run.project && (
+                <> · {manifest.run.entity}/{manifest.run.project}</>
+              )}
+            </>
+          )}
+          {err && <span style={{ color: 'crimson' }}>err: {err}</span>}
+        </div>
+      </div>
+      <div style={{ minWidth: 200, fontSize: '0.8rem', color: '#ccc', textAlign: 'right' }}>
+        {/* Top: step counter + progress bar */}
+        {(steps?.step_max != null || lastStep != null) && (
+          <div>
+            step <b>{(lastStep ?? steps?.step_max ?? 0).toLocaleString()}</b>
+            {targetLabel && ` / ${targetLabel}`}
+            {progressPct != null && (
+              <div style={{
+                height: 4, marginTop: 4, backgroundColor: '#333', borderRadius: 2,
+              }}>
+                <div style={{
+                  width: `${progressPct}%`, height: '100%',
+                  backgroundColor: hwColor, borderRadius: 2,
+                }} />
+              </div>
+            )}
+          </div>
+        )}
+        {/* Sparkline: step vs wallclock over last 6h. Flat = preempt/restart. */}
+        {sparkPts.length >= 2 && freshSec != null && (
+          <div style={{ marginTop: 6, display: 'flex', justifyContent: 'flex-end',
+                        alignItems: 'center', gap: 6 }}>
+            <span title={`last log: ${new Date(lastTs! * 1000).toLocaleString()}`}
+              style={{
+                fontSize: '0.68rem', color: freshnessColor(freshSec),
+                fontFamily: 'monospace',
+              }}>
+              ● {secsAgo(lastTs!)}
+            </span>
+            <Sparkline pts={sparkPts} color={freshnessColor(freshSec)} />
+          </div>
+        )}
+        {/* Step-rate over last 1m / 1h / 6h. Anchored to last log timestamp
+            (a run that died 2m ago shows steps in the 1m before that). */}
+        {(rate1m != null || rate1h != null || rate6h != null) && (
+          <div style={{ marginTop: 2, fontFamily: 'monospace', fontSize: '0.7rem',
+                        color: '#aaa' }}
+            title="steps in last 1m / 1h / 6h, ending at latest log">
+            {rate1m != null && <>+{rate1m}/min</>}
+            {rate1h != null && <> · +{rate1h.toLocaleString()}/h</>}
+            {rate6h != null && <> · +{rate6h.toLocaleString()}/6h</>}
+          </div>
+        )}
+        {/* Latest summary metrics */}
+        <div style={{ marginTop: 4, fontFamily: 'monospace', fontSize: '0.72rem' }}>
+          {typeof trainLoss === 'number' && <>tr {trainLoss.toFixed(3)}</>}
+          {typeof evalLoss === 'number' && <> · ev {evalLoss.toFixed(3)}</>}
+          {typeof mfu === 'number' && <> · MFU {mfu.toFixed(1)}%</>}
+          {typeof matNmae === 'number' && <> · NMAE {(matNmae * 100).toFixed(2)}%</>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function parseTargetSteps(s: string): number {
+  // "10k" → 10000, "500" → 500
+  const m = s.match(/^(\d+)(k|K)?$/)
+  if (!m) return Number.POSITIVE_INFINITY
+  return parseInt(m[1], 10) * (m[2] ? 1000 : 1)
+}
+
+/** Compact step count: 80000 → "80k", 1234 → "1,234". */
+function formatStepCount(n: number): string {
+  if (n >= 1000 && n % 1000 === 0) return `${n / 1000}k`
+  if (n >= 10000) return `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k`
+  return n.toLocaleString()
+}
+
+// Genuinely executing right now: iris RUNNING, or a job-less run (e.g. Modal)
+// that wandb still reports as running.
+function isRunning(c: RunCardData): boolean {
+  if (c.job?.state === 'RUNNING') return true
+  if (!c.job && c.manifest?.run.state === 'running') return true
+  return false
+}
+
+// Enqueued / being scheduled — iris has the job but it isn't on a device yet.
+// Distinct from an inactive/finished run: a queued run will start on its own.
+function isQueued(c: RunCardData): boolean {
+  return c.job?.state === 'PENDING' || c.job?.state === 'BUILDING'
+}
+
+/** Authoritative step target: `trainer.num_train_steps` from the run config. */
+function numTrainStepsOf(manifest: RunManifest | null): number | null {
+  const v = (manifest?.run.config as Record<string, unknown> | undefined)?.trainer
+  if (v && typeof v === 'object' && 'num_train_steps' in v) {
+    const n = (v as { num_train_steps?: unknown }).num_train_steps
+    if (typeof n === 'number' && n > 0) return n
+  }
+  return null
+}
+
+// iris reports SUCCEEDED whenever the job process exits 0 — including a run
+// that was preempted and shut down cleanly on SIGTERM. So a "SUCCEEDED" run
+// that never reached its step target is really incomplete + inactive (iris
+// will not re-enqueue it). Flag that so it doesn't read as a healthy finish.
+function isIncomplete(c: RunCardData): boolean {
+  if (c.job?.state !== 'SUCCEEDED') return false
+  const stepMax = c.manifest?.history?.step_max ?? null
+  const target = numTrainStepsOf(c.manifest)
+  return stepMax != null && target != null && stepMax < target - 1
+}
+
+// Hide noisy/stale runs from the dashboard. Bare-names list for now — graduate
+// to a sidecar JSON in R2 or to a UI toggle if this grows.
+const EXCLUDED_RUNS: ReadonlySet<string> = new Set([
+  // Cascade-bug victims from 2026-05-14 — all died <step 200 before --max-retries was wired.
+  'train-full-v3-200M-bs1792-emd-do-15k-v5p32-shuf1k-zf-r2',
+  'train-full-v3-200M-bs512-emd-do-15k-v5p16-shuf1k-zf-r2',
+  'train-full-v3-200M-bs256-emd-do-15k-v5p16-shuf1k-zf-r2',
+  // Pyspy profiling smoke (500 steps).
+  'train-full-v3-200M-bs128-emd-do-500-v5p16-shuf1k-pyspy-3',
+])
+
+// Order: running first, then by "most recently active" (`history.ts_max`).
+// Falls back to `created_at` when ts_max is missing. This puts cont7k-ext
+// at the top after it last logged today, even though it was created May 11.
+function orderRuns(cards: RunCardData[]): RunCardData[] {
+  const activityTs = (c: RunCardData): number => {
+    const tsMax = c.manifest?.history.ts_max
+    if (typeof tsMax === 'number') return tsMax * 1000
+    const ca = c.manifest?.run.created_at
+    return ca ? Date.parse(ca) : 0
+  }
+  // Sort buckets: running first, then queued, then everything else; within a
+  // bucket by most-recent activity.
+  const rank = (c: RunCardData): number =>
+    isRunning(c) ? 0 : isQueued(c) ? 1 : 2
+  return [...cards].sort((a, b) => {
+    const dr = rank(a) - rank(b)
+    if (dr !== 0) return dr
+    return activityTs(b) - activityTs(a)
+  })
+}
+
+function RunsIndex() {
+  // Per-card DOM refs so we can detect off-screen + scroll into view.
+  const cardRefs = useRef<Map<string, HTMLDivElement>>(new Map())
+  const setCardRef = useCallback((id: string, el: HTMLDivElement | null) => {
+    if (el) cardRefs.current.set(id, el)
+    else cardRefs.current.delete(id)
+  }, [])
+  // Whether the currently-active card is inside the viewport. Drives the
+  // sticky-bottom banner (shown when active but off-screen).
+  // (Effect that watches `activeRunId` is registered below, after that
+  // value is derived from the trace-highlight state.)
+  const [activeInView, setActiveInView] = useState(true)
+
+  // Live data via react-query: the run list + iris snapshot poll on their
+  // own cadences; each run's manifest and parquet history get their own
+  // query so they refetch (and structurally-share) independently.
+  const runsQ = useQuery({
+    queryKey: ['runs'], queryFn: fetchRuns, refetchInterval: REFETCH_MS.runs,
+  })
+  const irisQ = useQuery({
+    queryKey: ['iris'], queryFn: fetchIrisState, refetchInterval: REFETCH_MS.iris,
+  })
+
+  // Visible runs in stable listing order — drives per-run color assignment.
+  const visible = useMemo(
+    () => (runsQ.data?.runs ?? []).filter((id) => !EXCLUDED_RUNS.has(id)),
+    [runsQ.data],
+  )
+
+  const manifestQs = useQueries({
+    queries: visible.map((id) => ({
+      queryKey: ['manifest', id],
+      queryFn: () => fetchManifest(id),
+      refetchInterval: REFETCH_MS.manifest,
+    })),
+  })
+  const historyQs = useQueries({
+    queries: visible.map((id) => ({
+      queryKey: ['history', id],
+      queryFn: () => fetchRunHistory(parquetUrl(id)),
+      refetchInterval: REFETCH_MS.history,
+    })),
+  })
+
+  const iris = irisQ.data ?? null
+  const err = runsQ.error ? String(runsQ.error) : null
+  // One card per visible run, assembled from the per-run queries; each field
+  // fills in as its query resolves. A failed history fetch is non-fatal (the
+  // card just lacks its sparkline/plot) — only a manifest error surfaces.
+  const cards: RunCardData[] | null = runsQ.data
+    ? visible.map((id, idx) => {
+        const mqErr = manifestQs[idx]?.error
+        return {
+          id,
+          manifest: manifestQs[idx]?.data ?? null,
+          job: iris?.jobs[irisJobIdForRun(id)] ?? null,
+          history: historyQs[idx]?.data ?? null,
+          color: colorForIndex(idx),
+          err: mqErr ? String(mqErr) : null,
+        }
+      })
+    : null
+
+  const ordered = cards ? orderRuns(cards) : null
+  const runningCount = ordered?.filter(isRunning).length ?? 0
+  const queuedCount = ordered?.filter(isQueued).length ?? 0
+  const incompleteCount = ordered?.filter(isIncomplete).length ?? 0
+
+  // Build timeline series from any cards that have history loaded.
+  // Order matters for color stability — use index from `ordered`.
+  const timelineSeries: RunTimelineSeries[] = (ordered ?? [])
+    .filter((c) => c.history != null)
+    .map((c) => ({
+      id: c.id,
+      history: c.history!,
+      label: shortLabel(c.id),
+      color: c.color,
+    }))
+
+  // Single source of truth for trace + card highlight. pltly's hook gives us
+  // hover/pin state + handlers; the Plot consumes `highlight` directly, and
+  // cards read `activeTrace` (and call `setHoverTrace` / `togglePin`).
+  const traceLabels = timelineSeries.map((r) => r.label)
+  // debounceMs: when the cursor crosses the gap between two cards, the leave
+  // fires `setHoverTrace(null)` — debouncing it means a `setHoverTrace(next)`
+  // arriving within the window cancels the null, so the highlight doesn't
+  // flicker off-and-on between rows.
+  const highlight = useTraceHighlight(traceLabels, { debounceMs: 120 })
+  // label → id for converting active-trace back to runId for card matching.
+  const labelToId = useMemo(
+    () => new Map(timelineSeries.map((r) => [r.label, r.id])),
+    // Re-derive when the set of trace labels changes (new run synced in).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [traceLabels.join('|')],
+  )
+  const idToLabel = useMemo(
+    () => new Map(timelineSeries.map((r) => [r.id, r.label])),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [traceLabels.join('|')],
+  )
+  const activeRunId = highlight.activeTrace ? labelToId.get(highlight.activeTrace) ?? null : null
+
+  // IntersectionObserver on the active card — drives the sticky-bottom banner.
+  // Must live below `activeRunId` (TDZ): the dep array is evaluated during
+  // render, so it can't appear before the declaration.
+  useEffect(() => {
+    if (!activeRunId) { setActiveInView(true); return }
+    const el = cardRefs.current.get(activeRunId)
+    if (!el) { setActiveInView(true); return }
+    const io = new IntersectionObserver(
+      ([entry]) => setActiveInView(entry.isIntersecting),
+      { threshold: 0.2 },
+    )
+    io.observe(el)
+    return () => io.disconnect()
+  }, [activeRunId])
+
+  const onCardHover = useCallback(
+    (runId: string | null) => {
+      highlight.setHoverTrace(runId ? idToLabel.get(runId) ?? null : null)
+    },
+    [highlight, idToLabel],
+  )
+
+  // Click a card to pin it: the timeline plot solos to that run and Plotly
+  // autoranges to its extent (small/short runs are invisible at the shared
+  // 0–80k scale). Click again — or another card — to unpin / switch.
+  const onCardClick = useCallback(
+    (runId: string) => {
+      const label = idToLabel.get(runId)
+      if (label) highlight.togglePin(label)
+    },
+    [highlight, idToLabel],
+  )
+  const pinnedRunId = highlight.pinnedTrace
+    ? labelToId.get(highlight.pinnedTrace) ?? null
+    : null
+
+  // Click anywhere that isn't a card / legend item / link / button — page
+  // margins, header, gaps, plot background — to unpin. A document listener
+  // (only while pinned) so it catches clicks outside the centered container.
+  useEffect(() => {
+    if (!highlight.isPinned) return
+    const onDocClick = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null
+      if (t?.closest('[data-runcard], .pltly-legend-item, a, button')) return
+      highlight.clearPin()
+    }
+    document.addEventListener('click', onDocClick)
+    return () => document.removeEventListener('click', onDocClick)
+  }, [highlight])
+
+  return (
+    <div
+      style={{ maxWidth: 1100, margin: '2rem auto', padding: '0 1rem' }}
+      // Safety net: clear any highlight when the cursor leaves the whole view.
+      // A card's own onMouseLeave can be missed if the list reorders under the
+      // cursor during an auto-refresh — without this the fade could stick.
+      onMouseLeave={() => highlight.setHoverTrace(null)}
+    >
       <h1>tomat runs</h1>
-      <p style={{ color: '#666' }}>
-        Synced from wandb (PrinceOA/tomat-lmq-P19) → R2 via{' '}
+      <p style={{ color: '#888', fontSize: '0.85rem' }}>
+        {ordered && (
+          <>
+            <b>{runningCount}</b> running
+            {queuedCount > 0 && <> · <b>{queuedCount}</b> queued</>}
+            {incompleteCount > 0 && <> · <b>{incompleteCount}</b> incomplete</>}
+            {' · '}<b>{ordered.length}</b> total ·{' '}
+          </>
+        )}
+        synced from wandb via{' '}
         <code>tomat runs sync</code>. iris state via{' '}
-        <code>tomat iris sync</code>. See{' '}
+        <code>tomat iris sync</code>
+        {iris && <> (snapshot {timeAgo(iris.synced_at)})</>}
+        . See{' '}
         <a href="https://github.com/Open-Athena/tomat/blob/main/specs/23-runs-dashboard.md">
           spec
-        </a>
-        .
-        {iris && <span style={{ marginLeft: 8 }}>
-          iris snapshot: {new Date(iris.synced_at).toLocaleString()}
-        </span>}
+        </a>.
       </p>
       {err && <p style={{ color: 'crimson' }}>error: {err}</p>}
-      {!runs && !err && <p>loading…</p>}
-      {runs && runs.length === 0 && <p>(none synced yet)</p>}
-      {runs && runs.length > 0 && (
-        <ul style={{ listStyle: 'none', padding: 0 }}>
-          {runs.map((id) => {
-            const job = iris?.jobs[irisJobIdForRun(id)]
-            return (
-              <li key={id} style={{ marginBottom: '0.3rem' }}>
-                {job && <IrisBadge job={job} />}{' '}
-                <a
-                  href={`#/runs/${id}`}
-                  onClick={(e) => {
-                    if (isModifiedClick(e)) return
-                    e.preventDefault()
-                    navigate(`runs/${id}`)
-                  }}
-                >
-                  {id}
-                </a>
-              </li>
-            )
-          })}
-        </ul>
+      {!ordered && !err && <p>loading…</p>}
+      {ordered && ordered.length === 0 && <p>(none synced yet)</p>}
+      {timelineSeries.length > 0 && (
+        <div style={{ marginBottom: '1.2rem' }}>
+          <RunsTimelinePlot runs={timelineSeries} highlight={highlight} />
+        </div>
+      )}
+      {ordered && ordered.map((c) => (
+        <RunCard
+          key={c.id}
+          data={c}
+          activeRunId={activeRunId}
+          pinnedRunId={pinnedRunId}
+          onHover={onCardHover}
+          onClick={onCardClick}
+          onScrollTargetRef={setCardRef}
+        />
+      ))}
+      {/* Sticky bottom banner when an active card is off-screen — gives a
+          breadcrumb back to it ("highlighted card is below"). */}
+      {activeRunId && !activeInView && (
+        <StickyActiveBanner
+          runId={activeRunId}
+          card={ordered?.find((c) => c.id === activeRunId) ?? null}
+          onScrollTo={() => {
+            const el = cardRefs.current.get(activeRunId)
+            el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+          }}
+        />
       )}
     </div>
   )
 }
 
-function RunDetail({ runId }: { runId: string }) {
-  const [manifest, setManifest] = useState<RunManifest | null>(null)
-  const [history, setHistory] = useState<RunHistory | null>(null)
-  const [err, setErr] = useState<string | null>(null)
+function StickyActiveBanner({
+  runId, card, onScrollTo,
+}: {
+  runId: string
+  card: RunCardData | null
+  onScrollTo: () => void
+}) {
+  const meta = parseRunName(runId)
+  const hwColor = meta.hardwareKind ? HW_COLORS[meta.hardwareKind] : '#888'
+  return (
+    <div
+      // stopPropagation so this doesn't reach the view-level "click empty
+      // space to unpin" handler.
+      onClick={(e) => { e.stopPropagation(); onScrollTo() }}
+      style={{
+        position: 'fixed',
+        bottom: 12, left: 12, right: 12,
+        margin: '0 auto', maxWidth: 1050,
+        backgroundColor: 'rgba(24,24,24,0.96)',
+        border: '1px solid #4a8aff',
+        borderRadius: 6,
+        padding: '0.55rem 0.9rem',
+        fontSize: '0.8rem',
+        display: 'flex', alignItems: 'center', gap: '0.6rem',
+        cursor: 'pointer',
+        backdropFilter: 'blur(4px)',
+        boxShadow: '0 4px 18px rgba(0,0,0,0.5)',
+      }}>
+      <span style={{ color: hwColor, fontWeight: 600 }}>
+        {meta.hardware ?? '?'}
+      </span>
+      <span style={{ fontFamily: 'monospace' }}>{runId}</span>
+      <span style={{ color: '#888', fontSize: '0.72rem', marginLeft: 'auto' }}>
+        {card?.job && <>iris: {card.job.state} </>}
+        ↓ click to scroll to card
+      </span>
+    </div>
+  )
+}
 
-  useEffect(() => {
-    setManifest(null)
-    setHistory(null)
-    setErr(null)
-    fetchManifest(runId)
-      .then(setManifest)
-      .catch((e) => setErr(String(e)))
-    fetchRunHistory(parquetUrl(runId))
-      .then(setHistory)
-      .catch((e) => setErr(String(e)))
-  }, [runId])
+function RunDetail({ runId }: { runId: string }) {
+  // Same query keys as RunsIndex, so arriving from the index renders the
+  // cached manifest/history instantly while a fresh fetch runs underneath.
+  const manifestQ = useQuery({
+    queryKey: ['manifest', runId],
+    queryFn: () => fetchManifest(runId),
+    refetchInterval: REFETCH_MS.manifest,
+  })
+  const historyQ = useQuery({
+    queryKey: ['history', runId],
+    queryFn: () => fetchRunHistory(parquetUrl(runId)),
+    refetchInterval: REFETCH_MS.history,
+  })
+  const manifest = manifestQ.data ?? null
+  const history = historyQ.data ?? null
+  const errObj = manifestQ.error || historyQ.error
+  const err = errObj ? String(errObj) : null
 
   return (
-    <div style={{ maxWidth: 1200, margin: '2rem auto', padding: '0 1rem' }}>
+    <div style={{ maxWidth: 1600, margin: '2rem auto', padding: '0 1rem' }}>
       <p>
         <a
           href="#/runs"
@@ -144,7 +853,7 @@ function RunDetail({ runId }: { runId: string }) {
       <h1 style={{ fontSize: '1.2rem', fontFamily: 'monospace' }}>{runId}</h1>
       {err && <p style={{ color: 'crimson' }}>error: {err}</p>}
       {manifest && (
-        <div style={{ color: '#666', fontSize: '0.9rem', marginBottom: '1rem' }}>
+        <div style={{ color: '#888', fontSize: '0.9rem', marginBottom: '1rem' }}>
           state: {manifest.run.state} ·{' '}
           history: {manifest.history.rows} rows, steps [
           {manifest.history.step_min ?? '-'}, {manifest.history.step_max ?? '-'}] ·{' '}
