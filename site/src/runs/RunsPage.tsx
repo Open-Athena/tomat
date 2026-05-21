@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
+import { Tooltip } from '../Tooltip'
 import { fetchIrisState, fetchManifest, fetchRuns, irisJobIdForRun, parquetUrl } from './api'
 import type { IrisJob, RunManifest } from './api'
 import { fetchRunHistory } from './parquet'
@@ -172,18 +173,91 @@ function IrisBadge({ job, incomplete }: { job: IrisJob; incomplete?: boolean }) 
   const tail = job.preempts > 0 || job.failures > 0
     ? ` (p=${job.preempts}, f=${job.failures})` : ''
   return (
-    <span
-      title={showIncomplete
-        ? `iris reported SUCCEEDED, but the run ended early — likely preempted with a clean SIGTERM exit. `
-          + `iris will not re-enqueue it. preempts=${job.preempts} failures=${job.failures}`
-        : (job.error || `iris state=${job.state} preempts=${job.preempts} failures=${job.failures}`)}
-      style={{
-        backgroundColor: style.bg, color: style.fg,
-        padding: '1px 6px', borderRadius: 3,
-        fontSize: '0.75rem', fontFamily: 'monospace',
-      }}
-    >
-      {showIncomplete ? 'INCOMPLETE' : job.state}{tail}
+    <Tooltip content={showIncomplete
+      ? `iris reported SUCCEEDED, but the run ended early — likely preempted with a clean SIGTERM exit. `
+        + `iris will not re-enqueue it. preempts=${job.preempts} failures=${job.failures}`
+      : (job.error || `iris state=${job.state} preempts=${job.preempts} failures=${job.failures}`)}>
+      <span
+        style={{
+          backgroundColor: style.bg, color: style.fg,
+          padding: '1px 6px', borderRadius: 3,
+          fontSize: '0.75rem', fontFamily: 'monospace',
+        }}
+      >
+        {showIncomplete ? 'INCOMPLETE' : job.state}{tail}
+      </span>
+    </Tooltip>
+  )
+}
+
+// ── status dots ────────────────────────────────────────────────────────────
+// Two dots per card — iris job state + wandb run state. Replaces the old
+// italic distinction: colour shows each source's health, so a healthy run
+// reads as two green dots and an iris/wandb disagreement is visible at a
+// glance. A hollow dot = that source has nothing (e.g. no iris job).
+const DOT = {
+  green: '#22c55e', amber: '#f59e0b', blue: '#3b82f6',
+  orange: '#b4632a', red: '#ef4444', grey: '#6a737d',
+}
+
+function irisDotColor(job: IrisJob, incomplete: boolean): string {
+  switch (job.state) {
+    case 'RUNNING': return DOT.green
+    case 'PENDING':
+    case 'BUILDING': return DOT.amber
+    case 'SUCCEEDED': return incomplete ? DOT.orange : DOT.blue
+    case 'FAILED':
+    case 'WORKER_FAILED':
+    case 'UNSCHEDULABLE': return DOT.red
+    default: return DOT.grey // KILLED / unknown
+  }
+}
+
+// wandb's `state` lags, and a crashed run often never flips off "running" —
+// so a "running" run that hasn't logged in >10 min is treated as stale (grey).
+function wandbDotColor(state: string, logAgeSec: number | null): string {
+  if (state === 'running') {
+    return logAgeSec != null && logAgeSec < 600 ? DOT.green : DOT.grey
+  }
+  if (state === 'finished') return DOT.blue
+  if (state === 'crashed' || state === 'failed') return DOT.red
+  return DOT.grey // killed / unknown
+}
+
+function Dot({ color, hollow, title }: { color?: string; hollow?: boolean; title: string }) {
+  return (
+    <Tooltip content={title}>
+      <span
+        style={{
+          display: 'inline-block', width: 9, height: 9, borderRadius: '50%',
+          flexShrink: 0,
+          backgroundColor: hollow ? 'transparent' : color,
+          border: hollow ? '1px solid #555' : 'none',
+        }}
+      />
+    </Tooltip>
+  )
+}
+
+function StatusDots({ job, manifest, incomplete, lastLogTs }: {
+  job: IrisJob | null
+  manifest: RunManifest | null
+  incomplete: boolean
+  lastLogTs: number | null
+}) {
+  const logAgeSec = lastLogTs != null ? Math.max(0, Date.now() / 1000 - lastLogTs) : null
+  const loggedStr = lastLogTs != null ? `last logged ${secsAgo(lastLogTs)}` : 'never logged'
+  return (
+    <span style={{ display: 'inline-flex', gap: 3, alignItems: 'center' }}>
+      {job
+        ? <Dot color={irisDotColor(job, incomplete)} title={`iris: ${job.state}`} />
+        : <Dot hollow title="iris: no job (e.g. a Modal run)" />}
+      {manifest
+        ? <Dot
+            color={wandbDotColor(manifest.run.state, logAgeSec)}
+            title={`wandb: ${manifest.run.state} · ${loggedStr}`}
+          />
+        : <Dot hollow title="wandb: no data yet" />}
     </span>
   )
 }
@@ -276,6 +350,13 @@ function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTar
   const isActive = activeRunId === id
   const isPinned = pinnedRunId === id
   const otherActive = activeRunId != null && !isActive
+  const incomplete = isIncomplete(data)
+  // wandb's run state can sit at "running" long after a Modal job has died
+  // (it never flushed a terminal state). Treat a "running" run that hasn't
+  // logged in >10min as stale — so the badge greys instead of reading green.
+  const lastLogTs = manifest?.history.ts_max ?? null
+  const wandbStale = manifest?.run.state === 'running'
+    && lastLogTs != null && (Date.now() / 1000 - lastLogTs) >= 600
   const cardRef = useRef<HTMLDivElement | null>(null)
   useEffect(() => {
     onScrollTargetRef(id, cardRef.current)
@@ -285,7 +366,6 @@ function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTar
   const meta = parseRunName(id)
   const hwColor = meta.hardwareKind ? HW_COLORS[meta.hardwareKind] : '#888'
   const wbUrl = manifest?.run.url
-  const steps = manifest?.history
   // Prefer `trainer.num_train_steps` from the manifest config (authoritative,
   // reflects most-recent resume target) over the run-name parse (which freezes
   // the *original* target — e.g. cont7k-ext was named …-8k but is now resumed
@@ -295,8 +375,20 @@ function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTar
   const targetLabel = trainerNumSteps != null
     ? formatStepCount(trainerNumSteps)
     : (meta.targetSteps ?? null)
-  const progressPct = steps?.step_max != null && targetSteps != null
-    ? Math.min(100, (steps.step_max / targetSteps) * 100)
+  // Steps completed. Levanter's `global_step` is 0-indexed — a finished
+  // N-step run ends at `global_step = N-1` — so "steps done" is that + 1.
+  // Showing `global_step` raw is the confusing "79,999 / 80k" off-by-one.
+  // (Read from the run summary, not `history.step_max`, which is wandb's
+  // `_step` log-counter — a different quantity.)
+  const gsRaw = manifest?.summary['global_step']
+  const lastGlobalStep = typeof gsRaw === 'number' ? gsRaw : null
+  const stepsDone = lastGlobalStep != null
+    ? (targetSteps != null
+        ? Math.min(lastGlobalStep + 1, targetSteps)
+        : lastGlobalStep + 1)
+    : null
+  const progressPct = stepsDone != null && targetSteps != null
+    ? Math.min(100, (stepsDone / targetSteps) * 100)
     : null
   const trainLoss = manifest?.summary['train/loss']
   const evalLoss = manifest?.summary['eval/loss']
@@ -305,7 +397,6 @@ function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTar
 
   const sparkPts = useMemo(() => history ? recentStepPoints(history) : [], [history])
   const lastTs = sparkPts.length > 0 ? sparkPts[sparkPts.length - 1].x : null
-  const lastStep = sparkPts.length > 0 ? sparkPts[sparkPts.length - 1].y : null
   const freshSec = lastTs != null ? Math.max(0, Date.now() / 1000 - lastTs) : null
 
   // "Steps in last 1m / 1h / 6h" — anchored to the latest log timestamp (so a
@@ -365,25 +456,34 @@ function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTar
       <div style={{ minWidth: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
           {isPinned && (
-            <span title="pinned — the plot is soloed + rescaled to this run; click the card again to unpin">
-              📌
-            </span>
+            <Tooltip content="pinned — the plot is soloed + rescaled to this run; click the card again to unpin">
+              <span>📌</span>
+            </Tooltip>
           )}
-          {job && <IrisBadge job={job} incomplete={isIncomplete(data)} />}
+          <StatusDots
+            job={job}
+            manifest={manifest}
+            incomplete={incomplete}
+            lastLogTs={lastLogTs}
+          />
+          {job && <IrisBadge job={job} incomplete={incomplete} />}
           {!job && manifest && (
             // No iris job (e.g. a Modal run) → fall back to wandb's run state.
-            // Uppercased to match the iris badges; italic marks it as the
-            // laggier wandb-derived state (lower-trust than iris).
-            <span
-              title={`wandb state (no iris job): ${manifest.run.state}`}
-              style={{
-                backgroundColor: WANDB_STATE_BG[manifest.run.state] ?? '#555',
-                color: '#fff', padding: '1px 6px', borderRadius: 3,
-                fontSize: '0.75rem', fontFamily: 'monospace',
-                fontStyle: 'italic',
-              }}>
-              {manifest.run.state.toUpperCase()}
-            </span>
+            // The status dots mark the source; a "running" run gone stale
+            // (no logs in >10min) shows greyed as STALE rather than green.
+            <Tooltip content={wandbStale
+              ? `wandb says running, but last logged ${secsAgo(lastLogTs!)} — likely dead`
+              : `wandb state (no iris job): ${manifest.run.state}`}>
+              <span
+                style={{
+                  backgroundColor: wandbStale
+                    ? '#6a737d' : (WANDB_STATE_BG[manifest.run.state] ?? '#555'),
+                  color: '#fff', padding: '1px 6px', borderRadius: 3,
+                  fontSize: '0.75rem', fontFamily: 'monospace',
+                }}>
+                {wandbStale ? 'STALE' : manifest.run.state.toUpperCase()}
+              </span>
+            </Tooltip>
           )}
           <a
             href={`#/runs/${id}`}
@@ -397,11 +497,12 @@ function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTar
             {id}
           </a>
           {wbUrl && (
-            <a href={wbUrl} target="_blank" rel="noreferrer"
-              style={{ fontSize: '0.75rem', color: '#888' }}
-              title="wandb">
-              wandb ↗
-            </a>
+            <Tooltip content="open this run in wandb">
+              <a href={wbUrl} target="_blank" rel="noreferrer"
+                style={{ fontSize: '0.75rem', color: '#888' }}>
+                wandb ↗
+              </a>
+            </Tooltip>
           )}
         </div>
         <div style={{ marginTop: '0.4rem', fontSize: '0.8rem', color: '#ccc',
@@ -412,14 +513,29 @@ function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTar
           {meta.model && <span>{meta.model}</span>}
           {meta.batchSize && <span>BS={meta.batchSize}</span>}
           {meta.lossType && <span>{meta.lossType}</span>}
-          {targetLabel && <span title={trainerNumSteps != null ? 'trainer.num_train_steps (authoritative)' : 'parsed from run name'}>target {targetLabel}</span>}
+          {targetLabel && (
+            <Tooltip content={trainerNumSteps != null ? 'trainer.num_train_steps (authoritative)' : 'parsed from run name'}>
+              <span>target {targetLabel}</span>
+            </Tooltip>
+          )}
           {meta.suffix && <span style={{ color: '#888' }}>· {meta.suffix}</span>}
         </div>
         <div style={{ marginTop: '0.3rem', fontSize: '0.75rem', color: '#888' }}>
           {manifest && (
             <>
-              created {timeAgo(manifest.run.created_at)} ·{' '}
-              synced {timeAgo(manifest.synced_at)}
+              created {timeAgo(manifest.run.created_at)}
+              {manifest.history.ts_max != null && (
+                <>
+                  {' · '}
+                  <span style={{
+                    color: freshnessColor(
+                      Math.max(0, Date.now() / 1000 - manifest.history.ts_max)),
+                  }}>
+                    logged {secsAgo(manifest.history.ts_max)}
+                  </span>
+                </>
+              )}
+              {' · '}synced {timeAgo(manifest.synced_at)}
               {manifest.run.entity && manifest.run.project && (
                 <> · {manifest.run.entity}/{manifest.run.project}</>
               )}
@@ -430,10 +546,13 @@ function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTar
       </div>
       <div style={{ minWidth: 200, fontSize: '0.8rem', color: '#ccc', textAlign: 'right' }}>
         {/* Top: step counter + progress bar */}
-        {(steps?.step_max != null || lastStep != null) && (
+        {stepsDone != null && (
           <div>
-            step <b>{(lastStep ?? steps?.step_max ?? 0).toLocaleString()}</b>
-            {targetLabel && ` / ${targetLabel}`}
+            {/* Once complete (steps done == target) just show it once,
+                compact — "step 80k" rather than "step 80,000 / 80k". */}
+            {stepsDone === targetSteps && targetLabel
+              ? <>step <b>{targetLabel}</b></>
+              : <>step <b>{stepsDone.toLocaleString()}</b>{targetLabel ? ` / ${targetLabel}` : ''}</>}
             {progressPct != null && (
               <div style={{
                 height: 4, marginTop: 4, backgroundColor: '#333', borderRadius: 2,
@@ -450,26 +569,29 @@ function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTar
         {sparkPts.length >= 2 && freshSec != null && (
           <div style={{ marginTop: 6, display: 'flex', justifyContent: 'flex-end',
                         alignItems: 'center', gap: 6 }}>
-            <span title={`last log: ${new Date(lastTs! * 1000).toLocaleString()}`}
-              style={{
-                fontSize: '0.68rem', color: freshnessColor(freshSec),
-                fontFamily: 'monospace',
-              }}>
-              ● {secsAgo(lastTs!)}
-            </span>
+            <Tooltip content={`last log: ${new Date(lastTs! * 1000).toLocaleString()}`}>
+              <span
+                style={{
+                  fontSize: '0.68rem', color: freshnessColor(freshSec),
+                  fontFamily: 'monospace',
+                }}>
+                ● {secsAgo(lastTs!)}
+              </span>
+            </Tooltip>
             <Sparkline pts={sparkPts} color={freshnessColor(freshSec)} />
           </div>
         )}
         {/* Step-rate over last 1m / 1h / 6h. Anchored to last log timestamp
             (a run that died 2m ago shows steps in the 1m before that). */}
         {(rate1m != null || rate1h != null || rate6h != null) && (
-          <div style={{ marginTop: 2, fontFamily: 'monospace', fontSize: '0.7rem',
-                        color: '#aaa' }}
-            title="steps in last 1m / 1h / 6h, ending at latest log">
-            {rate1m != null && <>+{rate1m}/min</>}
-            {rate1h != null && <> · +{rate1h.toLocaleString()}/h</>}
-            {rate6h != null && <> · +{rate6h.toLocaleString()}/6h</>}
-          </div>
+          <Tooltip content="steps in last 1m / 1h / 6h, ending at latest log">
+            <div style={{ marginTop: 2, fontFamily: 'monospace', fontSize: '0.7rem',
+                          color: '#aaa' }}>
+              {rate1m != null && <>+{rate1m}/min</>}
+              {rate1h != null && <> · +{rate1h.toLocaleString()}/h</>}
+              {rate6h != null && <> · +{rate6h.toLocaleString()}/6h</>}
+            </div>
+          </Tooltip>
         )}
         {/* Latest summary metrics */}
         <div style={{ marginTop: 4, fontFamily: 'monospace', fontSize: '0.72rem' }}>
@@ -527,9 +649,12 @@ function numTrainStepsOf(manifest: RunManifest | null): number | null {
 // will not re-enqueue it). Flag that so it doesn't read as a healthy finish.
 function isIncomplete(c: RunCardData): boolean {
   if (c.job?.state !== 'SUCCEEDED') return false
-  const stepMax = c.manifest?.history?.step_max ?? null
+  // `global_step` is 0-indexed (a finished N-step run ends at N-1), so steps
+  // completed = global_step + 1; "incomplete" = that falls short of target.
+  const gs = c.manifest?.summary['global_step']
+  const lastGlobalStep = typeof gs === 'number' ? gs : null
   const target = numTrainStepsOf(c.manifest)
-  return stepMax != null && target != null && stepMax < target - 1
+  return lastGlobalStep != null && target != null && lastGlobalStep + 1 < target
 }
 
 // Hide noisy/stale runs from the dashboard. Bare-names list for now — graduate

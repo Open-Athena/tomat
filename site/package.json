@@ -10,6 +10,7 @@
     "snapshot": "vite build && node scripts/snapshot-deck.mjs"
   },
   "dependencies": {
+    "@floating-ui/react": "^0.27.19",
     "@tanstack/react-query": "^5.100.11",
     "d3-dsv": "^3.0.1",
     "hyparquet": "^1.25.8",

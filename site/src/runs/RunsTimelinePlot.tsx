@@ -9,6 +9,7 @@
 
 import { useState } from 'react'
 import { LegendItem, Plot, useTheme } from 'pltly/react'
+import { Tooltip } from '../Tooltip'
 import type { UseTraceHighlightReturn } from 'pltly/react'
 import { themedHoverlabel } from '../theme'
 import type { RunHistory } from './parquet'
@@ -42,14 +43,29 @@ function localDateStr(ms: number): string {
     + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 
-type XMode = 'clock' | 'rel' | 'loss'
+type XMode = 'clock' | 'rel' | 'active' | 'loss'
 const X_MODES: { id: XMode; label: string; help: string }[] = [
   { id: 'clock', label: 'clock', help: 'absolute wallclock — when each run was active' },
   { id: 'rel', label: 'elapsed', help: 'hours since each run’s own start — aligns runs at t=0' },
+  { id: 'active', label: 'active', help: 'training time only — idle / preempt gaps (the flat segments) removed' },
   { id: 'loss', label: 'loss vs step', help: 'training-loss curves against step' },
 ]
 const X_MODE_KEY = 'tomat:runs-xmode'
 const LEGEND_COLLAPSED_KEY = 'tomat:runs-legend-collapsed'
+
+// `active` x-mode: cap on a single inter-sample interval's contribution.
+// Runs log every ~minute while training, so anything longer is a gap the
+// run wasn't scheduled/running — collapse it to this many seconds rather
+// than its full wall duration.
+const IDLE_CAP_SEC = 300
+const LOGY_KEY = 'tomat:runs-logy'
+
+/** q-th quantile (0–1) of an ascending-sorted array. */
+function quantile(sorted: number[], q: number): number {
+  if (sorted.length === 0) return 0
+  const i = Math.min(sorted.length - 1, Math.max(0, Math.round(q * (sorted.length - 1))))
+  return sorted[i]
+}
 
 /** One run's (x, y) series for the given x-axis mode.
  *  clock/rel: y = running-max `global_step` (flats = idle/preempt).
@@ -71,7 +87,10 @@ function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
     return { x: pts.map((p) => p.s), y: pts.map((p) => p.l) }
   }
 
-  // clock / rel: running max of global_step along ascending _timestamp.
+  // clock / rel / active: running max of global_step along ascending
+  // _timestamp. `active` accumulates only the intervals in which the step
+  // advanced — idle / preempt stretches (the flat segments) collapse to zero,
+  // so the x-axis measures time the run was actually training.
   const ordered = timestamps
     .map((ts, i) => ({ ts, i }))
     .filter((r) => r.ts !== null && (cutoffSec == null || (r.ts as number) >= cutoffSec))
@@ -80,13 +99,28 @@ function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
   const x: (string | number)[] = []
   const y: number[] = []
   let runningMax = -Infinity
+  let prevTs: number | null = null
+  let activeCum = 0
   for (const { ts, i } of ordered) {
     const s = globalStep[i]
     if (s == null) continue
-    runningMax = Math.max(runningMax, s)
     const tsec = ts as number
-    x.push(mode === 'rel' ? (tsec - t0) / 3600 : localDateStr(tsec * 1000))
+    // `advanced` = this sample pushes a new step high → the interval since
+    // the previous sample saw real training. Cap it: a preemption gap ends
+    // with a step bump when the run resumes, so the gap interval reads as
+    // "advanced" — the cap collapses its multi-hour duration to a sliver.
+    // Non-advancing intervals (logged-but-stuck, or post-restore catch-up
+    // below the running max) contribute nothing.
+    const advanced = s > runningMax
+    if (mode === 'active' && prevTs !== null && advanced) {
+      activeCum += Math.min(tsec - prevTs, IDLE_CAP_SEC)
+    }
+    runningMax = Math.max(runningMax, s)
+    if (mode === 'clock') x.push(localDateStr(tsec * 1000))
+    else if (mode === 'rel') x.push((tsec - t0) / 3600)
+    else x.push(activeCum / 3600)
     y.push(runningMax)
+    prevTs = tsec
   }
   return { x, y }
 }
@@ -109,13 +143,22 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
   const [xMode, setXModeRaw] = useState<XMode>(() => {
     try {
       const v = localStorage.getItem(X_MODE_KEY)
-      if (v === 'clock' || v === 'rel' || v === 'loss') return v
+      if (v === 'clock' || v === 'rel' || v === 'active' || v === 'loss') return v
     } catch { /* ignore */ }
     return 'clock'
   })
   const setXMode = (m: XMode) => {
     setXModeRaw(m)
     try { localStorage.setItem(X_MODE_KEY, m) } catch { /* ignore */ }
+  }
+
+  // Log-scale the loss axis (loss-vs-step mode only). Persisted.
+  const [logY, setLogYRaw] = useState(() => {
+    try { return localStorage.getItem(LOGY_KEY) === '1' } catch { return false }
+  })
+  const setLogY = (v: boolean) => {
+    setLogYRaw(v)
+    try { localStorage.setItem(LOGY_KEY, v ? '1' : '0') } catch { /* ignore */ }
   }
 
   const cutoffSec = hoursBack ? (Date.now() / 1000 - hoursBack * 3600) : null
@@ -164,7 +207,39 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
     ? { type: 'date' as const, gridcolor, zerolinecolor, linecolor: gridcolor }
     : {
       type: 'linear' as const,
-      title: { text: xMode === 'rel' ? 'elapsed (h)' : 'step' },
+      title: {
+        text: xMode === 'rel' ? 'elapsed (h)'
+          : xMode === 'active' ? 'active (h)' : 'step',
+      },
+      gridcolor, zerolinecolor, linecolor: gridcolor,
+    }
+
+  // Loss mode: clip the y-axis to a robust percentile so spike outliers don't
+  // crush the trend band. A percentile (not median+σ — σ is inflated by the
+  // very spikes we want to exclude) is robust + predictable; plotly drag-zoom
+  // still gives continuous adjustment from there.
+  let lossLo = 1
+  let lossHi = 10
+  if (xMode === 'loss') {
+    const vals: number[] = []
+    for (const d of data) for (const v of d.y) if (Number.isFinite(v)) vals.push(v)
+    vals.sort((a, b) => a - b)
+    if (vals.length) {
+      lossLo = Math.max(vals[0], 1e-4)
+      lossHi = Math.max(quantile(vals, 0.99), lossLo * 1.05)
+    }
+  }
+  const yaxis = xMode === 'loss'
+    ? {
+      type: (logY ? 'log' : 'linear') as 'log' | 'linear',
+      title: { text: 'train loss' },
+      // Plotly log axes take `range` in log10 units.
+      range: (logY ? [Math.log10(lossLo), Math.log10(lossHi)] : [lossLo, lossHi]) as [number, number],
+      gridcolor, zerolinecolor, linecolor: gridcolor,
+    }
+    : {
+      type: 'linear' as const,
+      title: { text: 'step' },
       gridcolor, zerolinecolor, linecolor: gridcolor,
     }
 
@@ -177,22 +252,38 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
         {X_MODES.map((m) => {
           const on = m.id === xMode
           return (
-            <button
-              key={m.id}
-              onClick={() => setXMode(m.id)}
-              title={m.help}
-              style={{
-                background: on ? (isDark ? '#2a2a2a' : '#e8e8e8') : 'transparent',
-                border: `1px solid ${on ? (isDark ? '#444' : '#bbb') : 'transparent'}`,
-                borderRadius: 4, cursor: 'pointer', padding: '2px 8px',
-                fontSize: '0.72rem', fontFamily: 'inherit',
-                color: on ? fg : muted,
-              }}
-            >
-              {m.label}
-            </button>
+            <Tooltip key={m.id} content={m.help}>
+              <button
+                onClick={() => setXMode(m.id)}
+                style={{
+                  background: on ? (isDark ? '#2a2a2a' : '#e8e8e8') : 'transparent',
+                  border: `1px solid ${on ? (isDark ? '#444' : '#bbb') : 'transparent'}`,
+                  borderRadius: 4, cursor: 'pointer', padding: '2px 8px',
+                  fontSize: '0.72rem', fontFamily: 'inherit',
+                  color: on ? fg : muted,
+                }}
+              >
+                {m.label}
+              </button>
+            </Tooltip>
           )
         })}
+        {xMode === 'loss' && (
+          <Tooltip content="log-scale the loss axis">
+            <button
+              onClick={() => setLogY(!logY)}
+              style={{
+                background: logY ? (isDark ? '#2a2a2a' : '#e8e8e8') : 'transparent',
+                border: `1px solid ${logY ? (isDark ? '#444' : '#bbb') : 'transparent'}`,
+                borderRadius: 4, cursor: 'pointer', padding: '2px 8px',
+                fontSize: '0.72rem', fontFamily: 'inherit',
+                color: logY ? fg : muted, marginLeft: 8,
+              }}
+            >
+              log y
+            </button>
+          </Tooltip>
+        )}
       </div>
       <Plot
         data={data}
@@ -206,10 +297,7 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
           // Extra bottom room when there's an x-axis title (rel / loss modes).
           margin: { t: 30, l: 60, r: 12, b: xMode === 'clock' ? 36 : 48 },
           xaxis,
-          yaxis: {
-            title: { text: xMode === 'loss' ? 'train loss' : 'step' },
-            gridcolor, zerolinecolor, linecolor: gridcolor,
-          },
+          yaxis,
           // 'x unified' shows every trace's value at the hover x — much easier
           // to compare runs at a given moment than 'closest' (per-trace).
           hovermode: 'x unified',
