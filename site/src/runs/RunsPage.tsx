@@ -1198,7 +1198,9 @@ function RunDetail({ runId }: { runId: string }) {
         <EvalJobsTable jobs={evalJobs} evalByStep={evalByStep} />
       )}
       {!history && !err && <p>loading parquet…</p>}
-      {history && <WallclockPlot history={history} runId={runId} />}
+      {history && (
+        <WallclockPlot history={history} evalSeries={evalQ.data ?? null} runId={runId} />
+      )}
     </div>
   )
 }

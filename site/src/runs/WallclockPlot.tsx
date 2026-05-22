@@ -1,50 +1,76 @@
-// Per-run plot — 2 stacked subplots over a shared x-axis (wallclock UTC by
-// default; toggleable to gstep):
-//   1. step (Levanter's `global_step`, running max — top, 28%). Hidden in
-//      step mode (would degenerate to y=x).
-//   2. losses + NMAE on a single log y-axis (bottom):
-//        TL, VL, and MV/MT × {mean, median, p99}.
-// Lifecycle events (trainer_started / sigterm / cluster preempt) render as
-// vertical lines via `shapes` (yref='paper') so they span both panels.
+// Per-run plot — 2 stacked subplots over a shared x-axis. x-axis modes:
+//   • wallclock — local time (the viewer's zone)
+//   • elapsed   — hours since the run's first log
+//   • step      — Levanter `global_step`
+// Panels:
+//   1. step (running max of global_step) — top, 28%. Hidden in step mode
+//      (it would degenerate to y = x).
+//   2. losses + mat-NMAE + mat-NEMD on a single log y-axis (bottom).
 //
-// MT (train_200) traces are dashed; MV (val_200) traces solid. NMAE stat is
-// encoded by shade: mean (lime) → median (mid green) → p99 (dark green).
-// NMAE traces include markers because eval logging is sparse (~17 entries
-// per run); a pure line trace would be invisible between widely-spaced rows.
+// Eval traces (MV = val_200, MT = train_200) come from the canonical
+// per-step eval.json — NOT the parquet's collapsed harvested points. NMAE is
+// the green family, NEMD the teal family; the stat is encoded by shade
+// (mean → median → p99); MV solid, MT dashed. mean traces show by default;
+// median/p99 are `legendonly` (click the legend to add them). Eval points
+// are keyed by checkpoint step; on the time/elapsed axes they're placed at
+// the wallclock of that step, recovered from the parquet's
+// (timestamp, global_step) rows.
 //
-// Eval rows (MV/MT/VL) lack `global_step` in wandb, so in step mode we
-// back-fill it from the nearest preceding TL row by `_timestamp`.
+// Lifecycle events render as vertical lines via `shapes` (yref='paper') so
+// they span both panels.
 
 import { useMemo, useState } from 'react'
 import { Plot, useTheme } from 'pltly/react'
 import { themedHoverlabel } from '../theme'
 import type { RunHistory } from './parquet'
+import type { RunEval } from './api'
 
 interface Props {
   history: RunHistory
+  evalSeries: RunEval | null
   runId: string
 }
 
-type XMode = 'time' | 'step'
+type XMode = 'time' | 'elapsed' | 'step'
+type Stat = 'mean' | 'median' | 'p99'
 
 const COLORS = {
   step: '#2196f3',
   TL: '#ef5350',     // train/loss
   VL: '#ffa726',     // eval/loss
   // NMAE shades, light → dark = mean → median → p99
-  mean: '#9ccc65',
-  median: '#43a047',
-  p99: '#1b5e20',
+  nmae: { mean: '#9ccc65', median: '#43a047', p99: '#1b5e20' },
+  // NEMD shades — teal family, kept distinct from NMAE's green
+  nemd: { mean: '#4dd0e1', median: '#00acc1', p99: '#00838f' },
   start: '#ffa726',
   sigterm: '#bdbdbd',
   preempt: '#ba68c8',
 } as const
 
-export function WallclockPlot({ history, runId }: Props) {
+/** Local-time `YYYY-MM-DD HH:MM:SS` (no tz suffix → a Plotly date axis renders
+ *  it verbatim, i.e. in the viewer's local zone rather than UTC). */
+function toLocal(ts: number): string {
+  const d = new Date(ts * 1000)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
+    + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+/** Short local-timezone label for the x-axis title, e.g. "EDT". */
+const TZ_LABEL: string = (() => {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZoneName: 'short' })
+      .formatToParts(new Date())
+    return parts.find((p) => p.type === 'timeZoneName')?.value ?? 'local'
+  } catch {
+    return 'local'
+  }
+})()
+
+export function WallclockPlot({ history, evalSeries, runId }: Props) {
   const { isDark } = useTheme()
   const [xMode, setXMode] = useState<XMode>('time')
   const { timestamps, cols } = history
-  const toIso = (ts: number) => new Date(ts * 1000).toISOString()
 
   const ordered = useMemo(
     () => timestamps
@@ -53,10 +79,12 @@ export function WallclockPlot({ history, runId }: Props) {
       .sort((a, b) => (a.ts as number) - (b.ts as number)),
     [timestamps],
   )
+  const t0 = ordered.length > 0 ? (ordered[0].ts as number) : 0
 
-  // (ts → gstep) map: derived from any row that has a `global_step`. Used to
-  // back-fill the gstep for eval/lifecycle rows that wandb didn't tag.
-  const tsToGstep = useMemo(() => {
+  // (ts, gstep) pairs from every row carrying a `global_step` — sorted by ts
+  // and, since training is monotonic, effectively by gstep too. Drives both
+  // ts→gstep (eval/lifecycle back-fill) and gstep→ts (eval-point placement).
+  const tsGstep = useMemo(() => {
     const globalStep = cols.get('global_step') ?? []
     const pairs: { ts: number; gstep: number }[] = []
     for (const { ts, i } of ordered) {
@@ -67,21 +95,47 @@ export function WallclockPlot({ history, runId }: Props) {
     return pairs
   }, [ordered, cols])
 
+  /** gstep of the latest logged row at or before `ts`. */
   function gstepAtTs(ts: number): number | null {
-    if (tsToGstep.length === 0) return null
-    // Binary search for largest ts <= target.
-    let lo = 0, hi = tsToGstep.length - 1, best = -1
+    if (tsGstep.length === 0) return null
+    let lo = 0, hi = tsGstep.length - 1, best = -1
     while (lo <= hi) {
       const mid = (lo + hi) >> 1
-      if (tsToGstep[mid].ts <= ts) { best = mid; lo = mid + 1 }
+      if (tsGstep[mid].ts <= ts) { best = mid; lo = mid + 1 }
       else hi = mid - 1
     }
-    if (best < 0) return tsToGstep[0]?.gstep ?? null
-    return tsToGstep[best].gstep
+    return best < 0 ? (tsGstep[0]?.gstep ?? null) : tsGstep[best].gstep
   }
 
-  // Per-metric series: xs (date strings or gstep numbers depending on mode),
-  // ys, and gsteps (used for the hover tooltip in either mode).
+  /** Wallclock ts when the run first reached `step` (gstep is monotonic in
+   *  ts order). Used to place per-step eval points on the time axes. */
+  function tsAtGstep(step: number): number | null {
+    if (tsGstep.length === 0) return null
+    let lo = 0, hi = tsGstep.length - 1, best = -1
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      if (tsGstep[mid].gstep >= step) { best = mid; hi = mid - 1 }
+      else lo = mid + 1
+    }
+    return best < 0 ? tsGstep[tsGstep.length - 1].ts : tsGstep[best].ts
+  }
+
+  /** x-coordinate for a wallclock ts, per the current x-mode. */
+  function xOfTs(ts: number): string | number {
+    if (xMode === 'step') return gstepAtTs(ts) ?? NaN
+    if (xMode === 'elapsed') return (ts - t0) / 3600
+    return toLocal(ts)
+  }
+
+  /** x-coordinate for an eval point at checkpoint `step`. */
+  function xOfStep(step: number): string | number | null {
+    if (xMode === 'step') return step
+    const ts = tsAtGstep(step)
+    if (ts === null) return null
+    return xMode === 'elapsed' ? (ts - t0) / 3600 : toLocal(ts)
+  }
+
+  // Per-metric parquet series (TL/VL): xs, ys, gsteps (gstep for the tooltip).
   type Series = { xs: (string | number)[]; ys: number[]; gsteps: (number | null)[] }
   function series(key: string): Series {
     const col = cols.get(key) ?? []
@@ -91,9 +145,8 @@ export function WallclockPlot({ history, runId }: Props) {
     for (const { ts, i } of ordered) {
       const v = col[i]
       if (v === null || v === undefined) continue
-      const g = gstepAtTs(ts as number)
-      gsteps.push(g)
-      xs.push(xMode === 'time' ? toIso(ts as number) : (g ?? NaN))
+      gsteps.push(gstepAtTs(ts as number))
+      xs.push(xOfTs(ts as number))
       ys.push(v as number)
     }
     return { xs, ys, gsteps }
@@ -102,27 +155,69 @@ export function WallclockPlot({ history, runId }: Props) {
   // Step (top-panel) trace: running-max of global_step.
   const stepTrace = useMemo(() => {
     const globalStep = cols.get('global_step') ?? []
-    const xs: string[] = []
+    const xs: (string | number)[] = []
     const ys: number[] = []
     let runningMax = -Infinity
     for (const { ts, i } of ordered) {
       const s = globalStep[i]
       if (s === null) continue
       runningMax = Math.max(runningMax, s)
-      xs.push(toIso(ts as number))
+      xs.push(xOfTs(ts as number))
       ys.push(runningMax)
     }
     return { xs, ys }
-  }, [ordered, cols])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ordered, cols, xMode])
 
   const TL = series('train/loss')
   const VL = series('eval/loss')
-  const MVmean = series('eval/mat_nmae/val_200/mean')
-  const MVmed = series('eval/mat_nmae/val_200/median')
-  const MVp99 = series('eval/mat_nmae/val_200/p99')
-  const MTmean = series('eval/mat_nmae/train_200/mean')
-  const MTmed = series('eval/mat_nmae/train_200/median')
-  const MTp99 = series('eval/mat_nmae/train_200/p99')
+
+  // ── eval traces (MV/MT × {NMAE,NEMD} × {mean,median,p99}) from eval.json ──
+  const evalTrace = (
+    setKey: string, mvmt: string, dash: 'solid' | 'dash',
+    metric: 'nmae' | 'nemd', stat: Stat,
+  ) => {
+    const pts = evalSeries?.sets[setKey] ?? []
+    const xs: (string | number)[] = []
+    const ys: number[] = []
+    const steps: number[] = []
+    for (const pt of pts) {
+      const v = (pt as unknown as Record<string, number | null>)[`${metric}_${stat}`]
+      if (v === null || v === undefined) continue
+      const x = xOfStep(pt.step)
+      if (x === null) continue
+      xs.push(x); ys.push(v * 100); steps.push(pt.step)  // fraction → %
+    }
+    const color = COLORS[metric][stat]
+    const name = `${mvmt} ${metric.toUpperCase()} ${stat}`
+    return {
+      x: xs, y: ys, name,
+      type: 'scatter' as const,
+      mode: 'lines+markers' as const,
+      line: { color, width: 1.3, dash },
+      marker: { color, size: 4 },
+      yaxis: 'y2',
+      legendgroup: `${mvmt}-${metric}`,
+      customdata: steps,
+      hovertemplate: `${name} %{y:.2f}%%<br>step %{customdata}<extra></extra>`,
+      // mean shows by default; median/p99 are one legend-click away.
+      visible: (stat === 'mean' ? true : 'legendonly') as true | 'legendonly',
+    }
+  }
+  const evalTraces = useMemo(() => {
+    const out = []
+    for (const [setKey, mvmt, dash] of [
+      ['val_200', 'MV', 'solid'], ['train_200', 'MT', 'dash'],
+    ] as [string, string, 'solid' | 'dash'][]) {
+      for (const metric of ['nmae', 'nemd'] as const) {
+        for (const stat of ['mean', 'median', 'p99'] as Stat[]) {
+          out.push(evalTrace(setKey, mvmt, dash, metric, stat))
+        }
+      }
+    }
+    return out
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [evalSeries, xMode])
 
   // Lifecycle event timestamps.
   const eventTimes = (key: string): number[] => {
@@ -163,7 +258,7 @@ export function WallclockPlot({ history, runId }: Props) {
   const eventShapes: Shape[] = []
   const addShapes = (ts: number[], color: string, dash: 'dash' | 'dot' | 'solid') => {
     for (const t of ts) {
-      const x: string | number = xMode === 'time' ? toIso(t) : (gstepAtTs(t) ?? NaN)
+      const x = xOfTs(t)
       if (typeof x === 'number' && Number.isNaN(x)) continue
       eventShapes.push({
         type: 'line', xref: 'x', yref: 'paper',
@@ -188,43 +283,21 @@ export function WallclockPlot({ history, runId }: Props) {
     hoverinfo: 'skip' as const,
   })
 
-  const showTopPanel = xMode === 'time'
-  // gstep gets shown as customdata for the tooltip in both x-modes.
+  const showTopPanel = xMode !== 'step'
   const customGsteps = (s: Series) => s.gsteps.map((g) => (g === null ? '?' : g))
 
-  const tlHover = xMode === 'time'
-    ? 'TL %{y:.3f}<br>gstep %{customdata}<extra></extra>'
-    : 'TL %{y:.3f}<br>gstep %{x}<extra></extra>'
-  const vlHover = xMode === 'time'
-    ? 'VL %{y:.3f}<br>gstep %{customdata}<extra></extra>'
-    : 'VL %{y:.3f}<br>gstep %{x}<extra></extra>'
-  const nmaeHoverTmpl = (name: string) =>
-    xMode === 'time'
-      ? `${name} %{y:.2f}%%<br>gstep %{customdata}<extra></extra>`
-      : `${name} %{y:.2f}%%<br>gstep %{x}<extra></extra>`
-
-  const nmaeTrace = (name: string, s: Series, color: string, dash: 'solid' | 'dash') => ({
-    x: s.xs, y: s.ys, name,
-    type: 'scatter' as const,
-    mode: 'lines+markers' as const,
-    line: { color, width: 1.5, dash },
-    marker: { color, size: 5 },
-    yaxis: 'y2',
-    customdata: customGsteps(s),
-    hovertemplate: nmaeHoverTmpl(name),
-  })
-
   const logType: 'log' = 'log'
-
-  // Top-panel domain depends on whether we render it.
   const lossDomain: [number, number] = showTopPanel ? [0.0, 0.66] : [0.0, 1.0]
   const stepDomain: [number, number] = [0.72, 1.0]
+
+  const xTitle = xMode === 'time' ? TZ_LABEL
+    : xMode === 'elapsed' ? 'elapsed (h)' : 'global_step'
 
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.4rem', marginBottom: '0.3rem' }}>
         <span style={{ fontSize: '0.75rem', color: '#888', alignSelf: 'center' }}>x-axis:</span>
-        {(['time', 'step'] as XMode[]).map((m) => (
+        {(['time', 'elapsed', 'step'] as XMode[]).map((m) => (
           <button
             key={m}
             type="button"
@@ -239,28 +312,28 @@ export function WallclockPlot({ history, runId }: Props) {
               cursor: 'pointer',
             }}
           >
-            {m === 'time' ? 'wallclock' : 'step'}
+            {m === 'time' ? 'wallclock' : m}
           </button>
         ))}
       </div>
       <Plot
         data={[
-          // 1. step (top panel) — only when in time mode
+          // 1. step (top panel) — only when not in step mode
           ...(showTopPanel ? [{
             x: stepTrace.xs, y: stepTrace.ys, name: 'step',
             type: 'scatter' as const, mode: 'lines' as const,
             line: { color: COLORS.step, width: 2, shape: 'hv' as const },
             yaxis: 'y',
-            hovertemplate: '%{x|%Y-%m-%d %H:%M:%S}<br>step %{y}<extra></extra>',
+            hovertemplate: 'step %{y}<extra></extra>',
           }] : []),
-          // 2. losses + NMAE (shared log y2)
+          // 2. losses (shared log y2)
           {
             x: TL.xs, y: TL.ys, name: 'TL (train/loss)',
             type: 'scatter', mode: 'lines',
             line: { color: COLORS.TL, width: 1.2 },
             yaxis: 'y2',
             customdata: customGsteps(TL),
-            hovertemplate: tlHover,
+            hovertemplate: 'TL %{y:.3f}<br>gstep %{customdata}<extra></extra>',
           },
           {
             x: VL.xs, y: VL.ys, name: 'VL (eval/loss)',
@@ -268,14 +341,10 @@ export function WallclockPlot({ history, runId }: Props) {
             line: { color: COLORS.VL, width: 1.4 },
             yaxis: 'y2',
             customdata: customGsteps(VL),
-            hovertemplate: vlHover,
+            hovertemplate: 'VL %{y:.3f}<br>gstep %{customdata}<extra></extra>',
           },
-          nmaeTrace('MV mean',   MVmean, COLORS.mean,   'solid'),
-          nmaeTrace('MV median', MVmed,  COLORS.median, 'solid'),
-          nmaeTrace('MV p99',    MVp99,  COLORS.p99,    'solid'),
-          nmaeTrace('MT mean',   MTmean, COLORS.mean,   'dash'),
-          nmaeTrace('MT median', MTmed,  COLORS.median, 'dash'),
-          nmaeTrace('MT p99',    MTp99,  COLORS.p99,    'dash'),
+          // 3. mat-NMAE + mat-NEMD (from eval.json)
+          ...evalTraces,
           legendOnly(`trainer_started (${startTs.length})`, COLORS.start, 'dash'),
           legendOnly(`sigterm (${sigtermTs.length})`, COLORS.sigterm, 'dot'),
           legendOnly(`cluster preempt (${preemptTs.length})`, COLORS.preempt, 'solid'),
@@ -288,8 +357,9 @@ export function WallclockPlot({ history, runId }: Props) {
           autosize: true,
           height: 640,
           xaxis: {
-            title: { text: xMode === 'time' ? 'UTC' : 'global_step' },
+            title: { text: xTitle },
             type: xMode === 'time' ? 'date' : 'linear',
+            ...(xMode === 'time' ? { tickformat: '%-m/%-d %H:%M' } : {}),
             gridcolor, zerolinecolor, linecolor: gridcolor,
           },
           yaxis: {
@@ -300,13 +370,13 @@ export function WallclockPlot({ history, runId }: Props) {
             visible: showTopPanel,
           },
           yaxis2: {
-            title: { text: 'loss / NMAE % (log)' },
+            title: { text: 'loss / NMAE·NEMD % (log)' },
             type: logType,
             domain: lossDomain,
             gridcolor, zerolinecolor, linecolor: gridcolor,
           },
           shapes: eventShapes,
-          margin: { t: 50, l: 70, r: 160, b: 50 },
+          margin: { t: 50, l: 70, r: 170, b: 50 },
           hovermode: 'x unified',
           hoverlabel: themedHoverlabel(isDark),
           legend: { x: 1.02, y: 1, bgcolor: 'rgba(0,0,0,0)' },
