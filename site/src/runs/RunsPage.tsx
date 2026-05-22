@@ -735,6 +735,22 @@ function formatFlops(f: number): string {
   return `${(f / 10 ** exp).toFixed(1)}e${exp}`
 }
 
+/** Tokenizer generation, from the authoritative wandb project name
+ *  (`tomat-…-P14` = v2 patch tokenizer, `…-P19` = v3). The run *name* is not
+ *  reliable — some `train-full-v3-…` runs trained on v2 data (project P14). */
+function tokenizerGen(manifest: RunManifest | null): 'v2' | 'v3' | null {
+  const p = manifest?.run.project ?? ''
+  if (/P14/.test(p)) return 'v2'
+  if (/P19/.test(p)) return 'v3'
+  return null
+}
+
+/** v2 (P14) runs are obsolete + a recurring source of `train-full-v3-…`
+ *  mislabel confusion — hide them from the dashboard entirely. */
+function isV2Run(c: RunCardData): boolean {
+  return tokenizerGen(c.manifest) === 'v2'
+}
+
 // iris reports SUCCEEDED whenever the job process exits 0 — including a run
 // that was preempted and shut down cleanly on SIGTERM. So a "SUCCEEDED" run
 // that never reached its step target is really incomplete + inactive (iris
@@ -847,7 +863,9 @@ function RunsIndex() {
       })
     : null
 
-  const ordered = cards ? orderRuns(cards) : null
+  // Drop v2 (P14) runs — obsolete tokenizer, and a few are mislabeled
+  // `train-full-v3-…` (trained on v2 data) which is pure confusion on the board.
+  const ordered = cards ? orderRuns(cards.filter((c) => !isV2Run(c))) : null
   const runningCount = ordered?.filter(isRunning).length ?? 0
   const queuedCount = ordered?.filter(isQueued).length ?? 0
   const incompleteCount = ordered?.filter(isIncomplete).length ?? 0

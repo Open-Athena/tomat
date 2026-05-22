@@ -197,6 +197,12 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
       }
     })
     .filter((d): d is NonNullable<typeof d> => d !== null)
+  // Draw the highlighted trace last so it sits on top of the rest (Plotly
+  // z-order = data order). Array.sort is stable → others keep their order.
+  if (activeTrace) {
+    data.sort((a, b) =>
+      Number(a.name === activeTrace) - Number(b.name === activeTrace))
+  }
 
   const gridcolor = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'
   const zerolinecolor = isDark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.15)'
@@ -322,7 +328,11 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
         </button>
         {!collapsed && (
           <div style={{
-            display: 'flex', flexWrap: 'wrap', alignItems: 'center',
+            // Grid (not flex-wrap) so the columns line up like a table
+            // instead of raggedly tracking each label's width.
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fill, minmax(330px, 1fr))',
+            columnGap: 14, rowGap: 1,
             marginTop: 2, color: fg,
           }}>
             {runs.map((r) => (
