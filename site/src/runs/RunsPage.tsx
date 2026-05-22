@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { Tooltip } from '../Tooltip'
-import { evalJobsByRun, evalPhase, fetchIrisState, fetchManifest, fetchRuns, irisJobIdForRun, parquetUrl } from './api'
-import type { EvalJob, IrisJob, RunManifest } from './api'
+import { evalJobsByRun, evalPhase, fetchEval, fetchIrisState, fetchManifest, fetchRuns, irisJobIdForRun, parquetUrl } from './api'
+import type { EvalJob, EvalPoint, IrisJob, RunManifest } from './api'
 import { fetchRunHistory } from './parquet'
 import type { RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
@@ -993,25 +993,36 @@ function irisJobUrl(jobId: string): string {
   return `https://iris.oa.dev/#/job/${encodeURIComponent(jobId)}`
 }
 
-// One row per checkpoint step, a cell per mat-set — each cell the eval job's
-// iris state, linked to its iris-dashboard page.
-function EvalJobsTable({ jobs }: { jobs: EvalJob[] }) {
-  const steps = [...new Set(jobs.map((j) => j.step))].sort((a, b) => a - b)
+// One row per checkpoint step, a cell per mat-set — each cell shows the eval
+// job's iris state (linked to its iris-dashboard page) and, once the result
+// JSON has synced, the per-step mat-NMAE / mat-NEMD. NMAE/NEMD come from the
+// canonical GCS eval results (`tomat evals sync` → R2 `eval.json`), NOT the
+// harvested wandb points (those collapse in runs-sync's parquet merge).
+function EvalJobsTable({ jobs, evalByStep }: {
+  jobs: EvalJob[]
+  evalByStep: Map<number, Record<string, EvalPoint>>
+}) {
+  const steps = [...new Set([
+    ...jobs.map((j) => j.step),
+    ...evalByStep.keys(),
+  ])].sort((a, b) => a - b)
   const sets = ['val_200', 'train_200']
   const cell: React.CSSProperties = {
     padding: '3px 14px 3px 0', textAlign: 'left',
   }
+  const pct = (v: number | null | undefined) =>
+    typeof v === 'number' ? `${(v * 100).toFixed(2)}%` : null
   return (
     <div style={{ marginBottom: '1.4rem' }}>
       <h2 style={{ fontSize: '1rem', marginBottom: '0.3rem' }}>
-        m-eval jobs ({jobs.length})
+        m-evals ({steps.length} step{steps.length === 1 ? '' : 's'})
       </h2>
       <table style={{ borderCollapse: 'collapse', fontSize: '0.8rem',
                       fontFamily: 'monospace' }}>
         <thead>
           <tr style={{ color: '#888' }}>
             <th style={cell}>step</th>
-            {sets.map((s) => <th key={s} style={cell}>{s}</th>)}
+            {sets.map((s) => <th key={s} style={cell}>{s} — state · NMAE · NEMD</th>)}
           </tr>
         </thead>
         <tbody>
@@ -1020,13 +1031,26 @@ function EvalJobsTable({ jobs }: { jobs: EvalJob[] }) {
               <td style={cell}>{step.toLocaleString()}</td>
               {sets.map((set) => {
                 const ej = jobs.find((j) => j.step === step && j.matSet === set)
-                if (!ej) return <td key={set} style={{ ...cell, color: '#555' }}>–</td>
+                const pt = evalByStep.get(step)?.[set]
+                if (!ej && !pt) return <td key={set} style={{ ...cell, color: '#555' }}>–</td>
+                const nmae = pct(pt?.nmae_mean)
+                const nemd = pct(pt?.nemd_mean)
                 return (
                   <td key={set} style={cell}>
-                    <a href={irisJobUrl(ej.jobId)} target="_blank" rel="noreferrer"
-                       style={{ color: EVAL_PHASE_COLOR[evalPhase(ej.job)] }}>
-                      {ej.job.state.toLowerCase()}
-                    </a>
+                    {ej && (
+                      <a href={irisJobUrl(ej.jobId)} target="_blank" rel="noreferrer"
+                         style={{ color: EVAL_PHASE_COLOR[evalPhase(ej.job)] }}>
+                        {ej.job.state.toLowerCase()}
+                      </a>
+                    )}
+                    {(nmae || nemd) && (
+                      <span style={{ color: '#888' }}>
+                        {ej ? '  ' : ''}
+                        {nmae && `NMAE ${nmae}`}
+                        {nmae && nemd && ' · '}
+                        {nemd && `NEMD ${nemd}`}
+                      </span>
+                    )}
                   </td>
                 )
               })}
@@ -1054,12 +1078,34 @@ function RunDetail({ runId }: { runId: string }) {
   const irisQ = useQuery({
     queryKey: ['iris'], queryFn: fetchIrisState, refetchInterval: REFETCH_MS.iris,
   })
+  // Canonical per-step mat-NMAE/NEMD series — `tomat evals sync` → R2
+  // `eval.json`. (The parquet's `eval/mat_nmae/*` columns are the harvested
+  // wandb points, which collapse to a single value in runs-sync's merge.)
+  const evalQ = useQuery({
+    queryKey: ['eval', runId],
+    queryFn: () => fetchEval(runId),
+    refetchInterval: REFETCH_MS.history,
+  })
   const manifest = manifestQ.data ?? null
   const history = historyQ.data ?? null
   const evalJobs = useMemo(
     () => evalJobsByRun(irisQ.data ?? undefined).get(runId) ?? [],
     [irisQ.data, runId],
   )
+  // step → { val_200, train_200 } eval point, from the synced eval.json.
+  const evalByStep = useMemo(() => {
+    const m = new Map<number, Record<string, EvalPoint>>()
+    const sets = evalQ.data?.sets
+    if (!sets) return m
+    for (const [set, pts] of Object.entries(sets)) {
+      for (const pt of pts) {
+        const rec = m.get(pt.step) ?? {}
+        rec[set] = pt
+        m.set(pt.step, rec)
+      }
+    }
+    return m
+  }, [evalQ.data])
   const errObj = manifestQ.error || historyQ.error
   const err = errObj ? String(errObj) : null
 
@@ -1089,7 +1135,9 @@ function RunDetail({ runId }: { runId: string }) {
           <a href={manifest.run.url} target="_blank" rel="noreferrer">wandb ↗</a>
         </div>
       )}
-      {evalJobs.length > 0 && <EvalJobsTable jobs={evalJobs} />}
+      {(evalJobs.length > 0 || evalByStep.size > 0) && (
+        <EvalJobsTable jobs={evalJobs} evalByStep={evalByStep} />
+      )}
       {!history && !err && <p>loading parquet…</p>}
       {history && <WallclockPlot history={history} runId={runId} />}
     </div>

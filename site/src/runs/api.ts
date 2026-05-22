@@ -67,6 +67,42 @@ export function parquetUrl(runId: string): string {
   return `${API_BASE}/api/runs/${encodeURIComponent(runId)}/raw.parquet`
 }
 
+/** One checkpoint's mat-level eval. `nmae_*`/`nemd_*` are FRACTIONS (0.0117 =
+ *  1.17%) — ×100 for display. (Note: distinct from the manifest summary's
+ *  `eval/mat_nmae/...` values, which the watchdog logs already as percentages.) */
+export interface EvalPoint {
+  step: number
+  n_mats: number | null
+  nmae_mean: number | null
+  nmae_median: number | null
+  nmae_p99: number | null
+  nemd_mean: number | null
+  nemd_median: number | null
+  nemd_p99: number | null
+}
+
+/**
+ * Per-run mat-NMAE/NEMD series. `tomat evals sync` aggregates the canonical
+ * per-step GCS eval-result JSONs (written by `eval_mat_nmae.py`) into one
+ * `eval.json` per run on R2. This is the source of truth — the harvested
+ * wandb points collapse to a single value in runs-sync's parquet merge.
+ */
+export interface RunEval {
+  schema_version: number
+  synced_at: string
+  run: string
+  sets: Record<string, EvalPoint[]>  // 'val_200' | 'train_200'
+}
+
+/** Fetch a run's per-step eval series; null when the run hasn't been
+ *  eval-synced yet (no `eval.json` on R2 → 404). */
+export async function fetchEval(runId: string): Promise<RunEval | null> {
+  const r = await fetch(`${API_BASE}/api/runs/${encodeURIComponent(runId)}/eval.json`)
+  if (r.status === 404) return null
+  if (!r.ok) throw new Error(`fetchEval(${runId}) ${r.status}`)
+  return r.json()
+}
+
 export interface IrisJob {
   state: string
   state_code: number

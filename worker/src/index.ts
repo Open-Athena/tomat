@@ -5,11 +5,12 @@
  *   GET  /api/runs                       — list of synced run ids
  *   GET  /api/runs/:id/manifest.json     — per-run metadata (config, summary, history range)
  *   GET  /api/runs/:id/raw.parquet       — full history parquet
+ *   GET  /api/runs/:id/eval.json         — per-step mat-NMAE/NEMD series (both mat-sets)
  *   GET  /health
  *
- * Backed by R2 `openathena/tomat/runs/<id>/{raw.parquet,manifest.json}`,
- * populated out-of-band by `tomat runs sync <substr>` (will become an
- * on-demand pull from wandb in a later phase — see specs/23-runs-dashboard.md).
+ * Backed by R2 `openathena/tomat/runs/<id>/{raw.parquet,manifest.json,eval.json}`,
+ * populated out-of-band by `tomat runs sync` + `tomat evals sync` (will become
+ * an on-demand pull in a later phase — see specs/23-runs-dashboard.md).
  */
 
 export interface Env {
@@ -155,7 +156,7 @@ export default {
 		}
 
 		// /api/runs/:id/<file>
-		const runFileMatch = path.match(/^\/api\/runs\/([^/]+)\/(raw\.parquet|manifest\.json)$/);
+		const runFileMatch = path.match(/^\/api\/runs\/([^/]+)\/(raw\.parquet|manifest\.json|eval\.json)$/);
 		if (runFileMatch) {
 			const [, runId, file] = runFileMatch;
 			const key = `${env.R2_RUNS_PREFIX}/${runId}/${file}`;
