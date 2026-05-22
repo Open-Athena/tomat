@@ -39,7 +39,7 @@ def expand_label(short: str) -> str:
 
 
 @command()
-@option('-e', '--entity', default='PrinceOA')
+@option('-e', '--entity', default='open-athena')
 @option('-P', '--project', default='tomat-lmq-P19')
 @option('-n', '--dry-run', is_flag=True, help='List points without logging.')
 @argument('labels', nargs=-1, required=True)

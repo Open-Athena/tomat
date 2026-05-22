@@ -24,7 +24,7 @@ err = partial(print, file=sys.stderr)
 
 
 @command()
-@option('-e', '--entity', default='PrinceOA', help='Wandb entity.')
+@option('-e', '--entity', default='open-athena', help='Wandb entity (current tomat runs live in open-athena).')
 @option('-f', '--jsonl-file', type=ClickPath(exists=True, dir_okay=False), help='Backfill from JSONL (one entry per line).')
 @option('-i', '--run-id', required=True, help='Wandb run id (== levanter run name in our setup).')
 @option('-m', '--mat-set', help='Mat-set label (val_200, train_200) for single-point mode.')
