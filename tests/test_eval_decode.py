@@ -12,10 +12,15 @@ EMD is `dot(0, ·) = 0` (fake-perfect). `decode_density` takes the *raw* density
 logits and softmaxes those, which max-subtracts within the density range and so
 never underflows to all-zero.
 """
-import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
+
+# `marin.eval_mat_nmae` (and decode_density) pull in the jax/levanter stack.
+# It's installed in the local eval venv but not in lightweight CI — skip there.
+pytest.importorskip("jax")
+
+import jax
+import jax.numpy as jnp
 
 from marin.eval_mat_nmae import decode_density
 

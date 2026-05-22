@@ -8,6 +8,10 @@ placement-invariant mean) stays fine. No model / GPU needed.
 import numpy as np
 import pytest
 
+# `marin.eval_mat_nmae` imports the jax/levanter stack at module load (even
+# though the tiling helpers below are pure numpy) — absent in lightweight CI.
+pytest.importorskip("jax")
+
 from marin.eval_mat_nmae import tile_full_coverage_offsets
 
 P = 19
