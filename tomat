@@ -40,13 +40,28 @@ import os
 import re
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import click
 
 
-WANDB_PROJECT = "PrinceOA/tomat-lmq-P19"
+WANDB_PROJECT = "open-athena/tomat-lmq-P19"
+# Project name on the worker comes from `tomat-{density_codec_name}-P{patch_size}`.
+# v3 data label → codec=lmq, patch_size=19 → tomat-lmq-P19 (where the trainer
+# actually sends train/loss + global_step + MFU). The Mac CLI's preempt-watch +
+# placeholder-run must use the SAME project, else two wandb runs get created
+# with the same name (one with trainer data, one with cluster-monitor data
+# only) — see incident 2026-05-16 (z3 BS sweep).
+WANDB_PROJECTS_ARCHIVE = (
+    "open-athena/tomat-lmq-P14",     # empty placeholder created during PrinceOA->OA migration
+    "open-athena/tomat-lmq-v2-P14",  # pre-created earlier; will retire
+    "PrinceOA/tomat-lmq-P19",        # pre-2026-05-15 v3 TPU runs (cont7k-ext etc.)
+    "PrinceOA/tomat-lmq-P14",        # cont7k-ext steps 33k-80k accidentally went here mid-run
+    "PrinceOA/tomat-lmq-v2-P14",     # bakeoff Modal runs (lmq-v2 lat data)
+)
+WANDB_PROJECTS = (WANDB_PROJECT, *WANDB_PROJECTS_ARCHIVE)
 WANDB_BASE = "https://wandb.ai"
 IRIS_DASHBOARD = "https://iris.oa.dev"
 
@@ -67,7 +82,9 @@ _RUN_PARQUET_KEYS = [
     "train/loss", "eval/loss",
     "throughput/mfu", "throughput/tokens_per_second", "throughput/duration",
     "eval/mat_nmae/val_200/mean", "eval/mat_nmae/val_200/median", "eval/mat_nmae/val_200/p99",
+    "eval/mat_nmae/train_200/mean", "eval/mat_nmae/train_200/median", "eval/mat_nmae/train_200/p99",
     "eval/mat_nemd/val_200/mean", "eval/mat_nemd/val_200/median", "eval/mat_nemd/val_200/p99",
+    "eval/mat_nemd/train_200/mean", "eval/mat_nemd/train_200/median", "eval/mat_nemd/train_200/p99",
     "lifecycle/trainer_started", "lifecycle/sigterm_received", "lifecycle/trainer_finished",
     "cluster/preemptions", "cluster/failures",
     "cluster/preempts_delta", "cluster/failures_delta",
@@ -97,7 +114,27 @@ def fmt(x):
 
 
 def match_runs(api, substr: str | None):
-    runs = list(api.runs(WANDB_PROJECT))
+    """Walk all configured wandb projects (primary + archive). Per-run
+    `entity`/`project` attrs let callers route URLs/uploads correctly.
+
+    Empty/new projects (no runs yet) raise `ValueError("Could not find
+    project ...")` from wandb's lazy iterator — we swallow that.
+    """
+    runs: list = []
+    seen: set[tuple[str, str]] = set()
+    for path in WANDB_PROJECTS:
+        try:
+            project_runs = list(api.runs(path))
+        except ValueError as e:
+            if "Could not find project" in str(e):
+                continue  # newly-created, no runs yet
+            raise
+        for r in project_runs:
+            key = (r.entity, r.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            runs.append(r)
     if substr is None:
         return runs
     return [r for r in runs if substr in r.name]
@@ -214,14 +251,14 @@ def _fetch_summaries(rs, keys: list[str], max_workers: int = 16) -> list[dict]:
 
 @runs.command("ls")
 def runs_ls():
-    """List all wandb runs in the project, newest first."""
+    """List all wandb runs across primary + archive projects, newest first."""
     import wandb
 
     api = wandb.Api()
-    rs = list(api.runs(WANDB_PROJECT))
+    rs = match_runs(api, None)
     summaries = _fetch_summaries(rs, keys=[])
     summaries.sort(key=lambda d: d["created_at"], reverse=True)
-    print(f"{len(summaries)} runs in {WANDB_PROJECT}:")
+    print(f"{len(summaries)} runs across {len(WANDB_PROJECTS)} projects ({', '.join(WANDB_PROJECTS)}):")
     for d in summaries:
         runtime_h = (d["_runtime"] or 0) / 3600
         step = d["_step"]
@@ -355,7 +392,13 @@ def runs_nmae(substr: str, sets: str):
         print(line)
 
 
-def _wandb_url(run_name: str) -> str:
+def _wandb_url(run_name: str, entity: str | None = None, project: str | None = None) -> str:
+    """Compose a wandb run URL. Defaults to the primary project; callers
+    holding a wandb.Run can pass `entity=r.entity, project=r.project` so
+    archive (PrinceOA) runs link to the right place.
+    """
+    if entity and project:
+        return f"{WANDB_BASE}/{entity}/{project}/runs/{run_name}"
     return f"{WANDB_BASE}/{WANDB_PROJECT}/runs/{run_name}"
 
 
@@ -407,6 +450,9 @@ def runs_links(substr: str | None, limit: int, md: bool):
             "nmae_step": nmae_step,
             "nemd": nemd,
             "nemd_step": nemd_step,
+            # Per-run entity/project so archive (PrinceOA) URLs route correctly.
+            "entity": r.entity if r else None,
+            "project": r.project if r else None,
         })
 
     if md:
@@ -420,7 +466,7 @@ def runs_links(substr: str | None, limit: int, md: bool):
             # Use ` @ ` (with spaces) so GitHub doesn't render "@<step>" as a user mention.
             nmae_s = f"{r['nmae']:.2f}% @ {r['nmae_step']}" if r["nmae"] is not None else "-"
             nemd_s = f"{r['nemd']:.2f}% @ {r['nemd_step']}" if r["nemd"] is not None else "-"
-            wb = f"[wb]({_wandb_url(r['name'])})"
+            wb = f"[wb]({_wandb_url(r['name'], r.get('entity'), r.get('project'))})"
             ir = f"[iris]({_iris_url(r['name'])})"
             print(f"| `{r['name']}` | {r['state']} | {step_s} | {rt_s} | {mfu_s} | {nmae_s} | {nemd_s} | {wb} | {ir} |")
     else:
@@ -432,7 +478,7 @@ def runs_links(substr: str | None, limit: int, md: bool):
                 print(f"  val NMAE: {r['nmae']:.3f}% @ step {r['nmae_step']}")
             if r["nemd"] is not None:
                 print(f"  val NEMD: {r['nemd']:.3f}% @ step {r['nemd_step']}")
-            print(f"  wandb:   {_wandb_url(r['name'])}")
+            print(f"  wandb:   {_wandb_url(r['name'], r.get('entity'), r.get('project'))}")
             print(f"  iris:    {_iris_url(r['name'])}")
             print()
 
@@ -454,9 +500,15 @@ def _run_parquet_arrow_schema():
         ("eval/mat_nmae/val_200/mean",       pa.float32()),
         ("eval/mat_nmae/val_200/median",     pa.float32()),
         ("eval/mat_nmae/val_200/p99",        pa.float32()),
+        ("eval/mat_nmae/train_200/mean",     pa.float32()),
+        ("eval/mat_nmae/train_200/median",   pa.float32()),
+        ("eval/mat_nmae/train_200/p99",      pa.float32()),
         ("eval/mat_nemd/val_200/mean",       pa.float32()),
         ("eval/mat_nemd/val_200/median",     pa.float32()),
         ("eval/mat_nemd/val_200/p99",        pa.float32()),
+        ("eval/mat_nemd/train_200/mean",     pa.float32()),
+        ("eval/mat_nemd/train_200/median",   pa.float32()),
+        ("eval/mat_nemd/train_200/p99",      pa.float32()),
         ("lifecycle/trainer_started",        pa.int8()),
         ("lifecycle/sigterm_received",       pa.int8()),
         ("lifecycle/trainer_finished",       pa.int8()),
@@ -496,6 +548,8 @@ def _r2_put_bytes(bucket: str, key: str, data: bytes, content_type: str):
 
 @runs.command("sync")
 @click.option("-b", "--bucket", default=R2_BUCKET, help="R2 bucket")
+@click.option("-P", "--project", default=None,
+              help="restrict to one wandb project (use when a name was reused across t10n)")
 @click.option("-p", "--prefix", default=R2_RUNS_PREFIX,
               help="R2 key prefix (run id appended)")
 @click.option("-n", "--dry-run", is_flag=True,
@@ -503,7 +557,7 @@ def _r2_put_bytes(bucket: str, key: str, data: bytes, content_type: str):
 @click.option("-o", "--out-dir", default=None,
               help="if set, also write a local copy of the parquet + manifest")
 @click.argument("substr")
-def runs_sync(substr: str, bucket: str, prefix: str, dry_run: bool, out_dir: str | None):
+def runs_sync(substr: str, bucket: str, prefix: str, project: str | None, dry_run: bool, out_dir: str | None):
     """Pull a wandb run's history → parquet → OA's R2.
 
     Writes `s3://<bucket>/<prefix>/<run_name>/{raw.parquet,manifest.json}`.
@@ -522,16 +576,85 @@ def runs_sync(substr: str, bucket: str, prefix: str, dry_run: bool, out_dir: str
     import pyarrow.parquet as pq
 
     api = wandb.Api()
-    r = require_one(match_runs(api, substr), substr)
-    err(f"[sync] run: {r.name} (state={r.state}, project={r.project})")
+    # Find every (entity, project) copy of this run — a single wandb display
+    # name can have multiple `(entity, project, id)` keys if the same worker
+    # logged across projects (e.g. cluster-monitor vs trainer mismatch). We
+    # re-walk projects explicitly to keep all copies, then group by display
+    # name and validate they're actually the *same* logical run.
+    seen: set[tuple[str, str, str]] = set()
+    matches: list = []
+    for path in WANDB_PROJECTS:
+        try:
+            proj_runs = list(api.runs(path))
+        except ValueError as e:
+            if "Could not find project" in str(e):
+                continue
+            raise
+        for r in proj_runs:
+            if substr not in r.name:
+                continue
+            key = (r.entity, r.project, r.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            matches.append(r)
+
+    if not matches:
+        err(f"no runs match {substr!r}")
+        sys.exit(1)
+    if project is not None:
+        before = len(matches)
+        matches = [r for r in matches if r.project == project]
+        err(f"[sync] --project={project} → filtered {before} → {len(matches)} copy/copies")
+        if not matches:
+            err(f"no copies of {substr!r} in project {project!r}")
+            sys.exit(1)
+    # Group by (entity, display_name) — copies of the same logical run.
+    groups: dict[tuple[str, str], list] = {}
+    for r in matches:
+        groups.setdefault((r.entity, r.name), []).append(r)
+    if len(groups) > 1:
+        err(f"multiple distinct runs match {substr!r}:")
+        for (ent, name) in groups:
+            err(f"  {ent}/{name}  ({len(groups[(ent, name)])} project copies)")
+        sys.exit(1)
+    (entity, run_name), copies = next(iter(groups.items()))
+    # Refuse cross-project merge when copies have different tokenizations
+    # (different `data.cache_dir`). Two runs with the same display_name but
+    # different t10n are physically distinct experiments that happened to
+    # share a name — merging them produces nonsense overlays in the
+    # dashboard. Caller must pass --project to pick one.
+    def _cache_dir(rn) -> str | None:
+        return (rn.config.get("data") or {}).get("cache_dir")
+    cache_dirs = {_cache_dir(r) for r in copies}
+    if len(cache_dirs) > 1:
+        err(f"refusing to merge {len(copies)} copies of {substr!r} — "
+            f"different `data.cache_dir`s (incompatible t10n):")
+        for r in copies:
+            err(f"  {r.entity}/{r.project}: cache_dir={_cache_dir(r)!r}")
+        err(f"pass --project=<one-of-the-above> to sync a single copy")
+        sys.exit(2)
+    # Primary copy = most-recently active (largest _timestamp on last row).
+    # Used for manifest metadata (state, url, config). History is merged
+    # across ALL copies (now guaranteed t10n-compatible).
+    primary = max(copies, key=lambda r: float(r.summary.get("_timestamp") or 0))
+    err(f"[sync] run: {run_name} — {len(copies)} project copy/copies: "
+        f"{', '.join(f'{r.project}({r.state})' for r in copies)}; "
+        f"primary={primary.project}")
 
     keep = set(_RUN_PARQUET_KEYS)
-    rows = []
-    for row in r.scan_history():
-        projected = {k: v for k, v in row.items() if k in keep}
-        if any(k for k in projected if not k.startswith("_")):
-            rows.append(projected)
-    err(f"[sync] pulled {len(rows)} history rows")
+    rows: list[dict] = []
+    for r in copies:
+        before = len(rows)
+        for row in r.scan_history():
+            projected = {k: v for k, v in row.items() if k in keep}
+            if any(k for k in projected if not k.startswith("_")):
+                rows.append(projected)
+        err(f"  [sync] {r.project}: +{len(rows) - before} rows")
+    # Order merged rows by _timestamp so plots-over-time read naturally.
+    rows.sort(key=lambda d: (d.get("_timestamp") or 0, d.get("_step") or 0))
+    err(f"[sync] pulled {len(rows)} merged history rows")
+    r = primary  # downstream code reads `r.name`, `r.url`, etc.
 
     schema = _run_parquet_arrow_schema()
     if rows:
@@ -817,57 +940,85 @@ _IRIS_JOB_STATE = {
 
 
 def _iris_query_json(sql: str, timeout: int = 60) -> list[dict]:
-    """Run a controller SQL query and parse the JSON result."""
+    """Run a controller SQL query and parse the JSON result.
+
+    Times every call. Warns loudly if elapsed > 10 s — that's the Russell
+    threshold for "you are putting load on the shared controller." See
+    `memory/feedback_iris_controller_load.md`. The single user of this
+    helper today is `tomat iris sync`, whose LEFT JOIN was exactly the
+    pattern that prompted the complaint.
+    """
     cmd = ["uv", "run", "iris", "--cluster=marin", "query", sql, "-f", "json"]
+    t0 = time.monotonic()
     r = subprocess.run(cmd, cwd=str(MARIN_DIR), capture_output=True, text=True, timeout=timeout)
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    if elapsed_ms > 10_000:
+        err(f"⚠️  [iris-query {elapsed_ms}ms] SLOW — controller may be under load")
+    else:
+        err(f"[iris-query {elapsed_ms}ms]")
     if r.returncode != 0:
         err(f"iris query failed: rc={r.returncode}\n{r.stderr[-500:]}")
         sys.exit(r.returncode)
     return json.loads(strip_iris_log(r.stdout).strip())
 
 
+def _iris_job_list_json(prefix: str, timeout: int = 60) -> list[dict]:
+    """RPC-only: `iris job list --prefix PFX --json`. Safe to call on a cadence.
+
+    Replaces the controller-SQL `_iris_query_json` for the dashboard sync.
+    See `memory/feedback_iris_controller_load.md` — RPC is fine, SQL JOINs
+    on `jobs × tasks` are what melt the shared controller.
+    """
+    cmd = ["uv", "run", "iris", "--cluster=marin", "job", "list",
+           "--prefix", prefix, "--json"]
+    t0 = time.monotonic()
+    r = subprocess.run(cmd, cwd=str(MARIN_DIR), capture_output=True, text=True, timeout=timeout)
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    if elapsed_ms > 10_000:
+        err(f"⚠️  [iris-rpc {prefix} {elapsed_ms}ms] SLOW")
+    else:
+        err(f"[iris-rpc {prefix} {elapsed_ms}ms]")
+    if r.returncode != 0:
+        err(f"iris job list failed: rc={r.returncode}\n{r.stderr[-500:]}")
+        return []
+    return json.loads(strip_iris_log(r.stdout).strip())
+
+
 @iris_grp.command("sync")
 @click.option("-b", "--bucket", default=R2_BUCKET, help="R2 bucket")
 @click.option("-k", "--key", default="tomat/iris-state.json", help="R2 key")
-@click.option("-l", "--limit", default=200, type=int, help="how many recent /ryan/* jobs to include")
 @click.option("-d", "--dry-run", is_flag=True, help="print the JSON without uploading")
-def iris_sync(bucket: str, key: str, limit: int, dry_run: bool):
-    """Snapshot iris job state for our recent /ryan/* parent jobs → R2.
+def iris_sync(bucket: str, key: str, dry_run: bool):
+    """Snapshot iris job state for /ryan/{tomat,train,eval}/* parent jobs → R2.
 
-    Powers the iris-state column on tomat.oa.dev/runs. Manual invocation
-    for now; consider `watch -n 60 tomat iris sync` while babysitting
-    a fleet of training jobs, or cron from a small GCE box later.
+    Powers the iris-state column on tomat.oa.dev/runs. Uses `iris job list
+    --json` over RPC per prefix — SAFE to run on a cadence (e.g. cron every
+    minute). The prior SQL-based version was banned for controller load.
     """
-    sql = f"""
-        SELECT
-          j.job_id, j.name, j.state, j.error, j.exit_code,
-          j.submitted_at_ms, j.started_at_ms, j.finished_at_ms,
-          j.num_tasks,
-          COALESCE(MAX(t.preemption_count), 0) AS preempts,
-          COALESCE(MAX(t.failure_count), 0)    AS failures
-        FROM jobs j
-        LEFT JOIN tasks t ON t.job_id = j.job_id
-        WHERE j.job_id LIKE '/ryan/%' AND (j.parent_job_id IS NULL OR j.parent_job_id = '')
-        GROUP BY j.job_id
-        ORDER BY j.submitted_at_ms DESC
-        LIMIT {limit}
-    """
-    rows = _iris_query_json(sql)
     jobs: dict[str, dict] = {}
-    for row in rows:
-        state_code = int(row.get("state") or 0)
-        jobs[row["job_id"]] = {
-            "state": _IRIS_JOB_STATE.get(state_code, f"UNKNOWN_{state_code}"),
-            "state_code": state_code,
-            "preempts": int(row.get("preempts") or 0),
-            "failures": int(row.get("failures") or 0),
-            "error": row.get("error") or None,
-            "exit_code": row.get("exit_code"),
-            "submitted_at_ms": int(row["submitted_at_ms"]) if row.get("submitted_at_ms") else None,
-            "started_at_ms": int(row["started_at_ms"]) if row.get("started_at_ms") else None,
-            "finished_at_ms": int(row["finished_at_ms"]) if row.get("finished_at_ms") else None,
-            "num_tasks": int(row.get("num_tasks") or 0),
-        }
+    for prefix in DEFAULT_IRIS_PREFIXES:
+        for row in _iris_job_list_json(prefix):
+            if row.get("has_children"):
+                # Skip parent of a parent — we want parent jobs only.
+                pass
+            jid = row["job_id"]
+            if jid.count("/") > 2:
+                # Skip task rows (`/ryan/<job>/<task>`); we want parents.
+                continue
+            state_full = row.get("state", "")  # e.g. "JOB_STATE_RUNNING"
+            state = state_full.removeprefix("JOB_STATE_") if state_full else "UNKNOWN"
+            jobs[jid] = {
+                "state": state,
+                "state_code": 0,  # legacy; sql path filled this in
+                "preempts": int(row.get("preemption_count") or 0),
+                "failures": int(row.get("failure_count") or 0),
+                "error": row.get("error") or None,
+                "exit_code": row.get("exit_code"),
+                "submitted_at_ms": int((row.get("submitted_at") or {}).get("epoch_ms") or 0) or None,
+                "started_at_ms": int((row.get("started_at") or {}).get("epoch_ms") or 0) or None,
+                "finished_at_ms": int((row.get("finished_at") or {}).get("epoch_ms") or 0) or None,
+                "num_tasks": int(row.get("task_count") or 0),
+            }
     payload = {
         "schema_version": 1,
         "synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
@@ -1105,6 +1256,83 @@ def evals_harvest(run_label: str, sets: str, interval: int, eval_label: str | No
         print(f"[{s} watchdog pid={pid} log={log}]")
 
 
+@evals.command("sync")
+@click.option("-b", "--bucket", default=R2_BUCKET, help="R2 bucket")
+@click.option("-n", "--dry-run", is_flag=True, help="assemble + report, but skip the R2 upload")
+@click.option("-p", "--prefix", default=R2_RUNS_PREFIX, help="R2 key prefix (run id appended)")
+@click.argument("substr", required=False)
+def evals_sync(substr: str | None, bucket: str, dry_run: bool, prefix: str):
+    """Aggregate per-step GCS eval-result JSONs → `eval.json` → OA's R2.
+
+    `eval_mat_nmae.py` writes one JSON per (checkpoint, mat-set) under
+    `gs://marin-eu-west4/tomat/eval/results/<run>/<set>/step-<N>.json`. This
+    collapses each run's JSONs into a compact
+    `s3://<bucket>/<prefix>/<run>/eval.json` (per-step mat-NMAE/NEMD, both
+    sets) — the canonical series the /runs dashboard reads. The harvested
+    wandb points can't substitute: runs-sync's history-parquet merge
+    collapses them to a single value.
+
+    SUBSTR (optional) restricts to runs whose label contains it; omitted =
+    every run with eval results.
+    """
+    import fsspec
+    from datetime import datetime, timezone
+
+    fs = fsspec.filesystem("gcs")
+    results_base = "marin-eu-west4/tomat/eval/results"
+    run_dirs = sorted(
+        p.rsplit("/", 1)[-1] for p in fs.ls(results_base)
+        if fs.isdir(p) and p.rsplit("/", 1)[-1] != "checkpoints"
+    )
+    if substr:
+        run_dirs = [r for r in run_dirs if substr in r]
+    if not run_dirs:
+        err(f"[evals sync] no eval-result run dirs match {substr!r}")
+        sys.exit(1)
+
+    stat_keys = ("nmae_mean", "nmae_median", "nmae_p99",
+                 "nemd_mean", "nemd_median", "nemd_p99")
+    for run in run_dirs:
+        sets: dict[str, list[dict]] = {}
+        for mat_set in ("val_200", "train_200"):
+            base = f"{results_base}/{run}/{mat_set}"
+            if not fs.exists(base):
+                continue
+            paths = [
+                p for p in fs.ls(base)
+                if (n := p.rsplit("/", 1)[-1]).startswith("step-")
+                and n.endswith(".json")
+            ]
+            rows = []
+            for path, raw in fs.cat(paths).items():  # parallel fetch
+                d = json.loads(raw)
+                name = path.rsplit("/", 1)[-1]
+                row = {"step": int(name[len("step-"):-len(".json")]),
+                       "n_mats": d.get("n_mats")}
+                row.update({k: d.get(k) for k in stat_keys})
+                rows.append(row)
+            if rows:
+                sets[mat_set] = sorted(rows, key=lambda r: r["step"])
+        if not sets:
+            err(f"[evals sync] {run}: no eval JSONs, skipping")
+            continue
+        doc = {
+            "schema_version": 1,
+            "synced_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "run": run,
+            "sets": sets,
+        }
+        data = json.dumps(doc, separators=(",", ":")).encode()
+        n_pts = sum(len(v) for v in sets.values())
+        key = f"{prefix}/{run}/eval.json"
+        if dry_run:
+            err(f"[evals sync] {run}: {n_pts} pts, {len(data)} B → "
+                f"s3://{bucket}/{key} (dry-run)")
+        else:
+            _r2_put_bytes(bucket, key, data, "application/json")
+            err(f"[evals sync] {run}: {n_pts} pts → {R2_ENDPOINT}/{bucket}/{key}")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # tomat preempts
 # ──────────────────────────────────────────────────────────────────────
@@ -1272,7 +1500,9 @@ def _latest_ckpt_step(run_label: str, bucket: str = GCS_BUCKET) -> int | None:
 @cli.command("train")
 @click.option("-r", "--resume", "resume_mode", is_flag=True,
               help="resume existing run (same LABEL → Levanter auto-discovers latest ckpt + continues with intact optimizer state)")
-@click.option("-D", "--data-label", default="train-full-lmq-v2-lat",
+@click.option("--from-ckpt", "from_ckpt", default=None,
+              help="gs:// path to a step-N ckpt dir to true-resume from under a NEW LABEL. Pre-copies the ckpt into the new run's output dir so Levanter auto-discovers it with optimizer state + step counter intact. Requires --resume.")
+@click.option("-D", "--data-label", default="train-full-v3",
               help="TOMAT_LABEL (data subdir under tokenized/)")
 @click.option("-m", "--model", default="200M", help="TOMAT_MODEL preset")
 @click.option("-T", "--tpu", default="v6e-16", help="iris --tpu")
@@ -1306,10 +1536,17 @@ def _latest_ckpt_step(run_label: str, bucket: str = GCS_BUCKET) -> int | None:
 @click.option("--pyspy-record-seconds", default=0, type=int, help="TOMAT_PYSPY_RECORD_SECONDS > 0 switches from `py-spy dump` (text) to `py-spy record` (flame-graph SVG) of that length per cycle.")
 @click.option("-f", "--force", is_flag=True, help="allow from-scratch overwrite of existing results dir")
 @click.option("-d", "--dry-run", is_flag=True, help="print iris cmd without firing")
+@click.option("--bucket", "bucket_override", default=None,
+              help="override TOMAT_BUCKET (default = per-tpu-family region). Use when running a v5p/v6e job from a non-default region (e.g. firing v5p in us-east5 instead of us-central1). Ckpts go to <bucket>/results/.")
+@click.option("--queue/--no-queue", default=False,
+              help="poll iris-avail every --queue-poll seconds and submit when the target pool has READY≥1. Catches capacity churn between hourly polls. Blocks until iris accepts the job.")
+@click.option("--queue-poll", default=60, type=int,
+              help="seconds between iris-avail polls when --queue is set (default 60)")
 @click.argument("label")
 def train(
     label: str,
     resume_mode: bool,
+    from_ckpt: str | None,
     data_label: str,
     model: str,
     tpu: str,
@@ -1342,6 +1579,9 @@ def train(
     pyspy_record_seconds: int,
     force: bool,
     dry_run: bool,
+    bucket_override: str | None,
+    queue: bool,
+    queue_poll: int,
 ):
     """Launch (or resume) a tomat training run.
 
@@ -1361,14 +1601,53 @@ def train(
     # first ckpt save for a v5p job writing back to marin-eu-west4).
     # v5p lives in us-central1/us-east5; v6e-preemptible-16 currently in
     # us-east1; everything else stays on eu-west4.
-    if tpu.startswith("v5p"):
+    if bucket_override:
+        bucket = bucket_override.rstrip("/")
+        print(f"[tomat train] bucket: {bucket} (--bucket override)")
+    elif tpu.startswith("v5p"):
         bucket = "gs://marin-us-central1/tomat"
     elif tpu.startswith("v5e") or tpu.startswith("v6e"):
         bucket = "gs://marin-eu-west4/tomat"
     else:
         bucket = "gs://marin-eu-west4/tomat"  # default
-    if bucket != GCS_BUCKET:
+    if not bucket_override and bucket != GCS_BUCKET:
         print(f"[tomat train] bucket: {bucket} (tpu={tpu}; default would have been {GCS_BUCKET})")
+
+    # --from-ckpt: pre-copy an explicit step-N ckpt into the new run's
+    # output dir, so Levanter's auto-discovery picks it up as a true
+    # resume (full optimizer state + step counter, NOT a warm-start).
+    # The new LABEL must be fresh — we only copy if the target step-N/
+    # dir doesn't already exist.
+    if from_ckpt is not None:
+        if not resume_mode:
+            err(f"--from-ckpt requires --resume / -r")
+            sys.exit(1)
+        if not from_ckpt.startswith("gs://"):
+            err(f"--from-ckpt must be a gs:// path, got: {from_ckpt!r}")
+            sys.exit(1)
+        # Parse step-N segment from the source path.
+        import re as _re
+        m = _re.search(r"/step-(\d+)/?$", from_ckpt.rstrip("/"))
+        if not m:
+            err(f"--from-ckpt path must end in /step-N/ (no trailing slash needed); got: {from_ckpt!r}")
+            sys.exit(1)
+        src_step = int(m.group(1))
+        src = from_ckpt.rstrip("/")
+        target = f"{bucket}/results/{label}/checkpoints/{label}/step-{src_step}"
+        # Idempotent: skip copy if target already exists.
+        check = subprocess.run(["gsutil", "ls", target + "/"], capture_output=True, text=True)
+        if check.returncode == 0:
+            print(f"[tomat train] --from-ckpt: target {target}/ already exists, skipping copy")
+        elif dry_run:
+            print(f"[tomat train] --from-ckpt: [dry-run] would copy {src}/ → {target}/")
+        else:
+            print(f"[tomat train] --from-ckpt: copying {src}/ → {target}/ …")
+            cp = subprocess.run(["gsutil", "-m", "cp", "-r", src, target.rsplit("/", 1)[0] + "/"],
+                                capture_output=False, text=True)
+            if cp.returncode != 0:
+                err(f"--from-ckpt: gsutil cp failed (rc={cp.returncode})")
+                sys.exit(cp.returncode)
+            print(f"[tomat train] --from-ckpt: copy complete")
 
     latest = _latest_ckpt_step(label, bucket=bucket)
     if resume_mode:
@@ -1376,8 +1655,18 @@ def train(
             err(f"--resume {label}: no step-* ckpts under "
                 f"{bucket}/results/{label}/checkpoints/{label}/")
             sys.exit(1)
-        print(f"[tomat train] resume mode: latest ckpt step-{latest} → "
-              f"continuing to step {steps}")
+        # Levanter convention: a `step-N` ckpt represents step index N *just
+        # completed* (0-indexed), so N+1 update steps have actually run. A run
+        # invoked with `num_train_steps=S` produces a final `step-(S-1)` ckpt,
+        # not `step-S`. Surface that explicitly + short-circuit no-op resumes.
+        completed = latest + 1
+        if completed >= steps:
+            print(f"[tomat train] resume {label!r}: already complete "
+                  f"(step-{latest} = {completed}/{steps} steps; "
+                  f"`step-N` = N+1 completed). Pass --steps > {completed} to extend.")
+            sys.exit(0)
+        print(f"[tomat train] resume mode: latest ckpt step-{latest} "
+              f"(= {completed}/{steps} steps completed) → continuing")
     else:
         if latest is not None and not force:
             err(f"results dir for {label!r} already has step-{latest} ckpt at {bucket}; "
@@ -1389,12 +1678,81 @@ def train(
         err("WANDB_API_KEY not set in env")
         sys.exit(1)
 
+    # For --resume, auto-detect the existing run's wandb entity AND verify
+    # the user-passed `--data-label` matches the existing run's cache_dir.
+    # The trainer (marin/train_tomat_tpu.py) derives wandb project from
+    # `meta.density_codec_name + meta.patch_size` of whatever cache it
+    # opens — so a mismatched data_label silently routes the resume to
+    # the wrong wandb project AND trains on incompatible t10n (effectively
+    # random init). See cont7k-ext postmortem (P19 trainer mis-resumed as
+    # P14 on 2026-05-15, producing tainted ckpts step-34000..79999).
+    wandb_entity = "open-athena"
+    if resume_mode:
+        try:
+            import wandb as _wandb
+            _api = _wandb.Api()
+            exact = [r for r in match_runs(_api, label) if r.name == label]
+            if not exact and from_ckpt is not None:
+                # --from-ckpt creates a new wandb run with this label;
+                # the trainer will pick project from cache meta. Skip
+                # cache_dir verification since there's nothing to compare.
+                print(f"[tomat train] resume {label!r}: no existing wandb run "
+                      f"(expected — --from-ckpt mode); trainer will create new run")
+                exact = []  # signal: skip the rest of the validation block
+            if not exact and from_ckpt is None:
+                err(f"[tomat train] resume {label!r}: no matching wandb run found "
+                    f"(searched: {', '.join(WANDB_PROJECTS)})")
+                sys.exit(1)
+            if len(exact) > 1:
+                # Multiple project copies — pick the one whose cache_dir matches
+                # the user's --data-label, else error and require disambiguation.
+                expected_cache = f"gs://marin-eu-west4/tomat/cache/{data_label}/"
+                matching = [r for r in exact if (r.config.get("data") or {}).get("cache_dir") == expected_cache]
+                if len(matching) != 1:
+                    err(f"[tomat train] resume {label!r}: {len(exact)} project copies; "
+                        f"{len(matching)} match --data-label={data_label!r} (cache {expected_cache!r}):")
+                    for r in exact:
+                        err(f"  {r.entity}/{r.project}: cache_dir={(r.config.get('data') or {}).get('cache_dir')!r}")
+                    sys.exit(1)
+                exact = matching
+            if exact:
+                existing = exact[0]
+                wandb_entity = existing.entity
+                existing_cache = (existing.config.get("data") or {}).get("cache_dir") or ""
+                # Compare the cache *subdir name* (after /cache/), not the full
+                # gs:// path — same cache is mirrored across region buckets
+                # (eu-west4, us-east5, us-central1) and `--share-cache` picks
+                # the local mirror at runtime. What matters for t10n
+                # compatibility is the subdir name.
+                import re as _re
+                m = _re.search(r"/cache/([^/]+)/?$", existing_cache.rstrip("/"))
+                existing_subdir = m.group(1) if m else ""
+                if existing_subdir and existing_subdir != data_label:
+                    err(f"[tomat train] resume {label!r}: --data-label mismatch.")
+                    err(f"  existing wandb run ({existing.entity}/{existing.project}) "
+                        f"cache_dir = {existing_cache!r}")
+                    err(f"  --data-label={data_label!r} (subdir {data_label!r}) "
+                        f"!= existing subdir {existing_subdir!r}")
+                    err(f"  resuming with a mismatched cache would silently re-route to "
+                        f"a different wandb project and train on incompatible t10n.")
+                    err(f"  pass --data-label={existing_subdir}")
+                    sys.exit(2)
+                print(f"[tomat train] resume target: {existing.entity}/{existing.project}/{label}")
+                print(f"[tomat train]   cache subdir verified: {existing_subdir} (existing: {existing_cache})")
+                if wandb_entity != "open-athena":
+                    print(f"[tomat train]   passing TOMAT_WANDB_ENTITY={wandb_entity}")
+        except SystemExit:
+            raise
+        except Exception as e:
+            err(f"[tomat train] warning: couldn't resolve resume target for {label!r}: {e}")
+
     # Bucket-relative LMQ codec path: assume the codec was mirrored into
     # the same prefix under the target bucket (e.g. via
     # `gsutil cp gs://marin-eu-west4/tomat/codecs/* gs://marin-us-central1/tomat/codecs/`).
     default_lmq_path = f"{bucket}/codecs/lmq-v2-16k.npz"
     env_vars: list[tuple[str, str]] = [
         ("WANDB_API_KEY", wandb_key),
+        ("TOMAT_WANDB_ENTITY", wandb_entity),
         ("TOMAT_BUCKET", bucket),
         ("TOMAT_LABEL", data_label),
         ("TOMAT_RESULTS_LABEL", label),
@@ -1465,10 +1823,73 @@ def train(
         print(f"  {pretty}")
         return
 
-    r = subprocess.run(cmd, cwd=str(MARIN_DIR), capture_output=True, text=True)
-    if r.returncode != 0:
-        err(f"[FAIL launch {label}] rc={r.returncode}\n{r.stderr[-1000:]}")
-        sys.exit(r.returncode)
+    def _try_iris_launch():
+        return subprocess.run(cmd, cwd=str(MARIN_DIR), capture_output=True, text=True)
+
+    if queue:
+        # Build the expected pool name for capacity probing. Pools are named
+        # `tpu_<variant>-<zone>` (e.g. `tpu_v5p-preemptible_16-us-central1-a`).
+        # If --zone is unset we accept any zone for this variant.
+        target_zones = [z.strip() for z in (zone or "").split(",") if z.strip()]
+        if not target_zones:
+            print(f"[tomat train --queue] no --zone pin; will accept any zone for {tpu}")
+        else:
+            print(f"[tomat train --queue] target pool(s): "
+                  + ", ".join(f"tpu_{tpu}-{z}" for z in target_zones))
+        print(f"[tomat train --queue] poll interval: {queue_poll}s")
+        attempt = 0
+        t_start = time.time()
+        while True:
+            attempt += 1
+            # Probe iris-avail-as-json to check whether the target pool has
+            # READY≥1 before bothering iris's scheduler.
+            probe = subprocess.run(
+                ["uv", "run", "iris", "--cluster=marin", "rpc", "controller", "get-autoscaler-status"],
+                cwd=str(MARIN_DIR), capture_output=True, text=True, timeout=90,
+            )
+            ready_pools: list[tuple[str, int]] = []
+            if probe.returncode == 0:
+                try:
+                    data = json.loads(strip_iris_log(probe.stdout).strip())
+                    for p in _walk_pools(data):
+                        if p["status"] != "available" or p["ready"] <= 0:
+                            continue
+                        # Match variant + (optional) zone.
+                        name = p["name"]
+                        if f"tpu_{tpu}-" not in name:
+                            continue
+                        if target_zones and not any(name.endswith(f"-{z}") for z in target_zones):
+                            continue
+                        ready_pools.append((name, p["ready"]))
+                except Exception as e:
+                    err(f"[tomat train --queue] avail parse failed: {e}")
+            elif probe.returncode == 124 or (probe.stderr and "timed out" in probe.stderr.lower()):
+                err(f"[tomat train --queue] attempt {attempt}: iris-avail timed out, retrying")
+                time.sleep(queue_poll)
+                continue
+            elapsed = int(time.time() - t_start)
+            if not ready_pools:
+                if attempt == 1 or attempt % 10 == 0:
+                    err(f"[tomat train --queue] attempt {attempt} ({elapsed//60}m{elapsed%60}s): "
+                        f"no matching pool with READY≥1; sleeping {queue_poll}s")
+                time.sleep(queue_poll)
+                continue
+            # Found a pool. Try iris launch immediately.
+            best = max(ready_pools, key=lambda x: x[1])
+            err(f"[tomat train --queue] attempt {attempt} ({elapsed//60}m{elapsed%60}s): "
+                f"pool {best[0]} has READY={best[1]} — firing iris job")
+            r = _try_iris_launch()
+            if r.returncode == 0:
+                break
+            tail = (r.stderr or "")[-300:]
+            err(f"[tomat train --queue] iris rejected (rc={r.returncode}): {tail[-120:]}")
+            err(f"[tomat train --queue] capacity probably claimed in the gap; retrying in {queue_poll}s")
+            time.sleep(queue_poll)
+    else:
+        r = _try_iris_launch()
+        if r.returncode != 0:
+            err(f"[FAIL launch {label}] rc={r.returncode}\n{r.stderr[-1000:]}")
+            sys.exit(r.returncode)
     print(f"[launched {label} on {tpu}, {steps} steps"
           f"{f' (resume from step-{latest})' if resume_mode else ''}]")
     print(f"  wandb: https://wandb.ai/{WANDB_PROJECT}/runs/{label}")
