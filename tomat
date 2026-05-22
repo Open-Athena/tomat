@@ -1539,7 +1539,7 @@ def _latest_ckpt_step(run_label: str, bucket: str = GCS_BUCKET) -> int | None:
 @click.option("--memory", default="64GB", help="iris --memory")
 @click.option("--max-retries", default=20, show_default=True, type=int, help="iris --max-retries (failure budget; iris default is 0, which classifies JAX-distributed leader-preempt cascades as fatal failures. 20 buys us ~20 sibling-cascade survivals before terminal.)")
 @click.option("-e", "--env", "extra_env", multiple=True, help="extra env var KEY=VAL (repeatable)")
-@click.option("--shuffle-window-blocks", type=int, default=0, help="TOMAT_SHUFFLE_WINDOW_BLOCKS; 0 = no shuffle (default), >0 = BlockShuffle window radius")
+@click.option("--shuffle-window-blocks", type=int, default=1024, show_default=True, help="TOMAT_SHUFFLE_WINDOW_BLOCKS; BlockShuffle within-window mixing radius. Shuffle is ON by default — pass 0 to disable.")
 @click.option("--shuffle-io-block-size", type=int, default=0, help="TOMAT_SHUFFLE_IO_BLOCK_SIZE; 0 = auto from meta (M)")
 @click.option("--share-cache/--no-share-cache", default=True, help="Trainer reads the mirrored cache at `<bucket>/cache/<data_label>/` (default on). With TOMAT_SHARE_CACHE=1, the trainer detects its actual GCE zone at startup and picks the local-region mirror — drop `--zone` to let iris park the slice wherever has capacity. `--no-share-cache` falls back to per-run rebuild under the canonical bucket.")
 @click.option("--watch-preempts/--no-watch-preempts", default=True, help="auto-fire `tomat preempts watch <LABEL>` in the background after launch (default on)")
@@ -1786,10 +1786,11 @@ def train(
     if steps_per_eval is not None:
         env_vars.append(("TOMAT_STEPS_PER_EVAL", str(steps_per_eval)))
     env_vars.append(("TOMAT_GRADIENT_CHECKPOINTING", "1" if grad_ckpt else "0"))
-    if shuffle_window_blocks > 0:
-        env_vars.append(("TOMAT_SHUFFLE_WINDOW_BLOCKS", str(shuffle_window_blocks)))
-        if shuffle_io_block_size > 0:
-            env_vars.append(("TOMAT_SHUFFLE_IO_BLOCK_SIZE", str(shuffle_io_block_size)))
+    # Always emit — shuffle is on by default; `--shuffle-window-blocks 0` is
+    # the explicit opt-out (the trainer's own env default then never applies).
+    env_vars.append(("TOMAT_SHUFFLE_WINDOW_BLOCKS", str(shuffle_window_blocks)))
+    if shuffle_io_block_size > 0:
+        env_vars.append(("TOMAT_SHUFFLE_IO_BLOCK_SIZE", str(shuffle_io_block_size)))
     if share_cache:
         # Trainer detects its actual GCE region at startup and picks the
         # matching mirror — no submit-time bucket pinning needed.

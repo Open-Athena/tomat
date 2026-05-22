@@ -467,16 +467,16 @@ def main():
         cache_dir=cache_dir,
         format=prebuilt,
     )
-    # Shuffle config. By default Levanter's `LmDataConfig.shuffle=False` —
-    # batches are read in cache order, which for tomat means consecutive
-    # patches from the same material (M=32 or 64 sequences/mat). That gives
-    # batches with only ~BS/M unique mats, hurting gradient quality.
-    # `TOMAT_SHUFFLE_WINDOW_BLOCKS > 0` enables `BlockShuffleConfig`:
+    # Shuffle config. Levanter's `LmDataConfig.shuffle` defaults to False —
+    # batches read in cache order, which for tomat means consecutive patches
+    # from the same material (M=32 or 64 sequences/mat): only ~BS/M unique
+    # mats per batch, hurting gradient quality. So shuffle is ON by default
+    # here — `TOMAT_SHUFFLE_WINDOW_BLOCKS` (default 1024) → `BlockShuffleConfig`:
     #   - `io_block_size` (rows per IO chunk; default = M from meta) keeps
     #     each block as one mat's patches — cache-friendly sequential reads.
-    #   - `window_blocks` (default 0 = off) is the within-window mixing
-    #     radius; 1024 blocks × M rows ≈ 32–65k rows per shuffle window.
-    shuffle_window_blocks = int(os.environ.get("TOMAT_SHUFFLE_WINDOW_BLOCKS", "0"))
+    #   - `window_blocks` is the within-window mixing radius; 1024 blocks ×
+    #     M rows ≈ 32–65k rows per shuffle window. Set to 0 to disable.
+    shuffle_window_blocks = int(os.environ.get("TOMAT_SHUFFLE_WINDOW_BLOCKS", "1024"))
     shuffle_io_block_size = int(
         os.environ.get("TOMAT_SHUFFLE_IO_BLOCK_SIZE", "0")
     ) or int(meta.get("patches_per_material", 32))
@@ -489,7 +489,7 @@ def main():
               f"window_blocks={shuffle_window_blocks})")
     else:
         shuffle_cfg = False
-        print(f"[tomat-tpu] shuffle: OFF (set TOMAT_SHUFFLE_WINDOW_BLOCKS>0 to enable)")
+        print(f"[tomat-tpu] shuffle: OFF (TOMAT_SHUFFLE_WINDOW_BLOCKS=0)")
 
     data = LmDataConfig(
         tokenizer="passthrough",
