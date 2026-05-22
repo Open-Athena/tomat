@@ -922,6 +922,24 @@ function RunsIndex() {
     ? labelToId.get(highlight.pinnedTrace) ?? null
     : null
 
+  // The pinned run floats to the top of the card list — a click lands you on
+  // its card directly, no footer scroll-chase. (Counts/timeline still use the
+  // activity-ordered `ordered`; only the rendered list is re-ordered.)
+  const displayed = useMemo(() => {
+    if (!ordered || !pinnedRunId) return ordered
+    const pinned = ordered.find((c) => c.id === pinnedRunId)
+    if (!pinned) return ordered
+    return [pinned, ...ordered.filter((c) => c.id !== pinnedRunId)]
+  }, [ordered, pinnedRunId])
+
+  // On (re)pin, scroll the now-top pinned card into view.
+  useEffect(() => {
+    if (!pinnedRunId) return
+    cardRefs.current.get(pinnedRunId)?.scrollIntoView({
+      behavior: 'smooth', block: 'nearest',
+    })
+  }, [pinnedRunId])
+
   // Click anywhere that isn't a card / legend item / link / button — page
   // margins, header, gaps, plot background — to unpin. A document listener
   // (only while pinned) so it catches clicks outside the centered container.
@@ -971,7 +989,7 @@ function RunsIndex() {
           <RunsTimelinePlot runs={timelineSeries} highlight={highlight} />
         </div>
       )}
-      {ordered && ordered.map((c) => (
+      {displayed && displayed.map((c) => (
         <RunCard
           key={c.id}
           data={c}
@@ -982,9 +1000,9 @@ function RunsIndex() {
           onScrollTargetRef={setCardRef}
         />
       ))}
-      {/* Sticky bottom banner when an active card is off-screen — gives a
-          breadcrumb back to it ("highlighted card is below"). */}
-      {activeRunId && !activeInView && (
+      {/* Bottom breadcrumb when a *hovered* card is off-screen. Pinned runs
+          don't need it — they're rendered at the top of the list. */}
+      {activeRunId && !activeInView && !highlight.isPinned && (
         <StickyActiveBanner
           runId={activeRunId}
           card={ordered?.find((c) => c.id === activeRunId) ?? null}
@@ -1032,7 +1050,7 @@ function StickyActiveBanner({
       <span style={{ fontFamily: 'monospace' }}>{runId}</span>
       <span style={{ color: '#888', fontSize: '0.72rem', marginLeft: 'auto' }}>
         {card?.job && <>iris: {card.job.state} </>}
-        ↓ click to scroll to card
+        click to scroll to its card
       </span>
     </div>
   )
