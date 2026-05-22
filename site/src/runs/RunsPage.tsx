@@ -429,6 +429,8 @@ function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTar
   // as a percentage (cont7k-ext logs 1.73 = 1.73%), so display as-is — no ×100.
   const mtNmae = manifest?.summary['eval/mat_nmae/train_200/mean']
   const mvNmae = manifest?.summary['eval/mat_nmae/val_200/mean']
+  const nEpochs = nEpochsOf(manifest)
+  const nFlops = nFlopsOf(manifest)
 
   const sparkPts = useMemo(() => history ? recentStepPoints(history) : [], [history])
   const lastTs = sparkPts.length > 0 ? sparkPts[sparkPts.length - 1].x : null
@@ -636,6 +638,8 @@ function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTar
           {typeof mfu === 'number' && <> · MFU {mfu.toFixed(1)}%</>}
           {typeof mtNmae === 'number' && <> · MT {mtNmae.toFixed(2)}%</>}
           {typeof mvNmae === 'number' && <> · MV {mvNmae.toFixed(2)}%</>}
+          {nEpochs != null && <> · {nEpochs.toFixed(2)} ep</>}
+          {nFlops != null && <> · {formatFlops(nFlops)} FLOP</>}
         </div>
       </div>
     </div>
@@ -678,6 +682,57 @@ function numTrainStepsOf(manifest: RunManifest | null): number | null {
     if (typeof n === 'number' && n > 0) return n
   }
   return null
+}
+
+// ── n_epochs / n_flops ──────────────────────────────────────────────────────
+// Sequences per epoch (Levanter cache `total_num_rows`), keyed by data label —
+// the `cache/<label>/` segment of `config.data.cache_dir`. From each cache's
+// `train/shard_ledger.json`. TODO: fold into the manifest so a new data label
+// doesn't need a code change here.
+const EPOCH_SEQUENCES: Record<string, number> = {
+  'train-full-v3': 4954176,
+}
+
+/** Data label (tokenization) of a run — the `cache/<label>/` path segment. */
+function dataLabelOf(manifest: RunManifest | null): string | null {
+  const data = (manifest?.run.config as Record<string, unknown> | undefined)?.data
+  const cd = data && typeof data === 'object'
+    ? (data as { cache_dir?: unknown }).cache_dir : undefined
+  if (typeof cd !== 'string') return null
+  const m = cd.match(/\/cache\/([^/]+)\/?$/)
+  return m ? m[1] : null
+}
+
+/** Tokens trained on so far (`throughput/total_tokens` from the run summary). */
+function totalTokensOf(manifest: RunManifest | null): number | null {
+  const t = manifest?.summary['throughput/total_tokens']
+  return typeof t === 'number' && t > 0 ? t : null
+}
+
+/** Forward+backward FLOPs — the standard 6·N·D estimate (N params, D tokens). */
+function nFlopsOf(manifest: RunManifest | null): number | null {
+  const n = manifest?.summary['parameter_count']
+  const tok = totalTokensOf(manifest)
+  if (typeof n !== 'number' || tok == null) return null
+  return 6 * n * tok
+}
+
+/** Passes over the training set = tokens / (epoch_sequences · seq_len).
+ *  Null when the data label's epoch size isn't in EPOCH_SEQUENCES. */
+function nEpochsOf(manifest: RunManifest | null): number | null {
+  const tok = totalTokensOf(manifest)
+  const label = dataLabelOf(manifest)
+  const seqLen = (manifest?.run.config as Record<string, unknown> | undefined)?.train_seq_len
+  if (tok == null || label == null || typeof seqLen !== 'number' || seqLen <= 0) return null
+  const epochSeqs = EPOCH_SEQUENCES[label]
+  if (!epochSeqs) return null
+  return tok / (epochSeqs * seqLen)
+}
+
+/** FLOP count → "1.1e20". */
+function formatFlops(f: number): string {
+  const exp = Math.floor(Math.log10(f))
+  return `${(f / 10 ** exp).toFixed(1)}e${exp}`
 }
 
 // iris reports SUCCEEDED whenever the job process exits 0 — including a run
@@ -1108,6 +1163,8 @@ function RunDetail({ runId }: { runId: string }) {
   }, [evalQ.data])
   const errObj = manifestQ.error || historyQ.error
   const err = errObj ? String(errObj) : null
+  const nEpochs = nEpochsOf(manifest)
+  const nFlops = nFlopsOf(manifest)
 
   return (
     <div style={{ maxWidth: 1600, margin: '2rem auto', padding: '0 1rem' }}>
@@ -1131,6 +1188,8 @@ function RunDetail({ runId }: { runId: string }) {
           history: {manifest.history.rows} rows, steps [
           {manifest.history.step_min ?? '-'}, {manifest.history.step_max ?? '-'}] ·{' '}
           synced: {manifest.synced_at}
+          {nEpochs != null && <> · {nEpochs.toFixed(2)} epochs</>}
+          {nFlops != null && <> · {formatFlops(nFlops)} FLOPs</>}
           {' · '}
           <a href={manifest.run.url} target="_blank" rel="noreferrer">wandb ↗</a>
         </div>
