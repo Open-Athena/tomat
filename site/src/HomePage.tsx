@@ -1,6 +1,5 @@
 import { MatsMetadataPlots } from './MatsMetadataPlots'
 import { ThemeToggle } from './theme'
-import { TrajectoryPlot } from './TrajectoryPlot'
 
 function ExtLink({ href, children }: { href: string; children: React.ReactNode }) {
   return <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>
@@ -29,51 +28,68 @@ export function HomePage() {
 
       <h2>Current best</h2>
       <p>
-        <strong>200 M parameter Qwen3, v3 patch tokenizer + LMQ-v2-16k
-        density codec.</strong> Best validation NMAE so far is{' '}
-        <strong>1.73 %</strong> at step ~21 k of the{' '}
-        <ExtLink href={`${WB_PROJECT}/runs/train-full-v3-200M-bs128-emd-do-8k-tpu16-shuf1k-cont7k-ext`}>
-          <code>cont7k-ext</code>
-        </ExtLink>{' '}run, with NEMD <strong>1.76 %</strong> at step 20 k.
-        Run is a constant-LR continuation past Chinchilla-optimal and is
-        still trending lower.
+        <strong>200 M-parameter Qwen3, v3 patch tokenizer + LMQ-v2-16k
+        density codec.</strong> The clean 80 k-step run <code>cont33k</code>{' '}
+        reaches <strong>0.96 % mean</strong> (0.75 % median) validation
+        mat-NMAE — with mat-NEMD ~1 % — and holds a smooth sub-1.5 % band
+        across its last ~47 k steps.
+      </p>
+      <p className="note">
+        ⚠ This is a <strong>teacher-forced</strong> metric: each density
+        voxel is scored given the <em>true</em> density of all prior voxels
+        in the patch. ChargE3Net predicts density from structure alone
+        (free-running), so the two numbers are <strong>not directly
+        comparable</strong> — ours is optimistic. A free-running
+        (autoregressive-generation) eval, the apples-to-apples number, is
+        in progress.
       </p>
       <table className="runs-table">
         <thead>
-          <tr><th>model</th><th>params</th><th>val NMAE</th><th>val NEMD</th><th>notes</th></tr>
+          <tr><th>model</th><th>params</th><th>val mat-NMAE</th><th>regime</th><th>notes</th></tr>
         </thead>
         <tbody>
           <tr>
             <td><ExtLink href="https://arxiv.org/abs/2312.05388">ChargE3Net</ExtLink></td>
-            <td>—</td><td><strong>0.523 %</strong></td><td>—</td>
+            <td>—</td><td><strong>0.523 %</strong></td>
+            <td>free-running (atoms → ρ)</td>
             <td>equivariant GNN; published SOTA (Materials Project)</td>
           </tr>
           <tr>
-            <td><strong>tomat <code>cont7k-ext</code></strong></td>
-            <td>200 M</td><td><strong>1.73 %</strong> @ 21 k</td><td><strong>1.76 %</strong> @ 20 k</td>
-            <td>v6e-16, 25 k+ steps, training</td>
+            <td><strong>tomat <code>cont33k</code></strong></td>
+            <td>200 M</td>
+            <td><strong>0.96 %</strong> mean · 0.75 % median</td>
+            <td>teacher-forced</td>
+            <td>clean v3 80 k-step run, v6e-16</td>
           </tr>
           <tr>
             <td>LMQ-v2-16k codec floor</td>
-            <td>—</td><td>0.18 %</td><td>—</td>
-            <td>oracle: best NMAE if model outputs the codec posterior perfectly</td>
+            <td>—</td><td>~0.18 %</td><td>oracle</td>
+            <td>best achievable mat-NMAE if the model output the codec posterior perfectly</td>
           </tr>
         </tbody>
       </table>
       <p className="note">
-        Codec floor 0.18 % means our metric ceiling well exceeds SOTA;
-        room is in the model, not the tokenization.
+        The codec floor (~0.18 %) sits well below SOTA — the headroom is in
+        the model, not the tokenization. The model-vs-SOTA gap itself can't
+        be read off the teacher-forced row above; that needs the free-running
+        eval.
       </p>
-      <div className="plot-card">
-        <TrajectoryPlot url={`${base}/nmae-nemd-trajectories.json`} />
+      <div className="plot-card" style={{ textAlign: 'center', padding: '1.4rem 1rem' }}>
+        <a href="#/runs" style={{ fontSize: '1.1rem', fontWeight: 600 }}>
+          → Live runs dashboard
+        </a>
+        <p className="note" style={{ marginTop: '0.45rem', marginBottom: 0 }}>
+          Every run's loss · step · MFU · mat-NMAE/NEMD curves, lifecycle
+          events, preemptions, and per-checkpoint evals — live from wandb +
+          iris.
+        </p>
       </div>
-      <p className="note">
-        For live state of all runs (loss, step, MFU, lifecycle events,
-        sigterms, preemptions over UTC wall-clock), see{' '}
-        <a href="#/runs">the runs dashboard</a> — parquet sourced from
-        wandb via <code>tomat runs sync</code>, served from R2 through a
-        Cloudflare Worker.
-      </p>
+
+      <details>
+        <summary style={{ cursor: 'pointer', fontWeight: 600, margin: '0.5rem 0' }}>
+          Method &amp; data internals — patch tokenization, LMQ codec, geometry,
+          dataset stats
+        </summary>
 
       <h2>Patch tokenization (v3, current era)</h2>
       <p>
@@ -186,15 +202,15 @@ export function HomePage() {
         scaling axis — codec floor at 0.18 % NMAE doesn't bind, so
         bigger-context experiments are about model capacity, not codec.
       </p>
+      </details>
 
       <h2>Up next</h2>
       <ul>
         <li>
-          <strong>Multi-epoch run to characterize overfitting.</strong>{' '}
-          <code>cont7k-ext</code> resumed with target step{' '}
-          <strong>80 k</strong> (~4.1 epochs through unique data). Want
-          to see at what point train/val diverge — current best is on
-          ~1.7 epochs in, so overfitting hasn't been informative yet.
+          <strong>Free-running eval.</strong> The headline number is
+          teacher-forced; an autoregressive-generation eval (structure → ρ
+          with no density prefix) is what's directly comparable to
+          ChargE3Net — in progress.
         </li>
         <li>
           <strong>Cluster diagnosis for v5p host stall.</strong> v5p-16
