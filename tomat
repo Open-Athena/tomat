@@ -1276,6 +1276,7 @@ def evals_sync(substr: str | None, bucket: str, dry_run: bool, prefix: str):
     every run with eval results.
     """
     import fsspec
+    import numpy as np
     from datetime import datetime, timezone
 
     fs = fsspec.filesystem("gcs")
@@ -1310,6 +1311,17 @@ def evals_sync(substr: str | None, bucket: str, dry_run: bool, prefix: str):
                 row = {"step": int(name[len("step-"):-len(".json")]),
                        "n_mats": d.get("n_mats")}
                 row.update({k: d.get(k) for k in stat_keys})
+                # p1/p25/p75 — spread percentiles for the dashboard's band
+                # plot (the JSON aggregate only carries mean/median/p99).
+                per_mat = d.get("per_mat") or []
+                for metric in ("nmae", "nemd"):
+                    vals = np.asarray(
+                        [m[metric] for m in per_mat if m.get(metric) is not None],
+                        dtype=float,
+                    )
+                    if vals.size:
+                        for pct, key in ((1, "p1"), (25, "p25"), (75, "p75")):
+                            row[f"{metric}_{key}"] = float(np.percentile(vals, pct))
                 rows.append(row)
             if rows:
                 sets[mat_set] = sorted(rows, key=lambda r: r["step"])

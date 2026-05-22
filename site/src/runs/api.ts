@@ -74,10 +74,16 @@ export interface EvalPoint {
   step: number
   n_mats: number | null
   nmae_mean: number | null
+  nmae_p1: number | null
+  nmae_p25: number | null
   nmae_median: number | null
+  nmae_p75: number | null
   nmae_p99: number | null
   nemd_mean: number | null
+  nemd_p1: number | null
+  nemd_p25: number | null
   nemd_median: number | null
+  nemd_p75: number | null
   nemd_p99: number | null
 }
 

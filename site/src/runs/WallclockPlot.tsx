@@ -7,14 +7,13 @@
 //      (it would degenerate to y = x).
 //   2. losses + mat-NMAE + mat-NEMD on a single log y-axis (bottom).
 //
-// Eval traces (MV = val_200, MT = train_200) come from the canonical
-// per-step eval.json — NOT the parquet's collapsed harvested points. NMAE is
-// the green family, NEMD the teal family; the stat is encoded by shade
-// (mean → median → p99); MV solid, MT dashed. mean traces show by default;
-// median/p99 are `legendonly` (click the legend to add them). Eval points
-// are keyed by checkpoint step; on the time/elapsed axes they're placed at
-// the wallclock of that step, recovered from the parquet's
-// (timestamp, global_step) rows.
+// Eval bands (MV = val_200, MT = train_200) come from the canonical per-step
+// eval.json — NOT the parquet's collapsed harvested points. Per (set × metric)
+// the plot draws a median center line plus two shaded spread bands across the
+// 200 mats: p25–p75 (IQR) and a fainter p1–p99. NMAE is green, NEMD teal; MV
+// solid, MT dashed. Eval points are keyed by checkpoint step; on the
+// time/elapsed axes they're placed at the wallclock of that step, recovered
+// from the parquet's (timestamp, global_step) rows.
 //
 // Lifecycle events render as vertical lines via `shapes` (yref='paper') so
 // they span both panels.
@@ -32,20 +31,21 @@ interface Props {
 }
 
 type XMode = 'time' | 'elapsed' | 'step'
-type Stat = 'mean' | 'median' | 'p99'
 
 const COLORS = {
   step: '#2196f3',
   TL: '#ef5350',     // train/loss
   VL: '#ffa726',     // eval/loss
-  // NMAE shades, light → dark = mean → median → p99
-  nmae: { mean: '#9ccc65', median: '#43a047', p99: '#1b5e20' },
-  // NEMD shades — teal family, kept distinct from NMAE's green
-  nemd: { mean: '#4dd0e1', median: '#00acc1', p99: '#00838f' },
+  nmae: '#43a047',   // mat-NMAE — green
+  nemd: '#00acc1',   // mat-NEMD — teal
   start: '#ffa726',
   sigterm: '#bdbdbd',
   preempt: '#ba68c8',
 } as const
+
+/** Translucent fill for a metric's spread band. */
+const bandFill = (metric: 'nmae' | 'nemd', alpha: number): string =>
+  metric === 'nmae' ? `rgba(67,160,71,${alpha})` : `rgba(0,172,193,${alpha})`
 
 /** Local-time `YYYY-MM-DD HH:MM:SS` (no tz suffix → a Plotly date axis renders
  *  it verbatim, i.e. in the viewer's local zone rather than UTC). */
@@ -172,47 +172,69 @@ export function WallclockPlot({ history, evalSeries, runId }: Props) {
   const TL = series('train/loss')
   const VL = series('eval/loss')
 
-  // ── eval traces (MV/MT × {NMAE,NEMD} × {mean,median,p99}) from eval.json ──
-  const evalTrace = (
+  // ── eval bands from eval.json ──
+  // Per (set × metric): a median center line + a p25–p75 IQR band + a fainter
+  // p1–p99 band. Band edges are `showlegend:false`; the median carries the
+  // legend entry, and a shared `legendgroup` makes a legend-click toggle the
+  // whole group (median + both bands). `fill:'tonexty'` fills to the
+  // immediately-preceding trace, so the per-group order is
+  // [p1, p99, p25, p75, median].
+  const evalBandGroup = (
     setKey: string, mvmt: string, dash: 'solid' | 'dash',
-    metric: 'nmae' | 'nemd', stat: Stat,
+    metric: 'nmae' | 'nemd',
   ) => {
     const pts = evalSeries?.sets[setKey] ?? []
     const xs: (string | number)[] = []
-    const ys: number[] = []
     const steps: number[] = []
+    const pct: Record<string, (number | null)[]> = {
+      p1: [], p25: [], median: [], p75: [], p99: [],
+    }
     for (const pt of pts) {
-      const v = (pt as unknown as Record<string, number | null>)[`${metric}_${stat}`]
-      if (v === null || v === undefined) continue
       const x = xOfStep(pt.step)
       if (x === null) continue
-      xs.push(x); ys.push(v * 100); steps.push(pt.step)  // fraction → %
+      const rec = pt as unknown as Record<string, number | null>
+      xs.push(x); steps.push(pt.step)
+      for (const k of ['p1', 'p25', 'median', 'p75', 'p99']) {
+        const v = rec[`${metric}_${k}`]
+        pct[k].push(typeof v === 'number' ? v * 100 : null)  // fraction → %
+      }
     }
-    const color = COLORS[metric][stat]
-    const name = `${mvmt} ${metric.toUpperCase()} ${stat}`
-    return {
-      x: xs, y: ys, name,
-      type: 'scatter' as const,
-      mode: 'lines+markers' as const,
-      line: { color, width: 1.3, dash },
-      marker: { color, size: 4 },
-      yaxis: 'y2',
-      legendgroup: `${mvmt}-${metric}`,
-      customdata: steps,
-      hovertemplate: `${name} %{y:.2f}%%<br>step %{customdata}<extra></extra>`,
-      // mean shows by default; median/p99 are one legend-click away.
-      visible: (stat === 'mean' ? true : 'legendonly') as true | 'legendonly',
-    }
+    const color = COLORS[metric]
+    const name = `${mvmt} ${metric.toUpperCase()}`
+    const lg = `${mvmt}-${metric}`
+    const edge = (key: string, fill: number | null) => ({
+      x: xs, y: pct[key], name,
+      type: 'scatter' as const, mode: 'lines' as const,
+      line: { width: 0, color },
+      ...(fill !== null
+        ? { fill: 'tonexty' as const, fillcolor: bandFill(metric, fill) }
+        : {}),
+      yaxis: 'y2', legendgroup: lg, showlegend: false,
+      hoverinfo: 'skip' as const,
+    })
+    return [
+      edge('p1', null),     // lower edge of the p1–p99 band
+      edge('p99', 0.09),    // upper edge → fills down to p1
+      edge('p25', null),    // lower edge of the IQR band
+      edge('p75', 0.20),    // upper edge → fills down to p25
+      {                     // median — the legend-bearing center line
+        x: xs, y: pct.median, name,
+        type: 'scatter' as const, mode: 'lines+markers' as const,
+        line: { color, width: 1.6, dash },
+        marker: { color, size: 3 },
+        yaxis: 'y2', legendgroup: lg,
+        customdata: steps,
+        hovertemplate: `${name} median %{y:.2f}%%<br>step %{customdata}<extra></extra>`,
+      },
+    ]
   }
   const evalTraces = useMemo(() => {
-    const out = []
+    const out: Record<string, unknown>[] = []
     for (const [setKey, mvmt, dash] of [
       ['val_200', 'MV', 'solid'], ['train_200', 'MT', 'dash'],
     ] as [string, string, 'solid' | 'dash'][]) {
       for (const metric of ['nmae', 'nemd'] as const) {
-        for (const stat of ['mean', 'median', 'p99'] as Stat[]) {
-          out.push(evalTrace(setKey, mvmt, dash, metric, stat))
-        }
+        out.push(...evalBandGroup(setKey, mvmt, dash, metric))
       }
     }
     return out
