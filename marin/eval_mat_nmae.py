@@ -561,6 +561,49 @@ def build_all_patch_input_ids_v3(
     return ids
 
 
+def decode_density(density_logits, target_dens, decoder, decode_dens):
+    """Decode per-position density-bin logits → (rho point estimate, EMD).
+
+    Args:
+      density_logits: (B, Pos, n_bins) raw logits over the density-token bins.
+        MUST be the raw density logits — *not* a slice of the full-vocab
+        softmax. Slicing then renormalizing is identical in exact arithmetic,
+        but underflows fp32 to an all-zero distribution when the model
+        confidently predicts a non-density token (density logits >~80 below
+        the vocab max → exp() flushes to 0). An all-zero p_norm decodes
+        (median) to the last bin — rho = decode_dens[-1], ~3e4 of garbage —
+        while EMD = dot(0, ·) = 0 (fake-perfect): the NMAE-vs-NEMD blowup.
+        softmax over the density logits alone max-subtracts within the density
+        range, so it is always a valid normalized distribution.
+      target_dens: (B, Pos) true density value (codec round-trip) for the EMD.
+      decoder: "argmax" | "median" | "mean" — the point-estimate rule.
+      decode_dens: (n_bins,) bin index → density value.
+
+    Returns (rho, emd), each (B, Pos).
+    """
+    n_bins = decode_dens.shape[0]
+    p_norm = jax.nn.softmax(density_logits, axis=-1)  # (B, Pos, n_bins)
+    if decoder == "argmax":
+        rho = decode_dens[jnp.argmax(density_logits, axis=-1)]
+    elif decoder == "median":
+        # smallest bin where the cumulative mass reaches 0.5
+        cumP = jnp.cumsum(p_norm, axis=-1)
+        bin_idx = jnp.clip(
+            jnp.sum(cumP < 0.5, axis=-1).astype(jnp.int32), 0, n_bins - 1,
+        )
+        rho = decode_dens[bin_idx]
+    elif decoder == "mean":
+        rho = jnp.einsum("bpv,v->bp", p_norm, decode_dens)
+    else:
+        raise ValueError(f"unknown decoder: {decoder!r}")
+    # mat-EMD: per-position Wasserstein-1 vs the delta target, E_P[|v - t|].
+    # vmap (not a (B, Pos, n_bins) einsum) to avoid materializing the abs-diff.
+    def _emd1(p_v, t_d):
+        return jnp.dot(p_v, jnp.abs(decode_dens - t_d))
+    emd = jax.vmap(jax.vmap(_emd1))(p_norm, target_dens)
+    return rho, emd
+
+
 def main():
     label = os.environ.get("TOMAT_LABEL", "val-full-lmq-v2")
     model_preset = os.environ.get("TOMAT_MODEL", "200M")
@@ -577,6 +620,9 @@ def main():
     # =JAX_FLASH for the GPU eval path (pure-Pallas flash, ~5-10× faster, same
     # math). Flash is exact — differs from reference only by fp-rounding.
     attn_backend = os.environ.get("TOMAT_ATTN_BACKEND", "").strip()
+    # Debug: if set, eval ONLY this mp_id and dump its per-voxel grids to GCS
+    # (rho_pred / rho_true / emd_grid) — for pinning the NMAE-vs-NEMD bug.
+    debug_dump_mat = os.environ.get("TOMAT_DEBUG_DUMP_MAT", "").strip()
     decoder = os.environ.get("TOMAT_EVAL_DECODER", "median")
     if decoder not in ("argmax", "median", "mean"):
         raise ValueError(f"TOMAT_EVAL_DECODER must be argmax/median/mean, got {decoder!r}")
@@ -662,101 +708,35 @@ def main():
         model = mp_policy.cast_to_compute(model)
 
         # Decoder lives on-TPU: returns (B, Pos) float density predictions
-        # (not logits / not bin indices). Avoids transferring full vocab dist.
-        # The distribution is restricted to the density range and renormalized
-        # before decoding — non-density-token mass doesn't contribute.
+        # (not logits / not bin indices). Avoids transferring the full vocab
+        # distribution. See decode_density() for the point-estimate + EMD math.
         DENS_LO = density_offset
         DENS_HI = density_offset + len(recon)
         decode_dens = jnp.asarray(recon, dtype=jnp.float32)  # (n_bins,) float
 
-        if decoder == "argmax":
-            @hax.named_jit(axis_resources=compute_mapping)
-            def forward_decode(tokens_in):
-                act = model.activations(tokens_in, key=None, attn_mask=None)
-                head = model.get_lm_head()
-                logits = hax.dot(act, head, axis=model.Embed)
-                logits_arr = logits.array.astype(jnp.float32)  # (B, Pos, V)
-                density_logits = logits_arr[..., DENS_LO:DENS_HI]  # (B, Pos, n_bins)
-                bin_idx = jnp.argmax(density_logits, axis=-1)
-                rho = decode_dens[bin_idx]  # (B, Pos)
-                # mat-EMD via softmax (same as median path).
-                probs = jax.nn.softmax(logits_arr, axis=-1)
-                density_probs = probs[..., DENS_LO:DENS_HI]
-                sum_dens = density_probs.sum(axis=-1, keepdims=True) + 1e-12
-                p_norm = density_probs / sum_dens
-                tokens_arr = tokens_in.array
-                target_bins = jnp.clip(tokens_arr - DENS_LO, 0, len(decode_dens) - 1)
-                target_dens = decode_dens[target_bins]
-                def _emd1(p_v, t_d):
-                    return jnp.dot(p_v, jnp.abs(decode_dens - t_d))
-                emd = jax.vmap(jax.vmap(_emd1))(p_norm, target_dens)
-                return (
-                    hax.named(rho, (logits.axes[0], logits.axes[1])),
-                    hax.named(emd, (logits.axes[0], logits.axes[1])),
-                )
-        elif decoder == "median":
-            @hax.named_jit(axis_resources=compute_mapping)
-            def forward_decode(tokens_in):
-                act = model.activations(tokens_in, key=None, attn_mask=None)
-                head = model.get_lm_head()
-                logits = hax.dot(act, head, axis=model.Embed)
-                logits_arr = logits.array.astype(jnp.float32)
-                probs = jax.nn.softmax(logits_arr, axis=-1)
-                density_probs = probs[..., DENS_LO:DENS_HI]
-                sum_dens = density_probs.sum(axis=-1, keepdims=True) + 1e-12
-                p_norm = density_probs / sum_dens
-                cumP = jnp.cumsum(p_norm, axis=-1)
-                # smallest bin where cumP >= 0.5
-                bin_idx = jnp.sum(cumP < 0.5, axis=-1).astype(jnp.int32)
-                bin_idx = jnp.clip(bin_idx, 0, len(decode_dens) - 1)
-                rho = decode_dens[bin_idx]
-                # mat-EMD: per-voxel Wasserstein-1 vs delta target.
-                # Target bin = the input token at the NEXT position (since
-                # logits at position t predict token at t+1). Caller pulls
-                # `pred_positions = dens_positions - 1`; here we recover the
-                # corresponding target token from the input sequence.
-                # Logits at output position p predict input token at p+1, so
-                # the EMD target at output p must be tokens_in[..., p+1]. Shift
-                # left and pad the last column (it's irrelevant — the inference
-                # loop only reads emd at pred_positions = dens_positions - 1,
-                # which never includes the last position).
-                tokens_arr = tokens_in.array  # (B, Pos)
-                tokens_next = jnp.concatenate(
-                    [tokens_arr[..., 1:], tokens_arr[..., -1:]], axis=-1,
-                )
-                target_bins = jnp.clip(tokens_next - DENS_LO, 0, len(decode_dens) - 1)
-                target_dens = decode_dens[target_bins]  # (B, Pos)
-                # E_P[|v - v_target|] per voxel, computed via vmap to avoid
-                # materializing (B, Pos, n_bins) abs-diff tensor.
-                def _emd1(p_v, t_d):
-                    return jnp.dot(p_v, jnp.abs(decode_dens - t_d))
-                emd = jax.vmap(jax.vmap(_emd1))(p_norm, target_dens)  # (B, Pos)
-                return (
-                    hax.named(rho, (logits.axes[0], logits.axes[1])),
-                    hax.named(emd, (logits.axes[0], logits.axes[1])),
-                )
-        else:  # mean
-            @hax.named_jit(axis_resources=compute_mapping)
-            def forward_decode(tokens_in):
-                act = model.activations(tokens_in, key=None, attn_mask=None)
-                head = model.get_lm_head()
-                logits = hax.dot(act, head, axis=model.Embed)
-                logits_arr = logits.array.astype(jnp.float32)
-                probs = jax.nn.softmax(logits_arr, axis=-1)
-                density_probs = probs[..., DENS_LO:DENS_HI]
-                sum_dens = density_probs.sum(axis=-1, keepdims=True) + 1e-12
-                p_norm = density_probs / sum_dens
-                rho = jnp.einsum("bpv,v->bp", p_norm, decode_dens)
-                tokens_arr = tokens_in.array
-                target_bins = jnp.clip(tokens_arr - DENS_LO, 0, len(decode_dens) - 1)
-                target_dens = decode_dens[target_bins]
-                def _emd1(p_v, t_d):
-                    return jnp.dot(p_v, jnp.abs(decode_dens - t_d))
-                emd = jax.vmap(jax.vmap(_emd1))(p_norm, target_dens)
-                return (
-                    hax.named(rho, (logits.axes[0], logits.axes[1])),
-                    hax.named(emd, (logits.axes[0], logits.axes[1])),
-                )
+        @hax.named_jit(axis_resources=compute_mapping)
+        def forward_decode(tokens_in):
+            act = model.activations(tokens_in, key=None, attn_mask=None)
+            head = model.get_lm_head()
+            logits = hax.dot(act, head, axis=model.Embed)
+            logits_arr = logits.array.astype(jnp.float32)  # (B, Pos, V)
+            density_logits = logits_arr[..., DENS_LO:DENS_HI]  # (B, Pos, n_bins)
+            # EMD target = the input token at the NEXT position: logits at
+            # output position p predict input token p+1, so the target for the
+            # prediction at p is tokens_in[..., p+1]. Shift left and pad the
+            # last column (unused — the inference loop reads emd only at
+            # pred_positions = dens_positions - 1, never the last position).
+            tokens_arr = tokens_in.array  # (B, Pos)
+            tokens_next = jnp.concatenate(
+                [tokens_arr[..., 1:], tokens_arr[..., -1:]], axis=-1,
+            )
+            target_bins = jnp.clip(tokens_next - DENS_LO, 0, len(decode_dens) - 1)
+            target_dens = decode_dens[target_bins]  # (B, Pos)
+            rho, emd = decode_density(density_logits, target_dens, decoder, decode_dens)
+            return (
+                hax.named(rho, (logits.axes[0], logits.axes[1])),
+                hax.named(emd, (logits.axes[0], logits.axes[1])),
+            )
 
         # Pick mp-IDs: either from the pinned JSON snapshot (preferred for
         # apples-to-apples curves across runs), or from the parquets directly.
@@ -793,6 +773,10 @@ def main():
                     break
             mp_ids = all_ids[n_mats_skip : n_mats_skip + n_mats_cap]
             err(f"[eval-mat] skip={n_mats_skip}, cap={n_mats_cap}; eval on {len(mp_ids)} mats: {mp_ids}")
+
+        if debug_dump_mat:
+            mp_ids = [debug_dump_mat]
+            err(f"[eval-mat] DEBUG: single-mat per-voxel dump → {debug_dump_mat}")
 
         per_mat_results = []
         for mp_id in mp_ids:
@@ -918,6 +902,17 @@ def main():
             nemd = mean_emd / max(denom, 1e-30)
             err(f"[eval-mat] {mp_id}: MAE={mae:.4e}, EMD={mean_emd:.4e}, "
                 f"mean|ρ_true|={denom:.4e}, NMAE={nmae:.4%}, NEMD={nemd:.4%}")
+            if debug_dump_mat == mp_id:
+                import io
+                _buf = io.BytesIO()
+                np.savez_compressed(
+                    _buf, rho_pred=rho_pred, rho_true=rho_true, emd_grid=emd_grid,
+                    grid_shape=np.asarray(grid_shape),
+                )
+                _dump = f"{BUCKET}/eval/debug/{mp_id}-dump.npz"
+                with fsspec.open(_dump, "wb") as _f:
+                    _f.write(_buf.getvalue())
+                err(f"[eval-mat] DEBUG: dumped per-voxel grids → {_dump}")
             per_mat_results.append({
                 "mp_id": mp_id,
                 "grid_shape": list(grid_shape),
@@ -960,7 +955,7 @@ def main():
 
         # Persist to GCS keyed by checkpoint + mat-set, so bootstrap noise
         # estimation can read per-mat values for any prior eval.
-        if per_mat_results:
+        if per_mat_results and not debug_dump_mat:
             # Levanter checkpointer lays out as <base_path>/<run_id>/step-N, where
             # base_path here is `<BUCKET>/results/<RESULTS_LABEL>/checkpoints` and
             # run_id == RESULTS_LABEL — so the path doubles the label, e.g.

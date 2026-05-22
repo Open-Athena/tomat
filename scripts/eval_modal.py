@@ -96,6 +96,7 @@ def eval_checkpoint(
     n_mats: int = 200,
     decoder: str = "median",
     batch: int = 16,
+    debug_dump_mat: str = "",
 ) -> dict:
     """Eval one checkpoint against one mat-set; return the summary dict."""
     import json
@@ -126,10 +127,16 @@ def eval_checkpoint(
         # Pure-Pallas flash attention — ~5-10× faster than the reference impl
         # at seq-len 8192, no transformer_engine needed. Exact (same math).
         TOMAT_ATTN_BACKEND="JAX_FLASH",
+        TOMAT_DEBUG_DUMP_MAT=debug_dump_mat,
     )
     err(f"[eval-modal] {mat_set}: {checkpoint}")
     from marin.eval_mat_nmae import main as eval_main
     eval_main()
+
+    if debug_dump_mat:
+        dump = f"gs://marin-eu-west4/tomat/eval/debug/{debug_dump_mat}-dump.npz"
+        err(f"[eval-modal] debug per-voxel dump → {dump}")
+        return {"debug_dump_mat": debug_dump_mat, "dump_path": dump}
 
     # eval_main() already persisted the summary to GCS — read it back so the
     # local entrypoint gets the numbers without re-scraping stdout.
@@ -149,16 +156,27 @@ def main(
     model: str = "200M",
     n_mats: int = 200,
     decoder: str = "median",
+    debug_dump_mat: str = "",
 ):
-    """Eval `checkpoint` on `mat_set` (val_200 | train_200 | both)."""
+    """Eval `checkpoint` on `mat_set` (val_200 | train_200 | both).
+
+    `--debug-dump-mat <mp_id>`: eval ONLY that material and dump its per-voxel
+    grids (rho_pred / rho_true / emd_grid) to GCS — for pinning the NMAE bug.
+    """
     sets = ["val_200", "train_200"] if mat_set == "both" else [mat_set]
     # Spawn one container per mat-set so both splits run in parallel.
     calls = {
-        ms: eval_checkpoint.spawn(checkpoint, ms, label, lmq_path, model, n_mats, decoder)
+        ms: eval_checkpoint.spawn(
+            checkpoint, ms, label, lmq_path, model, n_mats, decoder,
+            debug_dump_mat=debug_dump_mat,
+        )
         for ms in sets
     }
     for ms, call in calls.items():
         s = call.get()
+        if "debug_dump_mat" in s:
+            print(f"\n=== {ms}: debug dump → {s['dump_path']} ===")
+            continue
         print(f"\n=== {ms} ({s['n_mats']} mats) ===")
         for metric in ("nmae", "nemd"):
             print(
