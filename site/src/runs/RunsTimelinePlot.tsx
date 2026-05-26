@@ -13,6 +13,7 @@ import { Tooltip } from '../Tooltip'
 import type { UseTraceHighlightReturn } from 'pltly/react'
 import { themedHoverlabel } from '../theme'
 import type { RunHistory } from './parquet'
+import { ALL_TAGS, tagsFor, type RunTag } from './tags'
 
 export interface RunTimelineSeries {
   id: string
@@ -53,6 +54,7 @@ const X_MODES: { id: XMode; label: string; help: string }[] = [
 const X_MODE_KEY = 'tomat:runs-xmode'
 const LEGEND_COLLAPSED_KEY = 'tomat:runs-legend-collapsed'
 const NAME_FILTER_KEY = 'tomat:runs-name-filter'
+const TAG_FILTER_KEY = 'tomat:runs-tag-filter'
 
 // `active` x-mode: cap on a single inter-sample interval's contribution.
 // Runs log every ~minute while training, so anything longer is a gap the
@@ -181,7 +183,38 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
     try { nameRe = new RegExp(nameFilter, 'i') }
     catch { nameReError = true }
   }
-  const filteredRuns = nameRe ? runs.filter((r) => nameRe!.test(r.label)) : runs
+  const nameFilteredRuns = nameRe ? runs.filter((r) => nameRe!.test(r.label)) : runs
+
+  // Tag-chip filter. AND across selected tags: a run is visible iff EVERY
+  // selected tag is in its tag set. Empty set = no tag constraint (show all).
+  // Untagged runs are hidden whenever any tag is selected (since they can't
+  // satisfy an "AND" with a tag they don't have). Persisted as JSON array.
+  const [selectedTags, setSelectedTagsRaw] = useState<Set<RunTag>>(() => {
+    try {
+      const raw = localStorage.getItem(TAG_FILTER_KEY)
+      if (raw) return new Set(JSON.parse(raw) as RunTag[])
+    } catch { /* ignore */ }
+    return new Set()
+  })
+  const toggleTag = (t: RunTag) => setSelectedTagsRaw((prev) => {
+    const next = new Set(prev)
+    if (next.has(t)) next.delete(t); else next.add(t)
+    try { localStorage.setItem(TAG_FILTER_KEY, JSON.stringify([...next])) } catch { /* ignore */ }
+    return next
+  })
+  // Only show chips for tags that ANY currently-visible (name-filtered) run
+  // carries — keeps the chip strip short and relevant.
+  const visibleTagSet = new Set<RunTag>()
+  for (const r of nameFilteredRuns) for (const t of tagsFor(r.label)) visibleTagSet.add(t)
+  const chipTags = ALL_TAGS.filter((t) => visibleTagSet.has(t))
+
+  const filteredRuns = selectedTags.size === 0
+    ? nameFilteredRuns
+    : nameFilteredRuns.filter((r) => {
+      const ts = tagsFor(r.label)
+      for (const sel of selectedTags) if (!ts.includes(sel)) return false
+      return true
+    })
 
   const cutoffSec = hoursBack ? (Date.now() / 1000 - hoursBack * 3600) : null
 
@@ -275,6 +308,49 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
 
   return (
     <div>
+      {/* Tag chips. Click to AND-filter; visible tags only. */}
+      {chipTags.length > 0 && (
+        <div style={{
+          display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 4,
+          alignItems: 'center', justifyContent: 'flex-end',
+        }}>
+          <span style={{ fontSize: '0.7rem', color: muted, marginRight: 4 }}>
+            tags:
+          </span>
+          {chipTags.map((t) => {
+            const on = selectedTags.has(t)
+            return (
+              <Tooltip key={t} content={`${on ? 'remove' : 'add'} "${t}" filter (AND across selected)`}>
+                <button
+                  onClick={() => toggleTag(t)}
+                  style={{
+                    background: on ? (isDark ? '#2a4a7a' : '#cbe0f5') : 'transparent',
+                    border: `1px solid ${on ? (isDark ? '#3a6ab0' : '#7aa7d9') : (isDark ? '#333' : '#ccc')}`,
+                    borderRadius: 10, cursor: 'pointer', padding: '1px 8px',
+                    fontSize: '0.7rem', fontFamily: 'inherit',
+                    color: on ? (isDark ? '#cfe2ff' : '#1d3a64') : muted,
+                  }}
+                >
+                  {t}
+                </button>
+              </Tooltip>
+            )
+          })}
+          {selectedTags.size > 0 && (
+            <button
+              onClick={() => { setSelectedTagsRaw(new Set()); try { localStorage.removeItem(TAG_FILTER_KEY) } catch { /* ignore */ } }}
+              title="clear all tag filters"
+              style={{
+                background: 'transparent', border: 'none', cursor: 'pointer',
+                color: muted, fontSize: '0.7rem', padding: '1px 4px',
+                fontFamily: 'inherit',
+              }}
+            >
+              ✕ clear
+            </button>
+          )}
+        </div>
+      )}
       {/* x-axis mode toggle + name-filter regex */}
       <div style={{
         display: 'flex', justifyContent: 'flex-end', gap: 4, marginBottom: 4,
