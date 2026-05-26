@@ -27,12 +27,17 @@ Two density-loss formulations are supported (selected via `loss_type` arg):
                     preamble tokens (atoms are unordered, patch offset is
                     chosen, etc.) — no reason to spend gradient there.
 
-Env vars:
+Env vars (AR density-aware loss):
     TOMAT_DENSITY_L1_WEIGHT     float (default 0.0 = pure CE).
     TOMAT_DENSITY_L1_MODE       "add" (default) or "replace".
     TOMAT_DENSITY_LOSS_TYPE     "l1" (default, back-compat) or "emd".
     TOMAT_DENSITY_ONLY_LOSS     "1" → zero CE on non-density tokens too.
     TOMAT_DENSITY_PENALTY       float (default 10.0 × density max).
+
+Env vars (MaskGIT mode):
+    TOMAT_MG_MODE               "1" → enable MaskGIT masked-token training.
+    TOMAT_MG_MASK_PRIOR         "cosine" (default) | "uniform" | "high".
+    TOMAT_MG_LOSS_TYPE          "ce" (default) | "ce_emd".
 """
 
 from __future__ import annotations
@@ -48,6 +53,7 @@ import jax.numpy as jnp
 import numpy as np
 from haliax import NamedArray
 
+from levanter.layers.attention import AttentionMask
 from levanter.models.lm_model import LmConfig, LmExample
 from levanter.models.qwen import Qwen3Config, Qwen3LMHeadModel
 
@@ -109,10 +115,15 @@ def density_aware_loss(
     input_tokens: NamedArray,        # (Batch, Pos)
     loss_weight: Optional[NamedArray],
     args: DensityLossArgs,
+    reduction=None,                  # None → return per-position; else apply
 ) -> NamedArray:
     """CE + λ·L_1 per position, optionally replacing CE at density positions.
 
-    Returns scalar (mean over all non-masked positions).
+    Returns rank-2 (Batch, Pos) per-position loss when reduction is None
+    (the path Levanter's eval shape-inference takes). When reduction is a
+    callable (e.g. hax.mean from the training-time default), returns a scalar
+    using a custom denom (number of density positions or all non-masked
+    positions, depending on `density_only`).
 
     Heavy math uses raw jnp on the underlying arrays to sidestep some haliax
     named-indexing subtleties.
@@ -164,7 +175,15 @@ def density_aware_loss(
     density_per_pos = jnp.where(is_density_target, density_per_pos, 0.0)
 
     combined = ce_per_pos + args.weight * density_per_pos  # (B, Pos)
-    weighted = combined * lw
+    weighted = combined * lw                                # (B, Pos)
+
+    if reduction is None:
+        # Eval path: per-position loss, rank-2. Levanter's accumulator
+        # will sum + divide by its own count across the eval batches.
+        # Reconstruct NamedArray with the original input's axes.
+        return hax.named(weighted, input_tokens.axes)
+
+    # Training path: scalar with custom normalization.
     total = jnp.sum(weighted)
     if args.density_only:
         # Normalize by density-position count so per-density-token gradient
@@ -200,14 +219,27 @@ class Qwen3DensityLMHeadModel(Qwen3LMHeadModel):
     Simpler path (what this module does): attach density loss args as a
     module-level global set by `configure_density_loss(...)`, and the subclass's
     `compute_next_token_loss` uses them.
+
+    NOTE on `init` override (2026-05-25): Levanter's `Qwen3LMHeadModel.init`
+    hard-codes `return Qwen3LMHeadModel(...)` instead of `return cls(...)`, so
+    `Qwen3DensityLMHeadModel.init(...)` silently returns a base Qwen3LMHeadModel
+    with the subclass discarded — `compute_next_token_loss` dispatches to the
+    base, never to this override. Every "density EMD"-mode run prior to this
+    fix was actually trained with standard CE. Re-wrap via parent's tuple to
+    restore the subclass.
     """
+
+    @classmethod
+    def init(cls, Vocab, config, *, key):
+        base = Qwen3LMHeadModel.init(Vocab, config, key=key)
+        return cls(base.transformer, base.embeddings, base.lm_head)
 
     def compute_next_token_loss(
         self,
         example: LmExample,
         *,
         key=None,
-        reduction=None,
+        reduction=hax.mean,        # match Levanter base default; eval passes None
         reduction_axis=None,
         logsumexp_weight=None,
         loss_dtype=jnp.float32,
@@ -243,6 +275,7 @@ class Qwen3DensityLMHeadModel(Qwen3LMHeadModel):
             input_tokens=example.tokens,
             loss_weight=example.loss_weight,
             args=args,
+            reduction=reduction,
         )
         return loss + aux_loss
 
@@ -254,3 +287,336 @@ _DENSITY_LOSS_ARGS: Optional[DensityLossArgs] = None
 def configure_density_loss(args: DensityLossArgs | None) -> None:
     global _DENSITY_LOSS_ARGS
     _DENSITY_LOSS_ARGS = args
+
+
+# ---------------------------------------------------------------------------
+# MaskGIT masked-token loss
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MaskGITLossArgs:
+    """Configuration for the MaskGIT masked-token loss and online masking.
+
+    `decode_all` has shape (Vocab,) identical to `DensityLossArgs.decode_all`:
+      - density tokens: codec decoded float value
+      - all other tokens: PENALTY
+
+    `mask_id`:  the [MASK] token id (= old vocab_size before the +1 bump).
+    `prior`:    mask-ratio sampling schedule — "cosine" | "uniform" | "high".
+    `loss_type`: "ce" (pure CE) or "ce_emd" (CE + Wasserstein-1 density term).
+    `weight`:   λ on the EMD term (only used when loss_type == "ce_emd").
+
+    Masking is applied inside `Qwen3MaskGITLMHeadModel.compute_next_token_loss`
+    using JAX random ops (so everything is JIT-traceable). No host-side collator
+    is needed.
+    """
+
+    decode_all: NamedArray       # (Vocab,) — precomputed
+    density_lo: int              # inclusive start of density vocab range
+    density_hi: int              # exclusive end of density vocab range
+    mask_id: int                 # [MASK] token id = old vocab_size
+    prior: str = "cosine"        # mask-ratio schedule: "cosine" | "uniform" | "high"
+    weight: float = 1.0          # λ multiplier on the EMD density term
+    loss_type: str = "ce"        # "ce" or "ce_emd"
+
+
+def build_maskgit_loss_args(
+    *,
+    Vocab: hax.Axis,
+    density_offset: int,
+    n_density_bins: int,
+    codec_recon: np.ndarray,     # shape (n_density_bins,)
+    penalty: float,
+    mask_id: int,
+    prior: str = "cosine",
+    weight: float = 1.0,
+    loss_type: str = "ce",
+) -> MaskGITLossArgs:
+    """Build `MaskGITLossArgs` from codec + config."""
+    if loss_type not in ("ce", "ce_emd", "emd"):
+        raise ValueError(f"loss_type must be 'ce'/'ce_emd'/'emd', got {loss_type!r}")
+    if prior not in ("cosine", "uniform", "high"):
+        raise ValueError(f"prior must be 'cosine'/'uniform'/'high', got {prior!r}")
+    decode_all_np = np.full(Vocab.size, float(penalty), dtype=np.float32)
+    decode_all_np[density_offset : density_offset + n_density_bins] = codec_recon.astype(np.float32)
+    decode_all = hax.named(decode_all_np, Vocab)
+    return MaskGITLossArgs(
+        decode_all=decode_all,
+        density_lo=density_offset,
+        density_hi=density_offset + n_density_bins,
+        mask_id=mask_id,
+        prior=prior,
+        weight=weight,
+        loss_type=loss_type,
+    )
+
+
+def maskgit_aware_loss(
+    *,
+    Pos: hax.Axis,
+    Vocab: hax.Axis,
+    logits: NamedArray,              # (Batch, Pos, Vocab)
+    input_tokens: NamedArray,        # (Batch, Pos) — the MASKED input
+    loss_weight: Optional[NamedArray],  # (Batch, Pos) — 1 at masked positions, 0 elsewhere
+    original_tokens: NamedArray,     # (Batch, Pos) — pre-mask ground-truth tokens
+    args: MaskGITLossArgs,
+    reduction=None,                  # None → return per-position; else apply
+) -> NamedArray:
+    """MaskGIT masked-token loss: CE (+ optional EMD) at masked positions only.
+
+    Key differences from `density_aware_loss`:
+    - No token shift: target at position t = original_tokens[t], NOT input[t+1].
+    - Loss restricted to masked positions (loss_weight=1 where [MASK] was
+      applied; collator zeros the rest).
+    - Normalized by sum(loss_weight) — masked-position count — to keep
+      gradient magnitude stable across varying mask ratios.
+    - EMD density term applied only at masked density positions.
+
+    Returns scalar (mean over masked positions).
+    """
+    logits_arr = logits.astype(jnp.float32).array          # (B, Pos, V)
+    targets_arr = original_tokens.array                     # (B, Pos) int
+    decode_all_arr = args.decode_all.astype(jnp.float32).array  # (V,)
+
+    # loss_weight: 1 at masked positions, 0 elsewhere
+    if loss_weight is None:
+        lw = jnp.ones(targets_arr.shape, dtype=jnp.float32)
+    else:
+        lw = loss_weight.astype(jnp.float32).array          # (B, Pos)
+
+    # Loss term selection. Mirrors AR's `density_aware_loss`:
+    #   ce      : pure CE at masked positions (default; MaskGIT paper).
+    #   ce_emd  : CE + λ·EMD at masked density positions.
+    #   emd     : pure EMD at masked density positions (no CE) — matches the
+    #             AR `density_only=True, loss_type="emd"` recipe that got us
+    #             0.91% NMAE TF on cont33k. Skip CE entirely.
+    if args.loss_type == "emd":
+        is_density_target = (targets_arr >= args.density_lo) & (targets_arr < args.density_hi)
+        probs = jax.nn.softmax(logits_arr, axis=-1)         # (B, Pos, V)
+        rho_true = decode_all_arr[targets_arr]              # (B, Pos)
+        diff = decode_all_arr[None, None, :] - rho_true[..., None]  # (B, Pos, V)
+        emd_per_pos = jnp.einsum("bpv,bpv->bp", probs, jnp.abs(diff))
+        combined = jnp.where(is_density_target, emd_per_pos, 0.0)
+    else:
+        # CE at masked positions: no shift — target at t is original token at t.
+        log_probs = jax.nn.log_softmax(logits_arr, axis=-1)     # (B, Pos, V)
+        ce_per_pos = -jnp.take_along_axis(
+            log_probs, targets_arr[..., None], axis=-1,
+        ).squeeze(-1)                                           # (B, Pos)
+        combined = ce_per_pos
+
+        if args.loss_type == "ce_emd":
+            # EMD density term at masked density positions only.
+            is_density_target = (targets_arr >= args.density_lo) & (targets_arr < args.density_hi)
+            probs = jax.nn.softmax(logits_arr, axis=-1)         # (B, Pos, V)
+            rho_true = decode_all_arr[targets_arr]              # (B, Pos)
+            diff = decode_all_arr[None, None, :] - rho_true[..., None]  # (B, Pos, V)
+            emd_per_pos = jnp.einsum("bpv,bpv->bp", probs, jnp.abs(diff))
+            emd_per_pos = jnp.where(is_density_target, emd_per_pos, 0.0)
+            combined = combined + args.weight * emd_per_pos
+
+    weighted = combined * lw
+    if reduction is None:
+        # Eval path: return per-position rank-2 (Batch, Pos) NamedArray.
+        return hax.named(weighted, input_tokens.axes)
+    # Training path: scalar normalized by masked-position count.
+    total = jnp.sum(weighted)
+    denom = jnp.maximum(jnp.sum(lw), 1.0)
+    loss_scalar = total / denom
+    return hax.named(loss_scalar, ())
+
+
+class Qwen3MaskGITConfig(Qwen3Config):
+    """Qwen3Config whose `model_type` is `Qwen3MaskGITLMHeadModel`."""
+
+    @property  # type: ignore[override]
+    def model_type(self):
+        return Qwen3MaskGITLMHeadModel
+
+
+class Qwen3MaskGITLMHeadModel(Qwen3LMHeadModel):
+    """Qwen3 + MaskGIT masked-token loss.
+
+    Same weights as Qwen3LMHeadModel; only the loss function differs.
+
+    Masking is applied *inside* `compute_next_token_loss` using JAX random ops
+    so everything remains JIT-traceable without a host-side collator. On entry
+    `example.tokens` are the original unmasked tokens; the model applies the
+    cosine/uniform/high mask schedule using `key`, then:
+      - Sets masked positions → MASK_ID in the token buffer.
+      - Builds `attn_mask=AttentionMask(is_causal=False)` (full bidirectional).
+      - Sets `loss_weight=1` at masked positions, 0 elsewhere.
+      - Forwards the masked sequence and computes `maskgit_aware_loss`.
+
+    The mask schedule prior and MASK_ID are read from `_MASKGIT_LOSS_ARGS`
+    (set at training-script startup via `configure_maskgit_loss`).
+
+    See `Qwen3DensityLMHeadModel.init` for why we need to override `init`
+    (Levanter's parent `Qwen3LMHeadModel.init` hard-codes the return class).
+    """
+
+    @classmethod
+    def init(cls, Vocab, config, *, key):
+        base = Qwen3LMHeadModel.init(Vocab, config, key=key)
+        return cls(base.transformer, base.embeddings, base.lm_head)
+
+    def compute_next_token_loss(
+        self,
+        example: LmExample,
+        *,
+        key=None,
+        reduction=hax.mean,        # match Levanter base default; eval passes None
+        reduction_axis=None,
+        logsumexp_weight=None,
+        loss_dtype=jnp.float32,
+        logit_soft_cap=None,
+    ) -> NamedArray:
+        args = _MASKGIT_LOSS_ARGS
+        # Trace-time guard: caught the mg-2 silent-fallback regression where
+        # args was None despite TOMAT_MG_MODE=1 → all 3 prior variants trained
+        # as plain bidirectional AR with bit-identical loss curves. Make it
+        # loud now — either confirm MG path or fail fast.
+        if args is None:
+            import os as _os
+            print("[maskgit] compute_next_token_loss: _MASKGIT_LOSS_ARGS is None")
+            if _os.environ.get("TOMAT_MG_MODE") == "1":
+                raise RuntimeError(
+                    "Qwen3MaskGITLMHeadModel.compute_next_token_loss called "
+                    "but _MASKGIT_LOSS_ARGS is None despite TOMAT_MG_MODE=1. "
+                    "configure_maskgit_loss() must be called before training "
+                    "starts (and survive the JIT trace). Silent fallback "
+                    "would train as plain bidirectional AR — that's the "
+                    "mg-2 sweep regression we're hardening against."
+                )
+            return super().compute_next_token_loss(
+                example,
+                key=key,
+                reduction=reduction,
+                reduction_axis=reduction_axis,
+                logsumexp_weight=logsumexp_weight,
+                loss_dtype=loss_dtype,
+                logit_soft_cap=logit_soft_cap,
+            )
+
+        # Trace-time confirmation print — fires once per JIT trace.
+        print(f"[maskgit] compute_next_token_loss TRACE: prior={args.prior!r} "
+              f"loss_type={args.loss_type!r} mask_id={args.mask_id} "
+              f"key_is_none={key is None}")
+
+        # Original tokens are the ground-truth targets (no shift).
+        original_tokens = example.tokens  # (Batch, Pos) NamedArray
+
+        # Apply MaskGIT masking inside JIT using JAX random.
+        # `key` may be None during eval — in that case skip masking and
+        # fall through to the standard forward (no loss for eval).
+        if key is not None:
+            masked_tokens, loss_weight = _jax_apply_maskgit(
+                original_tokens=original_tokens,
+                args=args,
+                key=key,
+            )
+        else:
+            masked_tokens = original_tokens
+            loss_weight = example.loss_weight
+
+        # Bidirectional attention (no causal mask).
+        bidir_mask = AttentionMask(is_causal=False)
+        masked_example = LmExample(
+            tokens=masked_tokens,
+            loss_weight=loss_weight,
+            attn_mask=bidir_mask,
+        )
+
+        activations = self.activations(masked_example.tokens, masked_example.attn_mask, key=None)
+        aux_loss = 0
+        if isinstance(activations, tuple):
+            activations, aux_loss = activations
+        head = self.get_lm_head()
+        logits = hax.dot(activations, head, axis=self.Embed)
+
+        loss = maskgit_aware_loss(
+            Pos=self.Pos,
+            Vocab=self.Vocab,
+            logits=logits,
+            input_tokens=masked_example.tokens,
+            loss_weight=masked_example.loss_weight,
+            original_tokens=original_tokens,
+            args=args,
+            reduction=reduction,
+        )
+        return loss + aux_loss
+
+
+def _jax_apply_maskgit(
+    original_tokens: NamedArray,   # (Batch, Pos)
+    args: "MaskGITLossArgs",
+    key,
+) -> tuple[NamedArray, NamedArray]:
+    """Apply MaskGIT masking inside a JIT-traced context.
+
+    For each example in the batch:
+      1. Identify density positions (tokens in [density_lo, density_hi)).
+      2. Sample mask ratio r from the configured prior (cosine/uniform/high).
+      3. Randomly pick ceil(r * P³) density positions and replace with MASK_ID.
+      4. Return (masked_tokens, loss_weight) NamedArrays with the same axes.
+
+    All ops are JAX-native so this runs under JIT without Python-side RNG.
+    """
+    tokens_arr = original_tokens.array.astype(jnp.int32)   # raw (B, Pos)
+    B, L = tokens_arr.shape
+    axes = original_tokens.axes
+
+    lo = args.density_lo
+    hi = args.density_hi
+    mask_id = args.mask_id
+    prior = args.prior
+
+    is_density = (tokens_arr >= lo) & (tokens_arr < hi)  # (B, Pos) bool
+
+    def mask_one_example(tokens_b, is_dens_b, key_b):
+        # Density positions for this example.
+        P3 = jnp.sum(is_dens_b)
+        key_r, key_sel = jax.random.split(key_b)
+        # Sample mask ratio from prior.
+        u = jax.random.uniform(key_r)
+        if prior == "cosine":
+            r = jnp.cos(u * jnp.pi / 2.0)
+        elif prior == "high":
+            r = 0.5 + 0.5 * u
+        else:  # "uniform"
+            r = u
+        mask_count = jnp.ceil(r * P3.astype(jnp.float32)).astype(jnp.int32)
+        mask_count = jnp.minimum(mask_count, P3)
+
+        # Assign random scores to all positions; highest scores at density
+        # positions among the top-mask_count are masked.
+        scores = jax.random.uniform(key_sel, shape=(L,))
+        # Penalty: non-density positions get score -1 so they're never picked.
+        scores = jnp.where(is_dens_b, scores, -1.0)
+        # Top-k indices: argsort descending, take first mask_count.
+        order = jnp.argsort(-scores)  # (L,) descending by score
+
+        # Mark positions whose rank < mask_count as masked.
+        rank = jnp.argsort(order)     # rank[i] = rank of position i
+        to_mask = rank < mask_count   # (L,) bool
+
+        masked = jnp.where(to_mask, mask_id, tokens_b)
+        lw = to_mask.astype(jnp.float32)
+        return masked, lw
+
+    keys = jax.random.split(key, B)
+    masked_arr, lw_arr = jax.vmap(mask_one_example)(tokens_arr, is_density, keys)
+
+    return (
+        hax.named(masked_arr, axes),
+        hax.named(lw_arr, axes),
+    )
+
+
+# Module-level state for MaskGIT (set once at training-script startup).
+_MASKGIT_LOSS_ARGS: Optional[MaskGITLossArgs] = None
+
+
+def configure_maskgit_loss(args: "MaskGITLossArgs | None") -> None:
+    global _MASKGIT_LOSS_ARGS
+    _MASKGIT_LOSS_ARGS = args

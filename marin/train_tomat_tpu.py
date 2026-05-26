@@ -431,6 +431,31 @@ def main():
     # Sequence length is the dataset's pad_to (drives both model max_seq_len
     # and trainer train_seq_len). v3-p15 uses 4608 vs v3 baseline's 8192.
     seq_len = int(meta.get("pad_to") or 8192)
+
+    # MaskGIT mode env vars — read early so vocab_size bump propagates into
+    # data config, model config, and everywhere else that uses vocab_size.
+    mg_mode = os.environ.get("TOMAT_MG_MODE", "0") == "1"
+    mg_mask_prior = os.environ.get("TOMAT_MG_MASK_PRIOR", "cosine")
+    mg_loss_type = os.environ.get("TOMAT_MG_LOSS_TYPE", "ce")
+    if mg_mask_prior not in ("cosine", "uniform", "high"):
+        raise ValueError(
+            f"TOMAT_MG_MASK_PRIOR must be cosine/uniform/high, got {mg_mask_prior!r}"
+        )
+    if mg_loss_type not in ("ce", "ce_emd", "emd"):
+        raise ValueError(
+            f"TOMAT_MG_LOSS_TYPE must be ce/ce_emd/emd, got {mg_loss_type!r}"
+        )
+
+    # Bump vocab_size by 1 for [MASK] token in MaskGIT mode.
+    # MASK_ID = old total_size (new token appended at the end of vocab).
+    MASK_ID: int | None = None
+    if mg_mode:
+        MASK_ID = vocab_size
+        vocab_size = vocab_size + 1
+        print(f"[tomat-tpu] MaskGIT mode: MASK_ID={MASK_ID}, "
+              f"new vocab_size={vocab_size}, prior={mg_mask_prior}, "
+              f"loss_type={mg_loss_type}")
+
     print(f"[tomat-tpu] label={label}, vocab_size={vocab_size}, "
           f"patch={meta['patch_size']}, codec={meta['density_codec_name']}, "
           f"model={model_preset}, val_seqs={val_seqs}, seq_len={seq_len}")
@@ -530,7 +555,83 @@ def main():
     density_only_loss = os.environ.get("TOMAT_DENSITY_ONLY_LOSS", "0") == "1"
     density_l1_penalty_env = os.environ.get("TOMAT_DENSITY_PENALTY")
     lmq_path_env = os.environ.get("TOMAT_LMQ_PATH")
-    if lmq_path_env:
+
+    # Inline-load helper reused by both density-loss and MaskGIT paths.
+    class _LMQCodecInline:
+        def __init__(self, boundaries, recon_points, clip_max):
+            self.boundaries = boundaries
+            self.recon_points = recon_points
+            self.clip_max = clip_max
+        @property
+        def n_bins(self):
+            return len(self.recon_points)
+
+    def _load_lmq(path: str) -> _LMQCodecInline:
+        import fsspec as _fs
+        with _fs.open(path, "rb") as f:
+            data = np.load(f, allow_pickle=True)
+            return _LMQCodecInline(
+                boundaries=np.asarray(data["boundaries"], dtype=np.float32),
+                recon_points=np.asarray(data["recon_points"], dtype=np.float32),
+                clip_max=float(data["clip_max"]),
+            )
+
+    # Compute density vocab offsets (reused by both paths when lmq_path_env set).
+    def _compute_density_offset(meta_dict):
+        specials = meta_dict["vocab"].get("specials", {})
+        _lat = "[LATTICE_START]" in specials or "LATTICE_START" in specials
+        _n_spec = 20 if _lat else 18
+        _n_atoms = 118
+        _n_ints = 1024
+        _pc = meta_dict["vocab"]["position_codec"]
+        _p_mag = _pc["token_mag_bits"]
+        _pos_sv = tuple((2 if i == 0 else 1) << b for i, b in enumerate(_p_mag))
+        return _n_spec + _n_atoms + _n_ints + sum(_pos_sv)
+
+    if mg_mode and lmq_path_env:
+        # MaskGIT path: configure loss args (masking itself is applied inside
+        # Qwen3MaskGITLMHeadModel.compute_next_token_loss via JAX random ops,
+        # so no host-side collator is needed — everything stays JIT-traceable).
+        from qwen3_density import (
+            Qwen3MaskGITConfig,
+            build_maskgit_loss_args,
+            configure_maskgit_loss,
+        )
+
+        import numpy as np
+        lmq_codec = _load_lmq(lmq_path_env)
+        DENSITY_OFFSET = _compute_density_offset(meta)
+        print(f"[tomat-tpu] MaskGIT: density_offset={DENSITY_OFFSET}, "
+              f"density_range=[{DENSITY_OFFSET}, {DENSITY_OFFSET + lmq_codec.n_bins})")
+
+        import haliax as hax
+        Vocab_mg = hax.Axis("vocab", vocab_size)
+        penalty_val = (
+            float(density_l1_penalty_env)
+            if density_l1_penalty_env is not None
+            else 10.0 * float(lmq_codec.recon_points.max())
+        )
+        mg_loss_args = build_maskgit_loss_args(
+            Vocab=Vocab_mg,
+            density_offset=DENSITY_OFFSET,
+            n_density_bins=lmq_codec.n_bins,
+            codec_recon=lmq_codec.recon_points,
+            penalty=penalty_val,
+            mask_id=MASK_ID,
+            prior=mg_mask_prior,
+            weight=density_l1_weight,
+            loss_type=mg_loss_type,
+        )
+        configure_maskgit_loss(mg_loss_args)
+        print(f"[tomat-tpu] MaskGIT loss configured: penalty={penalty_val:.4f}")
+        model_config_cls = Qwen3MaskGITConfig
+
+    elif mg_mode:
+        raise ValueError(
+            "TOMAT_MG_MODE=1 requires TOMAT_LMQ_PATH to be set "
+            "(the codec is needed to identify density positions)."
+        )
+    elif lmq_path_env:
         from qwen3_density import (
             Qwen3DensityConfig,
             build_density_loss_args,
@@ -541,40 +642,9 @@ def main():
               f"mode={density_l1_mode}, type={density_loss_type}, "
               f"density_only={density_only_loss}, lmq_path={lmq_path_env}")
 
-        # Inline-load the codec .npz since the `tomat` package isn't on the
-        # Marin workspace PYTHONPATH (iris bundles only this directory).
-        class _LMQCodecInline:
-            def __init__(self, boundaries, recon_points, clip_max):
-                self.boundaries = boundaries
-                self.recon_points = recon_points
-                self.clip_max = clip_max
-            @property
-            def n_bins(self):
-                return len(self.recon_points)
-
-        def _load_lmq(path: str) -> _LMQCodecInline:
-            import fsspec as _fs
-            with _fs.open(path, "rb") as f:
-                data = np.load(f, allow_pickle=True)
-                return _LMQCodecInline(
-                    boundaries=np.asarray(data["boundaries"], dtype=np.float32),
-                    recon_points=np.asarray(data["recon_points"], dtype=np.float32),
-                    clip_max=float(data["clip_max"]),
-                )
-
         import numpy as np
         lmq_codec = _load_lmq(lmq_path_env)
-
-        # Compute density vocab offsets per PatchVocab layout
-        # (specials=18, atoms=118, ints=1024, pos=pos_total, density=lmq_codec.n_bins)
-        n_specials = 18
-        n_atoms_in_vocab = 118
-        n_ints = 1024
-        pc = meta["vocab"]["position_codec"]
-        p_mag = pc["token_mag_bits"]
-        pos_signed_vocabs = tuple((2 if i == 0 else 1) << b for i, b in enumerate(p_mag))
-        pos_total = sum(pos_signed_vocabs)
-        DENSITY_OFFSET = n_specials + n_atoms_in_vocab + n_ints + pos_total
+        DENSITY_OFFSET = _compute_density_offset(meta)
         print(f"[tomat-tpu] density offset in vocab = {DENSITY_OFFSET}, "
               f"density vocab range = [{DENSITY_OFFSET}, {DENSITY_OFFSET + lmq_codec.n_bins})")
 
@@ -645,6 +715,10 @@ def main():
         # Prior `keep=[{"every": 1000}]` lost the v5p smoke (step 588) when
         # a preempt cascade killed the job before reaching step 1000.
         # Save itself runs every 10 min regardless; this is retention-only.
+        # On preempt-thrashed pools (e.g. mg-1 on degraded us-east1-d in
+        # May-26) `_last_save_time` resets per restart and the 10min temp
+        # save can fail to fire — but the fix is to use a healthier pool,
+        # not to tighten this config.
         # NOTE: Levanter's CheckpointerConfig.__post_init__ does
         # `interval["until"]` (not `.get`), so the trailing/unbounded entry
         # MUST include `"until": None` explicitly — omitting it raises
