@@ -1771,7 +1771,7 @@ def _latest_ckpt_step(run_label: str, bucket: str = GCS_BUCKET) -> int | None:
 @click.option("--val-seqs", default=256, type=int, help="TOMAT_VAL_SEQS")
 @click.option("--steps-per-eval", default=None, type=int, help="TOMAT_STEPS_PER_EVAL")
 @click.option("--grad-ckpt/--no-grad-ckpt", default=True, help="TOMAT_GRADIENT_CHECKPOINTING (default True; pass --no-grad-ckpt to disable for MFU experiments)")
-@click.option("--profile/--no-profile", default=True, help="TOMAT_PROFILE")
+@click.option("--profile/--no-profile", default=False, help="TOMAT_PROFILE; OFF by default — each run's jax profile is ~250MB and fills the org wandb storage. Pass --profile when actually MFU-debugging.")
 @click.option("--density-loss", default="emd", help="TOMAT_DENSITY_LOSS_TYPE (emd|l1)")
 @click.option("--density-only/--density-add", default=True, help="TOMAT_DENSITY_ONLY_LOSS")
 @click.option("--cpu", default=32, type=int, help="iris --cpu")
