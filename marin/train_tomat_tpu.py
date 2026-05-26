@@ -446,6 +446,27 @@ def main():
             f"TOMAT_MG_LOSS_TYPE must be ce/ce_emd/emd, got {mg_loss_type!r}"
         )
 
+    # Scheduled-sampling (FR-aware AR training) env vars — spec 31.
+    # SS is mutually exclusive with MaskGIT (different model subclass, different
+    # forward path); disallow both at once to keep the configuration sane.
+    ss_mode = os.environ.get("TOMAT_SS_MODE", "0") == "1"
+    ss_eps_max = float(os.environ.get("TOMAT_SS_EPS_MAX", "0.25"))
+    ss_sampler = os.environ.get("TOMAT_SS_SAMPLER", "median")
+    if ss_sampler not in ("median", "argmax", "sample"):
+        raise ValueError(
+            f"TOMAT_SS_SAMPLER must be median/argmax/sample, got {ss_sampler!r}"
+        )
+    if not (0.0 <= ss_eps_max <= 1.0):
+        raise ValueError(
+            f"TOMAT_SS_EPS_MAX must be in [0, 1], got {ss_eps_max!r}"
+        )
+    if ss_mode and mg_mode:
+        raise ValueError(
+            "TOMAT_SS_MODE=1 and TOMAT_MG_MODE=1 are mutually exclusive "
+            "(SS is an AR-side training intervention; MaskGIT replaces the AR "
+            "objective entirely)."
+        )
+
     # Bump vocab_size by 1 for [MASK] token in MaskGIT mode.
     # MASK_ID = old total_size (new token appended at the end of vocab).
     MASK_ID: int | None = None
@@ -631,13 +652,29 @@ def main():
             "TOMAT_MG_MODE=1 requires TOMAT_LMQ_PATH to be set "
             "(the codec is needed to identify density positions)."
         )
+    elif ss_mode and not lmq_path_env:
+        raise ValueError(
+            "TOMAT_SS_MODE=1 requires TOMAT_LMQ_PATH to be set "
+            "(the codec is needed to identify density positions for SS)."
+        )
     elif lmq_path_env:
         from qwen3_density import (
             Qwen3DensityConfig,
             build_density_loss_args,
             configure_density_loss,
         )
-        model_config_cls = Qwen3DensityConfig
+        # Scheduled-sampling (spec 31): subclass density model + configure SS.
+        if ss_mode:
+            from qwen3_density import (
+                Qwen3SSConfig,
+                build_ss_args,
+                configure_ss,
+            )
+            model_config_cls = Qwen3SSConfig
+            print(f"[tomat-tpu] scheduled-sampling: eps_max={ss_eps_max}, "
+                  f"sampler={ss_sampler}")
+        else:
+            model_config_cls = Qwen3DensityConfig
         print(f"[tomat-tpu] density loss: weight={density_l1_weight}, "
               f"mode={density_l1_mode}, type={density_loss_type}, "
               f"density_only={density_only_loss}, lmq_path={lmq_path_env}")
@@ -668,6 +705,17 @@ def main():
         )
         configure_density_loss(density_loss_args)
         print(f"[tomat-tpu] density-L_1 configured with PENALTY={penalty_val:.4f}")
+        if ss_mode:
+            ss_args = build_ss_args(
+                density_offset=DENSITY_OFFSET,
+                n_density_bins=lmq_codec.n_bins,
+                eps_max=ss_eps_max,
+                sampler=ss_sampler,
+            )
+            configure_ss(ss_args)
+            print(f"[tomat-tpu] scheduled-sampling configured: "
+                  f"eps_max={ss_args.eps_max} sampler={ss_args.sampler!r} "
+                  f"density_range=[{ss_args.density_lo}, {ss_args.density_hi})")
     else:
         model_config_cls = Qwen3Config
 

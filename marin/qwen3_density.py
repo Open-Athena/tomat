@@ -38,6 +38,18 @@ Env vars (MaskGIT mode):
     TOMAT_MG_MODE               "1" → enable MaskGIT masked-token training.
     TOMAT_MG_MASK_PRIOR         "cosine" (default) | "uniform" | "high".
     TOMAT_MG_LOSS_TYPE          "ce" (default) | "ce_emd".
+
+Env vars (scheduled-sampling / FR-aware AR mode — spec 31):
+    TOMAT_SS_MODE               "1" → enable token-level scheduled sampling on
+                                density tokens during AR training (Bengio 2015,
+                                always-sample variant restricted to density).
+    TOMAT_SS_EPS_MAX            float, default 0.25. Per-batch ε is sampled
+                                Uniform(0, ε_max) inside JIT; ε is the
+                                probability of replacing each density-target
+                                input with the model's own one-step prediction.
+    TOMAT_SS_SAMPLER            "median" (default, matches FR eval decoder) |
+                                "argmax" | "sample" (true categorical from
+                                softmax over the density vocab range).
 """
 
 from __future__ import annotations
@@ -620,3 +632,319 @@ _MASKGIT_LOSS_ARGS: Optional[MaskGITLossArgs] = None
 def configure_maskgit_loss(args: "MaskGITLossArgs | None") -> None:
     global _MASKGIT_LOSS_ARGS
     _MASKGIT_LOSS_ARGS = args
+
+
+# ---------------------------------------------------------------------------
+# Scheduled-sampling (FR-aware AR training) — spec 31
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SSArgs:
+    """Configuration for token-level scheduled sampling on density positions.
+
+    The base loss is the existing density-aware AR loss; SS only mutates the
+    *input* tokens before the real forward pass. The base `DensityLossArgs` is
+    reused for the loss term itself — see `_SS_DENSITY_ARGS_REQUIRED` for why
+    SS requires the density-loss path to be configured too.
+
+    `density_lo` / `density_hi`:  inclusive/exclusive density vocab range
+                                  (same convention as `DensityLossArgs`).
+    `eps_max`:    Upper bound on the per-batch ε ~ Uniform(0, eps_max). ε is
+                  the Bernoulli probability that each density-target input is
+                  replaced with the model's own prediction at that step.
+    `sampler`:    "median" (default, matches FR eval) | "argmax" | "sample".
+                  All operate on the density-bin slice of the predicted-logits
+                  distribution (not the full vocab), so they always return a
+                  valid density token.
+    """
+
+    density_lo: int                  # inclusive start of density vocab range
+    density_hi: int                  # exclusive end of density vocab range
+    eps_max: float = 0.25            # ε ~ Uniform(0, eps_max) per batch
+    sampler: str = "median"          # "median" | "argmax" | "sample"
+
+
+def build_ss_args(
+    *,
+    density_offset: int,
+    n_density_bins: int,
+    eps_max: float = 0.25,
+    sampler: str = "median",
+) -> SSArgs:
+    """Build SSArgs from codec config."""
+    if sampler not in ("median", "argmax", "sample"):
+        raise ValueError(f"sampler must be 'median'/'argmax'/'sample', got {sampler!r}")
+    if not (0.0 <= eps_max <= 1.0):
+        raise ValueError(f"eps_max must be in [0, 1], got {eps_max!r}")
+    return SSArgs(
+        density_lo=density_offset,
+        density_hi=density_offset + n_density_bins,
+        eps_max=float(eps_max),
+        sampler=sampler,
+    )
+
+
+def _jax_apply_ss(
+    original_tokens: NamedArray,   # (Batch, Pos) — GT input tokens
+    pre_logits: NamedArray,        # (Batch, Pos, Vocab) — pre-forward logits, stop_grad'd
+    args: SSArgs,
+    key,
+) -> NamedArray:
+    """Mix GT density-target inputs with the model's own predictions.
+
+    AR convention: target at position t is `tokens[t+1]`. The model's
+    one-step-ahead prediction at output position t is therefore the prediction
+    for the token that should appear at position t+1. For each density-target
+    position (i.e. positions t where `tokens[t+1]` is a density token), we:
+
+      1. Restrict `pre_logits[t, density_lo:density_hi]` to the density vocab.
+      2. Decode a single bin index via `sampler` (median / argmax / sample).
+      3. With Bernoulli(ε) per position, replace `tokens[t+1]` with the decoded
+         bin's vocab id. Non-density positions are never touched (the AR loss
+         doesn't grade them as densities, and the input semantics on preamble
+         tokens are categorical not continuous).
+
+    ε is sampled per-batch as `Uniform(0, eps_max)` (single scalar shared
+    across the whole batch) inside JIT. Mirrors how MaskGIT samples its mask
+    ratio per-example, but per-batch here keeps the schedule simple — Bengio
+    2015's "always-sample" variant restricted to density tokens.
+
+    Returns:
+      mixed_tokens: (Batch, Pos) NamedArray, same axes as `original_tokens`.
+      Non-density input positions and positions whose *next* token is not a
+      density token are guaranteed identical to the input.
+    """
+    tokens_arr = original_tokens.array.astype(jnp.int32)   # (B, L)
+    logits_arr = pre_logits.array.astype(jnp.float32)      # (B, L, V)
+    axes = original_tokens.axes
+    B, L = tokens_arr.shape
+
+    lo = args.density_lo
+    hi = args.density_hi
+    n_bins = hi - lo
+
+    # Sample per-batch ε ~ Uniform(0, eps_max).
+    key_eps, key_mask, key_sample = jax.random.split(key, 3)
+    eps = jax.random.uniform(key_eps, shape=(), minval=0.0, maxval=args.eps_max)
+
+    # density_logits[t] is the predicted distribution for token at position t+1.
+    # Restrict to the density vocab range so the decoded bin is always a valid
+    # density token (avoids the fp32 underflow bug fixed in `decode_density`).
+    density_logits = logits_arr[..., lo:hi]                # (B, L, n_bins)
+
+    # Decode per-position predicted bin via sampler.
+    if args.sampler == "argmax":
+        pred_bin = jnp.argmax(density_logits, axis=-1).astype(jnp.int32)  # (B, L)
+    elif args.sampler == "median":
+        probs = jax.nn.softmax(density_logits, axis=-1)    # (B, L, n_bins)
+        cumP = jnp.cumsum(probs, axis=-1)
+        pred_bin = jnp.clip(
+            jnp.sum(cumP < 0.5, axis=-1).astype(jnp.int32), 0, n_bins - 1,
+        )                                                  # (B, L)
+    else:  # "sample"
+        # Categorical sample, vmap across (B, L) via flatten.
+        flat = density_logits.reshape(B * L, n_bins)
+        keys = jax.random.split(key_sample, B * L)
+        sampled = jax.vmap(lambda k, lg: jax.random.categorical(k, lg))(keys, flat)
+        pred_bin = sampled.reshape(B, L).astype(jnp.int32)
+
+    pred_tokens = pred_bin + lo                            # (B, L) density vocab id
+
+    # The prediction at output position t is the candidate replacement for the
+    # INPUT token at position t+1. Build a (B, L) candidate-input buffer by
+    # shifting pred_tokens one to the right; position 0 has no upstream
+    # predictor and is filled with the original token (never replaced).
+    # candidate[b, t+1] = pred_tokens[b, t].
+    cand_tokens = jnp.concatenate(
+        [tokens_arr[:, :1], pred_tokens[:, :-1]], axis=-1,
+    )                                                      # (B, L)
+
+    # Replace only at positions whose original token is a density token (i.e.
+    # positions that are density-target inputs, t+1 in AR terms). Equivalent
+    # to: the prediction at t-1 generated this density bin.
+    is_density_input = (tokens_arr >= lo) & (tokens_arr < hi)  # (B, L) bool
+
+    # Per-position Bernoulli(ε) mask.
+    u = jax.random.uniform(key_mask, shape=tokens_arr.shape, dtype=jnp.float32)
+    bernoulli = u < eps                                    # (B, L) bool
+
+    do_replace = is_density_input & bernoulli              # (B, L) bool
+    mixed_arr = jnp.where(do_replace, cand_tokens, tokens_arr).astype(tokens_arr.dtype)
+
+    return hax.named(mixed_arr, axes)
+
+
+class Qwen3SSConfig(Qwen3Config):
+    """Qwen3Config whose `model_type` is `Qwen3SSLMHeadModel`."""
+
+    @property  # type: ignore[override]
+    def model_type(self):
+        return Qwen3SSLMHeadModel
+
+
+class Qwen3SSLMHeadModel(Qwen3DensityLMHeadModel):
+    """Qwen3 + density-aware loss + scheduled-sampling on density inputs.
+
+    Inherits from `Qwen3DensityLMHeadModel` so the loss term (CE / EMD /
+    density-only) is identical; SS only mutates the *input* tokens before the
+    real forward pass via `_jax_apply_ss`.
+
+    Two-step forward per train step:
+      1. Pre-forward `example.tokens` → logits, wrapped in `stop_gradient`.
+         No gradients from this pass; it only supplies candidate predictions
+         for the mixing step.
+      2. Mix predicted-vs-GT density inputs per a per-batch ε ~ U(0, ε_max)
+         + per-position Bernoulli(ε) mask, restricted to density-target
+         positions.
+      3. Real forward on the mixed input → existing `density_aware_loss` vs
+         the **original** ground-truth targets.
+
+    Eval path (`key is None`): SS is skipped — eval is teacher-forced by
+    construction, identical to `Qwen3DensityLMHeadModel`.
+
+    See `Qwen3DensityLMHeadModel.init` for the `init` re-wrap necessitated by
+    Levanter's parent `Qwen3LMHeadModel.init` hard-coding the return class
+    (specs/done/30-levanter-init-cls-postmortem.md).
+    """
+
+    @classmethod
+    def init(cls, Vocab, config, *, key):
+        base = Qwen3LMHeadModel.init(Vocab, config, key=key)
+        return cls(base.transformer, base.embeddings, base.lm_head)
+
+    def compute_next_token_loss(
+        self,
+        example: LmExample,
+        *,
+        key=None,
+        reduction=hax.mean,        # match Levanter base default; eval passes None
+        reduction_axis=None,
+        logsumexp_weight=None,
+        loss_dtype=jnp.float32,
+        logit_soft_cap=None,
+    ) -> NamedArray:
+        ss_args = _SS_ARGS
+
+        # Trace-time guard: mirror the mg-2 silent-fallback hardening. If
+        # TOMAT_SS_MODE=1 is set but configure_ss() was never called (or was
+        # called with None), raise loudly — silent fallback to plain AR would
+        # waste a multi-hour TPU run training the same model we already have.
+        if ss_args is None:
+            print("[ss] compute_next_token_loss: _SS_ARGS is None")
+            if os.environ.get("TOMAT_SS_MODE") == "1":
+                raise RuntimeError(
+                    "Qwen3SSLMHeadModel.compute_next_token_loss called but "
+                    "_SS_ARGS is None despite TOMAT_SS_MODE=1. "
+                    "configure_ss() must be called before training starts "
+                    "(and survive the JIT trace). Silent fallback would "
+                    "train as plain AR — the mg-2-style regression we're "
+                    "hardening against."
+                )
+            return super().compute_next_token_loss(
+                example,
+                key=key,
+                reduction=reduction,
+                reduction_axis=reduction_axis,
+                logsumexp_weight=logsumexp_weight,
+                loss_dtype=loss_dtype,
+                logit_soft_cap=logit_soft_cap,
+            )
+
+        # Eval path (key is None): SS is skipped — eval is teacher-forced by
+        # construction. Fall through to the parent density-aware loss with the
+        # original tokens.
+        if key is None:
+            return super().compute_next_token_loss(
+                example,
+                key=key,
+                reduction=reduction,
+                reduction_axis=reduction_axis,
+                logsumexp_weight=logsumexp_weight,
+                loss_dtype=loss_dtype,
+                logit_soft_cap=logit_soft_cap,
+            )
+
+        # Trace-time confirmation print — fires once per JIT trace.
+        print(f"[ss] compute_next_token_loss TRACE: sampler={ss_args.sampler!r} "
+              f"eps_max={ss_args.eps_max} density_range="
+              f"[{ss_args.density_lo}, {ss_args.density_hi})")
+
+        # Split RNG: one half drives the pre-forward (in case the model has
+        # dropout-style stochastic ops; for plain Qwen3 this is a no-op but
+        # keeps the contract right), the other half drives mixing.
+        key_pre, key_mix = jax.random.split(key, 2)
+
+        # --- Pre-forward (stop_gradient) -----------------------------------
+        # Get the model's own one-step-ahead predictions on the GT inputs.
+        # stop_gradient on the logits ensures the pre-forward contributes
+        # NO gradients — its sole purpose is to sample replacement tokens.
+        pre_act = self.activations(example.tokens, example.attn_mask, key=key_pre)
+        if isinstance(pre_act, tuple):
+            pre_act, _ = pre_act
+        pre_head = self.get_lm_head()
+        pre_logits = hax.dot(pre_act, pre_head, axis=self.Embed)
+        pre_logits_sg = jax.lax.stop_gradient(pre_logits)
+
+        # --- Mix GT inputs with predicted density tokens -------------------
+        mixed_tokens = _jax_apply_ss(
+            original_tokens=example.tokens,
+            pre_logits=pre_logits_sg,
+            args=ss_args,
+            key=key_mix,
+        )
+
+        mixed_example = LmExample(
+            tokens=mixed_tokens,
+            loss_weight=example.loss_weight,
+            attn_mask=example.attn_mask,
+        )
+
+        # --- Real forward on the mixed input → density-aware loss ----------
+        # Reuse the parent density-aware loss path; it shifts targets via
+        # roll(-1) on the *original* tokens (passed as `example.tokens`)
+        # which would normally equal the input. Here we want the loss graded
+        # against the GROUND-TRUTH targets, not the model's own predictions,
+        # so we compute logits on the mixed input but pass the ORIGINAL
+        # tokens as the `input_tokens` arg (which `density_aware_loss` rolls
+        # for the target sequence).
+        args = _DENSITY_LOSS_ARGS
+        if args is None or args.weight == 0.0:
+            # SS without density loss → CE on plain vocab, mixed input.
+            # Re-forward via the mixed example and let the parent compute CE.
+            return Qwen3LMHeadModel.compute_next_token_loss(
+                self,
+                mixed_example,
+                key=key,
+                reduction=reduction,
+                reduction_axis=reduction_axis,
+                logsumexp_weight=logsumexp_weight,
+                loss_dtype=loss_dtype,
+                logit_soft_cap=logit_soft_cap,
+            )
+
+        activations = self.activations(mixed_example.tokens, mixed_example.attn_mask, key=key)
+        aux_loss = 0
+        if isinstance(activations, tuple):
+            activations, aux_loss = activations
+        head = self.get_lm_head()
+        logits = hax.dot(activations, head, axis=self.Embed)
+
+        loss = density_aware_loss(
+            Pos=self.Pos,
+            Vocab=self.Vocab,
+            logits=logits,
+            input_tokens=example.tokens,   # ORIGINAL (GT) tokens — provides targets
+            loss_weight=example.loss_weight,
+            args=args,
+            reduction=reduction,
+        )
+        return loss + aux_loss
+
+
+# Module-level state for SS (set once at training-script startup).
+_SS_ARGS: Optional[SSArgs] = None
+
+
+def configure_ss(args: "SSArgs | None") -> None:
+    global _SS_ARGS
+    _SS_ARGS = args
