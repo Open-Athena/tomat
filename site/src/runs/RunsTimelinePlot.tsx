@@ -52,6 +52,7 @@ const X_MODES: { id: XMode; label: string; help: string }[] = [
 ]
 const X_MODE_KEY = 'tomat:runs-xmode'
 const LEGEND_COLLAPSED_KEY = 'tomat:runs-legend-collapsed'
+const NAME_FILTER_KEY = 'tomat:runs-name-filter'
 
 // `active` x-mode: cap on a single inter-sample interval's contribution.
 // Runs log every ~minute while training, so anything longer is a gap the
@@ -161,6 +162,27 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
     try { localStorage.setItem(LOGY_KEY, v ? '1' : '0') } catch { /* ignore */ }
   }
 
+  // Regex filter on run name. Persisted. Empty string = no filter (show all).
+  // Lets the user split groups of runs that don't share a y-axis range — most
+  // immediate use case: filter out the EMD-loss runs (TL ~100s) so the CE runs
+  // (TL ~few) aren't crushed against the bottom of the autoscaled axis.
+  const [nameFilter, setNameFilterRaw] = useState(() => {
+    try { return localStorage.getItem(NAME_FILTER_KEY) ?? '' } catch { return '' }
+  })
+  const setNameFilter = (v: string) => {
+    setNameFilterRaw(v)
+    try { localStorage.setItem(NAME_FILTER_KEY, v) } catch { /* ignore */ }
+  }
+  // Compile the regex once per change; invalid patterns just fall through to
+  // "no filter" with a visual hint on the input (red border).
+  let nameRe: RegExp | null = null
+  let nameReError = false
+  if (nameFilter.trim() !== '') {
+    try { nameRe = new RegExp(nameFilter, 'i') }
+    catch { nameReError = true }
+  }
+  const filteredRuns = nameRe ? runs.filter((r) => nameRe!.test(r.label)) : runs
+
   const cutoffSec = hoursBack ? (Date.now() / 1000 - hoursBack * 3600) : null
 
   const activeTrace = highlight?.activeTrace ?? null
@@ -168,7 +190,9 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
   // its extent — short/small runs are invisible squished against the shared
   // axis. Pinning is driven by clicking a run card or legend item.
   const pinnedTrace = highlight?.pinnedTrace ?? null
-  const plotted = pinnedTrace ? runs.filter((r) => r.label === pinnedTrace) : runs
+  const plotted = pinnedTrace
+    ? filteredRuns.filter((r) => r.label === pinnedTrace)
+    : filteredRuns
 
   // Fade non-highlighted traces to a true neutral grey (pltly's built-in fade
   // only desaturates partway / keeps a tint); the highlighted run keeps full
@@ -251,10 +275,27 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
 
   return (
     <div>
-      {/* x-axis mode toggle */}
+      {/* x-axis mode toggle + name-filter regex */}
       <div style={{
         display: 'flex', justifyContent: 'flex-end', gap: 4, marginBottom: 4,
+        alignItems: 'center',
       }}>
+        <Tooltip content="regex filter on run names (case-insensitive). Empty = show all. Useful for separating run groups with different TL y-axis scales (e.g. exclude EMD runs to see CE-magnitude TL clearly).">
+          <input
+            type="text"
+            value={nameFilter}
+            onChange={(e) => setNameFilter(e.target.value)}
+            placeholder="filter regex (e.g. cont33k|mg-4)"
+            style={{
+              background: 'transparent',
+              border: `1px solid ${nameReError ? '#c44' : (isDark ? '#444' : '#bbb')}`,
+              borderRadius: 4, padding: '2px 8px',
+              fontSize: '0.72rem', fontFamily: 'inherit',
+              color: nameReError ? '#c44' : fg,
+              width: '220px', marginRight: 8,
+            }}
+          />
+        </Tooltip>
         {X_MODES.map((m) => {
           const on = m.id === xMode
           return (
@@ -324,7 +365,9 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
             fontFamily: 'inherit',
           }}
         >
-          {collapsed ? '▸' : '▾'} legend · {runs.length} run{runs.length === 1 ? '' : 's'}
+          {collapsed ? '▸' : '▾'} legend · {filteredRuns.length}
+          {filteredRuns.length !== runs.length ? ` of ${runs.length}` : ''} run
+          {filteredRuns.length === 1 ? '' : 's'}
         </button>
         {!collapsed && (
           <div style={{
@@ -335,7 +378,7 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
             columnGap: 14, rowGap: 1,
             marginTop: 2, color: fg,
           }}>
-            {runs.map((r) => (
+            {filteredRuns.map((r) => (
               <LegendItem
                 key={r.id}
                 type="line"
