@@ -24,6 +24,15 @@ Env vars:
     TOMAT_EVAL_DECODER      "median" (default; L_1-optimal point estimator),
                             "argmax" (mode), or "mean" (E[ρ], L_2-optimal).
     TOMAT_ZARR_BASE         gs:// prefix for raw Zarrs (default rho_gga_raw/validation)
+    TOMAT_EVAL_MODE         "teacher" (default; one forward, true density fed
+                            in) or "free" (autoregressive — the model's own
+                            predictions feed back; v3-only). See specs/25 §1.
+                            Free mode covers the whole grid (every patch),
+                            same disjoint tiling as teacher-forced.
+    TOMAT_EVAL_FREE_BATCH   (free mode) patches per forward — an HBM knob, not
+                            a coverage cap (default 32). Free-running is ~P^3
+                            sequential forwards/patch; cap cost via the mat
+                            count (TOMAT_EVAL_N_MATS), not this.
 """
 
 from __future__ import annotations
@@ -561,6 +570,21 @@ def build_all_patch_input_ids_v3(
     return ids
 
 
+# Free-running decode re-forwards the (growing) prefix each step; padding the
+# forward to the next FREE_BUCKET multiple bounds the number of JIT shapes to
+# ~ceil(max_seq_len / FREE_BUCKET) while avoiding a full-length forward at
+# every early step. FREE_BUCKET MUST be a multiple of the flash-attention
+# block size (1024) — flash attention rejects a query axis that isn't a
+# block-size multiple. The token buffer is also padded to a FREE_BUCKET
+# multiple so the largest bucket is valid too.
+FREE_BUCKET = 1024
+
+
+def _next_bucket(n):
+    """Smallest FREE_BUCKET multiple >= n — the bucketed forward length."""
+    return ((n + FREE_BUCKET - 1) // FREE_BUCKET) * FREE_BUCKET
+
+
 def decode_density(density_logits, target_dens, decoder, decode_dens):
     """Decode per-position density-bin logits → (rho point estimate, EMD).
 
@@ -631,16 +655,46 @@ def main():
         "TOMAT_ZARR_BASE", f"{BUCKET}/rho_gga_raw/{split}"
     )
     seed = int(os.environ.get("TOMAT_SEED", "42"))
+    # Eval mode: teacher-forced (default), free-running AR, or MaskGIT iterative.
+    eval_mode = os.environ.get("TOMAT_EVAL_MODE", "teacher").strip()
+    if eval_mode not in ("teacher", "free", "maskgit"):
+        raise ValueError(f"TOMAT_EVAL_MODE must be teacher/free/maskgit, got {eval_mode!r}")
+    free_batch = int(os.environ.get("TOMAT_EVAL_FREE_BATCH", "32"))
+
+    # MaskGIT eval knobs.
+    mg_k_steps = int(os.environ.get("TOMAT_EVAL_MG_K_STEPS", "12"))
+    mg_decoder = os.environ.get("TOMAT_EVAL_MG_DECODER", decoder)  # default to TOMAT_EVAL_DECODER
+    if mg_decoder not in ("argmax", "median", "mean"):
+        raise ValueError(f"TOMAT_EVAL_MG_DECODER must be argmax/median/mean, got {mg_decoder!r}")
+
+    # Partial-mask diagnostic: if set (comma-sep list of floats in (0,1]),
+    # short-circuit the maskgit iterative loop. For each ratio r, mask r
+    # fraction of density positions, leave the rest as GT, do ONE forward,
+    # report NMAE on the masked positions only. Used to test whether the
+    # model has learned anything at all (good at r=0.1) vs nothing (flat
+    # at all r). Bypasses K-iteration entirely.
+    mg_partial_ratios_env = os.environ.get("TOMAT_EVAL_MG_PARTIAL_RATIOS", "").strip()
+    mg_partial_ratios = (
+        [float(x) for x in mg_partial_ratios_env.split(",") if x.strip()]
+        if mg_partial_ratios_env else []
+    )
 
     meta_url = f"{BUCKET}/tokenized/{label}/worker-00/meta.json"
     with fsspec.open(meta_url, "r") as f:
         meta = json.load(f)
     vocab_size = meta["vocab"]["total_size"]
+    # In MaskGIT mode the model was trained with a +1 vocab (MASK token at end).
+    # Bump vocab_size to match the checkpoint's embedding table.
+    MASK_ID: int | None = None
+    if eval_mode == "maskgit":
+        MASK_ID = vocab_size
+        vocab_size = vocab_size + 1
     patch_size_meta = meta.get("patch_size")
     P = int(patch_size_meta) if isinstance(patch_size_meta, int) else 14
     tokenizer_version = meta.get("tokenizer_version", "v2")
     err(f"[eval-mat] label={label}, model={model_preset}, P={P}, vocab={vocab_size}, "
-        f"tokenizer={tokenizer_version}")
+        f"tokenizer={tokenizer_version}, mode={eval_mode}"
+        + (f", MASK_ID={MASK_ID}, mg_k_steps={mg_k_steps}" if eval_mode == "maskgit" else ""))
 
     # LMQ codec
     bounds, recon, clip_max = load_lmq_codec(lmq_path)
@@ -738,6 +792,64 @@ def main():
                 hax.named(emd, (logits.axes[0], logits.axes[1])),
             )
 
+        # ---- Free-running (autoregressive) decode --------------------------
+        # One recompute step: forward the prefix, read the density logits at
+        # the frontier output position, median-decode → fed-back token; also
+        # return the configured-decoder point estimate (rho) and the EMD vs
+        # the true voxel density. No KV cache — the prefix is re-forwarded
+        # each step, padded up to the next FREE_BUCKET multiple (see
+        # specs/25 §1 for why recompute-first).
+        @hax.named_jit(axis_resources=compute_mapping)
+        def free_step(tokens_in, frontier, true_dens_i):
+            # tokens_in: (Batch, Pos) prefix; frontier: i32 scalar output
+            # position to read; true_dens_i: (Batch,) true voxel density.
+            act = model.activations(tokens_in, key=None, attn_mask=None)
+            head = model.get_lm_head()
+            logits = hax.dot(act, head, axis=model.Embed)
+            logits_arr = logits.array.astype(jnp.float32)          # (B, Pos, V)
+            density_logits = logits_arr[..., DENS_LO:DENS_HI]      # (B, Pos, n_bins)
+            dl = density_logits[:, frontier, :]                    # (B, n_bins)
+            p = jax.nn.softmax(dl, axis=-1)
+            cumP = jnp.cumsum(p, axis=-1)
+            med_bin = jnp.clip(
+                jnp.sum(cumP < 0.5, axis=-1).astype(jnp.int32), 0, len(recon) - 1,
+            )
+            next_tok = med_bin + DENS_LO                           # (B,) fed back
+            if decoder == "argmax":
+                rho = decode_dens[jnp.argmax(dl, axis=-1)]
+            elif decoder == "median":
+                rho = decode_dens[med_bin]
+            else:  # mean — E[rho]
+                rho = jnp.einsum("bv,v->b", p, decode_dens)
+            td = true_dens_i.array                                 # (B,)
+            emd = jax.vmap(lambda pv, t: jnp.dot(pv, jnp.abs(decode_dens - t)))(p, td)
+            B = tokens_in.axes[0]
+            return (hax.named(next_tok, (B,)), hax.named(rho, (B,)),
+                    hax.named(emd, (B,)))
+
+        # ---- MaskGIT iterative-refinement forward --------------------------
+        # One full-sequence bidirectional forward: tokens_in has density
+        # positions that are either MASK_ID or already filled-in.
+        # Returns (B, Pos) density logits and confidence at every position.
+        # Bidirectional attn is achieved by passing an explicit
+        # AttentionMask(is_causal=False) — materializes to None → full bidir.
+        from levanter.layers.attention import AttentionMask as _AttentionMask
+
+        _mg_bidir_mask = _AttentionMask(is_causal=False)
+
+        @hax.named_jit(axis_resources=compute_mapping)
+        def maskgit_forward(tokens_in):
+            """Forward with full bidirectional attention. Returns density logits.
+
+            tokens_in: (Batch, Pos) NamedArray.
+            Returns: density_logits (B, Pos, n_bins) float32 raw array.
+            """
+            act = model.activations(tokens_in, key=None, attn_mask=_mg_bidir_mask)
+            head = model.get_lm_head()
+            logits = hax.dot(act, head, axis=model.Embed)
+            logits_arr = logits.array.astype(jnp.float32)  # (B, Pos, V)
+            return logits_arr[..., DENS_LO:DENS_HI]       # (B, Pos, n_bins)
+
         # Pick mp-IDs: either from the pinned JSON snapshot (preferred for
         # apples-to-apples curves across runs), or from the parquets directly.
         if eval_mat_set:
@@ -779,6 +891,17 @@ def main():
             err(f"[eval-mat] DEBUG: single-mat per-voxel dump → {debug_dump_mat}")
 
         per_mat_results = []
+        # Per-position diagnostics — accumulated across all mats so the
+        # dashboard can plot mean error at each density-block position
+        # (0..P^3-1, row-major within the patch). Sums divided by pp_count
+        # in the summary block. See specs/26 §"Open questions": this is the
+        # answer to "is more training improving voxel-0 (structure→ρ) or
+        # only the AR shortcut?" — non-trivial-and-dropping at voxel 0 →
+        # real learning; flat at voxel 0 → only AR-conditional refinement.
+        pp_mae_sum = np.zeros(P ** 3, dtype=np.float64)
+        pp_emd_sum = np.zeros(P ** 3, dtype=np.float64)
+        pp_abs_true_sum = np.zeros(P ** 3, dtype=np.float64)
+        pp_count = 0
         for mp_id in mp_ids:
             # Load raw Zarr — download from GCS to local /tmp first to dodge
             # the gcsfs/aiohttp async-event-loop conflict with JAX's runtime.
@@ -810,6 +933,494 @@ def main():
             n_patches = len(offsets)
             err(f"[eval-mat] tiling: {n_patches} patches (full coverage), grid={grid_shape}")
 
+            # ---- Free-running branch -------------------------------------
+            # Autoregressive whole-grid eval: EVERY patch (full disjoint
+            # coverage — the same `tile_full_coverage_offsets` tiling the
+            # teacher-forced path uses) is free-run, the model regenerating
+            # its P^3 density tokens from its own predictions. `free_batch`
+            # is the per-forward batch size (an HBM knob), NOT a coverage
+            # cap — the loop sweeps all patches and NMAE/NEMD are computed
+            # over the full grid, identically to teacher-forced.
+            if eval_mode == "free":
+                if tokenizer_version != "v3":
+                    raise ValueError(
+                        f"free-running eval is v3-only (v2 runs are hidden); "
+                        f"got tokenizer={tokenizer_version}"
+                    )
+                P3 = P ** 3
+                B = free_batch
+                rho_pred = np.zeros(grid_shape, dtype=np.float32)
+                emd_grid = np.zeros(grid_shape, dtype=np.float32)
+                # Per-patch flat (n_patches, P^3) generation-order arrays —
+                # only retained for `TOMAT_DEBUG_DUMP_MAT`, the diagnostic
+                # path that captures the *shape* of free-running divergence
+                # (graceful drift vs cold-start garbage).
+                dump_per_patch = (debug_dump_mat == mp_id)
+                if dump_per_patch:
+                    rho_per_patch = np.zeros((n_patches, P3), dtype=np.float32)
+                    true_per_patch = np.zeros((n_patches, P3), dtype=np.float32)
+                n_full_batches = (n_patches + B - 1) // B
+                offsets_padded = list(offsets) + [offsets[0]] * (
+                    n_full_batches * B - n_patches
+                )
+                Batch = hax.Axis("batch", B)
+                t_gen0 = time.time()
+                seen_buckets: set[int] = set()
+                for bi in range(n_full_batches):
+                    off_arr = np.asarray(
+                        offsets_padded[bi * B:(bi + 1) * B], dtype=np.int32,
+                    )
+                    # Truth buffer (preamble + DENS_START + true density);
+                    # the density region is blanked and regenerated below.
+                    full_ids = build_all_patch_input_ids_v3(
+                        density, grid_shape, off_arr, Zs, frac, lmq_codec,
+                        vocab_offsets, P=P, pad_to=8192,
+                        lattice_params=lattice_params,
+                    )
+                    row0 = full_ids[0]
+                    is_d = ((row0 >= density_offset)
+                            & (row0 < density_offset + len(recon)))
+                    dpos = np.where(is_d)[0]
+                    if len(dpos) != P3:
+                        raise ValueError(
+                            f"free {mp_id}: {len(dpos)} density positions != "
+                            f"P^3={P3} — v3 layout assumption broken"
+                        )
+                    d0 = int(dpos[0]) - 1                  # DENS_START index
+                    seq_len = d0 + P3 + 3                  # + DENS_END + EOS
+
+                    # Codec-round-tripped true patch densities (B, P^3) — the
+                    # per-step EMD target. Row-major, matching the builder.
+                    iota = np.arange(P, dtype=np.int32)
+                    di, dj, dk = np.meshgrid(iota, iota, iota, indexing="ij")
+                    gx = np.asarray(grid_shape, dtype=np.int32)
+                    ix = (off_arr[:, 0, None, None, None] + di) % gx[0]
+                    iy = (off_arr[:, 1, None, None, None] + dj) % gx[1]
+                    iz = (off_arr[:, 2, None, None, None] + dk) % gx[2]
+                    tp = density[ix, iy, iz].reshape(B, P3).astype(np.float32)
+                    tbins = np.clip(
+                        np.searchsorted(bounds, np.clip(tp, 0.0, clip_max),
+                                        side="right"),
+                        0, len(recon) - 1,
+                    ).astype(np.int32)
+                    emd_target = recon[tbins].astype(np.float32)
+
+                    # On-device buffer, length padded to a FREE_BUCKET
+                    # multiple (flash attention needs a block-size-multiple
+                    # query axis); density region → PAD, regenerated.
+                    buf_len = _next_bucket(seq_len)
+                    tokens = jnp.asarray(full_ids[:, :buf_len].copy())
+                    tokens = tokens.at[:, d0 + 1:].set(TOK["PAD"])
+                    rho_b = jnp.zeros((B, P3), dtype=jnp.float32)
+                    emd_b = jnp.zeros((B, P3), dtype=jnp.float32)
+                    for i in range(P3):
+                        frontier = d0 + i
+                        bucket = _next_bucket(frontier + 1)
+                        if bucket not in seen_buckets:
+                            seen_buckets.add(bucket)
+                            err(f"[eval-mat] free: compiling bucket={bucket}")
+                        Pos = hax.Axis("position", bucket)
+                        tok_ha = hax.named(tokens[:, :bucket], (Batch, Pos))
+                        td_ha = hax.named(jnp.asarray(emd_target[:, i]), (Batch,))
+                        nt, rho_i, emd_i = free_step(
+                            tok_ha, jnp.asarray(frontier, jnp.int32), td_ha,
+                        )
+                        tokens = tokens.at[:, d0 + 1 + i].set(nt.array)
+                        rho_b = rho_b.at[:, i].set(rho_i.array)
+                        emd_b = emd_b.at[:, i].set(emd_i.array)
+                    rho_b_np = np.asarray(rho_b)              # (B, P^3)
+                    emd_b_np = np.asarray(emd_b)
+                    rho_blocks = rho_b_np.reshape(B, P, P, P)
+                    emd_blocks = emd_b_np.reshape(B, P, P, P)
+                    # Scatter each real patch into the full grid via its
+                    # local slice — exact disjoint coverage, same as the
+                    # teacher-forced path.
+                    for k in range(B):
+                        gidx = bi * B + k
+                        if gidx >= n_patches:              # padded entry
+                            continue
+                        ox, oy, oz = offsets[gidx]
+                        lx0, lx1, ly0, ly1, lz0, lz1 = local_slices[gidx]
+                        rho_pred[ox+lx0:ox+lx1, oy+ly0:oy+ly1, oz+lz0:oz+lz1] = \
+                            rho_blocks[k, lx0:lx1, ly0:ly1, lz0:lz1]
+                        emd_grid[ox+lx0:ox+lx1, oy+ly0:oy+ly1, oz+lz0:oz+lz1] = \
+                            emd_blocks[k, lx0:lx1, ly0:ly1, lz0:lz1]
+                        if dump_per_patch:
+                            rho_per_patch[gidx] = rho_b_np[k]
+                            true_per_patch[gidx] = tp[k]
+                        # Per-position diagnostics (same as teacher path).
+                        pp_mae_sum += np.abs(rho_b_np[k] - tp[k])
+                        pp_emd_sum += emd_b_np[k]
+                        pp_abs_true_sum += np.abs(tp[k])
+                        pp_count += 1
+                t_gen = time.time() - t_gen0
+
+                # NMAE / NEMD over the full grid — identical to teacher-forced.
+                rho_true = density
+                mae = float(np.mean(np.abs(rho_pred - rho_true)))
+                denom = float(np.mean(np.abs(rho_true)))
+                mean_emd = float(np.mean(emd_grid))
+                nmae = mae / max(denom, 1e-30)
+                nemd = mean_emd / max(denom, 1e-30)
+                err(f"[eval-mat] {mp_id} FREE: {n_patches} patches "
+                    f"({n_full_batches}×B{B}) × {P3} steps, full grid in "
+                    f"{t_gen:.1f}s, NMAE={nmae:.4%}, NEMD={nemd:.4%}")
+                if dump_per_patch:
+                    import io
+                    _buf = io.BytesIO()
+                    np.savez_compressed(
+                        _buf, rho_pred=rho_pred, rho_true=rho_true,
+                        emd_grid=emd_grid,
+                        rho_per_patch=rho_per_patch,
+                        true_per_patch=true_per_patch,
+                        offsets=np.asarray(offsets, dtype=np.int32),
+                        grid_shape=np.asarray(grid_shape),
+                    )
+                    _dump = f"{BUCKET}/eval/debug/{mp_id}-free-dump.npz"
+                    with fsspec.open(_dump, "wb") as _f:
+                        _f.write(_buf.getvalue())
+                    err(f"[eval-mat] DEBUG: dumped per-voxel free-run "
+                        f"grids → {_dump}")
+                per_mat_results.append({
+                    "mp_id": mp_id,
+                    "grid_shape": list(grid_shape),
+                    "n_patches": int(n_patches),
+                    "n_atoms": int(len(Zs)),
+                    "mae": mae,
+                    "mean_emd": mean_emd,
+                    "mean_abs_true": denom,
+                    "nmae": nmae,
+                    "nemd": nemd,
+                })
+                continue
+
+            # ---- MaskGIT iterative-refinement branch ----------------------
+            # All density positions start as MASK_ID; K_steps iterations of
+            # parallel confidence-driven filling (cosine schedule) until all
+            # positions are decoded. Then decode each filled bin → ρ.
+            if eval_mode == "maskgit":
+                if tokenizer_version != "v3":
+                    raise ValueError(
+                        f"maskgit eval is v3-only; got tokenizer={tokenizer_version}"
+                    )
+                if MASK_ID is None:
+                    raise RuntimeError(
+                        "maskgit eval requires MASK_ID (vocab bump), "
+                        "but MASK_ID is None — was TOMAT_EVAL_MODE=maskgit set?"
+                    )
+                P3 = P ** 3
+                B = eval_batch
+                rho_pred = np.zeros(grid_shape, dtype=np.float32)
+                # Diagnostic: alternative decode path that skips the final
+                # all-filled re-forward and uses the argmax-per-iter `filled_bins`
+                # directly. Compare NMAE_reforward vs NMAE_filled to test the
+                # "final re-forward is OOD (model never sees 0-mask inputs)"
+                # hypothesis.
+                rho_pred_filled = np.zeros(grid_shape, dtype=np.float32)
+                emd_grid = np.zeros(grid_shape, dtype=np.float32)
+                n_full_batches = (n_patches + B - 1) // B
+                offsets_padded = list(offsets) + [offsets[0]] * (
+                    n_full_batches * B - n_patches
+                )
+                Batch = hax.Axis("batch", B)
+                pad_to = meta.get("pad_to") or 8192
+
+                # Build one reference row to locate density positions.
+                _ref_ids = build_all_patch_input_ids_v3(
+                    density, grid_shape,
+                    np.asarray([offsets[0]], dtype=np.int32),
+                    Zs, frac, lmq_codec, vocab_offsets,
+                    P=P, pad_to=pad_to, lattice_params=lattice_params,
+                )
+                row0 = _ref_ids[0]
+                _is_d = (row0 >= density_offset) & (row0 < density_offset + len(recon))
+                dens_positions = np.where(_is_d)[0]
+                if len(dens_positions) != P3:
+                    err(f"[eval-mat] MaskGIT {mp_id}: expected {P3} dens positions, "
+                        f"got {len(dens_positions)}; skipping")
+                    continue
+                d0 = int(dens_positions[0])  # first density token index
+
+                # Partial-mask diagnostic short-circuit: skip iterative
+                # refinement, just measure NMAE on masked positions at fixed
+                # mask ratios via ONE forward each. Reports per-ratio NMAE
+                # and ρ-stats so we can tell "flat at all ratios" (architecture
+                # broken) from "good at low r, flat at r=1" (cosine-prior
+                # trivial-solution).
+                if mg_partial_ratios:
+                    rng = np.random.default_rng(seed=0)  # deterministic across mats
+                    pm_results: list[dict] = []
+                    t_pm0 = time.time()
+                    for ratio in mg_partial_ratios:
+                        # Build per-batch masked input; one forward each.
+                        nmae_num = 0.0       # sum |pred-true| over masked positions, all batches
+                        nmae_den = 0.0       # sum |true|       over masked positions, all batches
+                        pred_vals: list[np.ndarray] = []
+                        true_vals: list[np.ndarray] = []
+                        for bi in range(n_full_batches):
+                            off_arr_b = np.asarray(
+                                offsets_padded[bi * B:(bi + 1) * B], dtype=np.int32,
+                            )
+                            full_ids_b = build_all_patch_input_ids_v3(
+                                density, grid_shape, off_arr_b, Zs, frac, lmq_codec,
+                                vocab_offsets, P=P, pad_to=pad_to,
+                                lattice_params=lattice_params,
+                            )
+                            # Per-(example, position) mask: True ⇒ MASK_ID.
+                            mask_bool = rng.random((B, P3)) < ratio          # (B, P3) bool
+                            tok_b = full_ids_b.copy()
+                            flat_idx_b = dens_positions[None, :].repeat(B, axis=0)
+                            # Apply mask only where mask_bool is True.
+                            for bi_b in range(B):
+                                masked_idx_b = flat_idx_b[bi_b][mask_bool[bi_b]]
+                                tok_b[bi_b, masked_idx_b] = MASK_ID
+                            Pos_p = hax.Axis("position", pad_to)
+                            tok_ha_p = hax.named(jnp.asarray(tok_b), (Batch, Pos_p))
+                            dl_pm = np.asarray(maskgit_forward(tok_ha_p))   # (B, Pos, V_d)
+                            dl_pm_dens = dl_pm[:, dens_positions, :]        # (B, P3, V_d)
+                            pred_bin = dl_pm_dens.argmax(axis=-1)           # (B, P3)
+                            pred_rho = recon[pred_bin]                      # (B, P3)
+                            # True ρ via codec round-trip (apples-to-apples vs codec floor).
+                            true_bin = full_ids_b[:, dens_positions] - density_offset
+                            true_bin = np.clip(true_bin, 0, len(recon) - 1)
+                            true_rho = recon[true_bin]                      # (B, P3)
+                            # Accumulate over MASKED positions of REAL patches only.
+                            for bi_b in range(B):
+                                gidx = bi * B + bi_b
+                                if gidx >= n_patches:
+                                    continue
+                                m = mask_bool[bi_b]
+                                if not m.any():
+                                    continue
+                                p_vals = pred_rho[bi_b, m]
+                                t_vals = true_rho[bi_b, m]
+                                nmae_num += float(np.sum(np.abs(p_vals - t_vals)))
+                                nmae_den += float(np.sum(np.abs(t_vals)))
+                                pred_vals.append(p_vals)
+                                true_vals.append(t_vals)
+                        pv = np.concatenate(pred_vals) if pred_vals else np.zeros(0)
+                        tv = np.concatenate(true_vals) if true_vals else np.zeros(0)
+                        pm_nmae = nmae_num / max(nmae_den, 1e-30)
+                        pm_results.append({
+                            "mask_ratio": ratio,
+                            "n_masked": int(pv.size),
+                            "nmae": pm_nmae,
+                            "pred_mean": float(pv.mean()) if pv.size else 0.0,
+                            "pred_p50":  float(np.percentile(pv, 50)) if pv.size else 0.0,
+                            "pred_p99":  float(np.percentile(pv, 99)) if pv.size else 0.0,
+                            "true_mean": float(tv.mean()) if tv.size else 0.0,
+                            "true_p50":  float(np.percentile(tv, 50)) if tv.size else 0.0,
+                            "true_p99":  float(np.percentile(tv, 99)) if tv.size else 0.0,
+                        })
+                    t_pm = time.time() - t_pm0
+                    err(f"[eval-mat] {mp_id} PARTIAL-MASK ({n_patches} patches, {t_pm:.1f}s):")
+                    err(f"  {'r':>6s}  {'n_masked':>9s}  {'NMAE':>9s}  "
+                        f"{'pred μ/p50/p99':>22s}  {'true μ/p50/p99':>22s}")
+                    for r in pm_results:
+                        err(f"  {r['mask_ratio']:>6.2f}  {r['n_masked']:>9d}  "
+                            f"{r['nmae']:>9.4%}  "
+                            f"{r['pred_mean']:>7.2f}/{r['pred_p50']:>6.2f}/{r['pred_p99']:>6.2f}    "
+                            f"{r['true_mean']:>7.2f}/{r['true_p50']:>6.2f}/{r['true_p99']:>6.2f}")
+                    # Surface r=1.0 NMAE (or first entry) as top-level so the
+                    # aggregator doesn't KeyError; full per-ratio breakdown
+                    # lives in `partial_mask`.
+                    top_nmae = pm_results[-1]["nmae"] if pm_results else 0.0
+                    per_mat_results.append({
+                        "mp_id": mp_id,
+                        "grid_shape": list(grid_shape),
+                        "n_patches": int(n_patches),
+                        "n_atoms": int(len(Zs)),
+                        "nmae": top_nmae,
+                        "nemd": top_nmae,        # no EMD computed in partial-mask path
+                        "mae": 0.0,              # placeholder; not the primary metric here
+                        "mean_emd": 0.0,
+                        "mean_abs_true": 0.0,
+                        "partial_mask": pm_results,
+                    })
+                    continue  # skip the K-iter MaskGIT path for this mat
+
+                # Per-iter NMAE tracking (nice-to-have diagnostic).
+                iter_nmae: list[float] = []
+                iter_nemd: list[float] = []
+
+                t_gen0 = time.time()
+                for bi in range(n_full_batches):
+                    off_arr = np.asarray(
+                        offsets_padded[bi * B:(bi + 1) * B], dtype=np.int32,
+                    )
+                    # Build ground-truth ids; replace density block with MASK_ID.
+                    full_ids = build_all_patch_input_ids_v3(
+                        density, grid_shape, off_arr, Zs, frac, lmq_codec,
+                        vocab_offsets, P=P, pad_to=pad_to,
+                        lattice_params=lattice_params,
+                    )
+                    # tokens: (B, pad_to) with density positions → MASK_ID
+                    tokens = full_ids.copy()
+                    tokens[:, dens_positions] = MASK_ID
+
+                    # True densities for per-position EMD (codec round-trip).
+                    gx = np.asarray(grid_shape, dtype=np.int32)
+                    iota = np.arange(P, dtype=np.int32)
+                    _di, _dj, _dk = np.meshgrid(iota, iota, iota, indexing="ij")
+                    ix = (off_arr[:, 0, None, None, None] + _di) % gx[0]
+                    iy = (off_arr[:, 1, None, None, None] + _dj) % gx[1]
+                    iz = (off_arr[:, 2, None, None, None] + _dk) % gx[2]
+                    tp = density[ix, iy, iz].reshape(B, P3).astype(np.float32)
+
+                    # Which density positions are still masked (per example).
+                    # shape (B, P3); bool.
+                    still_masked = np.ones((B, P3), dtype=bool)
+
+                    for k in range(mg_k_steps):
+                        Pos = hax.Axis("position", pad_to)
+                        tok_ha = hax.named(jnp.asarray(tokens), (Batch, Pos))
+                        # (B, pad_to, n_bins) density logits
+                        dl_full = np.asarray(maskgit_forward(tok_ha))
+                        # Extract at density positions: (B, P3, n_bins)
+                        dl_dens = dl_full[:, dens_positions, :]
+
+                        # Softmax → confidence = max prob at each position.
+                        probs = jax.nn.softmax(jnp.asarray(dl_dens), axis=-1)
+                        probs_np = np.asarray(probs)  # (B, P3, n_bins)
+                        confidence = probs_np.max(axis=-1)   # (B, P3)
+                        picked_bin = probs_np.argmax(axis=-1) # (B, P3)
+
+                        # Cosine schedule: how many positions to have filled
+                        # after step k+1 (1-indexed).
+                        frac_fill = 1.0 - math.cos((k + 1) / mg_k_steps * math.pi / 2.0)
+                        n_fill_target = math.ceil(frac_fill * P3)
+                        n_fill_target = min(n_fill_target, P3)
+
+                        for b in range(B):
+                            masked_pos_idx = np.where(still_masked[b])[0]
+                            n_already_filled = P3 - len(masked_pos_idx)
+                            n_to_fill_now = max(0, n_fill_target - n_already_filled)
+                            n_to_fill_now = min(n_to_fill_now, len(masked_pos_idx))
+                            if n_to_fill_now == 0:
+                                continue
+                            # Pick the most-confident among still-masked.
+                            conf_masked = confidence[b, masked_pos_idx]
+                            top_k = np.argsort(-conf_masked)[:n_to_fill_now]
+                            to_fill = masked_pos_idx[top_k]
+                            tokens[b, dens_positions[to_fill]] = (
+                                density_offset + picked_bin[b, to_fill]
+                            )
+                            still_masked[b, to_fill] = False
+
+                    # Force-fill any remaining MASK positions (last-step safety).
+                    for b in range(B):
+                        remaining = np.where(still_masked[b])[0]
+                        if len(remaining) == 0:
+                            continue
+                        # Re-forward once more to fill the rest.
+                        Pos = hax.Axis("position", pad_to)
+                        tok_ha = hax.named(jnp.asarray(tokens[[b]]), (hax.Axis("batch", 1), Pos))
+                        dl_b = np.asarray(maskgit_forward(tok_ha))[0]  # (pad_to, n_bins)
+                        dl_r = dl_b[dens_positions[remaining], :]
+                        tokens[b, dens_positions[remaining]] = (
+                            density_offset + dl_r.argmax(axis=-1)
+                        )
+                        still_masked[b, remaining] = False
+
+                    # Decode filled tokens → ρ using the configured decoder.
+                    filled_bins = tokens[:, dens_positions] - density_offset  # (B, P3)
+                    filled_bins = np.clip(filled_bins, 0, len(recon) - 1)
+                    dl_arr = full_ids[:, dens_positions] - density_offset     # (B, P3) true bins
+                    dl_arr = np.clip(dl_arr, 0, len(recon) - 1)
+
+                    # DIAGNOSTIC PATH: ρ from the argmax-per-iter filled_bins,
+                    # bypassing the final all-filled re-forward. If the
+                    # re-forward is OOD, this should yield much better NMAE.
+                    rho_b_filled = recon[filled_bins]               # (B, P3)
+
+                    # Decode ρ point estimate (current primary path).
+                    Pos_d = hax.Axis("position", pad_to)
+                    tok_ha_f = hax.named(jnp.asarray(tokens), (Batch, Pos_d))
+                    dl_full2 = np.asarray(maskgit_forward(tok_ha_f))
+                    dl_dens2 = dl_full2[:, dens_positions, :]   # (B, P3, n_bins)
+                    probs2 = np.asarray(jax.nn.softmax(jnp.asarray(dl_dens2), axis=-1))
+
+                    if mg_decoder == "argmax":
+                        rho_b = recon[dl_dens2.argmax(axis=-1)]  # (B, P3)
+                    elif mg_decoder == "median":
+                        cumP2 = np.cumsum(probs2, axis=-1)
+                        bin_idx2 = np.clip(
+                            (cumP2 < 0.5).sum(axis=-1), 0, len(recon) - 1,
+                        )
+                        rho_b = recon[bin_idx2]
+                    else:  # mean
+                        rho_b = np.einsum("bpv,v->bp", probs2, recon)
+
+                    # EMD at each position vs true density.
+                    true_dens_b = recon[dl_arr]  # (B, P3) codec-round-tripped
+                    abs_diff = np.abs(recon[None, None, :] - true_dens_b[..., None])  # (B, P3, V)
+                    emd_b = np.einsum("bpv,bpv->bp", probs2, abs_diff)  # (B, P3)
+
+                    # Scatter into full grids + per-position diagnostics.
+                    rho_b_flat = rho_b
+                    rho_b = rho_b.reshape(B, P, P, P)
+                    rho_b_filled_3d = rho_b_filled.reshape(B, P, P, P)
+                    emd_b_grid = emd_b.reshape(B, P, P, P)
+                    for k in range(B):
+                        gidx = bi * B + k
+                        if gidx >= n_patches:
+                            continue
+                        ox, oy, oz = offsets[gidx]
+                        lx0, lx1, ly0, ly1, lz0, lz1 = local_slices[gidx]
+                        rho_pred[ox+lx0:ox+lx1, oy+ly0:oy+ly1, oz+lz0:oz+lz1] = \
+                            rho_b[k, lx0:lx1, ly0:ly1, lz0:lz1]
+                        rho_pred_filled[ox+lx0:ox+lx1, oy+ly0:oy+ly1, oz+lz0:oz+lz1] = \
+                            rho_b_filled_3d[k, lx0:lx1, ly0:ly1, lz0:lz1]
+                        emd_grid[ox+lx0:ox+lx1, oy+ly0:oy+ly1, oz+lz0:oz+lz1] = \
+                            emd_b_grid[k, lx0:lx1, ly0:ly1, lz0:lz1]
+                        pp_mae_sum += np.abs(rho_b_flat[k] - tp[k])
+                        pp_emd_sum += emd_b[k]
+                        pp_abs_true_sum += np.abs(tp[k])
+                        pp_count += 1
+
+                t_gen = time.time() - t_gen0
+                rho_true = density
+                mae = float(np.mean(np.abs(rho_pred - rho_true)))
+                mae_filled = float(np.mean(np.abs(rho_pred_filled - rho_true)))
+                denom = float(np.mean(np.abs(rho_true)))
+                mean_emd = float(np.mean(emd_grid))
+                nmae = mae / max(denom, 1e-30)
+                nmae_filled = mae_filled / max(denom, 1e-30)
+                nemd = mean_emd / max(denom, 1e-30)
+                # Diagnostic stats on the predicted-vs-true distribution shape
+                # — helps tell "median is in top bin" from "median is reasonable
+                # but biased" from "median ≈ truth on this mat".
+                pf_mean = float(np.mean(rho_pred_filled))
+                pf_p50 = float(np.percentile(rho_pred_filled, 50))
+                pf_p99 = float(np.percentile(rho_pred_filled, 99))
+                rf_mean = float(np.mean(rho_pred))
+                rf_p50 = float(np.percentile(rho_pred, 50))
+                rf_p99 = float(np.percentile(rho_pred, 99))
+                t_mean = float(np.mean(rho_true))
+                t_p99 = float(np.percentile(rho_true, 99))
+                err(f"[eval-mat] {mp_id} MASKGIT: {n_patches} patches, "
+                    f"K={mg_k_steps} iters, {t_gen:.1f}s")
+                err(f"  NMAE(reforward,{mg_decoder})={nmae:.4%}  "
+                    f"NMAE(filled_bins,argmax)={nmae_filled:.4%}  "
+                    f"NEMD={nemd:.4%}")
+                err(f"  rho_true        mean={t_mean:.3e}  p99={t_p99:.3e}")
+                err(f"  rho_pred(reforw) mean={rf_mean:.3e}  p50={rf_p50:.3e}  p99={rf_p99:.3e}")
+                err(f"  rho_pred(filled) mean={pf_mean:.3e}  p50={pf_p50:.3e}  p99={pf_p99:.3e}")
+                per_mat_results.append({
+                    "mp_id": mp_id,
+                    "grid_shape": list(grid_shape),
+                    "n_patches": int(n_patches),
+                    "n_atoms": int(len(Zs)),
+                    "mae": mae,
+                    "mae_filled": mae_filled,
+                    "mean_emd": mean_emd,
+                    "mean_abs_true": denom,
+                    "nmae": nmae,
+                    "nmae_filled": nmae_filled,
+                    "nemd": nemd,
+                })
+                continue
+
             rho_pred = np.zeros(grid_shape, dtype=np.float32)
 
             # Pad to multiple of eval_batch so every patch is evaluated
@@ -834,6 +1445,20 @@ def main():
                 lattice_params=lattice_params,
             )  # (n_eval, 8192) int32
             t_tok = time.time() - t_tok0
+
+            # True per-patch density values in row-major (matches the builder's
+            # DENS-block extraction). Used for per-position diagnostics —
+            # accumulated into pp_*_sum below.
+            _iota = np.arange(P, dtype=np.int32)
+            _di, _dj, _dk = np.meshgrid(_iota, _iota, _iota, indexing="ij")
+            _gx = np.asarray(grid_shape, dtype=np.int32)
+            _real_off = np.asarray(offsets, dtype=np.int32)
+            _ix = (_real_off[:, 0, None, None, None] + _di) % _gx[0]
+            _iy = (_real_off[:, 1, None, None, None] + _dj) % _gx[1]
+            _iz = (_real_off[:, 2, None, None, None] + _dk) % _gx[2]
+            all_true_patch = density[_ix, _iy, _iz].reshape(
+                n_patches, P ** 3,
+            ).astype(np.float32)
 
             # Density-token positions are deterministic (same layout per patch).
             n_bins = len(recon)
@@ -884,6 +1509,12 @@ def main():
                             pred_blocks[k, lx0:lx1, ly0:ly1, lz0:lz1]
                         emd_grid[ox+lx0:ox+lx1, oy+ly0:oy+ly1, oz+lz0:oz+lz1] = \
                             emd_blocks[k, lx0:lx1, ly0:ly1, lz0:lz1]
+                        # Per-position diagnostics: accumulate |err|, emd, |true|
+                        # at each row-major position 0..P^3-1 in the patch.
+                        pp_mae_sum += np.abs(pred_dens_floats[k] - all_true_patch[global_idx])
+                        pp_emd_sum += emd_dens_floats[k]
+                        pp_abs_true_sum += np.abs(all_true_patch[global_idx])
+                        pp_count += 1
                         total += 1
             t_fwd = time.time() - t_fwd0
             err(f"[eval-mat] {mp_id}: processed {total} patches "
@@ -934,6 +1565,29 @@ def main():
             err(f"  median NMAE : {np.median(nmaes):.4%}    median NEMD : {np.median(nemds):.4%}")
             err(f"  p99 NMAE    : {np.percentile(nmaes, 99):.4%}    p99 NEMD    : {np.percentile(nemds, 99):.4%}")
 
+        # Per-position diagnostic curve (averaged across all real patches of
+        # all mats). per_pos_mae[i] is the mean |pred - true| at row-major
+        # position i ∈ [0, P^3) within the patch; per_pos_abs_true[i] gives
+        # the denominator so the dashboard can compute per-position NMAE.
+        # Voxel 0 (= "P(ρ | structure-only)") is the cold-start prediction
+        # — if it's flat over training, the model is only learning the AR
+        # shortcut; if it's dropping, real structure→ρ learning is happening.
+        per_pos_mae = (pp_mae_sum / max(pp_count, 1)).astype(np.float32)
+        per_pos_emd = (pp_emd_sum / max(pp_count, 1)).astype(np.float32)
+        per_pos_abs_true = (pp_abs_true_sum / max(pp_count, 1)).astype(np.float32)
+        if pp_count > 0:
+            err(f"[eval-mat] per-position diagnostic ({pp_count} patches):")
+            # A few canonical positions: voxel 0 (structure-only); voxel
+            # P-1 (end of first 1D-row); voxel P (start of next 1D-row,
+            # spatially adjacent to voxel 0 via y); voxel P^2 (start of
+            # next 2D-slab, spatially adjacent to voxel 0 via x); mid; last.
+            canon = [0, P - 1, P, P ** 2 - 1, P ** 2, (P ** 3) // 2, P ** 3 - 1]
+            denom = float(per_pos_abs_true.mean())
+            for i in canon:
+                npm = float(per_pos_mae[i]) / max(denom, 1e-30)
+                err(f"  i={i:>5d}: mae={per_pos_mae[i]:>9.3g}  emd={per_pos_emd[i]:>9.3g}"
+                    f"  |true|={per_pos_abs_true[i]:>9.3g}  NMAE_global_denom={npm:.4%}")
+
         # Machine-readable summary (also persists per-mat results to GCS so
         # downstream noise-calibration / bootstrap analysis can use them
         # without scraping iris job logs, which truncate per-mat lines).
@@ -941,6 +1595,7 @@ def main():
             "checkpoint": checkpoint_path,
             "label": label,
             "model": model_preset,
+            "mode": eval_mode,
             "mat_set": eval_mat_set,
             "n_mats": len(per_mat_results),
             "nmae_mean": float(nmaes.mean()) if per_mat_results else None,
@@ -949,6 +1604,10 @@ def main():
             "nemd_mean": float(nemds.mean()) if per_mat_results else None,
             "nemd_median": float(np.median(nemds)) if per_mat_results else None,
             "nemd_p99": float(np.percentile(nemds, 99)) if per_mat_results else None,
+            "per_pos_mae": per_pos_mae.tolist() if pp_count > 0 else None,
+            "per_pos_emd": per_pos_emd.tolist() if pp_count > 0 else None,
+            "per_pos_abs_true": per_pos_abs_true.tolist() if pp_count > 0 else None,
+            "per_pos_n_patches": int(pp_count),
             "per_mat": per_mat_results,
         }
         print(json.dumps(summary, indent=2))
@@ -964,7 +1623,15 @@ def main():
             parts = checkpoint_path.rstrip("/").split("/")
             ckpt_tail = parts[-1]
             run_label = parts[-4]
-            ms = eval_mat_set or "default"
+            # Mode-specific results land in sibling subdirs to avoid collisions
+            # with the teacher-forced `<set>/` JSONs.
+            if eval_mode == "free":
+                mode_suffix = "-free"
+            elif eval_mode == "maskgit":
+                mode_suffix = "-maskgit"
+            else:
+                mode_suffix = ""
+            ms = (eval_mat_set or "default") + mode_suffix
             results_path = f"{BUCKET}/eval/results/{run_label}/{ms}/{ckpt_tail}.json"
             try:
                 with fsspec.open(results_path, "w") as f:
