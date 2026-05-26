@@ -152,6 +152,60 @@ def require_one(runs, substr: str):
     return runs[0]
 
 
+def _resolve_eval_step_list(
+    steps_arg: str,
+    run_label: str,
+    bucket: str = GCS_BUCKET,
+) -> list[int]:
+    """Parse `evals fire -s ...` and reconcile with the actual GCS ckpts.
+
+    Handles the recurring Levanter OBO (`num_train_steps=N` produces a final
+    `step-(N-1)` ckpt) and supports `-s latest` for "whatever's freshest."
+    Errors loudly if a requested step doesn't exist (vs the old behavior of
+    silently submitting an iris job that fails ~minutes later on ckpt load).
+    """
+    base = f"{bucket}/results/{run_label}/checkpoints/{run_label}"
+    try:
+        listing = subprocess.run(
+            ["gcloud", "storage", "ls", f"{base}/"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+    except Exception as e:
+        err(f"[evals fire] WARN: GCS ls failed ({type(e).__name__}: {e}); "
+            f"falling back to raw `-s` values without pre-flight")
+        return [int(s.strip()) for s in steps_arg.split(",")]
+    available = sorted({
+        int(m.group(1)) for m in re.finditer(r"step-(\d+)/?", listing)
+    })
+    if not available:
+        err(f"[evals fire] no `step-*` ckpts at {base}/ — has training started?")
+        sys.exit(1)
+
+    resolved: list[int] = []
+    for raw in steps_arg.split(","):
+        raw = raw.strip()
+        if raw.lower() in ("latest", "final", "last"):
+            chosen = available[-1]
+            err(f"[evals fire] -s {raw} → step-{chosen} "
+                f"(latest of {len(available)} ckpts on GCS)")
+            resolved.append(chosen)
+            continue
+        n = int(raw)
+        if n in available:
+            resolved.append(n)
+        elif (n - 1) in available:
+            err(f"[evals fire] WARN: step-{n} not on GCS but step-{n-1} is; "
+                f"using step-{n-1} (Levanter num_train_steps={n} → final "
+                f"step-{n-1} OBO). Pass `-s {n-1}` or `-s latest` to silence.")
+            resolved.append(n - 1)
+        else:
+            near = [a for a in available if abs(a - n) <= max(1000, n // 20)]
+            err(f"[evals fire] step-{n} not found on GCS. "
+                f"Nearby: {near[-10:]}; latest: step-{available[-1]}")
+            sys.exit(1)
+    return resolved
+
+
 def iris_run(*args: str, capture: bool = True, timeout: int = 180) -> subprocess.CompletedProcess:
     """Invoke `uv run iris --cluster=marin job <args>` from marin/."""
     cmd = ["uv", "run", "iris", "--cluster=marin", "job", *args]
@@ -390,6 +444,98 @@ def runs_nmae(substr: str, sets: str):
             ne_s = fmt(ne) if ne is not None else "  -  "
             line += f"  {fmt(d.get(s + '/mean'))}/{fmt(d.get(s + '/median'))}/{fmt(d.get(s + '/p99'))}  {ne_s}"
         print(line)
+
+
+_TRAJ_DEFAULT_KEYS = "train/loss,eval/loss,throughput/mfu"
+
+
+@runs.command("traj")
+@click.argument("substr")
+@click.option("-k", "--keys", default=_TRAJ_DEFAULT_KEYS,
+              help="comma-sep metric keys to pull (default: train/loss,eval/loss,throughput/mfu)")
+@click.option("-n", "--n-samples", default=20, type=int,
+              help="evenly-spaced samples to print (first+last always included). Set 0 to print all.")
+@click.option("--csv", is_flag=True, help="emit raw CSV (every row, no sampling)")
+def runs_traj(substr: str, keys: str, n_samples: int, csv: bool):
+    """Pull metric trajectory(ies) for the matching wandb run.
+
+    Useful when "did training actually descend?" needs a concrete answer.
+    With `--csv`, dumps every (step,key,value) for downstream plotting.
+    Otherwise prints N evenly-spaced samples + first + last as a compact
+    table, indexed by `global_step` (falls back to `_step` if missing).
+    """
+    import wandb
+
+    api = wandb.Api()
+    r = require_one(match_runs(api, substr), substr)
+    key_list = [k.strip() for k in keys.split(",") if k.strip()]
+    # scan_history can take a `keys` arg but it filters to rows containing
+    # ALL listed keys — too strict (rare combined-row cadence). Scan all
+    # rows and split per-key here.
+    by_key: dict[str, list[tuple[int, float]]] = {k: [] for k in key_list}
+    for row in r.scan_history(page_size=1000):
+        step = row.get("global_step") or row.get("_step")
+        if step is None:
+            continue
+        for k in key_list:
+            v = row.get(k)
+            if v is not None:
+                by_key[k].append((step, v))
+    for k in key_list:
+        by_key[k].sort()
+    counts = ", ".join(f"{k}={len(by_key[k])}" for k in key_list)
+    err(f"{r.name}  ({counts})")
+
+    if csv:
+        print("step," + ",".join(key_list))
+        # union of all steps that appeared for any key
+        all_steps = sorted({s for k in key_list for s, _ in by_key[k]})
+        per_key_idx = {k: dict(by_key[k]) for k in key_list}
+        for s in all_steps:
+            row = [str(s)]
+            for k in key_list:
+                v = per_key_idx[k].get(s)
+                row.append(f"{v}" if v is not None else "")
+            print(",".join(row))
+        return
+
+    # Pretty table: pick sample steps from the longest series, look up
+    # nearest-earlier value for each key (so sparser series like eval/loss
+    # still show alongside dense train/loss).
+    densest = max(key_list, key=lambda k: len(by_key[k]))
+    pts = by_key[densest]
+    if not pts:
+        err(f"no data for any of {keys!r} in {r.name}")
+        sys.exit(1)
+    if n_samples <= 0 or len(pts) <= n_samples + 2:
+        sampled = pts
+    else:
+        n = len(pts)
+        idxs = sorted(set([0, n - 1] + [int(i * n / n_samples) for i in range(1, n_samples)]))
+        sampled = [pts[i] for i in idxs]
+    sample_steps = [s for s, _ in sampled]
+
+    def at_or_before(series: list[tuple[int, float]], step: int) -> float | None:
+        lo, hi = 0, len(series) - 1
+        if hi < 0 or series[0][0] > step:
+            return None
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if series[mid][0] <= step:
+                lo = mid
+            else:
+                hi = mid - 1
+        return series[lo][1]
+
+    col_w = max(11, max(len(k) for k in key_list))
+    header = f"{'step':>8s}  " + "  ".join(f"{k:>{col_w}s}" for k in key_list)
+    print(header)
+    for s in sample_steps:
+        cells = []
+        for k in key_list:
+            v = at_or_before(by_key[k], s)
+            cells.append(f"{v:>{col_w}.4f}" if isinstance(v, (int, float)) else f"{'-':>{col_w}s}")
+        print(f"{s:>8d}  " + "  ".join(cells))
 
 
 def _wandb_url(run_name: str, entity: str | None = None, project: str | None = None) -> str:
@@ -1136,6 +1282,13 @@ def evals():
 @click.option("-t", "--tpu", default="v6e-8")
 @click.option("--decoder", default="median")
 @click.option("-d", "--dry-run", is_flag=True, help="print iris commands without executing")
+@click.option("-D", "--debug-dump-mat", default="", help="dump per-voxel rho_pred/rho_true (and per-patch flat arrays in free mode) to GCS for this mp_id; overrides n_mats")
+@click.option("-f", "--free-batch", default=32, type=int, help="(--mode free) patches per forward — HBM knob, not a coverage cap")
+@click.option("--mode", default="teacher", type=click.Choice(["teacher", "free", "maskgit"]), help="teacher-forced (default), free-running AR, or MaskGIT iterative-refinement eval")
+@click.option("--mg-k-steps", default=12, type=int, help="(--mode maskgit) number of iterative-refinement steps (TOMAT_EVAL_MG_K_STEPS)")
+@click.option("--mg-partial-ratios", default="", help="(--mode maskgit) diagnostic: comma-sep mask ratios (e.g. 0.1,0.5,0.9,1.0). When set, skip K-iter loop; mask R fraction at random, ONE forward, report NMAE on masked positions only. Tests whether model has learned at any mask ratio.")
+@click.option("--bucket", "bucket_override", default=None, help=f"GCS bucket where the run's ckpts live (default: {GCS_BUCKET}). Use when the run was trained with --bucket override (e.g. v5p in us-east5 → gs://marin-us-east5/tomat).")
+@click.option("--mirror-to", "mirror_to", default=None, help="Before firing, mirror the resolved ckpt(s) to this bucket via `tomat ckpt mirror` and run eval against the mirror. Prevents cross-region egress when eval TPU region differs from ckpt bucket. See [[cross-region-eval-egress]].")
 @click.argument("run_label")
 def evals_fire(
     run_label: str,
@@ -1148,21 +1301,79 @@ def evals_fire(
     tpu: str,
     decoder: str,
     dry_run: bool,
+    debug_dump_mat: str,
+    free_batch: int,
+    mode: str,
+    mg_k_steps: int,
+    mg_partial_ratios: str,
+    bucket_override: str | None,
+    mirror_to: str | None,
 ):
     """Fire mat-NMAE eval jobs against a run's GCS checkpoints.
 
-    Pre-populates the watchdog FIRED files so a subsequent
-    `tomat evals harvest <run>` will pick the harvested numbers up.
-    Use --dry-run to print the iris commands without firing.
+    Teacher-forced (default) pre-populates the watchdog FIRED files so a
+    subsequent `tomat evals harvest <run>` picks the numbers up. Free-running
+    (`--mode free`) covers the whole grid (every patch) but is ~P^3 sequential
+    forwards/patch — cap cost with `-n` (mat count, e.g. 1), not coverage;
+    results land in GCS `<set>-free/`. MaskGIT iterative-refinement
+    (`--mode maskgit`) runs K bidirectional forwards per patch (confidence-
+    sorted cosine schedule); results land in GCS `<set>-maskgit/`.
+    Use --dry-run to print iris commands without executing.
     """
-    step_list = [int(s) for s in steps.split(",")]
+    # Resolve `-s` against actual GCS ckpts. Two recurring foot-guns this
+    # avoids: (1) the Levanter `num_train_steps=N` → final ckpt named
+    # `step-(N-1)` OBO that's bitten us in mg-1 / cont33k / cont7k-ext /
+    # the 8k-smoke; (2) typo'd step values that silently submit a job
+    # which fails ~minutes later when the ckpt load can't find the path.
+    # Accept `-s latest` (or `-s final` / `-s last`) to skip the integer
+    # arithmetic entirely and just take the highest GCS ckpt.
+    eval_bucket = bucket_override or GCS_BUCKET
+    step_list = _resolve_eval_step_list(steps, run_label, bucket=eval_bucket)
+
+    # If --mirror-to was passed, copy the resolved ckpts to that bucket once
+    # before firing iris jobs, then point eval at the mirrored copy. Avoids
+    # cross-region egress when eval TPU region differs from ckpt source.
+    if mirror_to is not None:
+        mirror_to = mirror_to.rstrip("/")
+        if mirror_to != eval_bucket:
+            err(f"[evals fire] --mirror-to: copying {len(step_list)} step(s) "
+                f"from {eval_bucket} → {mirror_to}")
+            src_ckpt_root = f"{eval_bucket}/results/{run_label}/checkpoints/{run_label}"
+            dst_ckpt_root = f"{mirror_to}/results/{run_label}/checkpoints/{run_label}"
+            for s in step_list:
+                src = f"{src_ckpt_root}/step-{s}/"
+                dst = f"{dst_ckpt_root}/step-{s}/"
+                # Skip if already there (idempotent — supports re-running an
+                # eval over a previously-mirrored ckpt without re-copying).
+                dst_check = subprocess.run(
+                    ["gcloud", "storage", "ls", dst],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if dst_check.returncode == 0 and "manifest.ocdbt" in dst_check.stdout:
+                    err(f"  step-{s}: already at dst; skipping copy")
+                    continue
+                cmd = ["gcloud", "storage", "cp", "-r", src, dst]
+                err(f"  step-{s}: copying...")
+                if dry_run:
+                    err(f"  (dry-run) {' '.join(cmd)}")
+                    continue
+                r = subprocess.run(cmd)
+                if r.returncode != 0:
+                    err(f"[FAIL] mirror cp rc={r.returncode}; aborting evals fire")
+                    sys.exit(r.returncode)
+            # All subsequent eval submits read from the mirrored bucket.
+            eval_bucket = mirror_to
+        else:
+            err(f"[evals fire] --mirror-to == --bucket ({mirror_to}); skipping mirror")
     set_list = sets.split(",")
     for s in set_list:
         if s not in SPLITS:
             err(f"unknown mat-set {s!r}; known: {sorted(SPLITS)}")
             sys.exit(1)
 
-    if not dry_run:
+    # Teacher-forced evals seed the harvest watchdog via FIRED files; the
+    # free-running and maskgit harvest paths read GCS directly.
+    if not dry_run and mode == "teacher":
         TMP_DIR.mkdir(exist_ok=True)
         for s in set_list:
             (TMP_DIR / f"{run_label}-{s}-evals-fired.txt").write_text("")
@@ -1175,9 +1386,15 @@ def evals_fire(
     fired_total = 0
     for step in step_list:
         for s in set_list:
-            jn = f"tomat-eval-{run_label}-{s}-step-{step}"
+            if mode == "free":
+                infix = "eval-free"
+            elif mode == "maskgit":
+                infix = "eval-maskgit"
+            else:
+                infix = "eval"
+            jn = f"tomat-{infix}-{run_label}-{s}-step-{step}"
             split = SPLITS[s]
-            ckpt = f"{GCS_BUCKET}/results/{run_label}/checkpoints/{run_label}/step-{step}"
+            ckpt = f"{eval_bucket}/results/{run_label}/checkpoints/{run_label}/step-{step}"
             cmd = [
                 "uv", "run", "iris", "--cluster=marin", "job", "run",
                 "--tpu", tpu, "--enable-extra-resources",
@@ -1193,6 +1410,27 @@ def evals_fire(
                 "--env-vars", "TOMAT_EVAL_DECODER", decoder,
                 "--env-vars", "TOMAT_EVAL_MAT_SET", s,
                 "--env-vars", "TOMAT_EVAL_SPLIT", split,
+            ]
+            if mode == "free":
+                cmd += [
+                    "--env-vars", "TOMAT_EVAL_MODE", "free",
+                    "--env-vars", "TOMAT_EVAL_FREE_BATCH", str(free_batch),
+                ]
+            elif mode == "maskgit":
+                cmd += [
+                    "--env-vars", "TOMAT_EVAL_MODE", "maskgit",
+                    "--env-vars", "TOMAT_EVAL_MG_K_STEPS", str(mg_k_steps),
+                ]
+                if mg_partial_ratios:
+                    cmd += [
+                        "--env-vars", "TOMAT_EVAL_MG_PARTIAL_RATIOS",
+                        mg_partial_ratios,
+                    ]
+            if debug_dump_mat:
+                cmd += [
+                    "--env-vars", "TOMAT_DEBUG_DUMP_MAT", debug_dump_mat,
+                ]
+            cmd += [
                 "--no-wait", "--no-terminate-on-exit",
                 "--job-name", jn,
                 "--", "python", "eval_mat_nmae.py",
@@ -1215,8 +1453,9 @@ def evals_fire(
                 err(f"[FAIL fire {jn}] rc={r.returncode}\n{r.stderr[-500:]}")
                 continue
             print(f"[fired {jn}]")
-            with open(TMP_DIR / f"{run_label}-{s}-evals-fired.txt", "a") as f:
-                f.write(f"{step}\n")
+            if mode == "teacher":
+                with open(TMP_DIR / f"{run_label}-{s}-evals-fired.txt", "a") as f:
+                    f.write(f"{step}\n")
             fired_total += 1
 
     suffix = " (dry-run)" if dry_run else ""
@@ -2225,6 +2464,139 @@ def cache_build(
         err(f"[FAIL launch {job_name}] rc={r.returncode}\n{r.stderr[-1000:]}")
         sys.exit(r.returncode)
     print(f"[launched cache-build {job_name} → {bucket}/cache/{data_label}/]")
+
+
+@cli.group("ckpt")
+def ckpt_grp():
+    """Manage training-run checkpoints on GCS: mirror across regions, list, delete."""
+
+
+def _resolve_run_bucket(run_label: str) -> str | None:
+    """Find which canonical bucket a run's ckpts live in by checking each."""
+    for bkt in (GCS_BUCKET, "gs://marin-us-east5/tomat",
+                "gs://marin-us-central1/tomat", "gs://marin-us-east1/tomat"):
+        path = f"{bkt}/results/{run_label}/checkpoints/{run_label}/"
+        r = subprocess.run(
+            ["gcloud", "storage", "ls", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return bkt
+    return None
+
+
+@ckpt_grp.command("mirror")
+@click.argument("run_label")
+@click.option("--from", "src_bucket", default=None,
+              help="source bucket (autodetected if omitted by ls'ing the canonical buckets)")
+@click.option("--to", "dst_bucket", required=True,
+              help="destination bucket (e.g. gs://marin-us-east5/tomat)")
+@click.option("-s", "--step", default="latest",
+              help="step to mirror: a positive int, 'latest', or 'all'. Default 'latest'.")
+@click.option("-d", "--dry-run", is_flag=True, help="print gcloud commands without running")
+def ckpt_mirror(run_label: str, src_bucket: str | None, dst_bucket: str, step: str, dry_run: bool):
+    """Copy a run's checkpoint(s) from one bucket to another (one-shot, parallelized).
+
+    Use case: when eval-side TPU capacity is in a different region than the
+    training bucket, mirror the ckpt once instead of paying cross-region
+    egress on every eval that loads it. See [[cross-region-eval-egress]].
+
+    Examples:
+      tomat ckpt mirror train-mg-3-cos-emd --to gs://marin-us-east5/tomat
+      tomat ckpt mirror train-mg-1 -s 9999 --to gs://marin-us-east5/tomat
+      tomat ckpt mirror cont33k -s all --to gs://marin-us-east5/tomat
+    """
+    if src_bucket is None:
+        src_bucket = _resolve_run_bucket(run_label)
+        if src_bucket is None:
+            err(f"could not find {run_label!r} ckpts in any canonical bucket; "
+                f"pass --from explicitly")
+            sys.exit(1)
+        err(f"[ckpt mirror] autodetected source: {src_bucket}")
+    src_bucket = src_bucket.rstrip("/")
+    dst_bucket = dst_bucket.rstrip("/")
+    if src_bucket == dst_bucket:
+        err(f"[ckpt mirror] src == dst ({src_bucket}); nothing to do")
+        return
+
+    src_ckpt_root = f"{src_bucket}/results/{run_label}/checkpoints/{run_label}"
+    dst_ckpt_root = f"{dst_bucket}/results/{run_label}/checkpoints/{run_label}"
+
+    # Enumerate step-* dirs on the source.
+    listing = subprocess.run(
+        ["gcloud", "storage", "ls", f"{src_ckpt_root}/"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if listing.returncode != 0:
+        err(f"[ckpt mirror] failed to list {src_ckpt_root}/: {listing.stderr}")
+        sys.exit(1)
+    available = sorted({
+        int(m.group(1)) for m in re.finditer(r"step-(\d+)/?", listing.stdout)
+    })
+    if not available:
+        err(f"[ckpt mirror] no step-* ckpts at {src_ckpt_root}/")
+        sys.exit(1)
+
+    if step.lower() in ("latest", "final", "last"):
+        chosen = [available[-1]]
+    elif step.lower() == "all":
+        chosen = available
+    else:
+        n = int(step)
+        if n in available:
+            chosen = [n]
+        elif (n - 1) in available:
+            err(f"[ckpt mirror] WARN: step-{n} not found; using step-{n-1} (Levanter OBO)")
+            chosen = [n - 1]
+        else:
+            err(f"[ckpt mirror] step-{n} not found. Available (last 10): {available[-10:]}")
+            sys.exit(1)
+
+    print(f"[ckpt mirror] {run_label}: {src_bucket} → {dst_bucket}")
+    print(f"  steps to copy: {chosen}")
+    for s in chosen:
+        src = f"{src_ckpt_root}/step-{s}/"
+        dst = f"{dst_ckpt_root}/step-{s}/"
+        cmd = ["gcloud", "storage", "cp", "-r", src, dst]
+        print()
+        print(f"# step-{s}")
+        print(" ", " ".join(cmd))
+        if dry_run:
+            continue
+        r = subprocess.run(cmd)
+        if r.returncode != 0:
+            err(f"[FAIL] cp rc={r.returncode}; aborting mirror")
+            sys.exit(r.returncode)
+    if not dry_run:
+        print(f"[ckpt mirror] done: {len(chosen)} step(s) copied")
+
+
+@ckpt_grp.command("ls")
+@click.argument("run_label")
+@click.option("--bucket", "bucket_override", default=None,
+              help="bucket to inspect (autodetect if omitted)")
+def ckpt_ls(run_label: str, bucket_override: str | None):
+    """List checkpoint steps + sizes for a run."""
+    bkt = bucket_override or _resolve_run_bucket(run_label)
+    if bkt is None:
+        err(f"could not find {run_label!r}")
+        sys.exit(1)
+    base = f"{bkt}/results/{run_label}/checkpoints/{run_label}"
+    listing = subprocess.run(
+        ["gcloud", "storage", "ls", "--long", f"{base}/"],
+        capture_output=True, text=True, timeout=30,
+    )
+    print(f"# {run_label} in {bkt}")
+    steps = sorted({
+        int(m.group(1)) for m in re.finditer(r"step-(\d+)/?", listing.stdout)
+    })
+    print(f"  {len(steps)} step-* dirs: {steps[:5]}{'...' if len(steps) > 10 else ''}{steps[-5:] if len(steps) > 10 else ''}")
+    # Total size
+    du = subprocess.run(
+        ["gcloud", "storage", "du", "-s", f"{bkt}/results/{run_label}/"],
+        capture_output=True, text=True, timeout=60,
+    )
+    print(f"  size: {du.stdout.strip()}")
 
 
 @cli.group("wb")
