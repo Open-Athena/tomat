@@ -7,7 +7,7 @@ import { fetchRunHistory } from './parquet'
 import type { RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
 import { RunsTimelinePlot, colorForIndex, shortLabel, useNameFilter, compileMultiTermFilter, runHaystack, TAG_FILTER_KEY } from './RunsTimelinePlot'
-import { tagsFor, type RunTag } from './tags'
+import { parseTagFilters, runPassesTagFilters, serializeTagFilters, tagsFor, type TagFilters } from './tags'
 import type { RunTimelineSeries } from './RunsTimelinePlot'
 import { useTraceHighlight } from 'pltly/react'
 
@@ -1034,39 +1034,38 @@ function RunsIndex() {
   }, [filterCompiled, ordered, runHaystacksById])
 
   // Tag chip filter, lifted up from `RunsTimelinePlot` so the same selection
-  // can hard-filter the card list (not just the plotted traces). AND across
-  // selected tags. Initialized from `localStorage` once at mount, persisted
-  // on every change.
-  const [selectedTags, setSelectedTags] = useState<Set<RunTag>>(() => {
+  // can hard-filter the card list (not just the plotted traces). Tri-state
+  // per tag: each tag is off / `'in'` (run must have it) / `'out'` (run must
+  // not have it). Initialized from `localStorage` once at mount, persisted
+  // on every change. `parseTagFilters` handles the legacy single-state array
+  // shape so old localStorage entries still load.
+  const [tagFilters, setTagFilters] = useState<TagFilters>(() => {
     try {
       const raw = localStorage.getItem(TAG_FILTER_KEY)
-      if (raw) return new Set(JSON.parse(raw) as RunTag[])
+      if (raw) return parseTagFilters(raw)
     } catch { /* ignore */ }
-    return new Set()
+    return new Map()
   })
-  const onSelectedTagsChange = useCallback((next: Set<RunTag>) => {
-    setSelectedTags(next)
+  const onTagFiltersChange = useCallback((next: TagFilters) => {
+    setTagFilters(next)
     try {
       if (next.size === 0) localStorage.removeItem(TAG_FILTER_KEY)
-      else localStorage.setItem(TAG_FILTER_KEY, JSON.stringify([...next]))
+      else localStorage.setItem(TAG_FILTER_KEY, serializeTagFilters(next))
     } catch { /* ignore */ }
   }, [])
-  // Runs whose tag set satisfies the AND-of-selected-tags constraint. `null`
-  // when no tags are selected — semantics: "no tag constraint, show all".
-  // Distinct from regex-`matchedIds`, which only sorts: tags hard-filter
-  // (matching the plot's tag-chip behavior), so a run with no matching tags
+  // Runs whose tag set satisfies the tri-state constraint. `null` when no
+  // tags are active — semantics: "no tag constraint, show all". Distinct
+  // from regex-`matchedIds`, which only sorts: tags hard-filter (matching
+  // the plot's tag-chip behavior), so a run that fails the chip predicate
   // is hidden from the card list entirely.
   const tagMatchedIds = useMemo(() => {
-    if (selectedTags.size === 0 || !ordered) return null
+    if (tagFilters.size === 0 || !ordered) return null
     const s = new Set<string>()
     for (const c of ordered) {
-      const ts = tagsFor(shortLabel(c.id))
-      let ok = true
-      for (const sel of selectedTags) if (!ts.includes(sel)) { ok = false; break }
-      if (ok) s.add(c.id)
+      if (runPassesTagFilters(tagsFor(shortLabel(c.id)), tagFilters)) s.add(c.id)
     }
     return s
-  }, [selectedTags, ordered])
+  }, [tagFilters, ordered])
 
   // Card order: pinned first, then the plot-hover card (if any, and not the
   // already-pinned run), then regex-matches, then everything else (each group
@@ -1162,8 +1161,8 @@ function RunsIndex() {
             highlight={highlight}
             runHaystacks={runHaystacksByLabel}
             onPlotHover={setPlotHoverLabel}
-            selectedTags={selectedTags}
-            onSelectedTagsChange={onSelectedTagsChange}
+            tagFilters={tagFilters}
+            onTagFiltersChange={onTagFiltersChange}
           />
         </div>
       )}

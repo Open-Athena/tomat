@@ -156,3 +156,56 @@ export const ALL_TAGS: RunTag[] = (() => {
 export function tagsFor(runName: string): RunTag[] {
   return RUN_TAGS[runName] ?? []
 }
+
+/** Per-tag filter state. Absent (Map miss) = "don't care" / off.
+ *  - `'in'`  ⇒ the run MUST have this tag.
+ *  - `'out'` ⇒ the run MUST NOT have this tag.
+ *
+ *  Tags are tri-state: click cycles off → in → out → off. */
+export type TagFilterState = 'in' | 'out'
+export type TagFilters = Map<RunTag, TagFilterState>
+
+/** Apply the tag-filter map to a run's tag list. */
+export function runPassesTagFilters(runTags: RunTag[], filters: TagFilters): boolean {
+  if (filters.size === 0) return true
+  for (const [t, state] of filters) {
+    const has = runTags.includes(t)
+    if (state === 'in' && !has) return false
+    if (state === 'out' && has) return false
+  }
+  return true
+}
+
+/** Cycle one tag's state: off → 'in' → 'out' → off. Returns a *new* Map. */
+export function cycleTagFilter(filters: TagFilters, t: RunTag): TagFilters {
+  const next = new Map(filters)
+  const cur = next.get(t)
+  if (cur === undefined) next.set(t, 'in')
+  else if (cur === 'in') next.set(t, 'out')
+  else next.delete(t)
+  return next
+}
+
+/** Parse the localStorage payload into a `TagFilters` map. Accepts both the
+ *  old single-state array shape (`["CE","bunk"]` → all `'in'`) and the new
+ *  object shape (`{"CE":"in","bunk":"out"}`), so persisted state from before
+ *  the tri-state change keeps working. */
+export function parseTagFilters(raw: string): TagFilters {
+  const m: TagFilters = new Map()
+  try {
+    const parsed = JSON.parse(raw)
+    if (Array.isArray(parsed)) {
+      // Legacy shape — every entry was an implicit `'in'`.
+      for (const t of parsed as RunTag[]) m.set(t, 'in')
+    } else if (parsed && typeof parsed === 'object') {
+      for (const [k, v] of Object.entries(parsed as Record<string, string>)) {
+        if (v === 'in' || v === 'out') m.set(k, v)
+      }
+    }
+  } catch { /* ignore — return empty */ }
+  return m
+}
+
+export function serializeTagFilters(filters: TagFilters): string {
+  return JSON.stringify(Object.fromEntries(filters))
+}

@@ -13,7 +13,7 @@ import { Tooltip } from '../Tooltip'
 import type { UseTraceHighlightReturn } from 'pltly/react'
 import { themedHoverlabel } from '../theme'
 import type { RunHistory } from './parquet'
-import { ALL_TAGS, tagsFor, type RunTag } from './tags'
+import { ALL_TAGS, cycleTagFilter, parseTagFilters, runPassesTagFilters, serializeTagFilters, tagsFor, type RunTag, type TagFilters } from './tags'
 import { compileMultiTermFilter } from './filter'
 // Re-export so RunsPage can `import { ... } from './RunsTimelinePlot'` —
 // keeps callers off the helper module's internal path.
@@ -51,9 +51,12 @@ interface Props {
   /** Controlled tag-filter state. When omitted the plot owns its own state +
    *  localStorage persistence. The parent passes both to mirror the chip
    *  selection into the card list so tag filters can hard-filter rows, not
-   *  just trace plotting. */
-  selectedTags?: Set<RunTag>
-  onSelectedTagsChange?: (next: Set<RunTag>) => void
+   *  just trace plotting.
+   *
+   *  Tri-state per tag: `'in'` = run must have the tag, `'out'` = run must
+   *  not have it, absent = don't care. See `runPassesTagFilters`. */
+  tagFilters?: TagFilters
+  onTagFiltersChange?: (next: TagFilters) => void
 }
 
 /** Local-TZ datetime string for a Plotly date axis. Plotly treats a string
@@ -251,7 +254,7 @@ function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
   return { x, y }
 }
 
-export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onPlotHover, selectedTags: selectedTagsExternal, onSelectedTagsChange }: Props) {
+export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onPlotHover, tagFilters: tagFiltersExternal, onTagFiltersChange }: Props) {
   const { isDark } = useTheme()
 
   // Legend collapse persists in localStorage — it's long, some users tuck it
@@ -304,49 +307,44 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
     ? runs
     : runs.filter((r) => filterCompiled.matches(haystackFor(r.label)))
 
-  // Tag-chip filter. AND across selected tags: a run is visible iff EVERY
-  // selected tag is in its tag set. Empty set = no tag constraint (show all).
-  // Untagged runs are hidden whenever any tag is selected (since they can't
-  // satisfy an "AND" with a tag they don't have).
+  // Tag-chip filter. Tri-state per tag (off / 'in' / 'out'): a run is visible
+  // iff it has every `'in'` tag AND none of the `'out'` tags. Untagged runs
+  // are hidden whenever any `'in'` tag is selected (no way to satisfy "must
+  // have X" without tags).
   //
-  // Controlled when `selectedTagsExternal` is passed (parent owns state +
+  // Controlled when `tagFiltersExternal` is passed (parent owns state +
   // persistence + can hard-filter the card list against it); falls back to
   // own state + localStorage otherwise so the plot still works standalone.
-  const [selectedTagsInternal, setSelectedTagsInternal] = useState<Set<RunTag>>(() => {
-    if (selectedTagsExternal) return selectedTagsExternal
+  const [tagFiltersInternal, setTagFiltersInternal] = useState<TagFilters>(() => {
+    if (tagFiltersExternal) return tagFiltersExternal
     try {
       const raw = localStorage.getItem(TAG_FILTER_KEY)
-      if (raw) return new Set(JSON.parse(raw) as RunTag[])
+      if (raw) return parseTagFilters(raw)
     } catch { /* ignore */ }
-    return new Set()
+    return new Map()
   })
-  const selectedTags = selectedTagsExternal ?? selectedTagsInternal
-  const setSelectedTagsRaw = (next: Set<RunTag>) => {
-    if (onSelectedTagsChange) {
-      onSelectedTagsChange(next)
+  const tagFilters = tagFiltersExternal ?? tagFiltersInternal
+  const setTagFiltersRaw = (next: TagFilters) => {
+    if (onTagFiltersChange) {
+      onTagFiltersChange(next)
     } else {
-      setSelectedTagsInternal(next)
-      try { localStorage.setItem(TAG_FILTER_KEY, JSON.stringify([...next])) } catch { /* ignore */ }
+      setTagFiltersInternal(next)
+      try {
+        if (next.size === 0) localStorage.removeItem(TAG_FILTER_KEY)
+        else localStorage.setItem(TAG_FILTER_KEY, serializeTagFilters(next))
+      } catch { /* ignore */ }
     }
   }
-  const toggleTag = (t: RunTag) => {
-    const next = new Set(selectedTags)
-    if (next.has(t)) next.delete(t); else next.add(t)
-    setSelectedTagsRaw(next)
-  }
+  const toggleTag = (t: RunTag) => setTagFiltersRaw(cycleTagFilter(tagFilters, t))
   // Only show chips for tags that ANY currently-visible (name-filtered) run
   // carries — keeps the chip strip short and relevant.
   const visibleTagSet = new Set<RunTag>()
   for (const r of nameFilteredRuns) for (const t of tagsFor(r.label)) visibleTagSet.add(t)
   const chipTags = ALL_TAGS.filter((t) => visibleTagSet.has(t))
 
-  const filteredRuns = selectedTags.size === 0
+  const filteredRuns = tagFilters.size === 0
     ? nameFilteredRuns
-    : nameFilteredRuns.filter((r) => {
-      const ts = tagsFor(r.label)
-      for (const sel of selectedTags) if (!ts.includes(sel)) return false
-      return true
-    })
+    : nameFilteredRuns.filter((r) => runPassesTagFilters(tagsFor(r.label), tagFilters))
 
   const cutoffSec = hoursBack ? (Date.now() / 1000 - hoursBack * 3600) : null
 
@@ -576,32 +574,58 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
             tags:
           </span>
           {chipTags.map((t) => {
-            const on = selectedTags.has(t)
+            // Tri-state visual: off (neutral) / 'in' (blue, additive AND) /
+            // 'out' (red w/ strikethrough, exclusion AND). Click cycles
+            // off → 'in' → 'out' → off.
+            const state = tagFilters.get(t)
+            const styleFor = (s: typeof state) => {
+              if (s === 'in') return {
+                bg: isDark ? '#2a4a7a' : '#cbe0f5',
+                border: isDark ? '#3a6ab0' : '#7aa7d9',
+                text: isDark ? '#cfe2ff' : '#1d3a64',
+                decoration: 'none' as const,
+              }
+              if (s === 'out') return {
+                bg: isDark ? '#5a2a2a' : '#f5cbcb',
+                border: isDark ? '#b04a4a' : '#d97a7a',
+                text: isDark ? '#ffd0d0' : '#641d1d',
+                decoration: 'line-through' as const,
+              }
+              return {
+                bg: 'transparent',
+                border: isDark ? '#333' : '#ccc',
+                text: muted,
+                decoration: 'none' as const,
+              }
+            }
+            const sty = styleFor(state)
+            const nextLabel = state === undefined ? 'include' : state === 'in' ? 'exclude' : 'remove'
             return (
-              <Tooltip key={t} content={`${on ? 'remove' : 'add'} "${t}" filter (AND across selected)`}>
+              <Tooltip key={t} content={`${nextLabel} "${t}" filter (in → out → off; AND across)`}>
                 <button
                   onClick={() => toggleTag(t)}
                   style={{
-                    background: on ? (isDark ? '#2a4a7a' : '#cbe0f5') : 'transparent',
-                    border: `1px solid ${on ? (isDark ? '#3a6ab0' : '#7aa7d9') : (isDark ? '#333' : '#ccc')}`,
+                    background: sty.bg,
+                    border: `1px solid ${sty.border}`,
                     borderRadius: 10, cursor: 'pointer', padding: '1px 8px',
                     fontSize: '0.7rem', fontFamily: 'inherit',
-                    color: on ? (isDark ? '#cfe2ff' : '#1d3a64') : muted,
+                    color: sty.text,
+                    textDecoration: sty.decoration,
                   }}
                 >
-                  {t}
+                  {state === 'out' ? `−${t}` : t}
                 </button>
               </Tooltip>
             )
           })}
-          {selectedTags.size > 0 && (
+          {tagFilters.size > 0 && (
             <button
               onClick={() => {
-                setSelectedTagsRaw(new Set())
+                setTagFiltersRaw(new Map())
                 // Internal-state path also clears localStorage; the controlled
                 // path's persistence is the parent's responsibility (so
                 // controlled mode skips the removeItem here).
-                if (!onSelectedTagsChange) {
+                if (!onTagFiltersChange) {
                   try { localStorage.removeItem(TAG_FILTER_KEY) } catch { /* ignore */ }
                 }
               }}
