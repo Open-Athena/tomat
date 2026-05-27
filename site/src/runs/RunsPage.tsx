@@ -637,20 +637,6 @@ function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTar
             <Sparkline pts={sparkPts} color={freshnessColor(freshSec)} />
           </div>
         )}
-        {/* Placeholder when the parquet hasn't been fetched yet — happens for
-            off-screen cards (we only fetch within ~500px of the viewport, to
-            avoid loading ~9 MB of binary on first paint). */}
-        {history == null && (
-          <Tooltip content="parquet history is fetched on demand — scroll the card into view to load its sparkline + step rates">
-            <div style={{
-              marginTop: 6, height: 36, fontSize: '0.7rem', color: '#555',
-              fontFamily: 'monospace', textAlign: 'right',
-              display: 'flex', alignItems: 'center', justifyContent: 'flex-end',
-            }}>
-              sparkline loads on scroll
-            </div>
-          </Tooltip>
-        )}
         {/* Step-rate over last 1m / 1h / 6h. Anchored to last log timestamp
             (a run that died 2m ago shows steps in the 1m before that). */}
         {(rate1m != null || rate1h != null || rate6h != null) && (
@@ -832,76 +818,15 @@ function orderRuns(cards: RunCardData[]): RunCardData[] {
 function RunsIndex() {
   // Per-card DOM refs so we can detect off-screen + scroll into view.
   const cardRefs = useRef<Map<string, HTMLDivElement>>(new Map())
+  const setCardRef = useCallback((id: string, el: HTMLDivElement | null) => {
+    if (el) cardRefs.current.set(id, el)
+    else cardRefs.current.delete(id)
+  }, [])
   // Whether the currently-active card is inside the viewport. Drives the
   // sticky-bottom banner (shown when active but off-screen).
   // (Effect that watches `activeRunId` is registered below, after that
   // value is derived from the trace-highlight state.)
   const [activeInView, setActiveInView] = useState(true)
-
-  // Lazy parquet loading: a card's history fetch only fires once the card has
-  // come within ~500px of the viewport. Without this, the initial page load
-  // for ~50 runs is ~9 MB of binary parquets (median ~100 KB, largest 1.3 MB)
-  // even though most cards are off-screen. The 500px threshold is generous so
-  // the user doesn't see a flash when scrolling fast.
-  //
-  // The set is a "high-watermark" — once a card has been visible we keep its
-  // history loaded (and continue polling via TSQ `refetchInterval`). This
-  // avoids re-fetching every scroll-away/back and avoids the timeline plot
-  // losing traces as the user scrolls.
-  const [loadedRunIds, setLoadedRunIds] = useState<Set<string>>(new Set())
-  const observerRef = useRef<IntersectionObserver | null>(null)
-  // Bootstrap the IO lazily so we have a stable handle for both registering
-  // newly-mounted cards and unobserving once a card has crossed the threshold.
-  const getObserver = useCallback(() => {
-    if (observerRef.current) return observerRef.current
-    if (typeof IntersectionObserver === 'undefined') return null
-    const io = new IntersectionObserver(
-      (entries) => {
-        let changed = false
-        const next = new Set<string>()
-        for (const entry of entries) {
-          if (!entry.isIntersecting) continue
-          const id = (entry.target as HTMLElement).dataset.runcard
-          if (id) {
-            next.add(id)
-            // Once watermarked we don't need to keep watching — saves work and
-            // means a watermarked card stays loaded even if the IO is torn
-            // down later (e.g. on a list reorder).
-            io.unobserve(entry.target)
-            changed = true
-          }
-        }
-        if (changed) {
-          setLoadedRunIds((prev) => {
-            const m = new Set(prev)
-            for (const id of next) m.add(id)
-            return m.size === prev.size ? prev : m
-          })
-        }
-      },
-      // 500px margin: load cards just outside the viewport so a fast scroll
-      // doesn't expose an unloaded card before its fetch completes.
-      { rootMargin: '500px 0px' },
-    )
-    observerRef.current = io
-    return io
-  }, [])
-  useEffect(() => {
-    return () => {
-      observerRef.current?.disconnect()
-      observerRef.current = null
-    }
-  }, [])
-  const setCardRef = useCallback((id: string, el: HTMLDivElement | null) => {
-    if (el) {
-      cardRefs.current.set(id, el)
-      getObserver()?.observe(el)
-    } else {
-      const prev = cardRefs.current.get(id)
-      if (prev) observerRef.current?.unobserve(prev)
-      cardRefs.current.delete(id)
-    }
-  }, [getObserver])
 
   // Live data via react-query: ONE aggregated snapshot poll (runs list + every
   // manifest + iris state) replaces what used to be N+2 polls (runs + iris + N
@@ -952,18 +877,11 @@ function RunsIndex() {
     return cadence.idle
   }
 
-  // `enabled` gates per-run parquet fetching on visibility. A run's history
-  // only loads once its card has come within ~500px of the viewport (set by
-  // `loadedRunIds`). Once loaded, TSQ keeps the data cached and continues
-  // refetching on the configured cadence — scrolling away does not unload.
-  // The timeline plot at the top of the page is therefore "progressive": it
-  // shows traces for whatever has loaded so far, and grows as the user scrolls.
   const historyQs = useQueries({
     queries: visible.map((id) => ({
       queryKey: ['history', id],
       queryFn: () => fetchRunHistory(parquetUrl(id)),
       refetchInterval: intervalFor(id, REFETCH_MS.history),
-      enabled: loadedRunIds.has(id),
       retry: 1,
     })),
   })
