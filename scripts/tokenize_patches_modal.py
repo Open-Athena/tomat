@@ -92,6 +92,7 @@ def tokenize(
     r2_max: int = 75,
     lmq_path: str | None = None,
     tokenizer_version: str = "v2",
+    pack: bool = False,
 ) -> dict:
     """Invoke `scripts/tokenize_patches.py` as a subprocess with the
     Modal volume mount as `--rho-gga-dir`.
@@ -131,6 +132,8 @@ def tokenize(
         cmd += ["-n", str(n_materials)]
     if pad_to is not None:
         cmd += ["-L", str(pad_to)]
+    if pack:
+        cmd += ["--pack"]
 
     _sp.run(cmd, check=True)
 
@@ -165,8 +168,12 @@ def main(
     r2_max: int = 75,
     lmq_path: str = "",
     tokenizer_version: str = "v2",
+    pack: bool = False,
 ) -> None:
-    err(f"[modal] tokenize → /vol/tokenized/{label} (pad_to={pad_to}, shape={shape}, tk={tokenizer_version})")
+    # The volume binding is selected via `TOMAT_VOLUME` env var at module
+    # import time (line 40). Default is `tomat-rho-gga` (val, 4305 mats);
+    # set `TOMAT_VOLUME=tomat-rho-gga-train` for the 77498-mat train split.
+    err(f"[modal] tokenize → /vol/tokenized/{label} (pad_to={pad_to}, shape={shape}, tk={tokenizer_version}, pack={pack}, vol={VOLUME_NAME})")
     result = tokenize.remote(
         label=label,
         split=split,
@@ -182,6 +189,7 @@ def main(
         r2_max=r2_max,
         lmq_path=lmq_path or None,
         tokenizer_version=tokenizer_version,
+        pack=pack,
     )
     meta = result["meta"]
     err(f"[modal] done: {meta['total_rows']:,} rows in {meta['n_shards']} shards")
@@ -222,6 +230,7 @@ def parallel(
     r2_max: int = 75,
     lmq_path: str = "",
     tokenizer_version: str = "v2",
+    pack: bool = False,
 ) -> None:
     # NB: default bumped 16 → 256 per Ryan's 2026-04-24 observation that Modal
     # has plenty of headroom. Volume read throughput is the ceiling around this
@@ -263,6 +272,7 @@ def parallel(
             shape=shape, r2_max=r2_max,
             lmq_path=lmq_path or None,
             tokenizer_version=tokenizer_version,
+            pack=pack,
         )
         for i in indices
     ]
