@@ -42,6 +42,12 @@ interface Props {
    *  falls back to `[shortLabel, ...tagsFor(label)].join(' ')` (the haystack
    *  this component computed before the multi-term filter landed). */
   runHaystacks?: Map<string, string>
+  /** Fires when the closest trace under the cursor changes — passes the trace
+   *  label (= `RunTimelineSeries.label`) or `null` on unhover. Distinct from
+   *  `highlight.setHoverTrace` (which is also driven by card hover): use this
+   *  to do plot-hover-only side effects, e.g. floating the matching card to
+   *  the top without creating a card-hover feedback loop. */
+  onPlotHover?: (label: string | null) => void
 }
 
 /** Local-TZ datetime string for a Plotly date axis. Plotly treats a string
@@ -239,7 +245,7 @@ function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
   return { x, y }
 }
 
-export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks }: Props) {
+export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onPlotHover }: Props) {
   const { isDark } = useTheme()
 
   // Legend collapse persists in localStorage — it's long, some users tuck it
@@ -355,9 +361,14 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks }: P
           // step-progress curves are step functions; loss is continuous.
           shape: (xMode === 'loss' ? 'linear' : 'hv') as 'linear' | 'hv',
         },
+        // x-unified TT row layout: `<color> <hovertemplate-result>`. The
+        // `<extra>` (right-side annotation) holds the trace name in non-unified
+        // mode but is omitted from unified-mode rows, so we have to embed
+        // `fullData.name` in the template ourselves. Without this, every row
+        // reads "loss 3.093" with no way to tell which run is which.
         hovertemplate: xMode === 'loss'
-          ? `loss %{y:.3f}<extra></extra>`
-          : `step %{y:,}<extra></extra>`,
+          ? `%{fullData.name} · %{y:.3f}<extra></extra>`
+          : `%{fullData.name} · %{y:,}<extra></extra>`,
       }
     })
     .filter((d): d is NonNullable<typeof d> => d !== null)
@@ -431,6 +442,7 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks }: P
     if (bestName !== closestTraceRef.current) {
       closestTraceRef.current = bestName
       highlight?.setHoverTrace(bestName)
+      onPlotHover?.(bestName)
     }
   }
   const handlePlotUnhover = () => {
@@ -439,6 +451,7 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks }: P
     // useTraceHighlight) absorbs the brief gap when the next hover arrives.
     closestTraceRef.current = null
     highlight?.setHoverTrace(null)
+    onPlotHover?.(null)
   }
 
   // Plot click → pin the closest trace. Plot doesn't expose `onClick` as a

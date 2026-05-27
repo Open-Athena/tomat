@@ -944,6 +944,16 @@ function RunsIndex() {
   )
   const activeRunId = highlight.activeTrace ? labelToId.get(highlight.activeTrace) ?? null : null
 
+  // `plotHoverRunId` is set ONLY when the cursor is over the timeline plot and
+  // we compute a closest trace. Distinct from `activeRunId` (which is also set
+  // by *card* hover) — using `activeRunId` to drive the float-to-top below
+  // creates a feedback loop: hovering card N promotes it to slot 1, the cursor
+  // is now over card N+1 (a different run), which promotes *that* one to
+  // slot 1, …flicker. Card hover should highlight the legend/plot but NOT
+  // reorder the card list.
+  const [plotHoverLabel, setPlotHoverLabel] = useState<string | null>(null)
+  const plotHoverRunId = plotHoverLabel ? labelToId.get(plotHoverLabel) ?? null : null
+
   // IntersectionObserver on the active card — drives the sticky-bottom banner.
   // Must live below `activeRunId` (TDZ): the dep array is evaluated during
   // render, so it can't appear before the declaration.
@@ -1022,19 +1032,19 @@ function RunsIndex() {
     return s
   }, [filterCompiled, ordered, runHaystacksById])
 
-  // Card order: pinned first, then the hover-active card (if any, and not the
+  // Card order: pinned first, then the plot-hover card (if any, and not the
   // already-pinned run), then regex-matches, then everything else (each group
-  // preserving activity-order from `ordered`). The hover-active slot floats up
-  // the card whose timeline trace the cursor is closest to — sourced from
-  // `activeRunId`, which is set both by card hover and by the plot's
-  // closest-y-trace hover handler.
+  // preserving activity-order from `ordered`). The hover slot floats up the
+  // card whose timeline trace the cursor is closest to — sourced from
+  // `plotHoverRunId` (set ONLY by the plot's closest-trace hover handler).
+  // Using `activeRunId` here would create a flicker loop on card hover.
   const displayed = useMemo(() => {
     if (!ordered) return ordered
     const pinned = pinnedRunId ? ordered.find((c) => c.id === pinnedRunId) : null
-    // Hover slot collapses when the cursor isn't on a trace/card, or when the
-    // hovered card is already the pinned one (no point duplicating slot 0).
-    const hovered = activeRunId && activeRunId !== pinnedRunId
-      ? ordered.find((c) => c.id === activeRunId)
+    // Hover slot collapses when the cursor isn't on a trace, or when the
+    // closest-trace card is already pinned (no point duplicating slot 0).
+    const hovered = plotHoverRunId && plotHoverRunId !== pinnedRunId
+      ? ordered.find((c) => c.id === plotHoverRunId)
       : null
     const taken = new Set<string>()
     if (pinned) taken.add(pinned.id)
@@ -1049,7 +1059,7 @@ function RunsIndex() {
     const matched = rest.filter((c) => matchedIds.has(c.id))
     const others = rest.filter((c) => !matchedIds.has(c.id))
     return [...top, ...matched, ...others]
-  }, [ordered, pinnedRunId, activeRunId, matchedIds])
+  }, [ordered, pinnedRunId, plotHoverRunId, matchedIds])
 
   // On (re)pin, scroll the now-top pinned card into view.
   useEffect(() => {
@@ -1109,6 +1119,7 @@ function RunsIndex() {
             runs={timelineSeries}
             highlight={highlight}
             runHaystacks={runHaystacksByLabel}
+            onPlotHover={setPlotHoverLabel}
           />
         </div>
       )}
