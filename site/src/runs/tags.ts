@@ -209,3 +209,37 @@ export function parseTagFilters(raw: string): TagFilters {
 export function serializeTagFilters(filters: TagFilters): string {
   return JSON.stringify(Object.fromEntries(filters))
 }
+
+/** First-visit default. The init-cls-bug-era `bunk` runs (mg-1, mg-2-*) all
+ *  trained as plain CE, so they spam the CE/EMD chip filters and drown out
+ *  the post-fix runs that actually tested those losses. Pre-excluding them
+ *  matches what most viewers want by default; flip the chip to opt back in. */
+export function defaultTagFilters(): TagFilters {
+  return new Map([['bunk', 'out']])
+}
+
+/** URL-friendly encoding (distinct from `serializeTagFilters`, which emits
+ *  JSON for localStorage). `'in'` tags are emitted bare, `'out'` tags get a
+ *  leading `-`, joined by spaces. `URLSearchParams` then encodes the space
+ *  as `+` and any internal `+` (e.g. `CE+EMD`) as `%2B`, so
+ *  `{CE: 'in', bunk: 'out', CE+EMD: 'in'}` round-trips as
+ *  `?tags=CE+-bunk+CE%2BEMD` on the wire — mirrors the `use-prms` numeric
+ *  sign-as-delimiter convention. */
+export function serializeTagFiltersUrl(filters: TagFilters): string {
+  const parts: string[] = []
+  for (const [tag, state] of filters) {
+    parts.push(state === 'out' ? `-${tag}` : tag)
+  }
+  return parts.join(' ')
+}
+
+export function parseTagFiltersUrl(s: string): TagFilters {
+  const m: TagFilters = new Map()
+  if (!s) return m
+  for (const tok of s.split(/\s+/)) {
+    if (!tok) continue
+    if (tok.startsWith('-')) m.set(tok.slice(1), 'out')
+    else m.set(tok, 'in')
+  }
+  return m
+}

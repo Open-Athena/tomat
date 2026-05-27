@@ -13,7 +13,7 @@ import { Tooltip } from '../Tooltip'
 import type { UseTraceHighlightReturn } from 'pltly/react'
 import { themedHoverlabel } from '../theme'
 import type { RunHistory } from './parquet'
-import { ALL_TAGS, cycleTagFilter, parseTagFilters, runPassesTagFilters, serializeTagFilters, tagsFor, type RunTag, type TagFilters } from './tags'
+import { ALL_TAGS, cycleTagFilter, defaultTagFilters, parseTagFilters, parseTagFiltersUrl, runPassesTagFilters, serializeTagFilters, serializeTagFiltersUrl, tagsFor, type RunTag, type TagFilters } from './tags'
 import { compileMultiTermFilter } from './filter'
 // Re-export so RunsPage can `import { ... } from './RunsTimelinePlot'` —
 // keeps callers off the helper module's internal path.
@@ -128,6 +128,92 @@ function writeUrlRegex(v: string): void {
   if (next !== hash) {
     try { window.history.replaceState(null, '', next) } catch { /* ignore */ }
   }
+}
+
+/** URL-state for the tag-chip tri-state filter. Mirrors `useNameFilter`'s
+ *  hash-aware encode/decode (HashRouter; we look at `location.hash`, not
+ *  `.search`). Encoding: `'in'` tags emitted bare, `'out'` tags get a `-`
+ *  prefix, joined by spaces — URLSearchParams encodes the space as `+`.
+ *
+ *  Missing `?tags` (i.e. brand-new visit) → `null` (caller applies its own
+ *  default — typically `defaultTagFilters()`). Empty `?tags=` → empty Map
+ *  (user explicitly cleared every chip, default should not snap back). */
+function readUrlTags(): TagFilters | null {
+  if (typeof window === 'undefined') return null
+  const hash = window.location.hash || ''
+  const qIdx = hash.indexOf('?')
+  if (qIdx < 0) return null
+  try {
+    const params = new URLSearchParams(hash.slice(qIdx + 1))
+    const raw = params.get('tags')
+    if (raw === null) return null
+    return parseTagFiltersUrl(raw)
+  } catch { return null }
+}
+
+function writeUrlTags(filters: TagFilters): void {
+  if (typeof window === 'undefined') return
+  const hash = window.location.hash || '#/'
+  const qIdx = hash.indexOf('?')
+  const path = qIdx < 0 ? hash : hash.slice(0, qIdx)
+  let params: URLSearchParams
+  try { params = new URLSearchParams(qIdx < 0 ? '' : hash.slice(qIdx + 1)) }
+  catch { params = new URLSearchParams() }
+  // Always write — even an empty value — so reload / back-button doesn't
+  // snap back to the first-visit default. To reset to default, navigate
+  // to `/runs` (no `?tags=`).
+  params.set('tags', serializeTagFiltersUrl(filters))
+  const qs = params.toString()
+  const next = qs ? `${path}?${qs}` : path
+  if (next !== hash) {
+    try { window.history.replaceState(null, '', next) } catch { /* ignore */ }
+  }
+}
+
+const TAG_FILTER_EVT = 'tomat:runs-tag-filter-change'
+
+/** React hook owning the tag-filter map. URL is the source of truth; the
+ *  legacy `localStorage` value (single-state-array shape) is migrated on
+ *  first read then cleared. First-visit default: `{ bunk: 'out' }`. */
+export function useTagFilters(): readonly [TagFilters, (v: TagFilters) => void] {
+  const [filters, setFilters] = useState<TagFilters>(() => {
+    const fromUrl = readUrlTags()
+    if (fromUrl !== null) return fromUrl
+    try {
+      const raw = localStorage.getItem(TAG_FILTER_KEY)
+      if (raw) {
+        // Migrate to URL, then drop the localStorage entry (URL is canonical
+        // going forward). Future loads will read straight from the URL.
+        const ls = parseTagFilters(raw)
+        writeUrlTags(ls)
+        try { localStorage.removeItem(TAG_FILTER_KEY) } catch { /* ignore */ }
+        return ls
+      }
+    } catch { /* ignore */ }
+    return defaultTagFilters()
+  })
+  useEffect(() => {
+    const onEvt = (e: Event) => {
+      const detail = (e as CustomEvent<TagFilters>).detail
+      if (detail instanceof Map) setFilters(detail)
+    }
+    const onHash = () => {
+      const v = readUrlTags()
+      if (v !== null) setFilters(v)
+    }
+    window.addEventListener(TAG_FILTER_EVT, onEvt)
+    window.addEventListener('hashchange', onHash)
+    return () => {
+      window.removeEventListener(TAG_FILTER_EVT, onEvt)
+      window.removeEventListener('hashchange', onHash)
+    }
+  }, [])
+  const update = (v: TagFilters) => {
+    setFilters(v)
+    writeUrlTags(v)
+    window.dispatchEvent(new CustomEvent(TAG_FILTER_EVT, { detail: v }))
+  }
+  return [filters, update] as const
 }
 
 export function useNameFilter(): readonly [string, (v: string) => void] {

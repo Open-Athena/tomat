@@ -6,8 +6,8 @@ import type { EvalJob, EvalPoint, IrisJob, RunManifest } from './api'
 import { fetchRunHistory } from './parquet'
 import type { RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
-import { RunsTimelinePlot, colorForIndex, shortLabel, useNameFilter, compileMultiTermFilter, runHaystack, TAG_FILTER_KEY } from './RunsTimelinePlot'
-import { parseTagFilters, runPassesTagFilters, serializeTagFilters, tagsFor, type TagFilters } from './tags'
+import { RunsTimelinePlot, colorForIndex, shortLabel, useNameFilter, useTagFilters, compileMultiTermFilter, runHaystack } from './RunsTimelinePlot'
+import { runPassesTagFilters, tagsFor } from './tags'
 import type { RunTimelineSeries } from './RunsTimelinePlot'
 import { useTraceHighlight } from 'pltly/react'
 
@@ -1033,26 +1033,12 @@ function RunsIndex() {
     return s
   }, [filterCompiled, ordered, runHaystacksById])
 
-  // Tag chip filter, lifted up from `RunsTimelinePlot` so the same selection
-  // can hard-filter the card list (not just the plotted traces). Tri-state
-  // per tag: each tag is off / `'in'` (run must have it) / `'out'` (run must
-  // not have it). Initialized from `localStorage` once at mount, persisted
-  // on every change. `parseTagFilters` handles the legacy single-state array
-  // shape so old localStorage entries still load.
-  const [tagFilters, setTagFilters] = useState<TagFilters>(() => {
-    try {
-      const raw = localStorage.getItem(TAG_FILTER_KEY)
-      if (raw) return parseTagFilters(raw)
-    } catch { /* ignore */ }
-    return new Map()
-  })
-  const onTagFiltersChange = useCallback((next: TagFilters) => {
-    setTagFilters(next)
-    try {
-      if (next.size === 0) localStorage.removeItem(TAG_FILTER_KEY)
-      else localStorage.setItem(TAG_FILTER_KEY, serializeTagFilters(next))
-    } catch { /* ignore */ }
-  }, [])
+  // Tag chip filter (tri-state, URL-synced). `useTagFilters` is the shared
+  // source of truth: URL `?tags=` → state, default `{bunk: 'out'}` on first
+  // visit, legacy localStorage migrated on first read. The plot consumes the
+  // same hook via the controlled `tagFilters` / `onTagFiltersChange` props
+  // below, so chip clicks update both the plot and the card list in lockstep.
+  const [tagFilters, onTagFiltersChange] = useTagFilters()
   // Runs whose tag set satisfies the tri-state constraint. `null` when no
   // tags are active — semantics: "no tag constraint, show all". Distinct
   // from regex-`matchedIds`, which only sorts: tags hard-filter (matching
