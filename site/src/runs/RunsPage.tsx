@@ -1022,19 +1022,34 @@ function RunsIndex() {
     return s
   }, [filterCompiled, ordered, runHaystacksById])
 
-  // Card order: pinned first, then regex-matches, then everything else
-  // (each group preserving activity-order from `ordered`).
+  // Card order: pinned first, then the hover-active card (if any, and not the
+  // already-pinned run), then regex-matches, then everything else (each group
+  // preserving activity-order from `ordered`). The hover-active slot floats up
+  // the card whose timeline trace the cursor is closest to — sourced from
+  // `activeRunId`, which is set both by card hover and by the plot's
+  // closest-y-trace hover handler.
   const displayed = useMemo(() => {
     if (!ordered) return ordered
     const pinned = pinnedRunId ? ordered.find((c) => c.id === pinnedRunId) : null
-    const rest = pinned ? ordered.filter((c) => c.id !== pinned.id) : ordered
+    // Hover slot collapses when the cursor isn't on a trace/card, or when the
+    // hovered card is already the pinned one (no point duplicating slot 0).
+    const hovered = activeRunId && activeRunId !== pinnedRunId
+      ? ordered.find((c) => c.id === activeRunId)
+      : null
+    const taken = new Set<string>()
+    if (pinned) taken.add(pinned.id)
+    if (hovered) taken.add(hovered.id)
+    const rest = ordered.filter((c) => !taken.has(c.id))
+    const top: typeof ordered = []
+    if (pinned) top.push(pinned)
+    if (hovered) top.push(hovered)
     if (!matchedIds || matchedIds.size === 0) {
-      return pinned ? [pinned, ...rest] : rest
+      return [...top, ...rest]
     }
     const matched = rest.filter((c) => matchedIds.has(c.id))
     const others = rest.filter((c) => !matchedIds.has(c.id))
-    return pinned ? [pinned, ...matched, ...others] : [...matched, ...others]
-  }, [ordered, pinnedRunId, matchedIds])
+    return [...top, ...matched, ...others]
+  }, [ordered, pinnedRunId, activeRunId, matchedIds])
 
   // On (re)pin, scroll the now-top pinned card into view.
   useEffect(() => {

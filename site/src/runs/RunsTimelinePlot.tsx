@@ -7,7 +7,7 @@
 // Intended as the at-a-glance "what's happening across all my training jobs?"
 // visual at the top of the /runs index.
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { LegendItem, Plot, useTheme } from 'pltly/react'
 import { Tooltip } from '../Tooltip'
 import type { UseTraceHighlightReturn } from 'pltly/react'
@@ -379,6 +379,104 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks }: P
   // Reset when xMode changes (different x scale = different range units).
   const [userXRange, setUserXRange] = useState<[number | string, number | string] | null>(null)
   useEffect(() => { setUserXRange(null) }, [xMode])
+
+  // Closest-trace-on-hover: with `hovermode: 'x unified'` Plotly hands us every
+  // trace's value at the cursor's x; we pick the one whose y is closest to the
+  // cursor's y (in data coords) and route it through `highlight.setHoverTrace`.
+  // That paints the legend item active, fades the others, and lets the parent
+  // float the matching run card to the top of the list (see RunsPage.displayed).
+  //
+  // `closestTraceRef` mirrors the latest closest-trace name without re-rendering
+  // on every mousemove — the plotly_click handler reads it to know what to pin.
+  const closestTraceRef = useRef<string | null>(null)
+  const plotWrapperRef = useRef<HTMLDivElement | null>(null)
+  const handlePlotHover = (event: { points?: Array<Record<string, unknown>>; event?: MouseEvent }) => {
+    const points = event.points
+    if (!points || points.length === 0) return
+    // Cursor pixel y → data y via the first point's y-axis. All points share
+    // the same axis here (single subplot), so any point's `yaxis` works.
+    const first = points[0] as Record<string, unknown> & {
+      yaxis?: { p2d?: (p: number) => number; l2p?: (l: number) => number; _offset?: number; d2l?: (v: number) => number }
+    }
+    const yaxis = first.yaxis
+    const mouseEvt = event.event
+    if (!yaxis || !mouseEvt) return
+    const plotEl = (mouseEvt.target as HTMLElement | null)?.closest('.plotly') as HTMLElement | null
+    if (!plotEl) return
+    const rect = plotEl.getBoundingClientRect()
+    const cursorPx = mouseEvt.clientY - rect.top
+    const yOffset = yaxis._offset ?? 0
+    // Plotly's `p2d` converts pixel-within-axis to a data value (axis-aware:
+    // handles log scales etc.). We pass cursor-y relative to the axis origin.
+    const cursorY = yaxis.p2d ? yaxis.p2d(cursorPx - yOffset) : null
+    if (cursorY == null || !Number.isFinite(cursorY)) return
+    let bestName: string | null = null
+    let bestDist = Infinity
+    for (const p of points) {
+      const py = (p as { y?: number | null }).y
+      const data = (p as { data?: { name?: string } }).data
+      if (py == null || !Number.isFinite(py) || !data?.name) continue
+      // On a log y-axis, comparing |y_trace − y_cursor| in data space biases
+      // toward small values (a 10×-distant trace near y=1 looks closer than a
+      // 1.5×-distant trace near y=10). For loss-vs-step (the only log-capable
+      // mode) we compare in log space when logY is on, linear otherwise.
+      const dist = (xMode === 'loss' && logY)
+        ? Math.abs(Math.log(Math.max(py, 1e-9)) - Math.log(Math.max(cursorY as number, 1e-9)))
+        : Math.abs(py - (cursorY as number))
+      if (dist < bestDist) {
+        bestDist = dist
+        bestName = data.name
+      }
+    }
+    if (bestName !== closestTraceRef.current) {
+      closestTraceRef.current = bestName
+      highlight?.setHoverTrace(bestName)
+    }
+  }
+  const handlePlotUnhover = () => {
+    // Don't immediately clear — Plotly fires unhover when the cursor moves
+    // between samples on the same trace. The hook's debounce (debounceMs in
+    // useTraceHighlight) absorbs the brief gap when the next hover arrives.
+    closestTraceRef.current = null
+    highlight?.setHoverTrace(null)
+  }
+
+  // Plot click → pin the closest trace. Plot doesn't expose `onClick` as a
+  // prop, but Plotly's emitter mounted on `.js-plotly-plot` is reachable from
+  // our wrapper ref. Re-bind on every mount; the cleanup pulls the listener
+  // back off.
+  useEffect(() => {
+    const root = plotWrapperRef.current
+    if (!root || !highlight) return
+    // Plotly's div has class `js-plotly-plot` AND its emitter (`.on/.removeListener`).
+    // The element appears after Plotly's first react() call; poll briefly.
+    let cancelled = false
+    let plotEl: (HTMLElement & {
+      on?: (evt: string, fn: (e: unknown) => void) => void
+      removeListener?: (evt: string, fn: (e: unknown) => void) => void
+    }) | null = null
+    const handler = (_e: unknown) => {
+      const name = closestTraceRef.current
+      if (name) highlight.togglePin(name)
+    }
+    const attach = () => {
+      if (cancelled) return
+      const el = root.querySelector('.js-plotly-plot') as typeof plotEl
+      if (!el?.on) {
+        // Not ready yet; try again on next frame. Bail after ~1s of trying.
+        requestAnimationFrame(attach)
+        return
+      }
+      plotEl = el
+      el.on('plotly_click', handler)
+    }
+    attach()
+    return () => {
+      cancelled = true
+      plotEl?.removeListener?.('plotly_click', handler)
+    }
+    // Re-attach when highlight changes (different `togglePin` closure).
+  }, [highlight])
   const handleRelayout = (ev: Record<string, unknown>) => {
     // Double-click resets to auto-range.
     if (ev['xaxis.autorange'] === true) {
@@ -542,12 +640,15 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks }: P
           </Tooltip>
         )}
       </div>
+      <div ref={plotWrapperRef}>
       <Plot
         data={data}
         // Fade is applied in `data` above (true grey), not via pltly's
         // highlight fade. `disableSoloTrace` stops a stray click on a plotted
         // line from creating a solo state disconnected from our `highlight`.
         disableSoloTrace
+        onHover={handlePlotHover}
+        onUnhover={handlePlotUnhover}
         layout={{
           autosize: true,
           height: 320,
@@ -565,6 +666,7 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks }: P
         }}
         onRelayout={handleRelayout as never}
       />
+      </div>
       {/* Custom collapsible legend. Each item hovers→highlight, clicks→pin,
           via the shared `useTraceHighlight` handlers (the pltly idiom). */}
       <div style={{ marginTop: 2, fontSize: '0.75rem' }}>
