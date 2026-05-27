@@ -2,6 +2,16 @@
 
 Status: **v1 live** (81,769 mats ingested). Written 2026-04-23.
 
+> **2026-05-27 update**: schema bumped to **v3**. The virtual
+> `cube_seq_pN` / `ball_seq_rN` formulas below reflect the v2-era
+> tokenizer (extra SHAPE/OFFSET/HI blocks + 2-token-9-12 density codec).
+> v3 + LMQ-density (in production since post-04) instead emits
+> `21 + 10·N + V` tokens per patch (one density token per voxel). The
+> live formulas in `data/mpdb.sqlite` and `scripts/build_mpdb.py` have
+> been updated; this spec keeps the original schema as historical
+> reference. See `posts/08-tokenization-design-space.md` §1 for the v3
+> preamble breakdown.
+
 ## Purpose
 
 Single source of truth for per-material metadata. Replaces the ad-hoc

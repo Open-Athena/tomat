@@ -285,7 +285,14 @@ class PatchTokenizer:
         n: int,
         rng: np.random.Generator,
     ) -> np.ndarray:
-        """Return ``(n, 3)`` int offsets, uniformly over ``[0, grid_shape[i])``."""
+        """Return ``(n, 3)`` int offsets, uniformly over ``[0, grid_shape[i])``.
+
+        Each axis is sampled i.i.d. uniformly with replacement; no
+        de-duplication, no disjoint-stride constraint. Combined with the
+        PBC wrap in :py:meth:`extract_patch` (``np.take(mode='wrap')``),
+        the same voxel can appear in multiple sampled patches in one
+        epoch.
+        """
         return np.stack([rng.integers(0, s, size=n) for s in grid_shape], axis=1)
 
     # ---- tokenization -----------------------------------------------------
