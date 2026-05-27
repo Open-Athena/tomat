@@ -294,7 +294,25 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
   const fg = isDark ? '#bbb' : '#444'
   const muted = isDark ? '#888' : '#666'
 
-  const xaxis = xMode === 'clock'
+  // User-driven x-zoom selection. Sticky until the user double-clicks the plot
+  // (Plotly's auto-range gesture). Without this, every parent re-render
+  // recomputes the auto-ranged `xaxis` and overwrites Plotly's internal zoom.
+  // Reset when xMode changes (different x scale = different range units).
+  const [userXRange, setUserXRange] = useState<[number | string, number | string] | null>(null)
+  useEffect(() => { setUserXRange(null) }, [xMode])
+  const handleRelayout = (ev: Record<string, unknown>) => {
+    // Double-click resets to auto-range.
+    if (ev['xaxis.autorange'] === true) {
+      setUserXRange(null)
+      return
+    }
+    const x0 = ev['xaxis.range[0]']
+    const x1 = ev['xaxis.range[1]']
+    if (x0 != null && x1 != null) {
+      setUserXRange([x0 as number | string, x1 as number | string])
+    }
+  }
+  const xaxisBase = xMode === 'clock'
     ? { type: 'date' as const, gridcolor, zerolinecolor, linecolor: gridcolor }
     : {
       type: 'linear' as const,
@@ -304,6 +322,9 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
       },
       gridcolor, zerolinecolor, linecolor: gridcolor,
     }
+  const xaxis = userXRange
+    ? { ...xaxisBase, range: userXRange, autorange: false as const }
+    : xaxisBase
 
   // Loss mode: clip the y-axis to a robust percentile so spike outliers don't
   // crush the trend band. A percentile (not median+σ — σ is inflated by the
@@ -457,6 +478,7 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
           // shared trace-highlight so legend hover brushes the plot + cards.
           showlegend: false,
         }}
+        onRelayout={handleRelayout as never}
       />
       {/* Custom collapsible legend. Each item hovers→highlight, clicks→pin,
           via the shared `useTraceHighlight` handlers (the pltly idiom). */}
