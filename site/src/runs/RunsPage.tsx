@@ -6,8 +6,7 @@ import type { EvalJob, EvalPoint, IrisJob, RunManifest } from './api'
 import { fetchRunHistory } from './parquet'
 import type { RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
-import { RunsTimelinePlot, colorForIndex, shortLabel, useNameFilter, compileNameFilter } from './RunsTimelinePlot'
-import { tagsFor } from './tags'
+import { RunsTimelinePlot, colorForIndex, shortLabel, useNameFilter, compileMultiTermFilter, runHaystack } from './RunsTimelinePlot'
 import type { RunTimelineSeries } from './RunsTimelinePlot'
 import { useTraceHighlight } from 'pltly/react'
 
@@ -981,24 +980,47 @@ function RunsIndex() {
     ? labelToId.get(highlight.pinnedTrace) ?? null
     : null
 
+  // Per-run rich haystack (label + tags + YYMMDD created/last-activity +
+  // hardware tokens + lineage). Built once for all cards, then keyed by both
+  // run id (for card-match) and short-label (passed to the plot via prop).
+  // `ordered` carries the same manifest/job/history triple the haystack needs,
+  // so we build straight off of it.
+  const runHaystacksById = useMemo(() => {
+    const m = new Map<string, string>()
+    if (!ordered) return m
+    for (const c of ordered) {
+      m.set(c.id, runHaystack(shortLabel(c.id), c.manifest, c.job, c.history))
+    }
+    return m
+  }, [ordered])
+  const runHaystacksByLabel = useMemo(() => {
+    const m = new Map<string, string>()
+    if (!ordered) return m
+    for (const c of ordered) {
+      m.set(shortLabel(c.id), runHaystacksById.get(c.id) ?? shortLabel(c.id))
+    }
+    return m
+  }, [ordered, runHaystacksById])
+
   // Regex name-filter (synced with the plot's input via useNameFilter).
   // When active, matching cards float to the top of the list and non-matching
   // ones fade — same intent as the plot's filter, but non-destructive.
+  // New whitespace=AND syntax (see filter.ts). Invalid filter → no matching
+  // (treated as "no filter" so the dashboard stays usable while typing).
   const [nameFilter] = useNameFilter()
-  const { re: nameRe } = compileNameFilter(nameFilter)
+  const filterCompiled = useMemo(
+    () => compileMultiTermFilter(nameFilter),
+    [nameFilter],
+  )
   const matchedIds = useMemo(() => {
-    if (!nameRe || !ordered) return null
+    if (filterCompiled.empty || filterCompiled.error || !ordered) return null
     const s = new Set<string>()
-    // Match against [shortLabel + tags] so regexes can target either the
-    // displayed name OR a curated tag (e.g. `SS-sweep`, `noprm-experiment`).
-    // The tag side rescues runs whose names lie about their recipe
-    // (e.g. older `-emd-do-` runs that actually trained as CE).
     for (const c of ordered) {
-      const haystack = [shortLabel(c.id), ...tagsFor(c.id)].join(' ')
-      if (nameRe.test(haystack)) s.add(c.id)
+      const h = runHaystacksById.get(c.id) ?? shortLabel(c.id)
+      if (filterCompiled.matches(h)) s.add(c.id)
     }
     return s
-  }, [nameRe, ordered])
+  }, [filterCompiled, ordered, runHaystacksById])
 
   // Card order: pinned first, then regex-matches, then everything else
   // (each group preserving activity-order from `ordered`).
@@ -1068,7 +1090,11 @@ function RunsIndex() {
       {ordered && ordered.length === 0 && <p>(none synced yet)</p>}
       {timelineSeries.length > 0 && (
         <div style={{ marginBottom: '1.2rem' }}>
-          <RunsTimelinePlot runs={timelineSeries} highlight={highlight} />
+          <RunsTimelinePlot
+            runs={timelineSeries}
+            highlight={highlight}
+            runHaystacks={runHaystacksByLabel}
+          />
         </div>
       )}
       {displayed && displayed.map((c) => {

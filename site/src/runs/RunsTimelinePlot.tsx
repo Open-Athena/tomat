@@ -14,6 +14,11 @@ import type { UseTraceHighlightReturn } from 'pltly/react'
 import { themedHoverlabel } from '../theme'
 import type { RunHistory } from './parquet'
 import { ALL_TAGS, tagsFor, type RunTag } from './tags'
+import { compileMultiTermFilter } from './filter'
+// Re-export so RunsPage can `import { ... } from './RunsTimelinePlot'` —
+// keeps callers off the helper module's internal path.
+export { compileMultiTermFilter, runHaystack, FILTER_EXAMPLES } from './filter'
+export type { MultiTermFilter } from './filter'
 
 export interface RunTimelineSeries {
   id: string
@@ -31,6 +36,12 @@ interface Props {
   /** Shared trace-highlight state machine (from `useTraceHighlight` in parent).
    *  Drives fade/solo + lets cards + the custom legend brush the plot. */
   highlight?: UseTraceHighlightReturn
+  /** Per-run-id haystack string for the name-filter regex. The parent owns
+   *  manifest + iris + history (the inputs to the haystack) so it builds the
+   *  string per run; the plot just keys into the map. When omitted, the plot
+   *  falls back to `[shortLabel, ...tagsFor(label)].join(' ')` (the haystack
+   *  this component computed before the multi-term filter landed). */
+  runHaystacks?: Map<string, string>
 }
 
 /** Local-TZ datetime string for a Plotly date axis. Plotly treats a string
@@ -58,11 +69,16 @@ const NAME_FILTER_EVT = 'tomat:runs-name-filter-change'
 const TAG_FILTER_KEY = 'tomat:runs-tag-filter'
 
 /**
- * Cross-component reactive store for the regex name-filter input.
+ * Cross-component reactive store for the (multi-term regex) name-filter input.
  *
  * Sources of truth (precedence on load):
  *   1. URL `?regex=…` query param — shareable / linkable
  *   2. localStorage — survives page reloads
+ *
+ * The query-param name `regex` is preserved for backward compatibility with
+ * pre-existing shareable links; the value's grammar is whatever the current
+ * filter compiler accepts (today: whitespace=AND multi-term regex via
+ * `compileMultiTermFilter` in ./filter.ts).
  *
  * On change: writes both back (URL via replaceState, no extra history entry).
  * Same-tab `localStorage`/popstate events don't always fire, so the setter
@@ -139,9 +155,12 @@ export function useNameFilter(): readonly [string, (v: string) => void] {
   return [filter, update] as const
 }
 
-/** Compile the persisted name-filter to a regex (case-insensitive). Returns
- * `{re: null, error: false}` for empty input, and `{re: null, error: true}`
- * for invalid regex syntax (UI can show a red border). */
+/** Compile the persisted name-filter to a single case-insensitive regex.
+ *  @deprecated Use `compileMultiTermFilter` for the new whitespace=AND syntax.
+ *  Retained as a back-compat shim so any straggling import still typechecks;
+ *  internally it just delegates to the multi-term compiler and exposes the
+ *  same `{re, error}` shape the original returned (with `re` matching the
+ *  whole input as one regex when there's a single term). */
 export function compileNameFilter(filter: string): { re: RegExp | null; error: boolean } {
   if (filter.trim() === '') return { re: null, error: false }
   try { return { re: new RegExp(filter, 'i'), error: false } }
@@ -220,7 +239,7 @@ function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
   return { x, y }
 }
 
-export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
+export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks }: Props) {
   const { isDark } = useTheme()
 
   // Legend collapse persists in localStorage — it's long, some users tuck it
@@ -258,26 +277,20 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
 
   // Regex filter on run name. Persisted + cross-component-synced (RunsPage
   // reads the same hook to sort matching cards to top + fade non-matches).
+  // New multi-term syntax: whitespace = AND across regexes, `|` keeps regex-OR
+  // semantics within a term. Invalid regex in ANY term → whole filter invalid
+  // (red border + no filtering applied), same UX as the old single-regex.
   const [nameFilter, setNameFilter] = useNameFilter()
-  // Compile the regex once per change; invalid patterns just fall through to
-  // "no filter" with a visual hint on the input (red border).
-  let nameRe: RegExp | null = null
-  let nameReError = false
-  if (nameFilter.trim() !== '') {
-    try { nameRe = new RegExp(nameFilter, 'i') }
-    catch { nameReError = true }
-  }
-  // Match against both the (short) display label AND the run's tag set, so a
-  // regex like `noprm-experiment` or `SS-sweep` selects the right cells even
-  // when their names don't contain that string. Run names that lie about their
-  // recipe (e.g. older `-emd-do-` runs that actually ran as CE) are caught by
-  // the tag side; everything else still matches by name.
-  const nameFilteredRuns = nameRe
-    ? runs.filter((r) => {
-        const haystack = [r.label, ...tagsFor(r.label)].join(' ')
-        return nameRe!.test(haystack)
-      })
-    : runs
+  const filterCompiled = compileMultiTermFilter(nameFilter)
+  const nameReError = filterCompiled.error
+  // Haystack per run: parent-supplied (rich: includes dates, hardware,
+  // lineage) when present, else fall back to label+tags (what we did before
+  // the multi-term filter landed).
+  const haystackFor = (label: string): string =>
+    runHaystacks?.get(label) ?? [label, ...tagsFor(label)].join(' ')
+  const nameFilteredRuns = filterCompiled.empty || filterCompiled.error
+    ? runs
+    : runs.filter((r) => filterCompiled.matches(haystackFor(r.label)))
 
   // Tag-chip filter. AND across selected tags: a run is visible iff EVERY
   // selected tag is in its tag set. Empty set = no tag constraint (show all).
@@ -471,12 +484,18 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
         display: 'flex', justifyContent: 'flex-end', gap: 4, marginBottom: 4,
         alignItems: 'center',
       }}>
-        <Tooltip content="regex filter on run names (case-insensitive). Empty = show all. Useful for separating run groups with different TL y-axis scales (e.g. exclude EMD runs to see CE-magnitude TL clearly).">
+        <Tooltip content={
+          'multi-term regex filter (case-insensitive). Whitespace = AND across terms; '
+          + '`|` is regex OR within a term. Haystack includes shortLabel + tags + '
+          + 'YYMMDD (created + last activity) + hardware (TPU / GPU / modal / v6e-16 / h100x8) '
+          + '+ lineage (resume / scratch). Examples: '
+          + '`noprm` · `SS-sweep 260527` · `TPU resume|scratch`.'
+        }>
           <input
             type="text"
             value={nameFilter}
             onChange={(e) => setNameFilter(e.target.value)}
-            placeholder="filter regex (e.g. cont33k|mg-4)"
+            placeholder="filter (e.g. SS-sweep 260527)"
             style={{
               background: 'transparent',
               border: `1px solid ${nameReError ? '#c44' : (isDark ? '#444' : '#bbb')}`,
