@@ -119,11 +119,19 @@ function freshnessColor(secAgo: number): string {
 // manifests are small JSON so we poll them faster than the ~2MB parquet
 // histories (which also carry an R2 max-age=60, so refetches mostly hit
 // cache). Polling pauses automatically while the tab is backgrounded.
+//
+// Per-run polling is split into `active` (iris reports RUNNING/PENDING/
+// BUILDING) and `idle` (everything else: finished, failed, no iris job).
+// 43 active runs × 30s/poll = 86 req/min of ~8KB each ≈ 11 MB/min, so we
+// back off idle runs hard and let active ones stay fresh.
 const REFETCH_MS = {
   runs: 60_000,
   iris: 30_000,
-  manifest: 30_000,
-  history: 90_000,
+  manifest: { active: 60_000, idle: 600_000 },
+  history: { active: 180_000, idle: 600_000 },
+  // On error (404, network), back off to keep TSQ from hammering R2 for a
+  // never-synced manifest / a parquet that doesn't exist yet.
+  errorBackoff: 300_000,
 }
 
 interface Props {
@@ -830,18 +838,44 @@ function RunsIndex() {
     [runsQ.data],
   )
 
+  // Active-run set drives the per-run poll interval. While iris hasn't
+  // loaded yet, treat every run as active (fail-open to fast polling for
+  // the first ~30s rather than freezing every run at 10-min cadence).
+  const activeRunIds = useMemo(() => {
+    if (!irisQ.data) return null
+    const s = new Set<string>()
+    for (const [jobName, job] of Object.entries(irisQ.data.jobs)) {
+      if (job.state === 'RUNNING' || job.state === 'PENDING' || job.state === 'BUILDING') {
+        // Job names are `/ryan/<run-label>`; strip the user prefix.
+        const m = jobName.match(/^\/[^/]+\/(.+)$/)
+        if (m) s.add(m[1])
+      }
+    }
+    return s
+  }, [irisQ.data])
+  const intervalFor = (
+    runId: string,
+    cadence: { active: number; idle: number },
+  ) => (q: { state: { error: unknown | null } }) => {
+    if (q.state.error) return REFETCH_MS.errorBackoff
+    if (!activeRunIds || activeRunIds.has(runId)) return cadence.active
+    return cadence.idle
+  }
+
   const manifestQs = useQueries({
     queries: visible.map((id) => ({
       queryKey: ['manifest', id],
       queryFn: () => fetchManifest(id),
-      refetchInterval: REFETCH_MS.manifest,
+      refetchInterval: intervalFor(id, REFETCH_MS.manifest),
+      retry: 1,
     })),
   })
   const historyQs = useQueries({
     queries: visible.map((id) => ({
       queryKey: ['history', id],
       queryFn: () => fetchRunHistory(parquetUrl(id)),
-      refetchInterval: REFETCH_MS.history,
+      refetchInterval: intervalFor(id, REFETCH_MS.history),
+      retry: 1,
     })),
   })
 
@@ -1182,15 +1216,21 @@ function EvalJobsTable({ jobs, evalByStep }: {
 function RunDetail({ runId }: { runId: string }) {
   // Same query keys as RunsIndex, so arriving from the index renders the
   // cached manifest/history instantly while a fresh fetch runs underneath.
+  // Detail view is single-run focused, so always use the active cadence
+  // (no need to gate on iris state — the user is staring at this one).
+  const errBackoff = (q: { state: { error: unknown | null } }) =>
+    q.state.error ? REFETCH_MS.errorBackoff : null
   const manifestQ = useQuery({
     queryKey: ['manifest', runId],
     queryFn: () => fetchManifest(runId),
-    refetchInterval: REFETCH_MS.manifest,
+    refetchInterval: (q) => errBackoff(q) ?? REFETCH_MS.manifest.active,
+    retry: 1,
   })
   const historyQ = useQuery({
     queryKey: ['history', runId],
     queryFn: () => fetchRunHistory(parquetUrl(runId)),
-    refetchInterval: REFETCH_MS.history,
+    refetchInterval: (q) => errBackoff(q) ?? REFETCH_MS.history.active,
+    retry: 1,
   })
   const irisQ = useQuery({
     queryKey: ['iris'], queryFn: fetchIrisState, refetchInterval: REFETCH_MS.iris,
@@ -1201,7 +1241,8 @@ function RunDetail({ runId }: { runId: string }) {
   const evalQ = useQuery({
     queryKey: ['eval', runId],
     queryFn: () => fetchEval(runId),
-    refetchInterval: REFETCH_MS.history,
+    refetchInterval: (q) => errBackoff(q) ?? REFETCH_MS.history.active,
+    retry: 1,
   })
   const manifest = manifestQ.data ?? null
   const history = historyQ.data ?? null
