@@ -1057,15 +1057,36 @@ def f1_sinusoidal_embed(xyz: jax.Array, num_freqs: int) -> jax.Array:
     return combined.reshape(out_shape)
 
 
+@dataclass(frozen=True)
 class Qwen3F1Config(Qwen3Config):
     """Qwen3Config whose `model_type` is `Qwen3F1LMHeadModel`.
 
     Spec 34 F1: 1 token/atom + sinusoidal continuous-xyz at the embed layer.
+
+    Adds F1-specific knobs as config fields so `config.build(Vocab, key)`
+    (which Levanter calls via `LmConfig.build → model_type.init(Vocab,
+    config, key=...)`) can thread them into `Qwen3F1LMHeadModel.init`.
+    The `build` override below is what wires these through.
     """
+
+    f1_num_freqs: int = 10
+    f1_atom_token_lo: int = 20   # ATOM_OFFSET in tomat.tokenizers.patch
+    f1_atom_token_hi: int = 138  # ATOM_END
+    f1_coord_frame: str = "fractional"
 
     @property  # type: ignore[override]
     def model_type(self):
         return Qwen3F1LMHeadModel
+
+    def build(self, Vocab, *, key):
+        # Translate config-time F1 settings → runtime `F1Args` for `init`.
+        f1_args = F1Args(
+            num_freqs=self.f1_num_freqs,
+            atom_token_lo=self.f1_atom_token_lo,
+            atom_token_hi=self.f1_atom_token_hi,
+            coord_frame=self.f1_coord_frame,
+        )
+        return Qwen3F1LMHeadModel.init(Vocab, self, key=key, f1_args=f1_args)
 
 
 class Qwen3F1LMHeadModel(Qwen3DensityLMHeadModel):
@@ -1181,3 +1202,109 @@ class Qwen3F1LMHeadModel(Qwen3DensityLMHeadModel):
         # Mask to atom positions only.
         mask = is_atom.astype(proj.dtype)
         return proj * mask
+
+    def compute_next_token_loss(
+        self,
+        example,
+        *,
+        key=None,
+        reduction=hax.mean,
+        reduction_axis=None,
+        logsumexp_weight=None,
+        loss_dtype=jnp.float32,
+        logit_soft_cap=None,
+    ) -> NamedArray:
+        """F1-aware loss dispatch.
+
+        If `example` is an `F1LmExample` carrying a non-None `atom_xyz`,
+        compute activations with the F1 path (sinusoidal-xyz addend at
+        atom positions) and then re-use the standard CE/density loss tail.
+        Otherwise fall through to the parent `Qwen3DensityLMHeadModel`
+        path (which itself falls through to plain Qwen3 CE when no density
+        loss args are configured).
+
+        This override only kicks in when there's actual F1 data to thread;
+        it preserves byte-for-byte parity with the parent loss when
+        `atom_xyz` is None (the TOMAT_F1_MODE=0 back-compat guarantee at
+        the loss layer).
+        """
+        # Late-import to avoid a forward-reference loop with the class
+        # definition above (F1LmExample lives in this module).
+        atom_xyz = getattr(example, "atom_xyz", None)
+        if atom_xyz is None:
+            return super().compute_next_token_loss(
+                example,
+                key=key,
+                reduction=reduction,
+                reduction_axis=reduction_axis,
+                logsumexp_weight=logsumexp_weight,
+                loss_dtype=loss_dtype,
+                logit_soft_cap=logit_soft_cap,
+            )
+
+        # Forward with atom_xyz, then re-use the parent's logit→loss tail.
+        activations = self.activations(
+            example.tokens, example.attn_mask, key=key, atom_xyz=atom_xyz,
+        )
+        aux_loss = 0
+        if isinstance(activations, tuple):
+            activations, aux_loss = activations
+        head = self.get_lm_head()
+        logits = hax.dot(activations, head, axis=self.Embed)
+
+        # Decide loss flavor based on whether a density-loss config is set.
+        args = _DENSITY_LOSS_ARGS
+        if args is not None and args.weight != 0.0:
+            loss = density_aware_loss(
+                Pos=self.Pos,
+                Vocab=self.Vocab,
+                logits=logits,
+                input_tokens=example.tokens,
+                loss_weight=example.loss_weight,
+                args=args,
+                reduction=reduction,
+            )
+            return loss + aux_loss
+
+        # Plain CE tail (mirrors `LmHeadModel.compute_next_token_loss`
+        # internals — we already paid for activations so we can't call
+        # super() to recompute them; we also bypass `head` recomputation).
+        from levanter.models.loss import maybe_fused_next_token_loss
+        loss = maybe_fused_next_token_loss(
+            self.Pos,
+            self.Embed,
+            self.Vocab,
+            activations,
+            head,
+            example.tokens,
+            loss_weight=example.loss_weight,
+            reduction=reduction,
+            reduction_axis=reduction_axis,
+            logsumexp_weight=logsumexp_weight,
+            dtype=loss_dtype,
+            logit_soft_cap=logit_soft_cap,
+        )
+        return loss + aux_loss
+
+
+class F1LmExample(LmExample):
+    """`LmExample` subclass that carries a per-position `atom_xyz` sidecar.
+
+    Spec 34 F1: `atom_xyz: NamedArray` with axes `(..., Pos, XYZ)` (XYZ
+    size 3), float32, NaN at non-atom positions, finite at atom positions
+    (translated fractional coords in the patch frame).
+
+    The field is `Optional` so an `F1LmExample` with `atom_xyz=None`
+    behaves like a plain `LmExample` (back-compat path).
+
+    Levanter's `LmExample` is an `eqx.Module`, so subclassing is the
+    sanctioned extension mechanism. Equinox `field(...)` is required for
+    optional NamedArray fields because `eqx.Module` is frozen.
+
+    NOTE: `LmExample.causal` (used by Levanter's collator) returns an
+    instance of `LmExample`, not `cls(...)`, so we can't just call
+    `F1LmExample.causal(...)`. The F1 loader plumbing constructs
+    `F1LmExample` instances directly from `LmExample.causal`'s output.
+    """
+
+    atom_xyz: NamedArray | None = eqx.field(default=None)
