@@ -7,6 +7,7 @@ import { fetchRunHistory } from './parquet'
 import type { RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
 import { RunsTimelinePlot, colorForIndex, shortLabel, useNameFilter, compileNameFilter } from './RunsTimelinePlot'
+import { tagsFor } from './tags'
 import type { RunTimelineSeries } from './RunsTimelinePlot'
 import { useTraceHighlight } from 'pltly/react'
 
@@ -1070,9 +1071,14 @@ function RunsIndex() {
   const matchedIds = useMemo(() => {
     if (!nameRe || !ordered) return null
     const s = new Set<string>()
-    // Match against shortLabel — same source the plot legend uses — so what
-    // the user sees in the input matches what they see on cards/legend.
-    for (const c of ordered) if (nameRe.test(shortLabel(c.id))) s.add(c.id)
+    // Match against [shortLabel + tags] so regexes can target either the
+    // displayed name OR a curated tag (e.g. `SS-sweep`, `noprm-experiment`).
+    // The tag side rescues runs whose names lie about their recipe
+    // (e.g. older `-emd-do-` runs that actually trained as CE).
+    for (const c of ordered) {
+      const haystack = [shortLabel(c.id), ...tagsFor(c.id)].join(' ')
+      if (nameRe.test(haystack)) s.add(c.id)
+    }
     return s
   }, [nameRe, ordered])
 

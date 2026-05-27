@@ -58,26 +58,82 @@ const NAME_FILTER_EVT = 'tomat:runs-name-filter-change'
 const TAG_FILTER_KEY = 'tomat:runs-tag-filter'
 
 /**
- * Cross-component reactive store for the regex name-filter input. Used by both
- * the plot (to filter visible traces) and the page (to sort matching cards to
- * the top + fade non-matches). Same-tab `localStorage` events don't fire, so
- * the setter dispatches a CustomEvent that every hook instance listens for.
+ * Cross-component reactive store for the regex name-filter input.
+ *
+ * Sources of truth (precedence on load):
+ *   1. URL `?regex=…` query param — shareable / linkable
+ *   2. localStorage — survives page reloads
+ *
+ * On change: writes both back (URL via replaceState, no extra history entry).
+ * Same-tab `localStorage`/popstate events don't always fire, so the setter
+ * also dispatches a CustomEvent so every hook instance stays in sync.
+ *
+ * Read the URL via hash-router-aware extractor: the app uses HashRouter
+ * (`#/runs?regex=…`), so we look at `window.location.hash`, not `.search`.
  */
+function readUrlRegex(): string | null {
+  if (typeof window === 'undefined') return null
+  // Hash is like `#/runs?regex=cont33k|mg-4`. Split on `?` and parse the rest.
+  const hash = window.location.hash || ''
+  const qIdx = hash.indexOf('?')
+  if (qIdx < 0) return null
+  try {
+    const params = new URLSearchParams(hash.slice(qIdx + 1))
+    return params.get('regex')
+  } catch { return null }
+}
+
+function writeUrlRegex(v: string): void {
+  if (typeof window === 'undefined') return
+  const hash = window.location.hash || '#/'
+  const qIdx = hash.indexOf('?')
+  const path = qIdx < 0 ? hash : hash.slice(0, qIdx)
+  let params: URLSearchParams
+  try { params = new URLSearchParams(qIdx < 0 ? '' : hash.slice(qIdx + 1)) }
+  catch { params = new URLSearchParams() }
+  if (v) params.set('regex', v); else params.delete('regex')
+  const qs = params.toString()
+  const next = qs ? `${path}?${qs}` : path
+  if (next !== hash) {
+    try { window.history.replaceState(null, '', next) } catch { /* ignore */ }
+  }
+}
+
 export function useNameFilter(): readonly [string, (v: string) => void] {
   const [filter, setFilter] = useState(() => {
+    // Precedence: URL ?regex= → localStorage → empty.
+    const fromUrl = readUrlRegex()
+    if (fromUrl != null) return fromUrl
     try { return localStorage.getItem(NAME_FILTER_KEY) ?? '' } catch { return '' }
   })
   useEffect(() => {
+    // If the page loaded with a URL filter, sync it to localStorage on mount
+    // so it persists across tabs / reloads that drop the query string.
+    const fromUrl = readUrlRegex()
+    if (fromUrl != null) {
+      try { localStorage.setItem(NAME_FILTER_KEY, fromUrl) } catch { /* ignore */ }
+    }
     const onEvt = (e: Event) => {
       const detail = (e as CustomEvent<string>).detail
       setFilter(typeof detail === 'string' ? detail : '')
     }
+    // Hash change can fire from manual URL edits / back-forward navigation —
+    // re-read so the input stays in sync.
+    const onHash = () => {
+      const v = readUrlRegex()
+      if (v != null) setFilter(v)
+    }
     window.addEventListener(NAME_FILTER_EVT, onEvt)
-    return () => window.removeEventListener(NAME_FILTER_EVT, onEvt)
+    window.addEventListener('hashchange', onHash)
+    return () => {
+      window.removeEventListener(NAME_FILTER_EVT, onEvt)
+      window.removeEventListener('hashchange', onHash)
+    }
   }, [])
   const update = (v: string) => {
     setFilter(v)
     try { localStorage.setItem(NAME_FILTER_KEY, v) } catch { /* ignore */ }
+    writeUrlRegex(v)
     window.dispatchEvent(new CustomEvent(NAME_FILTER_EVT, { detail: v }))
   }
   return [filter, update] as const
@@ -211,7 +267,17 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
     try { nameRe = new RegExp(nameFilter, 'i') }
     catch { nameReError = true }
   }
-  const nameFilteredRuns = nameRe ? runs.filter((r) => nameRe!.test(r.label)) : runs
+  // Match against both the (short) display label AND the run's tag set, so a
+  // regex like `noprm-experiment` or `SS-sweep` selects the right cells even
+  // when their names don't contain that string. Run names that lie about their
+  // recipe (e.g. older `-emd-do-` runs that actually ran as CE) are caught by
+  // the tag side; everything else still matches by name.
+  const nameFilteredRuns = nameRe
+    ? runs.filter((r) => {
+        const haystack = [r.label, ...tagsFor(r.label)].join(' ')
+        return nameRe!.test(haystack)
+      })
+    : runs
 
   // Tag-chip filter. AND across selected tags: a run is visible iff EVERY
   // selected tag is in its tag set. Empty set = no tag constraint (show all).

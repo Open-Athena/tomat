@@ -29,6 +29,34 @@ export const RUN_TAGS: Record<string, RunTag[]> = {
   'train-mg-smk-B': ['smoke', 'pre-init-fix'],
   'train-mg-smk-C': ['smoke', 'pre-init-fix'],
 
+  // ---- No-preamble experiment (2026-05-27): does cont33k use atoms at all? ----
+  // Both are CE (TOMAT_DENSITY_L1_WEIGHT=0 → density path falls through to base
+  // CE); only difference is preamble-zeroed vs preamble-intact, same seed.
+  'train-full-v3-200M-bs128-ce-10k-v5p16-noprm':
+    ['AR', 'CE', 'noprm-experiment', 'post-init-fix'],
+  'train-full-v3-200M-bs128-ce-10k-v5p16-paired-base':
+    ['AR', 'CE', 'noprm-experiment', 'post-init-fix'],
+
+  // ---- SS sweep (2026-05-27): scheduled-sampling fine-tunes off cont33k ----
+  // All warm-started from cont33k step-79999; vary ε distribution + sampler.
+  'train-ss-cont80k-emax025-1':
+    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix'],
+  'train-ss-cont80k-emax050-1':
+    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix'],
+  'train-ss-cont80k-emax075-1':
+    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix'],
+  'train-ss-cont80k-emax100-1':
+    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix'],
+  'train-ss-cont80k-eps1const-1':
+    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix'],
+  'train-ss-cont80k-hi-argmax-1':
+    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix'],
+
+  // ---- VV: VQ-VAE tokenizer-only training (no atomic encoding, self-supervised) ----
+  'vqvae-smoke-50k-02': ['VV', 'VV-smoke'],
+  'vqvae-cb8k-01': ['VV', 'VV-sweep'],
+  'vqvae-lat16-01': ['VV', 'VV-sweep'],
+
   // ---- Pre-init-fix: all trained as CE on the next-token objective ----
   // mg-* runs added a vocab+1 MASK token but never reached masked-loss code.
   'train-mg-1': ['AR', 'CE', 'pre-init-fix', 'bunk'],
@@ -110,9 +138,10 @@ export const RUN_TAGS: Record<string, RunTag[]> = {
 export const ALL_TAGS: RunTag[] = (() => {
   // Stable, semantic ordering — objective → loss → status → other.
   const ordered: RunTag[] = [
-    'AR', 'MaskGIT',
+    'AR', 'MaskGIT', 'SS', 'VV',
     'CE', 'EMD', 'CE+EMD',
     'production', 'collapsed', 'bunk', 'smoke',
+    'SS-sweep', 'VV-sweep', 'VV-smoke', 'noprm-experiment',
     'cont33k', '1B', 'post-init-fix', 'pre-init-fix', 'v2',
   ]
   const seen = new Set<RunTag>()
