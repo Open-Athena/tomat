@@ -18,6 +18,7 @@ import { FileTree } from '@rdub/file-tree/react'
 import { HttpStore } from '@rdub/file-tree/stores/http'
 import { ThemeToggle } from '../theme'
 import { API_BASE } from '../runs/api'
+import { ParquetViewer } from './ParquetViewer'
 
 const FILES_API_BASE = `${API_BASE}/api/files`
 
@@ -51,6 +52,7 @@ export function FilesPage() {
               rootPrefix="tomat/"
               title="openathena/tomat"
               className="files-tree"
+              parquetRenderer={ParquetViewer}
             />
           }
         />
@@ -63,6 +65,7 @@ export function FilesPage() {
               rootPrefix="tomat/"
               title="openathena/tomat"
               className="files-tree"
+              parquetRenderer={ParquetViewer}
             />
           }
         />

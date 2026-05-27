@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@floating-ui/react": "^0.27.19",
-    "@rdub/file-tree": "workspace:*",
+    "@rdub/file-tree": "https://github.com/runsascoded/file-tree#f54ebaa9f88c98dfa6472ba4d755e6b368ca4f1e",
     "@tanstack/react-query": "^5.100.11",
     "d3-dsv": "^3.0.1",
     "hyparquet": "^1.25.8",
