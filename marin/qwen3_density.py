@@ -60,10 +60,12 @@ from typing import Optional, cast
 
 import equinox as eqx
 import haliax as hax
+import haliax.nn as hnn
 import jax
 import jax.numpy as jnp
+import jax.random as jrandom
 import numpy as np
-from haliax import NamedArray
+from haliax import Axis, NamedArray
 
 from levanter.layers.attention import AttentionMask
 from levanter.models.lm_model import LmConfig, LmExample
@@ -978,3 +980,204 @@ _SS_ARGS: Optional[SSArgs] = None
 def configure_ss(args: "SSArgs | None") -> None:
     global _SS_ARGS
     _SS_ARGS = args
+
+
+# ---------------------------------------------------------------------------
+# Spec 34 F1 — sinusoidal continuous-xyz atom embedding
+# ---------------------------------------------------------------------------
+#
+# F1 layout (see `tomat.tokenizers.patch_v3` module docstring):
+#   - Each atom contributes ONE preamble token (the atom-type id).
+#   - Per-atom continuous (x, y, z) coords are carried as a side array
+#     `atom_xyz: float32[Pos, 3]` (NaN at non-atom positions).
+#
+# Model side: we add a learned linear projection of a NeRF-style sinusoidal
+# encoding of (x, y, z) to the token embedding at atom-token positions. The
+# rest of the Qwen3 stack is unchanged.
+#
+# Atom-token detection uses the [ATOM_OFFSET, ATOM_END) id range from
+# `tomat.tokenizers.patch.SPECIAL_TOKENS`. The model receives that range as
+# a config field (no import of tomat from inside the model module, so the
+# levanter/JIT path doesn't depend on tomat).
+#
+# JIT-traceability: `atom_xyz` enters `activations` as an explicit kwarg
+# alongside `input_ids`/`attn_mask`. Callers that don't have it (e.g. eval
+# paths that haven't been F1-plumbed yet) can omit it — `activations` falls
+# back to the standard embedding lookup.
+#
+# Loader plumbing: threading `atom_xyz` from a parquet column through the
+# Levanter `LmExample` (whose fields are frozen at the library layer) to
+# `compute_next_token_loss` requires subclassing `LmExample` (or replacing
+# the `PrebuiltLmDataset` adapter). That work is deferred — this module
+# provides only the model-side machinery; see spec 34 for the broader
+# integration plan.
+
+
+@dataclass(frozen=True)
+class F1Args:
+    """Spec-34 F1 configuration.
+
+    `num_freqs` (K): number of log-spaced frequencies in the sinusoidal
+    encoding `γ`. Output dim of γ is 6K (cos+sin per axis).
+    `atom_token_lo` / `atom_token_hi`: half-open [lo, hi) id range that
+    identifies atom-type tokens. Defaults match `tomat.tokenizers.patch`
+    (ATOM_OFFSET=20, ATOM_END=138).
+    `coord_frame`: "fractional" (default — matches v3 tokenizer's
+    translated-frac convention) or "cartesian" (caller pre-multiplies
+    fractional coords by the lattice).
+    """
+
+    num_freqs: int = 10
+    atom_token_lo: int = 20   # ATOM_OFFSET in tomat.tokenizers.patch
+    atom_token_hi: int = 138  # ATOM_END
+    coord_frame: str = "fractional"
+
+
+def f1_sinusoidal_embed(xyz: jax.Array, num_freqs: int) -> jax.Array:
+    """NeRF-style sinusoidal positional encoding.
+
+    Input: `xyz` of shape (..., 3) — coords in [0, 1) (fractional) or any
+    Cartesian range (works as long as it's consistent within a run).
+    Output: array of shape (..., 6 * num_freqs).
+
+    For each axis a ∈ {x, y, z} and frequency k ∈ {0, …, K-1}:
+        γ_{a, k}(p) = [sin(2^k · π · p_a), cos(2^k · π · p_a)]
+    Concatenated across (a, k, {sin, cos}).
+    """
+    # `freqs` shape (K,)
+    freqs = jnp.pi * (2.0 ** jnp.arange(num_freqs, dtype=xyz.dtype))
+    # `scaled` shape (..., 3, K)
+    scaled = xyz[..., None] * freqs
+    sin = jnp.sin(scaled)
+    cos = jnp.cos(scaled)
+    # Concatenate sin/cos along the freq axis → (..., 3, 2K),
+    # then flatten the last two dims into 6K.
+    combined = jnp.concatenate([sin, cos], axis=-1)
+    out_shape = xyz.shape[:-1] + (3 * 2 * num_freqs,)
+    return combined.reshape(out_shape)
+
+
+class Qwen3F1Config(Qwen3Config):
+    """Qwen3Config whose `model_type` is `Qwen3F1LMHeadModel`.
+
+    Spec 34 F1: 1 token/atom + sinusoidal continuous-xyz at the embed layer.
+    """
+
+    @property  # type: ignore[override]
+    def model_type(self):
+        return Qwen3F1LMHeadModel
+
+
+class Qwen3F1LMHeadModel(Qwen3DensityLMHeadModel):
+    """Spec-34 F1 model: standard Qwen3 + learned linear projection of a
+    sinusoidal encoding of per-atom (x, y, z), added to the atom-token
+    embedding at the embed layer.
+
+    Extra field (vs `Qwen3DensityLMHeadModel`):
+        `f1_atom_proj`: `hnn.Linear(In=PosFeat=6K, Out=Embed, use_bias=False)`
+
+    Forward path (override of `activations`):
+        1. Look up token embeddings the usual way (`self.embeddings.embed`).
+        2. If `atom_xyz` is None: return as-is (F1-OFF fallback — model
+           weights are still well-defined, just unused).
+        3. Compute γ(atom_xyz) on the *whole* `Pos` axis (NaN at non-atom
+           positions → finite output via `jnp.where(is_atom, xyz, 0.0)`
+           before γ is evaluated; γ(0)=cos(0)=1 leaks a constant but is
+           masked out by `is_atom` below).
+        4. Project to `Embed` and add at atom-token positions only.
+
+    Inherits `compute_next_token_loss` from `Qwen3DensityLMHeadModel`. The
+    density-loss path already calls `self.activations(...)` explicitly; F1
+    plumbing for *that* path requires passing `atom_xyz` through the
+    `LmExample`-adjacent kwargs chain (deferred — see module-docstring note).
+
+    See `Qwen3DensityLMHeadModel.init` for the `init` re-wrap necessitated by
+    Levanter's parent `Qwen3LMHeadModel.init` hard-coding the return class.
+    """
+
+    f1_atom_proj: hnn.Linear
+    f1_args: F1Args = eqx.field(static=True)
+
+    @classmethod
+    def init(cls, Vocab, config, *, key, f1_args: F1Args | None = None):
+        # Allow callers to pass F1Args; default to a fresh F1Args() for
+        # backward-compat with config-only call sites.
+        f1_args = f1_args if f1_args is not None else F1Args()
+        k_base, k_proj = jrandom.split(key, 2)
+        base = Qwen3LMHeadModel.init(Vocab, config, key=k_base)
+        PosFeat = Axis("pos_feat", 6 * f1_args.num_freqs)
+        # Standard small-variance init; Linear.init in haliax handles fan-in
+        # scaling. `use_bias=False` matches Llama/Qwen embed-projection style.
+        f1_atom_proj = hnn.Linear.init(
+            In=PosFeat,
+            Out=config.Embed,
+            key=k_proj,
+            use_bias=False,
+            out_first=True,
+        )
+        return cls(
+            base.transformer,
+            base.embeddings,
+            base.lm_head,
+            f1_atom_proj,
+            f1_args,
+        )
+
+    def activations(
+        self,
+        input_ids: NamedArray,
+        attn_mask: AttentionMask | NamedArray | None = None,
+        *,
+        key=None,
+        pos_ids: NamedArray | None = None,
+        atom_xyz: NamedArray | None = None,
+    ) -> NamedArray:
+        """F1 forward: standard embed + sinusoidal-xyz addition at atom positions.
+
+        `atom_xyz` is expected to have axes (Pos, XYZ) where XYZ has size 3.
+        NaN at non-atom positions is OK — we mask before the linear projection.
+        If `atom_xyz` is None (e.g. eval paths not yet F1-plumbed), this
+        reduces to standard Qwen3 forward.
+        """
+        x = self.embeddings.embed(input_ids)
+        if atom_xyz is not None:
+            x = x + self._f1_pos_addend(input_ids, atom_xyz)
+        x = self.transformer(x, attn_mask=attn_mask, key=key, pos_ids=pos_ids)
+        return x
+
+    def _f1_pos_addend(
+        self,
+        input_ids: NamedArray,
+        atom_xyz: NamedArray,
+    ) -> NamedArray:
+        """Compute the additive sinusoidal-xyz embedding contribution.
+
+        Returns a `NamedArray` shaped like `self.embeddings.embed(input_ids)`
+        (i.e. {..., Pos, Embed}), zero at non-atom positions, equal to
+        `f1_atom_proj(γ(xyz))` at atom positions.
+        """
+        f1 = self.f1_args
+        # Atom-mask: True where token id ∈ [lo, hi).
+        is_atom = hax.logical_and(
+            input_ids >= f1.atom_token_lo,
+            input_ids < f1.atom_token_hi,
+        )  # axes: same as input_ids → {..., Pos}
+
+        # Sanitize NaN at non-atom positions before applying γ (γ(NaN)=NaN
+        # would taint the masked-zero contribution via fp arithmetic).
+        # Bypass haliax for the elementwise jnp ops on the underlying array,
+        # then rewrap.
+        xyz_arr = atom_xyz.array  # shape (..., Pos, 3)
+        xyz_safe = jnp.where(jnp.isnan(xyz_arr), 0.0, xyz_arr)
+        gamma_arr = f1_sinusoidal_embed(xyz_safe, f1.num_freqs)
+        # Wrap γ as a NamedArray with axes (..., Pos, PosFeat).
+        pos_feat_axis = self.f1_atom_proj.In  # AxisSpec — could be tuple, but our init uses a single Axis
+        # `self.f1_atom_proj.In` may be a single Axis or a tuple; project
+        # safely by constructing a NamedArray with the right axes.
+        new_axes = atom_xyz.axes[:-1] + (pos_feat_axis,)
+        gamma = hax.named(gamma_arr, new_axes)
+        # Project to Embed.
+        proj = self.f1_atom_proj(gamma)  # axes (..., Pos, Embed)
+        # Mask to atom positions only.
+        mask = is_atom.astype(proj.dtype)
+        return proj * mask

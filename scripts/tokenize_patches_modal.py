@@ -93,6 +93,7 @@ def tokenize(
     lmq_path: str | None = None,
     tokenizer_version: str = "v2",
     pack: bool = False,
+    atom_encoding: str = "f0",
 ) -> dict:
     """Invoke `scripts/tokenize_patches.py` as a subprocess with the
     Modal volume mount as `--rho-gga-dir`.
@@ -125,6 +126,7 @@ def tokenize(
         "-w", str(worker_idx),
         "-W", str(n_workers),
         "-V", tokenizer_version,
+        "-F", atom_encoding,
     ]
     if lmq_path:
         cmd += ["--lmq-path", lmq_path]
@@ -169,11 +171,12 @@ def main(
     lmq_path: str = "",
     tokenizer_version: str = "v2",
     pack: bool = False,
+    atom_encoding: str = "f0",
 ) -> None:
     # The volume binding is selected via `TOMAT_VOLUME` env var at module
     # import time (line 40). Default is `tomat-rho-gga` (val, 4305 mats);
     # set `TOMAT_VOLUME=tomat-rho-gga-train` for the 77498-mat train split.
-    err(f"[modal] tokenize → /vol/tokenized/{label} (pad_to={pad_to}, shape={shape}, tk={tokenizer_version}, pack={pack}, vol={VOLUME_NAME})")
+    err(f"[modal] tokenize → /vol/tokenized/{label} (pad_to={pad_to}, shape={shape}, tk={tokenizer_version}, pack={pack}, atom_enc={atom_encoding}, vol={VOLUME_NAME})")
     result = tokenize.remote(
         label=label,
         split=split,
@@ -190,6 +193,7 @@ def main(
         lmq_path=lmq_path or None,
         tokenizer_version=tokenizer_version,
         pack=pack,
+        atom_encoding=atom_encoding,
     )
     meta = result["meta"]
     err(f"[modal] done: {meta['total_rows']:,} rows in {meta['n_shards']} shards")
@@ -231,6 +235,7 @@ def parallel(
     lmq_path: str = "",
     tokenizer_version: str = "v2",
     pack: bool = False,
+    atom_encoding: str = "f0",
 ) -> None:
     # NB: default bumped 16 → 256 per Ryan's 2026-04-24 observation that Modal
     # has plenty of headroom. Volume read throughput is the ceiling around this
@@ -273,6 +278,7 @@ def parallel(
             lmq_path=lmq_path or None,
             tokenizer_version=tokenizer_version,
             pack=pack,
+            atom_encoding=atom_encoding,
         )
         for i in indices
     ]

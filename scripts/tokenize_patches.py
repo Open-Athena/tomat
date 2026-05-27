@@ -59,14 +59,20 @@ DENSITY_CODECS: dict[str, callable] = {
 }
 
 
-def _build_schema() -> pa.Schema:
-    return pa.schema([
+def _build_schema(atom_encoding: str = "f0") -> pa.Schema:
+    fields = [
         pa.field("task_id", pa.string()),
         pa.field("offset_x", pa.int32()),
         pa.field("offset_y", pa.int32()),
         pa.field("offset_z", pa.int32()),
         pa.field("input_ids", pa.list_(pa.int32())),
-    ])
+    ]
+    if atom_encoding == "f1":
+        # Aligned, NaN-padded continuous xyz; one (x,y,z) per token-id slot,
+        # finite only at atom-token positions. Stored as list<list<float32>>
+        # rather than fixed-size to keep parquet readers happy across versions.
+        fields.append(pa.field("atom_xyz", pa.list_(pa.list_(pa.float32()))))
+    return pa.schema(fields)
 
 
 @command()
@@ -93,6 +99,11 @@ def _build_schema() -> pa.Schema:
 @option('-V', '--tokenizer-version', type=click.Choice(['v2', 'v3']), default='v2',
         help='v2 = global atom positions + SHAPE/OFFSET/HI blocks. v3 = patch-frame translated atoms, '
              'no SHAPE/OFFSET/HI in default case. v3 only valid with --shape=cube.')
+@option('-F', '--atom-encoding', type=click.Choice(['f0', 'f1']), default='f0',
+        help='Atom-position encoding (spec 34). f0 (default) = discrete xyz buckets in '
+             '[POS_START]…[POS_END] (status quo). f1 = 1 token/atom + sidecar atom_xyz '
+             'continuous coords (no [POS_START]…[POS_END] block). f1 requires '
+             '--tokenizer-version=v3.')
 @option('--r2-max', type=int, default=75,
         help='Ball squared-radius threshold (only for --shape=ball). '
              'Defaults to 75 (2,777 voxels, ≈cube P=14). '
@@ -135,6 +146,7 @@ def main(
     density_log_max: float,
     shape: str,
     tokenizer_version: str,
+    atom_encoding: str,
     r2_max: int,
     patch_size: int,
     output_dir: Path,
@@ -200,16 +212,22 @@ def main(
         err(f"[tokenize] loaded LMQ codec: n_bins={codec.n_bins}, clip_max={codec.clip_max:.4f}")
     else:
         codec = DENSITY_CODECS[density_codec](log_min=density_log_min, log_max=density_log_max)
+    if atom_encoding == 'f1' and tokenizer_version != 'v3':
+        raise click.UsageError("--atom-encoding f1 requires --tokenizer-version v3")
     if shape == 'ball':
         if tokenizer_version != 'v2':
             raise click.UsageError("--tokenizer-version v3 only valid with --shape=cube")
+        if atom_encoding != 'f0':
+            raise click.UsageError("--atom-encoding f1 only valid with --tokenizer-version v3")
         tokenizer = BallTokenizer(r2_max=r2_max, density_codec=codec)
         specials = BALL_SPECIAL_TOKENS
         err(f"[tokenize] ball shape: r²≤{r2_max} ({len(tokenizer.vocab.position_codec.signed_vocabs)} vocab groups)")
     elif tokenizer_version == 'v3':
-        tokenizer = PatchTokenizerV3(patch_size=patch_size, density_codec=codec)
+        tokenizer = PatchTokenizerV3(
+            patch_size=patch_size, density_codec=codec, atom_encoding=atom_encoding,
+        )
         specials = SPECIAL_TOKENS
-        err(f"[tokenize] v3 cube tokenizer: P={patch_size} translated atoms, no SHAPE/OFFSET/HI")
+        err(f"[tokenize] v3 cube tokenizer: P={patch_size} translated atoms, no SHAPE/OFFSET/HI, atom_encoding={atom_encoding}")
     else:
         tokenizer = PatchTokenizer(patch_size=patch_size, density_codec=codec)
         specials = SPECIAL_TOKENS
@@ -217,8 +235,7 @@ def main(
     # identical serial and parallel runs produce different offsets by design;
     # what's reproducible is a single (seed, n_workers) tuple.
     rng = np.random.default_rng(seed ^ worker_idx)
-    schema = _build_schema()
-
+    schema = _build_schema(atom_encoding=atom_encoding)
     # Streaming shard writer.
     shard_idx = 0
     rows_in_shard = 0
@@ -286,8 +303,12 @@ def main(
         # (with a single [PAD] sentinel between adjacent sub-sequences) in
         # stage 2; non-pack mode just right-pads each patch to `pad_to` and
         # emits one row per patch.
-        per_patch: list[tuple[tuple[int, int, int], list[int]]] = []
+        # For atom_encoding=f1 we also carry a parallel per-token xyz sidecar
+        # (NaN-padded float32 array of shape (len(ids), 3)) — packing/padding
+        # is mirrored on this sidecar.
+        per_patch: list[tuple[tuple[int, int, int], list[int], np.ndarray | None]] = []
         material_overflowed = False
+        emit_xyz = (atom_encoding == "f1")
         for anc in anchors:
             anchor_t = tuple(int(x) for x in anc)
             if shape == 'ball':
@@ -304,7 +325,11 @@ def main(
                     structure=sample.structure,
                     offset=anchor_t,
                 )
-            ids = tokenizer.tokenize(patch)
+            if emit_xyz:
+                ids, xyz_arr = tokenizer.tokenize_with_xyz(patch)
+            else:
+                ids = tokenizer.tokenize(patch)
+                xyz_arr = None
             if pad_to is not None and len(ids) > pad_to:
                 # Happens when preamble (scales with n_atoms) + density fills
                 # > pad_to. Rather than crash the whole worker, skip the
@@ -315,7 +340,7 @@ def main(
                     f"(anchor={anchor_t}, n_atoms={len(patch.atomic_numbers)})")
                 material_overflowed = True
                 break
-            per_patch.append((anchor_t, ids))
+            per_patch.append((anchor_t, ids, xyz_arr))
 
         if material_overflowed or not per_patch:
             overflowed.append(task_id)
@@ -325,20 +350,40 @@ def main(
         # (preserves the existing layout exactly). In pack mode, greedily
         # concat patches separated by a single PAD sentinel until the next
         # patch wouldn't fit, then start a new row. Trailing PAD fills out
-        # the final row's remainder.
+        # the final row's remainder. For f1, per-row atom_xyz mirrors the
+        # token stream: NaN at PAD/sentinel/non-atom slots, finite at atom
+        # slots.
         batch_task_ids: list[str] = []
         batch_ox: list[int] = []
         batch_oy: list[int] = []
         batch_oz: list[int] = []
         batch_ids: list[list[int]] = []
+        batch_atom_xyz: list[np.ndarray] = []
+
+        def _row_xyz(toks: list[int], chunks: list[np.ndarray | None]) -> np.ndarray:
+            """Build a full-row NaN-padded xyz array of shape (len(toks), 3) by
+            concatenating the per-chunk xyz arrays. Caller must guarantee that
+            concatenated chunks' total length ≤ len(toks). Slots beyond the
+            concatenated chunks (i.e. trailing PAD) stay NaN.
+            """
+            out = np.full((len(toks), 3), np.nan, dtype=np.float32)
+            cursor = 0
+            for chunk in chunks:
+                if chunk is None:
+                    continue
+                n = chunk.shape[0]
+                out[cursor:cursor + n] = chunk
+                cursor += n
+            return out
 
         if pack:
             assert pad_to is not None  # checked at top of main
             # Greedy first-fit packing within this material's anchor list.
             row_buf: list[int] = []
+            row_xyz_chunks: list[np.ndarray | None] = []
             row_anchor: tuple[int, int, int] | None = None
             row_patches = 0
-            for anchor_t, ids in per_patch:
+            for anchor_t, ids, xyz_arr in per_patch:
                 # Cost of adding this patch: ids length + 1-token PAD separator
                 # (except for the first patch in the row, which has no leading
                 # separator).
@@ -348,6 +393,8 @@ def main(
                     if row_buf:
                         row_buf = row_buf + [PAD_ID] * (pad_to - len(row_buf))
                         batch_ids.append(row_buf)
+                        if emit_xyz:
+                            batch_atom_xyz.append(_row_xyz(row_buf, row_xyz_chunks))
                         batch_task_ids.append(task_id)
                         assert row_anchor is not None
                         batch_ox.append(row_anchor[0])
@@ -355,18 +402,29 @@ def main(
                         batch_oz.append(row_anchor[2])
                         patches_per_row_hist.append(row_patches)
                     row_buf = []
+                    row_xyz_chunks = []
                     row_anchor = None
                     row_patches = 0
                     sep = 0
                 if sep:
                     row_buf.append(PAD_ID)
+                    if emit_xyz:
+                        # PAD sentinel slot — single NaN xyz row.
+                        row_xyz_chunks.append(
+                            np.full((1, 3), np.nan, dtype=np.float32)
+                        )
                 row_buf.extend(ids)
+                if emit_xyz:
+                    assert xyz_arr is not None
+                    row_xyz_chunks.append(xyz_arr)
                 if row_anchor is None:
                     row_anchor = anchor_t  # record first patch's anchor as the row's representative
                 row_patches += 1
             if row_buf:
                 row_buf = row_buf + [PAD_ID] * (pad_to - len(row_buf))
                 batch_ids.append(row_buf)
+                if emit_xyz:
+                    batch_atom_xyz.append(_row_xyz(row_buf, row_xyz_chunks))
                 batch_task_ids.append(task_id)
                 assert row_anchor is not None
                 batch_ox.append(row_anchor[0])
@@ -374,14 +432,25 @@ def main(
                 batch_oz.append(row_anchor[2])
                 patches_per_row_hist.append(row_patches)
         else:
-            for anchor_t, ids in per_patch:
+            for anchor_t, ids, xyz_arr in per_patch:
+                row_xyz = None
                 if pad_to is not None:
+                    if emit_xyz:
+                        assert xyz_arr is not None
+                        row_xyz = _row_xyz(
+                            ids + [PAD_ID] * (pad_to - len(ids)), [xyz_arr],
+                        )
                     ids = ids + [PAD_ID] * (pad_to - len(ids))
+                elif emit_xyz:
+                    row_xyz = xyz_arr
                 batch_task_ids.append(task_id)
                 batch_ox.append(anchor_t[0])
                 batch_oy.append(anchor_t[1])
                 batch_oz.append(anchor_t[2])
                 batch_ids.append(ids)
+                if emit_xyz:
+                    assert row_xyz is not None
+                    batch_atom_xyz.append(row_xyz)
                 patches_per_row_hist.append(1)
 
         total_patches += len(per_patch)
@@ -396,13 +465,21 @@ def main(
             rows_in_shard = 0
             writer = _new_writer(shard_idx)
 
-        table = pa.table({
+        table_data = {
             'task_id': batch_task_ids,
             'offset_x': pa.array(batch_ox, type=pa.int32()),
             'offset_y': pa.array(batch_oy, type=pa.int32()),
             'offset_z': pa.array(batch_oz, type=pa.int32()),
             'input_ids': pa.array(batch_ids, type=pa.list_(pa.int32())),
-        })
+        }
+        if emit_xyz:
+            # PyArrow expects list-of-list for the nested float column. Convert
+            # each (L, 3) float32 array into list[list[float]] (NaN preserved).
+            table_data['atom_xyz'] = pa.array(
+                [a.tolist() for a in batch_atom_xyz],
+                type=pa.list_(pa.list_(pa.float32())),
+            )
+        table = pa.table(table_data)
         writer.write_table(table)
         rows_in_shard += len(batch_ids)
         total_rows += len(batch_ids)
@@ -434,6 +511,7 @@ def main(
         "patches_per_material": patches_per_material,
         "shape": shape,
         "tokenizer_version": tokenizer_version,
+        "atom_encoding": atom_encoding,
         "patch_size": patch_size if shape == 'cube' else f"r{r2_max}",
         "r2_max": r2_max if shape == 'ball' else None,
         "density_codec_name": density_codec,
