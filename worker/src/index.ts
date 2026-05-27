@@ -2,10 +2,12 @@
  * tomat-runs-api — CFW backing tomat.oa.dev/runs.
  *
  * Endpoints (all read-only, public for now):
+ *   GET  /api/runs-snapshot.json         — aggregated: runs index + all manifests + iris state, in one shot
  *   GET  /api/runs                       — list of synced run ids
  *   GET  /api/runs/:id/manifest.json     — per-run metadata (config, summary, history range)
  *   GET  /api/runs/:id/raw.parquet       — full history parquet
  *   GET  /api/runs/:id/eval.json         — per-step mat-NMAE/NEMD series (both mat-sets)
+ *   GET  /api/iris-state.json            — iris snapshot (synced by tomat iris sync)
  *   GET  /health
  *
  * Backed by R2 `openathena/tomat/runs/<id>/{raw.parquet,manifest.json,eval.json}`,
@@ -126,8 +128,128 @@ async function listRuns(env: Env): Promise<string[]> {
 	return out.sort();
 }
 
+/**
+ * Aggregated snapshot endpoint — assembles the full runs-dashboard payload in
+ * ONE response so the frontend doesn't have to fan out N per-run requests.
+ *
+ * Replaces the old `/api/runs` + N×`/api/runs/:id/manifest.json` + 1×iris poll
+ * pattern with a single edge-cached endpoint. Runs in the index that don't
+ * have a manifest.json yet (e.g. just created, never synced) appear with
+ * `manifest: null` so the frontend can skip them — no more 404 fanout.
+ *
+ * Edge cache TTL is 30s: at 3 polls/min from each client, an N-client tab
+ * fleet still only hits R2 once per 30s window. R2 list + ~50 parallel
+ * `r2.get()` calls is fast (~200-500ms cold) but not free, so we cache.
+ *
+ * Cache key uses the request URL (no auth / no per-user differentiation), so
+ * all clients share one cached body.
+ */
+async function buildRunsSnapshot(env: Env): Promise<{
+	synced_at: string;
+	count: number;
+	runs: Record<string, unknown | null>;
+	iris: unknown | null;
+}> {
+	const runIds = await listRuns(env);
+
+	// Fan out manifest.json reads in parallel. ~50 small R2 GETs in parallel
+	// is well within the Worker's subrequest budget (50/req soft cap; 1000/req
+	// hard cap on paid plans) and finishes in roughly one R2 round-trip.
+	const manifestKeys = runIds.map((id) => `${env.R2_RUNS_PREFIX}/${id}/manifest.json`);
+	const manifestResults = await Promise.all(
+		manifestKeys.map(async (k): Promise<unknown | null> => {
+			const obj = await env.R2.get(k);
+			if (!obj) return null;
+			try {
+				return await obj.json();
+			} catch {
+				return null;
+			}
+		}),
+	);
+
+	const runs: Record<string, unknown | null> = {};
+	for (let i = 0; i < runIds.length; i++) {
+		runs[runIds[i]] = manifestResults[i];
+	}
+
+	// Inline the iris snapshot too — same R2 bucket, one more parallel GET
+	// would also work but this is already serial-after-the-fanout and cheap.
+	let iris: unknown | null = null;
+	const irisObj = await env.R2.get('tomat/iris-state.json');
+	if (irisObj) {
+		try {
+			iris = await irisObj.json();
+		} catch {
+			iris = null;
+		}
+	}
+
+	return {
+		synced_at: new Date().toISOString(),
+		count: runIds.length,
+		runs,
+		iris,
+	};
+}
+
+/** TTL for the snapshot edge cache. 30s matches the existing per-manifest
+ *  active-run poll cadence; the frontend's `refetchInterval` is independent
+ *  (TanStack-side) so this only governs how often any one Worker call has to
+ *  do real R2 work. */
+const SNAPSHOT_CACHE_TTL = 30;
+
+function snapshotResponse(snapshot: unknown, env: Env): Response {
+	return new Response(JSON.stringify(snapshot), {
+		headers: {
+			'Content-Type': 'application/json',
+			// Workers Cache API honors this for its own TTL.
+			'Cache-Control': `public, max-age=${SNAPSHOT_CACHE_TTL}`,
+			...corsHeaders(env),
+		},
+	});
+}
+
+async function handleRunsSnapshot(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const cache = caches.default;
+	// Use the canonical URL (path only, no host) for the cache key so a future
+	// host swap (e.g. moving the API under tomat.oa.dev) doesn't fragment the
+	// cache. The Workers Cache API requires an absolute URL, so we synthesize
+	// one off the request's origin.
+	const cacheKey = new Request(new URL('/api/runs-snapshot.json', new URL(req.url)).toString(), { method: 'GET' });
+
+	const cached = await cache.match(cacheKey);
+	if (cached) {
+		// Stale-while-revalidate: if the cached body is past its half-life,
+		// kick off a background refresh. The current request still gets the
+		// cached copy (instant) but the next one will see fresher data.
+		// `Age` is set by CF's edge cache; if missing (some test harnesses)
+		// we just always-serve-while-fresh.
+		const ageHeader = cached.headers.get('Age');
+		const age = ageHeader ? parseInt(ageHeader, 10) : 0;
+		if (age >= SNAPSHOT_CACHE_TTL / 2) {
+			ctx.waitUntil(refreshSnapshotCache(cache, cacheKey, env));
+		}
+		return cached;
+	}
+
+	// Cold path: compute + store.
+	const snapshot = await buildRunsSnapshot(env);
+	const resp = snapshotResponse(snapshot, env);
+	// Edge-cache a clone (the response we return is consumed by the client).
+	ctx.waitUntil(cache.put(cacheKey, resp.clone()));
+	return resp;
+}
+
+/** Recompute the snapshot and update the edge cache. Called from
+ *  `ctx.waitUntil` to refresh stale entries without blocking the request. */
+async function refreshSnapshotCache(cache: Cache, cacheKey: Request, env: Env): Promise<void> {
+	const snapshot = await buildRunsSnapshot(env);
+	await cache.put(cacheKey, snapshotResponse(snapshot, env));
+}
+
 export default {
-	async fetch(req: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
+	async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		if (req.method === 'OPTIONS') {
 			return new Response(null, { status: 204, headers: corsHeaders(env) });
 		}
@@ -143,6 +265,10 @@ export default {
 
 		if (path === '/health' || path === '/api/health') {
 			return jsonResponse({ ok: true }, env);
+		}
+
+		if (path === '/api/runs-snapshot.json') {
+			return handleRunsSnapshot(req, env, ctx);
 		}
 
 		if (path === '/api/runs') {

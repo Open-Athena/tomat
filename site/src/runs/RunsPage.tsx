@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { Tooltip } from '../Tooltip'
-import { evalJobsByRun, evalPhase, fetchEval, fetchIrisState, fetchManifest, fetchRuns, irisJobIdForRun, parquetUrl } from './api'
+import { evalJobsByRun, evalPhase, fetchEval, fetchIrisState, fetchManifest, fetchRunsSnapshot, irisJobIdForRun, parquetUrl } from './api'
 import type { EvalJob, EvalPoint, IrisJob, RunManifest } from './api'
 import { fetchRunHistory } from './parquet'
 import type { RunHistory } from './parquet'
@@ -116,18 +116,23 @@ function freshnessColor(secAgo: number): string {
 
 // Auto-refresh cadences (ms) for the react-query polling on the runs
 // dashboard. The `tomat-iris-cron` VM re-syncs R2 roughly every minute;
-// manifests are small JSON so we poll them faster than the ~2MB parquet
-// histories (which also carry an R2 max-age=60, so refetches mostly hit
-// cache). Polling pauses automatically while the tab is backgrounded.
+// the snapshot endpoint is edge-cached for ~30s on the Worker side so
+// polling it faster than that just hits the same CF edge cache.
 //
-// Per-run polling is split into `active` (iris reports RUNNING/PENDING/
-// BUILDING) and `idle` (everything else: finished, failed, no iris job).
-// 43 active runs × 30s/poll = 86 req/min of ~8KB each ≈ 11 MB/min, so we
-// back off idle runs hard and let active ones stay fresh.
+// The aggregated snapshot poll replaced the old per-run manifest fanout:
+// instead of 43 × 1/min manifest GETs (43 req/min, with a 404 tail for
+// runs-without-synced-manifests), we make ONE snapshot poll that
+// multiplexes all manifests server-side.
+//
+// Per-run history (raw.parquet) polling is still split into `active`
+// (iris reports RUNNING/PENDING/BUILDING) and `idle` (everything else)
+// because parquets are big (~2 MB each) and unchanged for finished runs.
 const REFETCH_MS = {
-  runs: 60_000,
+  snapshot: 30_000,
   iris: 30_000,
-  manifest: { active: 60_000, idle: 600_000 },
+  // RunDetail polls a single manifest (not a fanout), so it goes direct
+  // rather than via the aggregated snapshot endpoint.
+  manifest: 60_000,
   history: { active: 180_000, idle: 600_000 },
   // On error (404, network), back off to keep TSQ from hammering R2 for a
   // never-synced manifest / a parquet that doesn't exist yet.
@@ -822,29 +827,38 @@ function RunsIndex() {
   // value is derived from the trace-highlight state.)
   const [activeInView, setActiveInView] = useState(true)
 
-  // Live data via react-query: the run list + iris snapshot poll on their
-  // own cadences; each run's manifest and parquet history get their own
-  // query so they refetch (and structurally-share) independently.
-  const runsQ = useQuery({
-    queryKey: ['runs'], queryFn: fetchRuns, refetchInterval: REFETCH_MS.runs,
-  })
-  const irisQ = useQuery({
-    queryKey: ['iris'], queryFn: fetchIrisState, refetchInterval: REFETCH_MS.iris,
+  // Live data via react-query: ONE aggregated snapshot poll (runs list + every
+  // manifest + iris state) replaces what used to be N+2 polls (runs + iris + N
+  // per-run manifests). The Worker fans out to R2 server-side and edge-caches
+  // for ~30s. Per-run parquet histories are still polled individually because
+  // each is ~2 MB and we don't want to multiplex MB-scale binary in one body.
+  const snapshotQ = useQuery({
+    queryKey: ['runs-snapshot'],
+    queryFn: fetchRunsSnapshot,
+    refetchInterval: REFETCH_MS.snapshot,
   })
 
-  // Visible runs in stable listing order — drives per-run color assignment.
-  const visible = useMemo(
-    () => (runsQ.data?.runs ?? []).filter((id) => !EXCLUDED_RUNS.has(id)),
-    [runsQ.data],
-  )
+  // Runs in the index that have a non-null manifest, in stable order. Runs
+  // present in the R2 index but with `manifest: null` (just created, never
+  // synced) are dropped from the dashboard — they'd just render as empty
+  // cards with no metrics, and they'd also generate "loading…" forever.
+  const visible = useMemo(() => {
+    const data = snapshotQ.data
+    if (!data) return []
+    return Object.keys(data.runs)
+      .filter((id) => !EXCLUDED_RUNS.has(id) && data.runs[id] != null)
+      .sort()
+  }, [snapshotQ.data])
 
-  // Active-run set drives the per-run poll interval. While iris hasn't
+  const iris = snapshotQ.data?.iris ?? null
+
+  // Active-run set drives the per-run history poll interval. While iris hasn't
   // loaded yet, treat every run as active (fail-open to fast polling for
   // the first ~30s rather than freezing every run at 10-min cadence).
   const activeRunIds = useMemo(() => {
-    if (!irisQ.data) return null
+    if (!iris) return null
     const s = new Set<string>()
-    for (const [jobName, job] of Object.entries(irisQ.data.jobs)) {
+    for (const [jobName, job] of Object.entries(iris.jobs)) {
       if (job.state === 'RUNNING' || job.state === 'PENDING' || job.state === 'BUILDING') {
         // Job names are `/ryan/<run-label>`; strip the user prefix.
         const m = jobName.match(/^\/[^/]+\/(.+)$/)
@@ -852,7 +866,7 @@ function RunsIndex() {
       }
     }
     return s
-  }, [irisQ.data])
+  }, [iris])
   const intervalFor = (
     runId: string,
     cadence: { active: number; idle: number },
@@ -862,14 +876,6 @@ function RunsIndex() {
     return cadence.idle
   }
 
-  const manifestQs = useQueries({
-    queries: visible.map((id) => ({
-      queryKey: ['manifest', id],
-      queryFn: () => fetchManifest(id),
-      refetchInterval: intervalFor(id, REFETCH_MS.manifest),
-      retry: 1,
-    })),
-  })
   const historyQs = useQueries({
     queries: visible.map((id) => ({
       queryKey: ['history', id],
@@ -879,26 +885,22 @@ function RunsIndex() {
     })),
   })
 
-  const iris = irisQ.data ?? null
   // m-eval jobs grouped by the run they evaluate (parsed from iris job names).
   const evalByRun = useMemo(() => evalJobsByRun(iris ?? undefined), [iris])
-  const err = runsQ.error ? String(runsQ.error) : null
-  // One card per visible run, assembled from the per-run queries; each field
-  // fills in as its query resolves. A failed history fetch is non-fatal (the
-  // card just lacks its sparkline/plot) — only a manifest error surfaces.
-  const cards: RunCardData[] | null = runsQ.data
-    ? visible.map((id, idx) => {
-        const mqErr = manifestQs[idx]?.error
-        return {
-          id,
-          manifest: manifestQs[idx]?.data ?? null,
-          job: iris?.jobs[irisJobIdForRun(id)] ?? null,
-          history: historyQs[idx]?.data ?? null,
-          evalJobs: evalByRun.get(id) ?? [],
-          color: colorForIndex(idx),
-          err: mqErr ? String(mqErr) : null,
-        }
-      })
+  const err = snapshotQ.error ? String(snapshotQ.error) : null
+  // One card per visible run; manifests come straight from the snapshot,
+  // histories from their per-run parquet queries. Failed history fetch is
+  // non-fatal (the card just lacks its sparkline/plot).
+  const cards: RunCardData[] | null = snapshotQ.data
+    ? visible.map((id, idx) => ({
+        id,
+        manifest: snapshotQ.data.runs[id],
+        job: iris?.jobs[irisJobIdForRun(id)] ?? null,
+        history: historyQs[idx]?.data ?? null,
+        evalJobs: evalByRun.get(id) ?? [],
+        color: colorForIndex(idx),
+        err: null,
+      }))
     : null
 
   // Drop v2 (P14) runs — obsolete tokenizer, and a few are mislabeled
@@ -1223,7 +1225,7 @@ function RunDetail({ runId }: { runId: string }) {
   const manifestQ = useQuery({
     queryKey: ['manifest', runId],
     queryFn: () => fetchManifest(runId),
-    refetchInterval: (q) => errBackoff(q) ?? REFETCH_MS.manifest.active,
+    refetchInterval: (q) => errBackoff(q) ?? REFETCH_MS.manifest,
     retry: 1,
   })
   const historyQ = useQuery({

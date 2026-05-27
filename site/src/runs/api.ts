@@ -63,6 +63,29 @@ export async function fetchManifest(runId: string): Promise<RunManifest> {
   return r.json()
 }
 
+/**
+ * Aggregated snapshot: runs index + every run's manifest + iris state in ONE
+ * response. The Worker fans out to R2 server-side and edge-caches the result
+ * (~30s TTL), so a tab with 50 runs no longer issues 50 manifest polls —
+ * just one snapshot poll. Runs in the index without a synced manifest yet
+ * show up as `runs[id] = null`; the dashboard drops them silently.
+ *
+ * See `worker/src/index.ts:handleRunsSnapshot` and `specs/23-runs-dashboard.md`
+ * (Phase B "On-demand caching" section) for the design.
+ */
+export interface RunsSnapshot {
+  synced_at: string
+  count: number
+  runs: Record<string, RunManifest | null>
+  iris: IrisState | null
+}
+
+export async function fetchRunsSnapshot(): Promise<RunsSnapshot> {
+  const r = await fetch(`${API_BASE}/api/runs-snapshot.json`)
+  if (!r.ok) throw new Error(`fetchRunsSnapshot ${r.status}`)
+  return r.json()
+}
+
 export function parquetUrl(runId: string): string {
   return `${API_BASE}/api/runs/${encodeURIComponent(runId)}/raw.parquet`
 }
