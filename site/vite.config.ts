@@ -11,5 +11,8 @@ export default defineConfig({
     host: true,
     allowedHosts,
   },
-  plugins: [react()]
+  plugins: [react()],
+  optimizeDeps: {
+    exclude: ['@rdub/file-tree'],
+  },
 })

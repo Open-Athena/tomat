@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@floating-ui/react": "^0.27.19",
+    "@rdub/file-tree": "workspace:*",
     "@tanstack/react-query": "^5.100.11",
     "d3-dsv": "^3.0.1",
     "hyparquet": "^1.25.8",
@@ -18,7 +19,8 @@
     "plotly.js-basic-dist": "^2.35.2",
     "pltly": "https://gitlab.com/runsascoded/js/pltly/-/archive/9c64c11de2aa3656c308dfdad56eafbc5c2fb32e/pltly-9c64c11de2aa3656c308dfdad56eafbc5c2fb32e.tar.gz",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^6.30.3"
   },
   "devDependencies": {
     "@types/d3-dsv": "^3.0.7",

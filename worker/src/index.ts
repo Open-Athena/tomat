@@ -8,17 +8,29 @@
  *   GET  /api/runs/:id/raw.parquet       — full history parquet
  *   GET  /api/runs/:id/eval.json         — per-step mat-NMAE/NEMD series (both mat-sets)
  *   GET  /api/iris-state.json            — iris snapshot (synced by tomat iris sync)
+ *   GET  /api/files/list?prefix=&cursor= — generic R2 list (under FILES_PREFIX allow-list)
+ *   GET  /api/files/get?path=…           — generic R2 get with Range support
  *   GET  /health
  *
  * Backed by R2 `openathena/tomat/runs/<id>/{raw.parquet,manifest.json,eval.json}`,
  * populated out-of-band by `tomat runs sync` + `tomat evals sync` (will become
  * an on-demand pull in a later phase — see specs/23-runs-dashboard.md).
+ *
+ * The `/api/files/*` endpoints expose the broader `tomat/` sub-tree of the
+ * `openathena` bucket (runs/, eval/, codecs/, tokenized/, …) for the
+ * `@rdub/file-tree`-powered `/files` route on the site. Reuses the same R2
+ * binding; the allow-list (`FILES_PREFIX`) keeps consumers from poking at
+ * other tenants' data in the shared bucket.
  */
 
 export interface Env {
 	R2: R2Bucket;
 	CORS_ORIGIN: string;
 	R2_RUNS_PREFIX: string;
+	/** Allow-list root for /api/files/*. Any list/get outside this prefix is
+	 *  rejected. Single string for now (the bucket has one tomat sub-tree);
+	 *  if we ever need multiple roots, switch to comma-split + array. */
+	FILES_PREFIX: string;
 }
 
 function corsHeaders(env: Env): HeadersInit {
@@ -248,6 +260,176 @@ async function refreshSnapshotCache(cache: Cache, cacheKey: Request, env: Env): 
 	await cache.put(cacheKey, snapshotResponse(snapshot, env));
 }
 
+/** Reject any path outside the FILES_PREFIX allow-list. The allow-list is a
+ *  single root (e.g. `tomat/`) for now — see `Env.FILES_PREFIX`. Empty
+ *  `FILES_PREFIX` means "whole bucket"; we don't expose that by default. */
+function isFilesPrefixAllowed(env: Env, keyOrPrefix: string): boolean {
+	const root = env.FILES_PREFIX;
+	if (!root) return false;
+	// Both empty prefix → "root listing" — allow, the lister will scope to
+	// the root prefix anyway.
+	if (keyOrPrefix === '' || keyOrPrefix === root) return true;
+	return keyOrPrefix.startsWith(root);
+}
+
+interface FilesEntry {
+	/** Store-relative path. Directories end with `/`. */
+	key: string;
+	/** Bytes; absent for directories. */
+	size?: number;
+	/** ISO-8601; absent if the store doesn't track it. */
+	lastModified?: string;
+	isDir: boolean;
+}
+
+interface FilesListResult {
+	entries: FilesEntry[];
+	cursor?: string;
+}
+
+/** Generic R2 list with delimiter, emitting the file-tree HTTP shape that
+ *  `HttpStore` consumes. Edge-caches per (prefix, cursor) tuple for 60s —
+ *  R2 list isn't free and these are mostly static blob trees. */
+async function handleFilesList(req: Request, env: Env): Promise<Response> {
+	const url = new URL(req.url);
+	let prefix = url.searchParams.get('prefix') ?? '';
+	const cursor = url.searchParams.get('cursor') ?? undefined;
+	const limitS = url.searchParams.get('limit');
+	const limit = limitS ? Math.min(1000, Math.max(1, parseInt(limitS, 10) || 100)) : undefined;
+
+	// Empty prefix is meaningful: the file-tree UI's "root" listing. Scope
+	// to FILES_PREFIX so consumers see the tomat sub-tree as the apparent
+	// bucket root (no peeking at other openathena tenants).
+	if (prefix === '') {
+		prefix = env.FILES_PREFIX;
+	} else if (!isFilesPrefixAllowed(env, prefix)) {
+		return new Response('Forbidden: prefix outside FILES_PREFIX', {
+			status: 403,
+			headers: corsHeaders(env),
+		});
+	}
+
+	const listing = await env.R2.list({
+		prefix,
+		delimiter: '/',
+		...(cursor ? { cursor } : {}),
+		...(limit ? { limit } : {}),
+	});
+
+	const entries: FilesEntry[] = [];
+	// delimitedPrefixes = sub-"directories"; each ends with `/`.
+	for (const p of listing.delimitedPrefixes ?? []) {
+		entries.push({ key: p, isDir: true });
+	}
+	for (const o of listing.objects ?? []) {
+		// Skip the "directory marker" objects R2 sometimes has at the prefix
+		// itself (key === prefix). These confuse the tree UI.
+		if (o.key === prefix) continue;
+		entries.push({
+			key: o.key,
+			size: o.size,
+			lastModified: o.uploaded instanceof Date ? o.uploaded.toISOString() : undefined,
+			isDir: false,
+		});
+	}
+
+	const out: FilesListResult = { entries };
+	if (listing.truncated && listing.cursor) {
+		out.cursor = listing.cursor;
+	}
+
+	return new Response(JSON.stringify(out), {
+		headers: {
+			'Content-Type': 'application/json',
+			'Cache-Control': 'public, max-age=60',
+			...corsHeaders(env),
+		},
+	});
+}
+
+/** Best-effort content-type from extension. R2's `httpMetadata.contentType`
+ *  wins when set; this is the fallback for blobs uploaded without one
+ *  (most of our `tomat runs sync` output). */
+function contentTypeForKey(key: string): string {
+	const i = key.lastIndexOf('.');
+	const ext = i >= 0 ? key.slice(i + 1).toLowerCase() : '';
+	switch (ext) {
+		case 'json': return 'application/json';
+		case 'md': case 'markdown': return 'text/markdown; charset=utf-8';
+		case 'txt': case 'log': return 'text/plain; charset=utf-8';
+		case 'csv': return 'text/csv; charset=utf-8';
+		case 'tsv': return 'text/tab-separated-values; charset=utf-8';
+		case 'html': case 'htm': return 'text/html; charset=utf-8';
+		case 'js': return 'application/javascript';
+		case 'png': return 'image/png';
+		case 'jpg': case 'jpeg': return 'image/jpeg';
+		case 'gif': return 'image/gif';
+		case 'svg': return 'image/svg+xml';
+		case 'webp': return 'image/webp';
+		case 'mp4': return 'video/mp4';
+		case 'webm': return 'video/webm';
+		case 'mp3': return 'audio/mpeg';
+		case 'wav': return 'audio/wav';
+		case 'parquet': case 'pqt': return 'application/octet-stream';
+		case 'zip': return 'application/zip';
+		case 'pdf': return 'application/pdf';
+		case 'ipynb': return 'application/x-ipynb+json';
+		default: return 'application/octet-stream';
+	}
+}
+
+/** Serve an R2 object under the FILES_PREFIX allow-list. Like
+ *  `serveR2Object`, but uses extension-derived content-type when R2 has no
+ *  stored `httpMetadata.contentType`, and applies cache-control tuned for
+ *  static blobs (long for `*.parquet`, shorter for `*.json` which may
+ *  change as runs sync). */
+async function serveR2FilesObject(req: Request, env: Env, key: string): Promise<Response> {
+	const rangeHeader = req.headers.get('Range');
+	const r2Range = parseRangeHeader(rangeHeader);
+	const obj = r2Range
+		? await env.R2.get(key, { range: r2Range })
+		: await env.R2.get(key);
+	if (!obj) {
+		return new Response(`Not found: ${key}`, {
+			status: 404,
+			headers: corsHeaders(env),
+		});
+	}
+	const headers = new Headers();
+	obj.writeHttpMetadata(headers);
+	if (!headers.get('Content-Type')) {
+		headers.set('Content-Type', contentTypeForKey(key));
+	}
+	headers.set('etag', obj.httpEtag);
+	headers.set('Accept-Ranges', 'bytes');
+	// Cache parquet blobs longer (immutable per run id); json/log/manifest
+	// shorter since they can be re-synced.
+	const longTtl = /\.(parquet|pqt|zip|png|jpg|jpeg|webp|mp4|webm|mp3|wav|svg|pdf)$/i.test(key);
+	headers.set('Cache-Control', longTtl ? 'public, max-age=86400' : 'public, max-age=60');
+	const totalSize = obj.size;
+	let status = 200;
+	if (r2Range) {
+		let start: number, end: number;
+		if ('suffix' in r2Range && typeof r2Range.suffix === 'number') {
+			start = Math.max(0, totalSize - r2Range.suffix);
+			end = totalSize - 1;
+		} else {
+			const offsetRange = r2Range as { offset?: number; length?: number };
+			start = offsetRange.offset ?? 0;
+			end = start + (offsetRange.length ?? totalSize - start) - 1;
+		}
+		headers.set('Content-Range', `bytes ${start}-${end}/${totalSize}`);
+		headers.set('Content-Length', `${end - start + 1}`);
+		status = 206;
+	} else {
+		headers.set('Content-Length', `${totalSize}`);
+	}
+	for (const [k, v] of Object.entries(corsHeaders(env))) {
+		headers.set(k, v as string);
+	}
+	return new Response(obj.body, { status, headers });
+}
+
 export default {
 	async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		if (req.method === 'OPTIONS') {
@@ -287,6 +469,24 @@ export default {
 			const [, runId, file] = runFileMatch;
 			const key = `${env.R2_RUNS_PREFIX}/${runId}/${file}`;
 			return serveR2Object(req, env, key);
+		}
+
+		if (path === '/api/files/list') {
+			return handleFilesList(req, env);
+		}
+
+		if (path === '/api/files/get') {
+			const key = url.searchParams.get('path') ?? '';
+			if (!key) {
+				return new Response('path required', { status: 400, headers: corsHeaders(env) });
+			}
+			if (!isFilesPrefixAllowed(env, key)) {
+				return new Response('Forbidden: path outside FILES_PREFIX', {
+					status: 403,
+					headers: corsHeaders(env),
+				});
+			}
+			return serveR2FilesObject(req, env, key);
 		}
 
 		return new Response(`Not found: ${path}`, {

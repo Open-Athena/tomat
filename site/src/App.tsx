@@ -1,5 +1,6 @@
 import { PlotlyProvider } from 'pltly/react'
 import { DeckPage } from './DeckPage'
+import { FilesPage } from './files/FilesPage'
 import { HomePage } from './HomePage'
 import { RunsPage } from './runs/RunsPage'
 import { parseHash, useHash } from './useHash'
@@ -18,6 +19,8 @@ export function App() {
         <DeckPage />
       ) : route === 'runs' ? (
         <RunsPage parts={parts.slice(1)} />
+      ) : route === 'files' ? (
+        <FilesPage />
       ) : (
         <HomePage />
       )}
