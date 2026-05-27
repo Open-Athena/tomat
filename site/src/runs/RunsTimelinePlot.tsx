@@ -7,7 +7,7 @@
 // Intended as the at-a-glance "what's happening across all my training jobs?"
 // visual at the top of the /runs index.
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { LegendItem, Plot, useTheme } from 'pltly/react'
 import { Tooltip } from '../Tooltip'
 import type { UseTraceHighlightReturn } from 'pltly/react'
@@ -54,7 +54,43 @@ const X_MODES: { id: XMode; label: string; help: string }[] = [
 const X_MODE_KEY = 'tomat:runs-xmode'
 const LEGEND_COLLAPSED_KEY = 'tomat:runs-legend-collapsed'
 const NAME_FILTER_KEY = 'tomat:runs-name-filter'
+const NAME_FILTER_EVT = 'tomat:runs-name-filter-change'
 const TAG_FILTER_KEY = 'tomat:runs-tag-filter'
+
+/**
+ * Cross-component reactive store for the regex name-filter input. Used by both
+ * the plot (to filter visible traces) and the page (to sort matching cards to
+ * the top + fade non-matches). Same-tab `localStorage` events don't fire, so
+ * the setter dispatches a CustomEvent that every hook instance listens for.
+ */
+export function useNameFilter(): readonly [string, (v: string) => void] {
+  const [filter, setFilter] = useState(() => {
+    try { return localStorage.getItem(NAME_FILTER_KEY) ?? '' } catch { return '' }
+  })
+  useEffect(() => {
+    const onEvt = (e: Event) => {
+      const detail = (e as CustomEvent<string>).detail
+      setFilter(typeof detail === 'string' ? detail : '')
+    }
+    window.addEventListener(NAME_FILTER_EVT, onEvt)
+    return () => window.removeEventListener(NAME_FILTER_EVT, onEvt)
+  }, [])
+  const update = (v: string) => {
+    setFilter(v)
+    try { localStorage.setItem(NAME_FILTER_KEY, v) } catch { /* ignore */ }
+    window.dispatchEvent(new CustomEvent(NAME_FILTER_EVT, { detail: v }))
+  }
+  return [filter, update] as const
+}
+
+/** Compile the persisted name-filter to a regex (case-insensitive). Returns
+ * `{re: null, error: false}` for empty input, and `{re: null, error: true}`
+ * for invalid regex syntax (UI can show a red border). */
+export function compileNameFilter(filter: string): { re: RegExp | null; error: boolean } {
+  if (filter.trim() === '') return { re: null, error: false }
+  try { return { re: new RegExp(filter, 'i'), error: false } }
+  catch { return { re: null, error: true } }
+}
 
 // `active` x-mode: cap on a single inter-sample interval's contribution.
 // Runs log every ~minute while training, so anything longer is a gap the
@@ -164,17 +200,9 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight }: Props) {
     try { localStorage.setItem(LOGY_KEY, v ? '1' : '0') } catch { /* ignore */ }
   }
 
-  // Regex filter on run name. Persisted. Empty string = no filter (show all).
-  // Lets the user split groups of runs that don't share a y-axis range — most
-  // immediate use case: filter out the EMD-loss runs (TL ~100s) so the CE runs
-  // (TL ~few) aren't crushed against the bottom of the autoscaled axis.
-  const [nameFilter, setNameFilterRaw] = useState(() => {
-    try { return localStorage.getItem(NAME_FILTER_KEY) ?? '' } catch { return '' }
-  })
-  const setNameFilter = (v: string) => {
-    setNameFilterRaw(v)
-    try { localStorage.setItem(NAME_FILTER_KEY, v) } catch { /* ignore */ }
-  }
+  // Regex filter on run name. Persisted + cross-component-synced (RunsPage
+  // reads the same hook to sort matching cards to top + fade non-matches).
+  const [nameFilter, setNameFilter] = useNameFilter()
   // Compile the regex once per change; invalid patterns just fall through to
   // "no filter" with a visual hint on the input (red border).
   let nameRe: RegExp | null = null

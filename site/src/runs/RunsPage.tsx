@@ -6,7 +6,7 @@ import type { EvalJob, EvalPoint, IrisJob, RunManifest } from './api'
 import { fetchRunHistory } from './parquet'
 import type { RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
-import { RunsTimelinePlot, colorForIndex, shortLabel } from './RunsTimelinePlot'
+import { RunsTimelinePlot, colorForIndex, shortLabel, useNameFilter, compileNameFilter } from './RunsTimelinePlot'
 import type { RunTimelineSeries } from './RunsTimelinePlot'
 import { useTraceHighlight } from 'pltly/react'
 
@@ -85,6 +85,10 @@ function recentStepPoints(history: RunHistory): { x: number; y: number }[] {
       all.push({ x: t, y: s })
     }
   }
+  // Sort by timestamp — parquet row order isn't guaranteed strictly
+  // chronological (wandb syncs in chunks, interleaves system + training
+  // metrics), so connecting points in row order produces a zigzag.
+  all.sort((a, b) => a.x - b.x)
   if (all.length <= 120) return all
   // Downsample by stride
   const stride = Math.ceil(all.length / 120)
@@ -940,15 +944,33 @@ function RunsIndex() {
     ? labelToId.get(highlight.pinnedTrace) ?? null
     : null
 
-  // The pinned run floats to the top of the card list — a click lands you on
-  // its card directly, no footer scroll-chase. (Counts/timeline still use the
-  // activity-ordered `ordered`; only the rendered list is re-ordered.)
+  // Regex name-filter (synced with the plot's input via useNameFilter).
+  // When active, matching cards float to the top of the list and non-matching
+  // ones fade — same intent as the plot's filter, but non-destructive.
+  const [nameFilter] = useNameFilter()
+  const { re: nameRe } = compileNameFilter(nameFilter)
+  const matchedIds = useMemo(() => {
+    if (!nameRe || !ordered) return null
+    const s = new Set<string>()
+    // Match against shortLabel — same source the plot legend uses — so what
+    // the user sees in the input matches what they see on cards/legend.
+    for (const c of ordered) if (nameRe.test(shortLabel(c.id))) s.add(c.id)
+    return s
+  }, [nameRe, ordered])
+
+  // Card order: pinned first, then regex-matches, then everything else
+  // (each group preserving activity-order from `ordered`).
   const displayed = useMemo(() => {
-    if (!ordered || !pinnedRunId) return ordered
-    const pinned = ordered.find((c) => c.id === pinnedRunId)
-    if (!pinned) return ordered
-    return [pinned, ...ordered.filter((c) => c.id !== pinnedRunId)]
-  }, [ordered, pinnedRunId])
+    if (!ordered) return ordered
+    const pinned = pinnedRunId ? ordered.find((c) => c.id === pinnedRunId) : null
+    const rest = pinned ? ordered.filter((c) => c.id !== pinned.id) : ordered
+    if (!matchedIds || matchedIds.size === 0) {
+      return pinned ? [pinned, ...rest] : rest
+    }
+    const matched = rest.filter((c) => matchedIds.has(c.id))
+    const others = rest.filter((c) => !matchedIds.has(c.id))
+    return pinned ? [pinned, ...matched, ...others] : [...matched, ...others]
+  }, [ordered, pinnedRunId, matchedIds])
 
   // On (re)pin, scroll the now-top pinned card into view.
   useEffect(() => {
@@ -1007,17 +1029,21 @@ function RunsIndex() {
           <RunsTimelinePlot runs={timelineSeries} highlight={highlight} />
         </div>
       )}
-      {displayed && displayed.map((c) => (
-        <RunCard
-          key={c.id}
-          data={c}
-          activeRunId={activeRunId}
-          pinnedRunId={pinnedRunId}
-          onHover={onCardHover}
-          onClick={onCardClick}
-          onScrollTargetRef={setCardRef}
-        />
-      ))}
+      {displayed && displayed.map((c) => {
+        const faded = matchedIds && matchedIds.size > 0 && !matchedIds.has(c.id)
+        return (
+          <div key={c.id} style={faded ? { opacity: 0.35 } : undefined}>
+            <RunCard
+              data={c}
+              activeRunId={activeRunId}
+              pinnedRunId={pinnedRunId}
+              onHover={onCardHover}
+              onClick={onCardClick}
+              onScrollTargetRef={setCardRef}
+            />
+          </div>
+        )
+      })}
       {/* Bottom breadcrumb when a *hovered* card is off-screen. Pinned runs
           don't need it — they're rendered at the top of the list. */}
       {activeRunId && !activeInView && !highlight.isPinned && (
