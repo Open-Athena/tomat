@@ -1039,13 +1039,13 @@ function RunsIndex() {
   // same hook via the controlled `tagFilters` / `onTagFiltersChange` props
   // below, so chip clicks update both the plot and the card list in lockstep.
   const [tagFilters, onTagFiltersChange] = useTagFilters()
-  // Runs whose tag set satisfies the tri-state constraint. `null` when no
-  // tags are active — semantics: "no tag constraint, show all". Distinct
-  // from regex-`matchedIds`, which only sorts: tags hard-filter (matching
-  // the plot's tag-chip behavior), so a run that fails the chip predicate
-  // is hidden from the card list entirely.
+  // Runs whose tag set satisfies the tri-state constraint (overrides +
+  // per-tag defaults). Distinct from regex-`matchedIds`, which only sorts:
+  // tags hard-filter, so a run that fails the chip predicate is hidden
+  // from the card list entirely. No empty-Map fast-path — per-tag defaults
+  // (`bunk = out`) still constrain even when the override Map is empty.
   const tagMatchedIds = useMemo(() => {
-    if (tagFilters.size === 0 || !ordered) return null
+    if (!ordered) return null
     const s = new Set<string>()
     for (const c of ordered) {
       if (runPassesTagFilters(tagsFor(shortLabel(c.id)), tagFilters)) s.add(c.id)

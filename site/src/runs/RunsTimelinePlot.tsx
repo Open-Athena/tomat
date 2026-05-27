@@ -13,7 +13,7 @@ import { Tooltip } from '../Tooltip'
 import type { UseTraceHighlightReturn } from 'pltly/react'
 import { themedHoverlabel } from '../theme'
 import type { RunHistory } from './parquet'
-import { ALL_TAGS, cycleTagFilter, defaultTagFilters, parseTagFilters, parseTagFiltersUrl, runPassesTagFilters, serializeTagFilters, serializeTagFiltersUrl, tagsFor, type RunTag, type TagFilters } from './tags'
+import { ALL_TAGS, cycleTagFilter, effectiveTagState, parseTagFilters, parseTagFiltersUrl, runPassesTagFilters, serializeTagFilters, serializeTagFiltersUrl, tagsFor, type RunTag, type TagFilters } from './tags'
 import { compileMultiTermFilter } from './filter'
 // Re-export so RunsPage can `import { ... } from './RunsTimelinePlot'` —
 // keeps callers off the helper module's internal path.
@@ -132,12 +132,18 @@ function writeUrlRegex(v: string): void {
 
 /** URL-state for the tag-chip tri-state filter. Mirrors `useNameFilter`'s
  *  hash-aware encode/decode (HashRouter; we look at `location.hash`, not
- *  `.search`). Encoding: `'in'` tags emitted bare, `'out'` tags get a `-`
- *  prefix, joined by spaces — URLSearchParams encodes the space as `+`.
+ *  `.search`). Encoding (overrides only — see `tags.ts`):
+ *    bare `tag`   → in
+ *    `-tag`       → out
+ *    `~tag`       → off (only emitted when overriding a non-`off` default,
+ *                        e.g. dismissing the implicit `bunk = out`)
+ *  Tokens joined by spaces; `URLSearchParams` encodes space as `+`.
  *
- *  Missing `?tags` (i.e. brand-new visit) → `null` (caller applies its own
- *  default — typically `defaultTagFilters()`). Empty `?tags=` → empty Map
- *  (user explicitly cleared every chip, default should not snap back). */
+ *  The URL stores only NON-default state. A tag absent from the URL falls
+ *  back to its `TAG_DEFAULTS` entry, so `?tags=CE` keeps `bunk` at its
+ *  default `out` and the URL stays clean. Empty `?tags=` is identical to
+ *  absent — both yield the all-defaults state — so there's no "explicit
+ *  zero-filter" state separate from defaults. */
 function readUrlTags(): TagFilters | null {
   if (typeof window === 'undefined') return null
   const hash = window.location.hash || ''
@@ -159,10 +165,11 @@ function writeUrlTags(filters: TagFilters): void {
   let params: URLSearchParams
   try { params = new URLSearchParams(qIdx < 0 ? '' : hash.slice(qIdx + 1)) }
   catch { params = new URLSearchParams() }
-  // Always write — even an empty value — so reload / back-button doesn't
-  // snap back to the first-visit default. To reset to default, navigate
-  // to `/runs` (no `?tags=`).
-  params.set('tags', serializeTagFiltersUrl(filters))
+  // Empty override map = back to all-defaults, which is the absent state.
+  // Drop the param entirely so the URL stays clean (per the "URL stores
+  // only overrides" model — see `serializeTagFiltersUrl`).
+  if (filters.size === 0) params.delete('tags')
+  else params.set('tags', serializeTagFiltersUrl(filters))
   const qs = params.toString()
   const next = qs ? `${path}?${qs}` : path
   if (next !== hash) {
@@ -172,9 +179,12 @@ function writeUrlTags(filters: TagFilters): void {
 
 const TAG_FILTER_EVT = 'tomat:runs-tag-filter-change'
 
-/** React hook owning the tag-filter map. URL is the source of truth; the
- *  legacy `localStorage` value (single-state-array shape) is migrated on
- *  first read then cleared. First-visit default: `{ bunk: 'out' }`. */
+/** React hook owning the tag-filter OVERRIDE map. URL is canonical; legacy
+ *  `localStorage` is migrated on first read then cleared. The Map holds
+ *  only overrides — per-tag defaults (see `TAG_DEFAULTS`) apply for any
+ *  tag absent from the Map, so an empty Map is the all-defaults state.
+ *  No first-visit-default constant needed: defaults live in `TAG_DEFAULTS`
+ *  and `effectiveTagState` reads them on demand. */
 export function useTagFilters(): readonly [TagFilters, (v: TagFilters) => void] {
   const [filters, setFilters] = useState<TagFilters>(() => {
     const fromUrl = readUrlTags()
@@ -190,7 +200,7 @@ export function useTagFilters(): readonly [TagFilters, (v: TagFilters) => void] 
         return ls
       }
     } catch { /* ignore */ }
-    return defaultTagFilters()
+    return new Map()
   })
   useEffect(() => {
     const onEvt = (e: Event) => {
@@ -428,9 +438,11 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
   for (const r of nameFilteredRuns) for (const t of tagsFor(r.label)) visibleTagSet.add(t)
   const chipTags = ALL_TAGS.filter((t) => visibleTagSet.has(t))
 
-  const filteredRuns = tagFilters.size === 0
-    ? nameFilteredRuns
-    : nameFilteredRuns.filter((r) => runPassesTagFilters(tagsFor(r.label), tagFilters))
+  // No `.size === 0` fast-path: per-tag defaults (e.g. `bunk = out`) still
+  // constrain even when the override Map is empty. `runPassesTagFilters`
+  // short-circuits via its empty-constraint set when neither the Map nor
+  // `TAG_DEFAULTS` carry anything.
+  const filteredRuns = nameFilteredRuns.filter((r) => runPassesTagFilters(tagsFor(r.label), tagFilters))
 
   const cutoffSec = hoursBack ? (Date.now() / 1000 - hoursBack * 3600) : null
 
@@ -660,10 +672,12 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
             tags:
           </span>
           {chipTags.map((t) => {
-            // Tri-state visual: off (neutral) / 'in' (blue, additive AND) /
-            // 'out' (red w/ strikethrough, exclusion AND). Click cycles
-            // off → 'in' → 'out' → off.
-            const state = tagFilters.get(t)
+            // Tri-state visual driven by the *effective* state (override
+            // when present, else per-tag default). Cycle: in → out → off →
+            // in; the cycle is implemented over effective state in
+            // `cycleTagFilter`, so e.g. `bunk` (default `out`) starts at
+            // its default-red and cycles out → off → in → back to default.
+            const state = effectiveTagState(tagFilters, t)
             const styleFor = (s: typeof state) => {
               if (s === 'in') return {
                 bg: isDark ? '#2a4a7a' : '#cbe0f5',
@@ -685,7 +699,7 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
               }
             }
             const sty = styleFor(state)
-            const nextLabel = state === undefined ? 'include' : state === 'in' ? 'exclude' : 'remove'
+            const nextLabel = state === 'in' ? 'exclude' : state === 'out' ? 'remove' : 'include'
             return (
               <Tooltip key={t} content={`${nextLabel} "${t}" filter (in → out → off; AND across)`}>
                 <button

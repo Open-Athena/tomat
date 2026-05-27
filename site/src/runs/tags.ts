@@ -157,33 +157,72 @@ export function tagsFor(runName: string): RunTag[] {
   return RUN_TAGS[runName] ?? []
 }
 
-/** Per-tag filter state. Absent (Map miss) = "don't care" / off.
+/** Per-tag filter state.
  *  - `'in'`  ⇒ the run MUST have this tag.
  *  - `'out'` ⇒ the run MUST NOT have this tag.
+ *  - `'off'` ⇒ no constraint (this entry exists in the Map only as an
+ *               *override* of a non-`off` default — e.g. someone clicked
+ *               `bunk` to switch it from its built-in `'out'` default
+ *               back to "no filter").
  *
- *  Tags are tri-state: click cycles off → in → out → off. */
-export type TagFilterState = 'in' | 'out'
+ *  The Map stores ONLY non-default states. A tag missing from the Map
+ *  is implicitly at its default (see `TAG_DEFAULTS`), which is `'off'`
+ *  for every tag except `bunk` (which defaults to `'out'`). URL
+ *  serialization mirrors this — clean URLs only mention overrides. */
+export type TagFilterState = 'in' | 'out' | 'off'
 export type TagFilters = Map<RunTag, TagFilterState>
 
-/** Apply the tag-filter map to a run's tag list. */
+/** Per-tag default. Tags absent here implicitly default to `'off'`.
+ *  Rationale for `bunk`: init-cls-bug-era runs (mg-1, mg-2-*) all
+ *  trained as plain CE; they spam the CE / EMD chip filters and drown
+ *  out post-fix runs that actually tested those losses. Hiding them
+ *  by default matches what most viewers want; click the chip to opt
+ *  back in. See `memory/levanter-init-cls-bug.md`. */
+export const TAG_DEFAULTS: ReadonlyMap<RunTag, TagFilterState> = new Map([
+  ['bunk', 'out'],
+])
+
+export function defaultStateFor(tag: RunTag): TagFilterState {
+  return TAG_DEFAULTS.get(tag) ?? 'off'
+}
+
+/** The *effective* state for `tag`: the override if one exists,
+ *  otherwise the per-tag default. */
+export function effectiveTagState(filters: TagFilters, tag: RunTag): TagFilterState {
+  return filters.get(tag) ?? defaultStateFor(tag)
+}
+
+/** Apply the (overrides + defaults) tag-filter to a run's tag list.
+ *  Iterates the union of `filters` keys and `TAG_DEFAULTS` keys — both
+ *  carry constraints. */
 export function runPassesTagFilters(runTags: RunTag[], filters: TagFilters): boolean {
-  if (filters.size === 0) return true
-  for (const [t, state] of filters) {
-    const has = runTags.includes(t)
+  const constrained = new Set<RunTag>([...filters.keys(), ...TAG_DEFAULTS.keys()])
+  for (const tag of constrained) {
+    const state = effectiveTagState(filters, tag)
+    if (state === 'off') continue
+    const has = runTags.includes(tag)
     if (state === 'in' && !has) return false
     if (state === 'out' && has) return false
   }
   return true
 }
 
-/** Cycle one tag's state: off → 'in' → 'out' → off. Returns a *new* Map. */
+const NEXT_STATE: Record<TagFilterState, TagFilterState> = {
+  in: 'out',
+  out: 'off',
+  off: 'in',
+}
+
+/** Cycle `tag`'s effective state via `in → out → off → in`. The new
+ *  state is stored as an override only if it differs from the tag's
+ *  default — otherwise the entry is removed (so the URL stays minimal).
+ *  Returns a *new* Map. */
 export function cycleTagFilter(filters: TagFilters, t: RunTag): TagFilters {
-  const next = new Map(filters)
-  const cur = next.get(t)
-  if (cur === undefined) next.set(t, 'in')
-  else if (cur === 'in') next.set(t, 'out')
-  else next.delete(t)
-  return next
+  const next = NEXT_STATE[effectiveTagState(filters, t)]
+  const newFilters = new Map(filters)
+  if (next === defaultStateFor(t)) newFilters.delete(t)
+  else newFilters.set(t, next)
+  return newFilters
 }
 
 /** Parse the localStorage payload into a `TagFilters` map. Accepts both the
@@ -199,7 +238,7 @@ export function parseTagFilters(raw: string): TagFilters {
       for (const t of parsed as RunTag[]) m.set(t, 'in')
     } else if (parsed && typeof parsed === 'object') {
       for (const [k, v] of Object.entries(parsed as Record<string, string>)) {
-        if (v === 'in' || v === 'out') m.set(k, v)
+        if (v === 'in' || v === 'out' || v === 'off') m.set(k, v)
       }
     }
   } catch { /* ignore — return empty */ }
@@ -210,25 +249,26 @@ export function serializeTagFilters(filters: TagFilters): string {
   return JSON.stringify(Object.fromEntries(filters))
 }
 
-/** First-visit default. The init-cls-bug-era `bunk` runs (mg-1, mg-2-*) all
- *  trained as plain CE, so they spam the CE/EMD chip filters and drown out
- *  the post-fix runs that actually tested those losses. Pre-excluding them
- *  matches what most viewers want by default; flip the chip to opt back in. */
-export function defaultTagFilters(): TagFilters {
-  return new Map([['bunk', 'out']])
-}
-
 /** URL-friendly encoding (distinct from `serializeTagFilters`, which emits
- *  JSON for localStorage). `'in'` tags are emitted bare, `'out'` tags get a
- *  leading `-`, joined by spaces. `URLSearchParams` then encodes the space
- *  as `+` and any internal `+` (e.g. `CE+EMD`) as `%2B`, so
- *  `{CE: 'in', bunk: 'out', CE+EMD: 'in'}` round-trips as
- *  `?tags=CE+-bunk+CE%2BEMD` on the wire — mirrors the `use-prms` numeric
- *  sign-as-delimiter convention. */
+ *  JSON for localStorage). Encoding (the Map only ever contains overrides
+ *  of per-tag defaults, so any tag emitted here is already non-default):
+ *
+ *  - `'in'`  → bare `tag` (no prefix)
+ *  - `'out'` → `-tag`
+ *  - `'off'` → `~tag`  (only ever appears when the tag has a non-`off`
+ *                        default — today: `bunk`, when the user dismissed
+ *                        the pre-excluded chip)
+ *
+ *  Joined by spaces; `URLSearchParams` encodes the space as `+` and any
+ *  internal `+` (e.g. `CE+EMD`) as `%2B`. So `{CE: 'in', bunk: 'off'}`
+ *  round-trips as `?tags=CE+~bunk`, mirroring `use-prms`'s sign-as-delim
+ *  numeric convention. */
 export function serializeTagFiltersUrl(filters: TagFilters): string {
   const parts: string[] = []
   for (const [tag, state] of filters) {
-    parts.push(state === 'out' ? `-${tag}` : tag)
+    if (state === 'in') parts.push(tag)
+    else if (state === 'out') parts.push(`-${tag}`)
+    else parts.push(`~${tag}`)
   }
   return parts.join(' ')
 }
@@ -239,6 +279,8 @@ export function parseTagFiltersUrl(s: string): TagFilters {
   for (const tok of s.split(/\s+/)) {
     if (!tok) continue
     if (tok.startsWith('-')) m.set(tok.slice(1), 'out')
+    else if (tok.startsWith('~')) m.set(tok.slice(1), 'off')
+    else if (tok.startsWith('+')) m.set(tok.slice(1), 'in')
     else m.set(tok, 'in')
   }
   return m
