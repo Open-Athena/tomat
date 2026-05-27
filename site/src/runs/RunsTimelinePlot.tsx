@@ -48,6 +48,12 @@ interface Props {
    *  to do plot-hover-only side effects, e.g. floating the matching card to
    *  the top without creating a card-hover feedback loop. */
   onPlotHover?: (label: string | null) => void
+  /** Controlled tag-filter state. When omitted the plot owns its own state +
+   *  localStorage persistence. The parent passes both to mirror the chip
+   *  selection into the card list so tag filters can hard-filter rows, not
+   *  just trace plotting. */
+  selectedTags?: Set<RunTag>
+  onSelectedTagsChange?: (next: Set<RunTag>) => void
 }
 
 /** Local-TZ datetime string for a Plotly date axis. Plotly treats a string
@@ -72,7 +78,7 @@ const X_MODE_KEY = 'tomat:runs-xmode'
 const LEGEND_COLLAPSED_KEY = 'tomat:runs-legend-collapsed'
 const NAME_FILTER_KEY = 'tomat:runs-name-filter'
 const NAME_FILTER_EVT = 'tomat:runs-name-filter-change'
-const TAG_FILTER_KEY = 'tomat:runs-tag-filter'
+export const TAG_FILTER_KEY = 'tomat:runs-tag-filter'
 
 /**
  * Cross-component reactive store for the (multi-term regex) name-filter input.
@@ -245,7 +251,7 @@ function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
   return { x, y }
 }
 
-export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onPlotHover }: Props) {
+export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onPlotHover, selectedTags: selectedTagsExternal, onSelectedTagsChange }: Props) {
   const { isDark } = useTheme()
 
   // Legend collapse persists in localStorage — it's long, some users tuck it
@@ -301,20 +307,33 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
   // Tag-chip filter. AND across selected tags: a run is visible iff EVERY
   // selected tag is in its tag set. Empty set = no tag constraint (show all).
   // Untagged runs are hidden whenever any tag is selected (since they can't
-  // satisfy an "AND" with a tag they don't have). Persisted as JSON array.
-  const [selectedTags, setSelectedTagsRaw] = useState<Set<RunTag>>(() => {
+  // satisfy an "AND" with a tag they don't have).
+  //
+  // Controlled when `selectedTagsExternal` is passed (parent owns state +
+  // persistence + can hard-filter the card list against it); falls back to
+  // own state + localStorage otherwise so the plot still works standalone.
+  const [selectedTagsInternal, setSelectedTagsInternal] = useState<Set<RunTag>>(() => {
+    if (selectedTagsExternal) return selectedTagsExternal
     try {
       const raw = localStorage.getItem(TAG_FILTER_KEY)
       if (raw) return new Set(JSON.parse(raw) as RunTag[])
     } catch { /* ignore */ }
     return new Set()
   })
-  const toggleTag = (t: RunTag) => setSelectedTagsRaw((prev) => {
-    const next = new Set(prev)
+  const selectedTags = selectedTagsExternal ?? selectedTagsInternal
+  const setSelectedTagsRaw = (next: Set<RunTag>) => {
+    if (onSelectedTagsChange) {
+      onSelectedTagsChange(next)
+    } else {
+      setSelectedTagsInternal(next)
+      try { localStorage.setItem(TAG_FILTER_KEY, JSON.stringify([...next])) } catch { /* ignore */ }
+    }
+  }
+  const toggleTag = (t: RunTag) => {
+    const next = new Set(selectedTags)
     if (next.has(t)) next.delete(t); else next.add(t)
-    try { localStorage.setItem(TAG_FILTER_KEY, JSON.stringify([...next])) } catch { /* ignore */ }
-    return next
-  })
+    setSelectedTagsRaw(next)
+  }
   // Only show chips for tags that ANY currently-visible (name-filtered) run
   // carries — keeps the chip strip short and relevant.
   const visibleTagSet = new Set<RunTag>()
@@ -577,7 +596,15 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
           })}
           {selectedTags.size > 0 && (
             <button
-              onClick={() => { setSelectedTagsRaw(new Set()); try { localStorage.removeItem(TAG_FILTER_KEY) } catch { /* ignore */ } }}
+              onClick={() => {
+                setSelectedTagsRaw(new Set())
+                // Internal-state path also clears localStorage; the controlled
+                // path's persistence is the parent's responsibility (so
+                // controlled mode skips the removeItem here).
+                if (!onSelectedTagsChange) {
+                  try { localStorage.removeItem(TAG_FILTER_KEY) } catch { /* ignore */ }
+                }
+              }}
               title="clear all tag filters"
               style={{
                 background: 'transparent', border: 'none', cursor: 'pointer',

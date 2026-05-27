@@ -6,7 +6,8 @@ import type { EvalJob, EvalPoint, IrisJob, RunManifest } from './api'
 import { fetchRunHistory } from './parquet'
 import type { RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
-import { RunsTimelinePlot, colorForIndex, shortLabel, useNameFilter, compileMultiTermFilter, runHaystack } from './RunsTimelinePlot'
+import { RunsTimelinePlot, colorForIndex, shortLabel, useNameFilter, compileMultiTermFilter, runHaystack, TAG_FILTER_KEY } from './RunsTimelinePlot'
+import { tagsFor, type RunTag } from './tags'
 import type { RunTimelineSeries } from './RunsTimelinePlot'
 import { useTraceHighlight } from 'pltly/react'
 
@@ -1032,25 +1033,66 @@ function RunsIndex() {
     return s
   }, [filterCompiled, ordered, runHaystacksById])
 
+  // Tag chip filter, lifted up from `RunsTimelinePlot` so the same selection
+  // can hard-filter the card list (not just the plotted traces). AND across
+  // selected tags. Initialized from `localStorage` once at mount, persisted
+  // on every change.
+  const [selectedTags, setSelectedTags] = useState<Set<RunTag>>(() => {
+    try {
+      const raw = localStorage.getItem(TAG_FILTER_KEY)
+      if (raw) return new Set(JSON.parse(raw) as RunTag[])
+    } catch { /* ignore */ }
+    return new Set()
+  })
+  const onSelectedTagsChange = useCallback((next: Set<RunTag>) => {
+    setSelectedTags(next)
+    try {
+      if (next.size === 0) localStorage.removeItem(TAG_FILTER_KEY)
+      else localStorage.setItem(TAG_FILTER_KEY, JSON.stringify([...next]))
+    } catch { /* ignore */ }
+  }, [])
+  // Runs whose tag set satisfies the AND-of-selected-tags constraint. `null`
+  // when no tags are selected — semantics: "no tag constraint, show all".
+  // Distinct from regex-`matchedIds`, which only sorts: tags hard-filter
+  // (matching the plot's tag-chip behavior), so a run with no matching tags
+  // is hidden from the card list entirely.
+  const tagMatchedIds = useMemo(() => {
+    if (selectedTags.size === 0 || !ordered) return null
+    const s = new Set<string>()
+    for (const c of ordered) {
+      const ts = tagsFor(shortLabel(c.id))
+      let ok = true
+      for (const sel of selectedTags) if (!ts.includes(sel)) { ok = false; break }
+      if (ok) s.add(c.id)
+    }
+    return s
+  }, [selectedTags, ordered])
+
   // Card order: pinned first, then the plot-hover card (if any, and not the
   // already-pinned run), then regex-matches, then everything else (each group
   // preserving activity-order from `ordered`). The hover slot floats up the
   // card whose timeline trace the cursor is closest to — sourced from
   // `plotHoverRunId` (set ONLY by the plot's closest-trace hover handler).
   // Using `activeRunId` here would create a flicker loop on card hover.
+  //
+  // Tag filter is a *hard* filter (drops non-matching rows entirely). Regex
+  // filter is a *soft* filter (sorts to top + fades non-matches). The plot
+  // already constrains pinned/hovered to tag-matching runs, so those slots
+  // don't need explicit tag filtering here.
   const displayed = useMemo(() => {
     if (!ordered) return ordered
-    const pinned = pinnedRunId ? ordered.find((c) => c.id === pinnedRunId) : null
-    // Hover slot collapses when the cursor isn't on a trace, or when the
-    // closest-trace card is already pinned (no point duplicating slot 0).
+    const tagFiltered = tagMatchedIds
+      ? ordered.filter((c) => tagMatchedIds.has(c.id))
+      : ordered
+    const pinned = pinnedRunId ? tagFiltered.find((c) => c.id === pinnedRunId) : null
     const hovered = plotHoverRunId && plotHoverRunId !== pinnedRunId
-      ? ordered.find((c) => c.id === plotHoverRunId)
+      ? tagFiltered.find((c) => c.id === plotHoverRunId)
       : null
     const taken = new Set<string>()
     if (pinned) taken.add(pinned.id)
     if (hovered) taken.add(hovered.id)
-    const rest = ordered.filter((c) => !taken.has(c.id))
-    const top: typeof ordered = []
+    const rest = tagFiltered.filter((c) => !taken.has(c.id))
+    const top: typeof tagFiltered = []
     if (pinned) top.push(pinned)
     if (hovered) top.push(hovered)
     if (!matchedIds || matchedIds.size === 0) {
@@ -1059,7 +1101,7 @@ function RunsIndex() {
     const matched = rest.filter((c) => matchedIds.has(c.id))
     const others = rest.filter((c) => !matchedIds.has(c.id))
     return [...top, ...matched, ...others]
-  }, [ordered, pinnedRunId, plotHoverRunId, matchedIds])
+  }, [ordered, pinnedRunId, plotHoverRunId, matchedIds, tagMatchedIds])
 
   // On (re)pin, scroll the now-top pinned card into view.
   useEffect(() => {
@@ -1120,6 +1162,8 @@ function RunsIndex() {
             highlight={highlight}
             runHaystacks={runHaystacksByLabel}
             onPlotHover={setPlotHoverLabel}
+            selectedTags={selectedTags}
+            onSelectedTagsChange={onSelectedTagsChange}
           />
         </div>
       )}
