@@ -86,6 +86,10 @@ class DensityLossArgs:
     mode: str                        # "add" or "replace"
     loss_type: str = "l1"            # "l1" (legacy |E[ρ]−ρ_true|) or "emd" (W₁)
     density_only: bool = False       # zero CE on non-density tokens, normalize by density count
+    pad_id: int | None = None        # spec 36: when set, zero loss at positions
+                                     # whose target equals pad_id (the segment-
+                                     # boundary sentinel in packed datasets).
+                                     # Also masks the trailing PAD region.
 
 
 def build_density_loss_args(
@@ -99,6 +103,7 @@ def build_density_loss_args(
     mode: str = "add",
     loss_type: str = "l1",
     density_only: bool = False,
+    pad_id: int | None = None,
 ) -> DensityLossArgs:
     """Build the decode_all NamedArray + other args from codec + config."""
     if mode not in ("add", "replace"):
@@ -116,6 +121,7 @@ def build_density_loss_args(
         mode=mode,
         loss_type=loss_type,
         density_only=density_only,
+        pad_id=pad_id,
     )
 
 
@@ -158,6 +164,16 @@ def density_aware_loss(
         lw = not_last
     else:
         lw = loss_weight.astype(jnp.float32).array * not_last
+
+    # Sequence-packing (spec 36): in packed datasets, a single PAD sentinel
+    # separates adjacent sub-sequences (and pads the row tail). The roll(-1)
+    # target at the *last* position of each sub-sequence is therefore PAD —
+    # we don't want to grade the model on "predict PAD after density". Mask
+    # these positions out of the loss weight. Also catches the trailing-PAD
+    # region (rolls forward to PAD or to the wrap-around token at pos 0).
+    if args.pad_id is not None:
+        non_pad_target = (targets_arr != args.pad_id).astype(jnp.float32)
+        lw = lw * non_pad_target
 
     is_density_target = (targets_arr >= args.density_lo) & (targets_arr < args.density_hi)
 
@@ -531,8 +547,14 @@ class Qwen3MaskGITLMHeadModel(Qwen3LMHeadModel):
             masked_tokens = original_tokens
             loss_weight = example.loss_weight
 
-        # Bidirectional attention (no causal mask).
+        # Bidirectional attention (no causal mask). Propagate any segment_ids
+        # from the incoming attn_mask so packed sub-sequences keep their
+        # block-diagonal isolation (spec 36).
         bidir_mask = AttentionMask(is_causal=False)
+        incoming = example.attn_mask
+        if isinstance(incoming, AttentionMask) and incoming.segment_ids is not None:
+            q_seg, kv_seg = incoming.segment_ids
+            bidir_mask = bidir_mask.with_segment_ids(q_seg, kv_seg)
         masked_example = LmExample(
             tokens=masked_tokens,
             loss_weight=loss_weight,
@@ -660,7 +682,8 @@ class SSArgs:
 
     density_lo: int                  # inclusive start of density vocab range
     density_hi: int                  # exclusive end of density vocab range
-    eps_max: float = 0.25            # ε ~ Uniform(0, eps_max) per batch
+    eps_min: float = 0.0             # ε ~ Uniform(eps_min, eps_max) per batch
+    eps_max: float = 0.25            #   (set eps_min == eps_max for constant ε)
     sampler: str = "median"          # "median" | "argmax" | "sample"
 
 
@@ -668,17 +691,23 @@ def build_ss_args(
     *,
     density_offset: int,
     n_density_bins: int,
+    eps_min: float = 0.0,
     eps_max: float = 0.25,
     sampler: str = "median",
 ) -> SSArgs:
     """Build SSArgs from codec config."""
     if sampler not in ("median", "argmax", "sample"):
         raise ValueError(f"sampler must be 'median'/'argmax'/'sample', got {sampler!r}")
+    if not (0.0 <= eps_min <= 1.0):
+        raise ValueError(f"eps_min must be in [0, 1], got {eps_min!r}")
     if not (0.0 <= eps_max <= 1.0):
         raise ValueError(f"eps_max must be in [0, 1], got {eps_max!r}")
+    if eps_min > eps_max:
+        raise ValueError(f"eps_min ({eps_min!r}) must be <= eps_max ({eps_max!r})")
     return SSArgs(
         density_lo=density_offset,
         density_hi=density_offset + n_density_bins,
+        eps_min=float(eps_min),
         eps_max=float(eps_max),
         sampler=sampler,
     )
@@ -723,9 +752,10 @@ def _jax_apply_ss(
     hi = args.density_hi
     n_bins = hi - lo
 
-    # Sample per-batch ε ~ Uniform(0, eps_max).
+    # Sample per-batch ε ~ Uniform(eps_min, eps_max). Constant ε is achieved
+    # by setting eps_min == eps_max.
     key_eps, key_mask, key_sample = jax.random.split(key, 3)
-    eps = jax.random.uniform(key_eps, shape=(), minval=0.0, maxval=args.eps_max)
+    eps = jax.random.uniform(key_eps, shape=(), minval=args.eps_min, maxval=args.eps_max)
 
     # density_logits[t] is the predicted distribution for token at position t+1.
     # Restrict to the density vocab range so the decoded bin is always a valid

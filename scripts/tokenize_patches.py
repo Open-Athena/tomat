@@ -109,6 +109,12 @@ def _build_schema() -> pa.Schema:
              'Required for Levanter PrebuiltLmDatasetFormat; error if any row '
              "already exceeds --pad-to. Typical value matches the model's "
              'max_seq_len (e.g., 8192 for tomat-30m).')
+@option('-P', '--pack/--no-pack', default=False,
+        help='Sequence packing (scheme 2a, spec 36): concatenate N whole '
+             'patches per row, separated by a single [PAD] sentinel. The '
+             'trainer derives segment IDs from the sentinel and applies '
+             'block-diagonal causal attention. Requires --pad-to. Each '
+             'material produces ~ceil(patches_per_material/N) packed rows.')
 @option('-w', '--worker-idx', type=int, default=0,
         help='When parallel: this worker processes task_ids[worker_idx::n_workers]. '
              'Default 0 (serial). Output auto-nested under worker-NN/ when '
@@ -135,6 +141,7 @@ def main(
     seed: int,
     rows_per_shard: int,
     pad_to: int | None,
+    pack: bool,
     worker_idx: int,
     n_workers: int,
     n_materials: int | None,
@@ -182,6 +189,9 @@ def main(
         f"patches/material={patches_per_material} {shape_desc} "
         f"density_codec={density_codec}")
 
+    if pack and pad_to is None:
+        raise click.UsageError("--pack requires --pad-to (packed rows are padded to fixed width)")
+
     output_dir.mkdir(parents=True, exist_ok=True)
     if density_codec == 'lmq':
         if not lmq_path:
@@ -220,10 +230,13 @@ def main(
         return pq.ParquetWriter(str(path), schema, compression="zstd")
 
     total_rows = 0
+    total_patches = 0
+    patches_per_row_hist: list[int] = []
     missing: list[str] = []
     oversized: list[tuple[str, tuple[int, int, int]]] = []
     overflowed: list[str] = []
     bad_lattice: list[tuple[str, tuple[float, ...]]] = []
+    PAD_ID = specials["[PAD]"]
     for mat_idx, task_id in enumerate(task_ids, start=1):
         zarr_path = rho_gga_dir / 'label' / f'{task_id}.zarr'
         if not zarr_path.exists():
@@ -268,12 +281,13 @@ def main(
                 density_shape, n=patches_per_material, rng=rng,
             )
 
-        batch_task_ids: list[str] = []
-        batch_ox: list[int] = []
-        batch_oy: list[int] = []
-        batch_oz: list[int] = []
-        batch_ids: list[list[int]] = []
-
+        # Stage 1: tokenize every patch for this material into raw (unpadded)
+        # token lists. Pack-mode greedily concatenates these into packed rows
+        # (with a single [PAD] sentinel between adjacent sub-sequences) in
+        # stage 2; non-pack mode just right-pads each patch to `pad_to` and
+        # emits one row per patch.
+        per_patch: list[tuple[tuple[int, int, int], list[int]]] = []
+        material_overflowed = False
         for anc in anchors:
             anchor_t = tuple(int(x) for x in anc)
             if shape == 'ball':
@@ -290,30 +304,87 @@ def main(
                     structure=sample.structure,
                     offset=anchor_t,
                 )
-            batch_task_ids.append(task_id)
-            batch_ox.append(anchor_t[0])
-            batch_oy.append(anchor_t[1])
-            batch_oz.append(anchor_t[2])
             ids = tokenizer.tokenize(patch)
-            if pad_to is not None:
-                if len(ids) > pad_to:
-                    # Happens when preamble (scales with n_atoms) + density fills
-                    # > pad_to. Rather than crash the whole worker, skip the
-                    # material and log — matches the oversized-grid-dim skip
-                    # pattern. Caller sees meta['n_materials_overflow'] to gauge
-                    # the effective corpus size of the variant.
-                    err(f"[tokenize] SKIP {task_id}: seq_len={len(ids)} > pad_to={pad_to} "
-                        f"(anchor={anchor_t}, n_atoms={len(patch.atomic_numbers)})")
-                    # Mark the whole material as overflow + break out of this mat's loop.
-                    batch_ids = []
-                    break
-                ids = ids + [specials["[PAD]"]] * (pad_to - len(ids))
-            batch_ids.append(ids)
+            if pad_to is not None and len(ids) > pad_to:
+                # Happens when preamble (scales with n_atoms) + density fills
+                # > pad_to. Rather than crash the whole worker, skip the
+                # material and log — matches the oversized-grid-dim skip
+                # pattern. Caller sees meta['n_materials_overflow'] to gauge
+                # the effective corpus size of the variant.
+                err(f"[tokenize] SKIP {task_id}: seq_len={len(ids)} > pad_to={pad_to} "
+                    f"(anchor={anchor_t}, n_atoms={len(patch.atomic_numbers)})")
+                material_overflowed = True
+                break
+            per_patch.append((anchor_t, ids))
 
-        # If the material overflowed pad_to (any patch), skip the whole material.
-        if not batch_ids:
+        if material_overflowed or not per_patch:
             overflowed.append(task_id)
             continue
+
+        # Stage 2: assemble rows. In non-pack mode, one row per patch
+        # (preserves the existing layout exactly). In pack mode, greedily
+        # concat patches separated by a single PAD sentinel until the next
+        # patch wouldn't fit, then start a new row. Trailing PAD fills out
+        # the final row's remainder.
+        batch_task_ids: list[str] = []
+        batch_ox: list[int] = []
+        batch_oy: list[int] = []
+        batch_oz: list[int] = []
+        batch_ids: list[list[int]] = []
+
+        if pack:
+            assert pad_to is not None  # checked at top of main
+            # Greedy first-fit packing within this material's anchor list.
+            row_buf: list[int] = []
+            row_anchor: tuple[int, int, int] | None = None
+            row_patches = 0
+            for anchor_t, ids in per_patch:
+                # Cost of adding this patch: ids length + 1-token PAD separator
+                # (except for the first patch in the row, which has no leading
+                # separator).
+                sep = 1 if row_buf else 0
+                if len(row_buf) + sep + len(ids) > pad_to:
+                    # Flush current row (pad to pad_to with PAD) and start a new one.
+                    if row_buf:
+                        row_buf = row_buf + [PAD_ID] * (pad_to - len(row_buf))
+                        batch_ids.append(row_buf)
+                        batch_task_ids.append(task_id)
+                        assert row_anchor is not None
+                        batch_ox.append(row_anchor[0])
+                        batch_oy.append(row_anchor[1])
+                        batch_oz.append(row_anchor[2])
+                        patches_per_row_hist.append(row_patches)
+                    row_buf = []
+                    row_anchor = None
+                    row_patches = 0
+                    sep = 0
+                if sep:
+                    row_buf.append(PAD_ID)
+                row_buf.extend(ids)
+                if row_anchor is None:
+                    row_anchor = anchor_t  # record first patch's anchor as the row's representative
+                row_patches += 1
+            if row_buf:
+                row_buf = row_buf + [PAD_ID] * (pad_to - len(row_buf))
+                batch_ids.append(row_buf)
+                batch_task_ids.append(task_id)
+                assert row_anchor is not None
+                batch_ox.append(row_anchor[0])
+                batch_oy.append(row_anchor[1])
+                batch_oz.append(row_anchor[2])
+                patches_per_row_hist.append(row_patches)
+        else:
+            for anchor_t, ids in per_patch:
+                if pad_to is not None:
+                    ids = ids + [PAD_ID] * (pad_to - len(ids))
+                batch_task_ids.append(task_id)
+                batch_ox.append(anchor_t[0])
+                batch_oy.append(anchor_t[1])
+                batch_oz.append(anchor_t[2])
+                batch_ids.append(ids)
+                patches_per_row_hist.append(1)
+
+        total_patches += len(per_patch)
 
         # Flush the batch (one material) to parquet, starting a new shard
         # whenever rows_per_shard would be exceeded.
@@ -369,7 +440,15 @@ def main(
         "lmq_path": lmq_path if density_codec == "lmq" else None,
         "seed": seed,
         "pad_to": pad_to,
+        "packed": pack,
         "total_rows": total_rows,
+        "total_patches": total_patches,
+        "patches_per_row_p50": (
+            int(np.percentile(patches_per_row_hist, 50)) if patches_per_row_hist else None
+        ),
+        "patches_per_row_p99": (
+            int(np.percentile(patches_per_row_hist, 99)) if patches_per_row_hist else None
+        ),
         "n_shards": shard_idx + 1 if writer is not None or total_rows > 0 else 0,
         "vocab": {
             "total_size": vocab.total_vocab_size,

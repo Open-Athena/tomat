@@ -432,6 +432,34 @@ def main():
     # and trainer train_seq_len). v3-p15 uses 4608 vs v3 baseline's 8192.
     seq_len = int(meta.get("pad_to") or 8192)
 
+    # Sequence packing (scheme 2a, spec 36). Auto-enabled when the dataset's
+    # meta.json says it was tokenized with --pack. TOMAT_PACKED env can force-
+    # enable for ad-hoc smokes; set =0 to force off even on packed data
+    # (debugging only — yields garbage attention).
+    _packed_env = os.environ.get("TOMAT_PACKED")
+    if _packed_env is None:
+        packed = bool(meta.get("packed", False))
+    else:
+        packed = _packed_env == "1"
+    PAD_ID = 0  # specials["[PAD]"] in all tokenizer variants
+    if packed:
+        # Reuse PAD as the segment-boundary sentinel. Levanter's
+        # block_cross_document_attention path computes
+        #   segment_ids = cumsum(tokens == eos_id)
+        # so each PAD increments the segment counter. Trailing PAD region
+        # ends up in its own (zero-loss) segment past the last real
+        # sub-sequence. Monkey-patch PassthroughTokenizer.eos_token_id so the
+        # rest of Levanter's machinery wires this through automatically.
+        from levanter.data.passthrough_tokenizer import (
+            PassthroughTokenizer as _PT,
+        )
+        _orig_eos = _PT.eos_token_id.fget
+        _PT.eos_token_id = property(lambda self: PAD_ID)  # type: ignore[assignment]
+        print(f"[tomat-tpu] packed mode ON: PAD_ID={PAD_ID} acts as segment boundary "
+              f"(meta.packed={meta.get('packed')}, env={_packed_env!r})")
+    else:
+        print(f"[tomat-tpu] packed mode OFF (meta.packed={meta.get('packed')}, env={_packed_env!r})")
+
     # MaskGIT mode env vars — read early so vocab_size bump propagates into
     # data config, model config, and everywhere else that uses vocab_size.
     mg_mode = os.environ.get("TOMAT_MG_MODE", "0") == "1"
@@ -450,15 +478,24 @@ def main():
     # SS is mutually exclusive with MaskGIT (different model subclass, different
     # forward path); disallow both at once to keep the configuration sane.
     ss_mode = os.environ.get("TOMAT_SS_MODE", "0") == "1"
+    ss_eps_min = float(os.environ.get("TOMAT_SS_EPS_MIN", "0.0"))
     ss_eps_max = float(os.environ.get("TOMAT_SS_EPS_MAX", "0.25"))
     ss_sampler = os.environ.get("TOMAT_SS_SAMPLER", "median")
     if ss_sampler not in ("median", "argmax", "sample"):
         raise ValueError(
             f"TOMAT_SS_SAMPLER must be median/argmax/sample, got {ss_sampler!r}"
         )
+    if not (0.0 <= ss_eps_min <= 1.0):
+        raise ValueError(
+            f"TOMAT_SS_EPS_MIN must be in [0, 1], got {ss_eps_min!r}"
+        )
     if not (0.0 <= ss_eps_max <= 1.0):
         raise ValueError(
             f"TOMAT_SS_EPS_MAX must be in [0, 1], got {ss_eps_max!r}"
+        )
+    if ss_eps_min > ss_eps_max:
+        raise ValueError(
+            f"TOMAT_SS_EPS_MIN ({ss_eps_min!r}) must be <= TOMAT_SS_EPS_MAX ({ss_eps_max!r})"
         )
     if ss_mode and mg_mode:
         raise ValueError(
@@ -702,6 +739,7 @@ def main():
             mode=density_l1_mode,
             loss_type=density_loss_type,
             density_only=density_only_loss,
+            pad_id=PAD_ID if packed else None,
         )
         configure_density_loss(density_loss_args)
         print(f"[tomat-tpu] density-L_1 configured with PENALTY={penalty_val:.4f}")
@@ -709,6 +747,7 @@ def main():
             ss_args = build_ss_args(
                 density_offset=DENSITY_OFFSET,
                 n_density_bins=lmq_codec.n_bins,
+                eps_min=ss_eps_min,
                 eps_max=ss_eps_max,
                 sampler=ss_sampler,
             )
