@@ -45,6 +45,41 @@ The Qwen3 subclasses in `marin/qwen3_density.py`
 `compute_next_token_loss`; they inherit `decode` from base — drop-in
 compatible, no overrides needed on our side.
 
+## Revised scope (after a closer Levanter read)
+
+The Explore agent reported "drop-in plug-compatible, ~100 LOC". After
+reading `levanter/inference/engine.py` and `jit_scheduler.py` myself:
+
+- The raw `model.decode(tokens, cache, batch_info, pos_ids)` call is
+  real (qwen.py:338). `PageBatchInfo` (page_table.py:62) IS the wiring
+  contract.
+- But `PageBatchInfo` is non-trivial to build by hand. The two
+  callers in tree (`engine.py:421` prefill, `engine.py:707` decode)
+  both go through `DecodeState` — a scheduler that owns page
+  allocation, slot management, position-id tracking, prng-key
+  propagation, and the queue abstraction.
+- Our use case doesn't match the engine's assumptions: we want
+  fixed-length (P³) per-patch decode with custom density-token
+  feedback at each step, not a token-queue + stop-token loop.
+
+Two implementation paths:
+
+**A. Bypass the engine, build `PageBatchInfo` directly.** Doable but
+fragile — page allocation, slot ids, new_token_dests, cu_q_lens all
+need to be wired by hand per step. Risk of subtle off-by-one in
+position ids or stale-page corruption. Estimated 2-3 days of work +
+equivalence-test iteration.
+
+**B. Adapt the engine's `DecodeState` for our use.** Lighter weight —
+let `DecodeState` manage pages; we just call `model.decode` with the
+binfo it produces. But the engine wraps this in higher-level
+`GenerationEngine.generate_until_done(...)` loops; need to drop down
+to the raw decode + manage our own stop condition. Estimated 1-2
+days.
+
+Either way, ~1-2 days of focused work, NOT the ~100 LOC the agent
+sketched. Honest about that.
+
 ## Plan
 
 ### Phase 1 — equivalence test (smoke; ~half a day)
