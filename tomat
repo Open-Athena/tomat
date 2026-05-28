@@ -1275,7 +1275,7 @@ def evals():
 @evals.command("fire")
 @click.option("-s", "--steps", required=True, help="comma-sep step list, e.g. 1000,2000,3000")
 @click.option("-S", "--sets", default="val_200,train_200", help="comma-sep mat-sets")
-@click.option("-l", "--eval-label", default="val-full-lmq-v2", help="TOMAT_LABEL for eval jobs (must match ckpt's tokenization, e.g. val-full-v3)")
+@click.option("-l", "--eval-label", default="val-full-v3", help="TOMAT_LABEL for eval jobs (must match ckpt's tokenization). Default `val-full-v3` matches the P19 production project; pass `val-full-lmq-v2` for archived P14/v2 runs.")
 @click.option("-m", "--model", default="200M", help="TOMAT_MODEL preset")
 @click.option("-n", "--n-mats", default=200, type=int)
 @click.option("-b", "--eval-batch", default=32, type=int)
@@ -1341,18 +1341,22 @@ def evals_fire(
             src_ckpt_root = f"{eval_bucket}/results/{run_label}/checkpoints/{run_label}"
             dst_ckpt_root = f"{mirror_to}/results/{run_label}/checkpoints/{run_label}"
             for s in step_list:
-                src = f"{src_ckpt_root}/step-{s}/"
-                dst = f"{dst_ckpt_root}/step-{s}/"
+                # `gcloud storage cp -r src dst` copies `src` (treated as a
+                # dir) INTO `dst` — passing `dst=step-N/` produces a
+                # doubled `step-N/step-N/` path. Pass the parent instead.
+                src = f"{src_ckpt_root}/step-{s}"
+                dst_parent = f"{dst_ckpt_root}/"
+                dst_dir = f"{dst_ckpt_root}/step-{s}/"
                 # Skip if already there (idempotent — supports re-running an
                 # eval over a previously-mirrored ckpt without re-copying).
                 dst_check = subprocess.run(
-                    ["gcloud", "storage", "ls", dst],
+                    ["gcloud", "storage", "ls", dst_dir],
                     capture_output=True, text=True, timeout=30,
                 )
                 if dst_check.returncode == 0 and "manifest.ocdbt" in dst_check.stdout:
                     err(f"  step-{s}: already at dst; skipping copy")
                     continue
-                cmd = ["gcloud", "storage", "cp", "-r", src, dst]
+                cmd = ["gcloud", "storage", "cp", "-r", src, dst_parent]
                 err(f"  step-{s}: copying...")
                 if dry_run:
                     err(f"  (dry-run) {' '.join(cmd)}")
@@ -1465,7 +1469,7 @@ def evals_fire(
 @evals.command("harvest")
 @click.option("-S", "--sets", default="val_200,train_200")
 @click.option("-i", "--interval", default=60, type=int, help="poll interval (sec)")
-@click.option("-l", "--eval-label", default=None, help="TOMAT_LABEL for eval jobs (default: watchdog's own default = val-full-lmq-v2)")
+@click.option("-l", "--eval-label", default=None, help="TOMAT_LABEL for eval jobs (default: watchdog's own default = val-full-v3 for P19 runs)")
 @click.option("-m", "--model", default="200M", help="TOMAT_MODEL preset for the eval jobs the watchdog will fire")
 @click.argument("run_label")
 def evals_harvest(run_label: str, sets: str, interval: int, eval_label: str | None, model: str):
@@ -2555,8 +2559,12 @@ def ckpt_mirror(run_label: str, src_bucket: str | None, dst_bucket: str, step: s
     print(f"[ckpt mirror] {run_label}: {src_bucket} → {dst_bucket}")
     print(f"  steps to copy: {chosen}")
     for s in chosen:
-        src = f"{src_ckpt_root}/step-{s}/"
-        dst = f"{dst_ckpt_root}/step-{s}/"
+        # `gcloud storage cp -r src dst` semantics: `src` is treated as a
+        # DIRECTORY and copied INTO `dst`. So `cp -r step-N/ step-N/`
+        # produces `step-N/step-N/…`. Pass the *parent* as dst so gcloud
+        # creates the step-N dir for us.
+        src = f"{src_ckpt_root}/step-{s}"
+        dst = f"{dst_ckpt_root}/"
         cmd = ["gcloud", "storage", "cp", "-r", src, dst]
         print()
         print(f"# step-{s}")

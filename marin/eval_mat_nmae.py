@@ -629,7 +629,7 @@ def decode_density(density_logits, target_dens, decoder, decode_dens):
 
 
 def main():
-    label = os.environ.get("TOMAT_LABEL", "val-full-lmq-v2")
+    label = os.environ.get("TOMAT_LABEL", "val-full-v3")
     model_preset = os.environ.get("TOMAT_MODEL", "200M")
     checkpoint_path = os.environ["TOMAT_CHECKPOINT"]
     lmq_path = os.environ["TOMAT_LMQ_PATH"]

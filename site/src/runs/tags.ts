@@ -47,8 +47,12 @@ export const RUN_TAGS: Record<string, RunTag[]> = {
     ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix'],
   'train-ss-cont80k-emax100-1':
     ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix'],
+  // BUNK: launcher set TOMAT_SS_EPS_MAX=1.0 but NOT TOMAT_SS_EPS_MIN=1.0,
+  // so ε sampled U(0, 1.0) — i.e. trained bit-identically to emax100-1
+  // (verified: TL matches to 6 decimal places across all 5000 fine-tune
+  // steps). See spec 37 + the SS print-statement fix in train_tomat_tpu.py.
   'train-ss-cont80k-eps1const-1':
-    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix'],
+    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix', 'bunk'],
   'train-ss-cont80k-hi-argmax-1':
     ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix'],
 

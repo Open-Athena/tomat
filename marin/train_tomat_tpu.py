@@ -161,20 +161,46 @@ def _log_lifecycle_event(event: str, **fields):
     emitted from `main()` right before calling into Levanter), so we defer
     the wandb side to a daemon thread that polls until `wandb.run` is live,
     then logs the spike + bumps a cumulative `lifecycle/resumes` summary
-    counter. SIGTERM-path calls run inline (wandb is live by then and the
-    process is about to die)."""
+    counter.
+
+    SIGTERM- and trainer-finished paths are *terminal* events: the
+    process is about to exit, so we MUST log inline + flush before
+    returning, otherwise the wandb POST never lands (per spec 37 — the
+    daemon thread is killed by `wandb.finish()` / interpreter teardown
+    before it can flush)."""
     ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     extras = " ".join(f"{k}={v}" for k, v in fields.items())
     print(f"[tomat-tpu lifecycle] {ts} event={event} {extras}", flush=True)
 
-    def _log_to_wandb():
+    def _log_to_wandb_now():
+        """Inline log + flush — used for terminal events. Returns when the
+        POST has been queued (or fail-fast if wandb isn't up)."""
+        try:
+            import wandb
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+        try:
+            payload = {f"lifecycle/{event}": 1, **{f"lifecycle/{k}": v for k, v in fields.items()}}
+            wandb.run.log(payload)
+            # Ask the wandb backend to flush its outbound queue before we
+            # return. Without this the process can exit before the network
+            # POST lands — see spec 37 for the trail of bodies (8 runs
+            # SUCCEEDED with no `lifecycle/trainer_finished` row).
+            try: wandb.run.log({}, commit=True)
+            except Exception: pass
+        except Exception:
+            pass
+
+    def _log_to_wandb_deferred():
+        """Daemon-thread path — used for `trainer_started` which fires
+        before `wandb.init` finishes. Polls for `wandb.run` up to 60 s."""
         import time
         try:
             import wandb
         except ImportError:
             return
-        # Wait up to 60 s for wandb.init to complete (it typically takes 5-10 s
-        # post-trainer_started, longer on cold caches).
         for _ in range(120):
             if wandb.run is not None:
                 break
@@ -192,8 +218,13 @@ def _log_lifecycle_event(event: str, **fields):
         except Exception:
             pass
 
-    import threading
-    threading.Thread(target=_log_to_wandb, daemon=True).start()
+    # Terminal events: log inline. `trainer_started` happens before
+    # `wandb.init` returns → must use the deferred polling path.
+    if event in ("trainer_finished", "sigterm_received"):
+        _log_to_wandb_now()
+    else:
+        import threading
+        threading.Thread(target=_log_to_wandb_deferred, daemon=True).start()
 
 
 def _handle_sigterm(signum, _frame):
@@ -788,7 +819,8 @@ def main():
                 configure_ss,
             )
             model_config_cls = Qwen3SSConfig
-            print(f"[tomat-tpu] scheduled-sampling: eps_max={ss_eps_max}, "
+            print(f"[tomat-tpu] scheduled-sampling: "
+                  f"eps_min={ss_eps_min}, eps_max={ss_eps_max}, "
                   f"sampler={ss_sampler}")
         else:
             model_config_cls = Qwen3DensityConfig
