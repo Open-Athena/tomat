@@ -16,6 +16,7 @@ import { useMemo } from 'react'
 import { HashRouter, Route, Routes } from 'react-router-dom'
 import { FileTree } from '@rdub/file-tree/react'
 import { HttpStore } from '@rdub/file-tree/stores/http'
+import { useUrlPersistedState } from '@rdub/file-tree/url-state'
 import { ThemeToggle } from '../theme'
 import { API_BASE } from '../runs/api'
 import { ParquetViewer } from './ParquetViewer'
@@ -53,6 +54,7 @@ export function FilesPage() {
               title="openathena/tomat"
               className="files-tree"
               parquetRenderer={ParquetViewer}
+              usePersistedState={useUrlPersistedState}
             />
           }
         />
@@ -66,6 +68,7 @@ export function FilesPage() {
               title="openathena/tomat"
               className="files-tree"
               parquetRenderer={ParquetViewer}
+              usePersistedState={useUrlPersistedState}
             />
           }
         />

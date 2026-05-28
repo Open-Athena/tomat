@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@floating-ui/react": "^0.27.19",
-    "@rdub/file-tree": "https://github.com/runsascoded/file-tree#f54ebaa9f88c98dfa6472ba4d755e6b368ca4f1e",
+    "@rdub/file-tree": "https://github.com/runsascoded/file-tree#0ca64f4a22f3aff962f8d64dbd2438d30277dc22",
     "@tanstack/react-query": "^5.100.11",
     "d3-dsv": "^3.0.1",
     "hyparquet": "^1.25.8",
@@ -20,7 +20,8 @@
     "pltly": "https://gitlab.com/runsascoded/js/pltly/-/archive/9c64c11de2aa3656c308dfdad56eafbc5c2fb32e/pltly-9c64c11de2aa3656c308dfdad56eafbc5c2fb32e.tar.gz",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "react-router-dom": "^6.30.3"
+    "react-router-dom": "^6.30.3",
+    "use-prms": "https://github.com/runsascoded/use-prms#da21b49c98e1ad372f88c4dee07eca483d17f1c8"
   },
   "devDependencies": {
     "@types/d3-dsv": "^3.0.7",

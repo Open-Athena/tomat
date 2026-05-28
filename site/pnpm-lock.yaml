@@ -12,8 +12,8 @@ importers:
         specifier: ^0.27.19
         version: 0.27.19(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
       '@rdub/file-tree':
-        specifier: https://github.com/runsascoded/file-tree#f54ebaa9f88c98dfa6472ba4d755e6b368ca4f1e
-        version: https://codeload.github.com/runsascoded/file-tree/tar.gz/f54ebaa9f88c98dfa6472ba4d755e6b368ca4f1e(highlight.js@11.11.1)(hyparquet@1.25.8)(react-dom@19.2.5(react@19.2.5))(react-markdown@10.1.0(@types/react@19.2.14)(react@19.2.5))(react-router-dom@6.30.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(react@19.2.5)(remark-gfm@4.0.1)
+        specifier: https://github.com/runsascoded/file-tree#0ca64f4a22f3aff962f8d64dbd2438d30277dc22
+        version: https://codeload.github.com/runsascoded/file-tree/tar.gz/0ca64f4a22f3aff962f8d64dbd2438d30277dc22(highlight.js@11.11.1)(hyparquet@1.25.8)(jq-web@0.6.2)(react-dom@19.2.5(react@19.2.5))(react-markdown@10.1.0(@types/react@19.2.14)(react@19.2.5))(react-router-dom@6.30.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(react@19.2.5)(remark-gfm@4.0.1)(use-prms@https://codeload.github.com/runsascoded/use-prms/tar.gz/da21b49c98e1ad372f88c4dee07eca483d17f1c8(react@19.2.5))
       '@tanstack/react-query':
         specifier: ^5.100.11
         version: 5.100.11(react@19.2.5)
@@ -41,6 +41,9 @@ importers:
       react-router-dom:
         specifier: ^6.30.3
         version: 6.30.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
+      use-prms:
+        specifier: https://github.com/runsascoded/use-prms#da21b49c98e1ad372f88c4dee07eca483d17f1c8
+        version: https://codeload.github.com/runsascoded/use-prms/tar.gz/da21b49c98e1ad372f88c4dee07eca483d17f1c8(react@19.2.5)
     devDependencies:
       '@types/d3-dsv':
         specifier: ^3.0.7
@@ -72,6 +75,9 @@ importers:
       aws4fetch:
         specifier: ^1.0.20
         version: 1.0.20
+      jq-web:
+        specifier: ^0.6
+        version: 0.6.2
     devDependencies:
       '@playwright/test':
         specifier: ^1.59.1
@@ -109,9 +115,12 @@ importers:
       typescript:
         specifier: ^5.9.0
         version: 5.9.3
+      use-prms:
+        specifier: ^0.4.1
+        version: 0.4.1(react@18.3.1)
       vitest:
         specifier: ^2.1.8
-        version: 2.1.9(@types/node@25.6.0)(terser@5.46.1)
+        version: 2.1.9(@types/node@25.6.0)(happy-dom@20.9.0)(terser@5.46.1)
 
 packages:
 
@@ -764,17 +773,19 @@ packages:
   '@plotly/regl@2.1.2':
     resolution: {integrity: sha512-Mdk+vUACbQvjd0m/1JJjOOafmkp/EpmHjISsopEz5Av44CBq7rPC05HHNbYGKVyNUF2zmEoBS/TT0pd0SPFFyw==}
 
-  '@rdub/file-tree@https://codeload.github.com/runsascoded/file-tree/tar.gz/f54ebaa9f88c98dfa6472ba4d755e6b368ca4f1e':
-    resolution: {tarball: https://codeload.github.com/runsascoded/file-tree/tar.gz/f54ebaa9f88c98dfa6472ba4d755e6b368ca4f1e}
-    version: 0.0.1-dist.8005f43
+  '@rdub/file-tree@https://codeload.github.com/runsascoded/file-tree/tar.gz/0ca64f4a22f3aff962f8d64dbd2438d30277dc22':
+    resolution: {tarball: https://codeload.github.com/runsascoded/file-tree/tar.gz/0ca64f4a22f3aff962f8d64dbd2438d30277dc22}
+    version: 0.0.1-dist.0d91515
     peerDependencies:
       highlight.js: ^11
       hyparquet: ^1
+      jq-web: ^0.6
       react: ^18 || ^19
       react-dom: ^18 || ^19
       react-markdown: ^9 || ^10
       react-router-dom: ^6 || ^7
       remark-gfm: ^4
+      use-prms: ^0.4
     peerDependenciesMeta:
       react:
         optional: true
@@ -1031,6 +1042,12 @@ packages:
 
   '@types/unist@3.0.3':
     resolution: {integrity: sha512-ko/gIFJRv177XgZsZcBwnqJN5x/Gien8qNOn0D5bQU/zAzVf9Zt3BlcUiLqhV9y4ARk0GbT3tnUiPNgnTXzc/Q==}
+
+  '@types/whatwg-mimetype@3.0.2':
+    resolution: {integrity: sha512-c2AKvDT8ToxLIOUlN51gTiHXflsfIFisS4pO7pDPoKouJCESkhZnEy623gwP9laCy5lnLDAw1vAzu2vM2YLOrA==}
+
+  '@types/ws@8.18.1':
+    resolution: {integrity: sha512-ThVF6DCVhA8kUGy+aazFQ4kXQ7E1Ty7A3ypFOe0IcJV8O/M511G99AW24irKrW56Wt44yG9+ij8FaqoBGkuBXg==}
 
   '@ungap/structured-clone@1.3.1':
     resolution: {integrity: sha512-mUFwbeTqrVgDQxFveS+df2yfap6iuP20NAKAsBt5jDEoOTDew+zwLAOilHCeQJOVSvmgCX4ogqIrA0mnyr08yQ==}
@@ -1512,6 +1529,10 @@ packages:
     resolution: {integrity: sha512-Qohcme7V1inbAfvjItgw0EaxVX5q2rdVEZHRBrEQdRZTssLDGsL8Lwrznl8oQ/6kuTJONLaDcGjkNP247XEhcA==}
     engines: {node: '>=10.13.0'}
 
+  entities@7.0.1:
+    resolution: {integrity: sha512-TWrgLOFUQTH994YUyl1yT4uyavY5nNB5muff+RtWaqNVCAK408b5ZnnbNAUEWLTCpum9w6arT70i1XdQ4UeOPA==}
+    engines: {node: '>=0.12'}
+
   es-errors@1.3.0:
     resolution: {integrity: sha512-Zf5H2Kxt2xjTvbJvP2ZWLEICxA6j+hAmMzIlypy4xcBg1vKVnx89Wy0GbS+kf5cwCVFFzdCFh2XSCFNULS6csw==}
     engines: {node: '>= 0.4'}
@@ -1754,6 +1775,10 @@ packages:
   grid-index@1.1.0:
     resolution: {integrity: sha512-HZRwumpOGUrHyxO5bqKZL0B0GlUpwtCAzZ42sgxUPniu33R1LSFH5yrIcBCHjkctCAh3mtWKcKd9J4vDDdeVHA==}
 
+  happy-dom@20.9.0:
+    resolution: {integrity: sha512-GZZ9mKe8r646NUAf/zemnGbjYh4Bt8/MqASJY+pSm5ZDtc3YQox+4gsLI7yi1hba6o+eCsGxpHn5+iEVn31/FQ==}
+    engines: {node: '>=20.0.0'}
+
   has-flag@4.0.0:
     resolution: {integrity: sha512-EykJT/Q1KjTWctppgIAgfSO0tKVuZUjhgMr17kqTumMl6Afv3EISleU7qZUzoXDFTAHTDC4NOoG/ZxU3EvlMPQ==}
     engines: {node: '>=8'}
@@ -1882,6 +1907,9 @@ packages:
   joycon@3.1.1:
     resolution: {integrity: sha512-34wB/Y7MW7bzjKRjUKTa46I2Z7eV62Rkhva+KkopW7Qvv/OSWBqvkSY7vusOPrNuZcUG3tApvdVgNB8POj3SPw==}
     engines: {node: '>=10'}
+
+  jq-web@0.6.2:
+    resolution: {integrity: sha512-+7XvjBYwTx4vP5PYkf6Q6orubO/v+UgMU6By1GritrmShr9QpT3UKa4ANzXWQfhdqtBnQYXsm7ZNbdIHT6tYpQ==}
 
   js-tokens@4.0.0:
     resolution: {integrity: sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==}
@@ -2775,6 +2803,20 @@ packages:
   update-diff@1.1.0:
     resolution: {integrity: sha512-rCiBPiHxZwT4+sBhEbChzpO5hYHjm91kScWgdHf4Qeafs6Ba7MBl+d9GlGv72bcTZQO0sLmtQS1pHSWoCLtN/A==}
 
+  use-prms@0.4.1:
+    resolution: {integrity: sha512-137eYoyglpP3bnQqU+BDnr4kJnPqkibcSBpjHAIZJugtRjtInRCi+Af+hsk5lElXcIqz+ReEA4me6YrOehg6XA==}
+    peerDependencies:
+      react: ^18.0.0 || ^19.0.0
+    peerDependenciesMeta:
+      react:
+        optional: true
+
+  use-prms@https://codeload.github.com/runsascoded/use-prms/tar.gz/da21b49c98e1ad372f88c4dee07eca483d17f1c8:
+    resolution: {tarball: https://codeload.github.com/runsascoded/use-prms/tar.gz/da21b49c98e1ad372f88c4dee07eca483d17f1c8}
+    version: 0.4.1-dist.678d4b4
+    peerDependencies:
+      react: ^18.0.0 || ^19.0.0
+
   util-deprecate@1.0.2:
     resolution: {integrity: sha512-EPD5q1uXyFxJpCrLnCc1nHnq3gOa6DZBocAIiI2TaSCA7VCJ1UJDMagCzIkXNsUYfD1daK//LTEQ8xiIbrHtcw==}
 
@@ -2912,6 +2954,10 @@ packages:
       webpack-cli:
         optional: true
 
+  whatwg-mimetype@3.0.0:
+    resolution: {integrity: sha512-nt+N2dzIutVRxARx1nghPKGv1xHikU7HKdfafKkLNLindmPU/ch3U31NOCGGA/dmPcmb1VlofO0vnKAcsm0o/Q==}
+    engines: {node: '>=12'}
+
   which@4.0.0:
     resolution: {integrity: sha512-GlaYyEb07DPxYCKhKzplCWBJtvxZcZMrL+4UkrTSJHHPyZU4mYYTv3qaOe77H7EODLSSopAUFAc6W8U4yqvscg==}
     engines: {node: ^16.13.0 || >=18.0.0}
@@ -2927,6 +2973,18 @@ packages:
 
   wrappy@1.0.2:
     resolution: {integrity: sha512-l4Sp/DRseor9wL6EvV2+TuQn63dMkPjZ/sp9XkghTEbV9KlPS1xUsZ3u7/IQO4wxtcFB4bgpQPRcR3QCvezPcQ==}
+
+  ws@8.21.0:
+    resolution: {integrity: sha512-Vsp28b7DRcimFQvrqu2Wek3z1iYxDCWqHYB8Qsnk/S4RfaCQzPGPyBNuVjJV3cd6UiKtUtp6sNM77gWvzcCH+g==}
+    engines: {node: '>=10.0.0'}
+    peerDependencies:
+      bufferutil: ^4.0.1
+      utf-8-validate: '>=5.0.2'
+    peerDependenciesMeta:
+      bufferutil:
+        optional: true
+      utf-8-validate:
+        optional: true
 
   xtend@2.2.0:
     resolution: {integrity: sha512-SLt5uylT+4aoXxXuwtQp5ZnMMzhDb1Xkg4pEqc00WUJCQifPfV9Ub1VrNhp9kXkrjZD2I2Hl8WnjP37jzZLPZw==}
@@ -3438,13 +3496,15 @@ snapshots:
 
   '@plotly/regl@2.1.2': {}
 
-  '@rdub/file-tree@https://codeload.github.com/runsascoded/file-tree/tar.gz/f54ebaa9f88c98dfa6472ba4d755e6b368ca4f1e(highlight.js@11.11.1)(hyparquet@1.25.8)(react-dom@19.2.5(react@19.2.5))(react-markdown@10.1.0(@types/react@19.2.14)(react@19.2.5))(react-router-dom@6.30.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(react@19.2.5)(remark-gfm@4.0.1)':
+  '@rdub/file-tree@https://codeload.github.com/runsascoded/file-tree/tar.gz/0ca64f4a22f3aff962f8d64dbd2438d30277dc22(highlight.js@11.11.1)(hyparquet@1.25.8)(jq-web@0.6.2)(react-dom@19.2.5(react@19.2.5))(react-markdown@10.1.0(@types/react@19.2.14)(react@19.2.5))(react-router-dom@6.30.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(react@19.2.5)(remark-gfm@4.0.1)(use-prms@https://codeload.github.com/runsascoded/use-prms/tar.gz/da21b49c98e1ad372f88c4dee07eca483d17f1c8(react@19.2.5))':
     dependencies:
       aws4fetch: 1.0.20
       highlight.js: 11.11.1
       hyparquet: 1.25.8
+      jq-web: 0.6.2
       react-markdown: 10.1.0(@types/react@19.2.14)(react@19.2.5)
       remark-gfm: 4.0.1
+      use-prms: https://codeload.github.com/runsascoded/use-prms/tar.gz/da21b49c98e1ad372f88c4dee07eca483d17f1c8(react@19.2.5)
     optionalDependencies:
       react: 19.2.5
       react-dom: 19.2.5(react@19.2.5)
@@ -3675,6 +3735,14 @@ snapshots:
   '@types/unist@2.0.11': {}
 
   '@types/unist@3.0.3': {}
+
+  '@types/whatwg-mimetype@3.0.2':
+    optional: true
+
+  '@types/ws@8.18.1':
+    dependencies:
+      '@types/node': 25.6.0
+    optional: true
 
   '@ungap/structured-clone@1.3.1': {}
 
@@ -4158,6 +4226,9 @@ snapshots:
       graceful-fs: 4.2.11
       tapable: 2.3.2
 
+  entities@7.0.1:
+    optional: true
+
   es-errors@1.3.0: {}
 
   es-module-lexer@1.7.0: {}
@@ -4516,6 +4587,19 @@ snapshots:
 
   grid-index@1.1.0: {}
 
+  happy-dom@20.9.0:
+    dependencies:
+      '@types/node': 25.6.0
+      '@types/whatwg-mimetype': 3.0.2
+      '@types/ws': 8.18.1
+      entities: 7.0.1
+      whatwg-mimetype: 3.0.0
+      ws: 8.21.0
+    transitivePeerDependencies:
+      - bufferutil
+      - utf-8-validate
+    optional: true
+
   has-flag@4.0.0: {}
 
   has-hover@1.0.1:
@@ -4630,6 +4714,8 @@ snapshots:
       supports-color: 8.1.1
 
   joycon@3.1.1: {}
+
+  jq-web@0.6.2: {}
 
   js-tokens@4.0.0: {}
 
@@ -5915,6 +6001,14 @@ snapshots:
 
   update-diff@1.1.0: {}
 
+  use-prms@0.4.1(react@18.3.1):
+    optionalDependencies:
+      react: 18.3.1
+
+  use-prms@https://codeload.github.com/runsascoded/use-prms/tar.gz/da21b49c98e1ad372f88c4dee07eca483d17f1c8(react@19.2.5):
+    dependencies:
+      react: 19.2.5
+
   util-deprecate@1.0.2: {}
 
   vfile-message@4.0.3:
@@ -5968,7 +6062,7 @@ snapshots:
       fsevents: 2.3.3
       terser: 5.46.1
 
-  vitest@2.1.9(@types/node@25.6.0)(terser@5.46.1):
+  vitest@2.1.9(@types/node@25.6.0)(happy-dom@20.9.0)(terser@5.46.1):
     dependencies:
       '@vitest/expect': 2.1.9
       '@vitest/mocker': 2.1.9(vite@5.4.21(@types/node@25.6.0)(terser@5.46.1))
@@ -5992,6 +6086,7 @@ snapshots:
       why-is-node-running: 2.3.0
     optionalDependencies:
       '@types/node': 25.6.0
+      happy-dom: 20.9.0
     transitivePeerDependencies:
       - less
       - lightningcss
@@ -6053,6 +6148,9 @@ snapshots:
       - esbuild
       - uglify-js
 
+  whatwg-mimetype@3.0.0:
+    optional: true
+
   which@4.0.0:
     dependencies:
       isexe: 3.1.5
@@ -6067,6 +6165,9 @@ snapshots:
       object-assign: 4.1.1
 
   wrappy@1.0.2: {}
+
+  ws@8.21.0:
+    optional: true
 
   xtend@2.2.0: {}
 
