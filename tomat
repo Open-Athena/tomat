@@ -388,7 +388,16 @@ def _per_mat_nemd(run_label: str, mat_set: str) -> dict[int, float]:
         name = path.rsplit("/", 1)[-1]
         if not (name.startswith("step-") and name.endswith(".json")):
             continue
-        step = int(name[len("step-") : -len(".json")])
+        # Per-task fan-out (`tomat evals fire --num-tasks N`) produces
+        # `step-<N>-task<i>.json`. Strip the optional `-task<i>` so all
+        # tasks for the same step roll up together.
+        stem = name[len("step-") : -len(".json")]
+        if "-task" in stem:
+            stem = stem.split("-task", 1)[0]
+        try:
+            step = int(stem)
+        except ValueError:
+            continue
         try:
             with fs.open(path, "r") as f:
                 d = json.load(f)
@@ -1278,6 +1287,7 @@ def evals():
 @click.option("-l", "--eval-label", default="val-full-v3", help="TOMAT_LABEL for eval jobs (must match ckpt's tokenization). Default `val-full-v3` matches the P19 production project; pass `val-full-lmq-v2` for archived P14/v2 runs.")
 @click.option("-m", "--model", default="200M", help="TOMAT_MODEL preset")
 @click.option("-n", "--n-mats", default=200, type=int)
+@click.option("-T", "--num-tasks", default=1, type=int, help="Fan out the mat set across N iris jobs. Each job gets a contiguous slice of size ~n_mats/N via the eval script's existing TOMAT_EVAL_SKIP+TOMAT_EVAL_N_MATS env vars. Per-task results land at `<set>-<mode>/step-<N>-task-<i>.json`; `tomat evals sync` aggregates them. Use when free-running eval at n_mats=200 is too slow on a single task (see specs/38).")
 @click.option("-b", "--eval-batch", default=32, type=int)
 @click.option("-t", "--tpu", default="v6e-8")
 @click.option("--decoder", default="median")
@@ -1297,6 +1307,7 @@ def evals_fire(
     eval_label: str,
     model: str,
     n_mats: int,
+    num_tasks: int,
     eval_batch: int,
     tpu: str,
     decoder: str,
@@ -1387,6 +1398,14 @@ def evals_fire(
         err("WANDB_API_KEY not set in env")
         sys.exit(1)
 
+    if num_tasks < 1:
+        err(f"--num-tasks must be >= 1, got {num_tasks}")
+        sys.exit(1)
+    # Slice the mat set across `num_tasks` jobs. Ceil-divide so that the
+    # union covers every mat; the last task may have a slightly smaller
+    # slice (truncated by `n_mats` on the eval-script side).
+    per_task = (n_mats + num_tasks - 1) // num_tasks
+
     fired_total = 0
     for step in step_list:
         for s in set_list:
@@ -1396,74 +1415,97 @@ def evals_fire(
                 infix = "eval-maskgit"
             else:
                 infix = "eval"
-            jn = f"tomat-{infix}-{run_label}-{s}-step-{step}"
             split = SPLITS[s]
             ckpt = f"{eval_bucket}/results/{run_label}/checkpoints/{run_label}/step-{step}"
-            cmd = [
-                "uv", "run", "iris", "--cluster=marin", "job", "run",
-                "--tpu", tpu, "--enable-extra-resources",
-                "--cpu", "32", "--memory", "64GB",
-                "--env-vars", "WANDB_API_KEY", wandb_key,
-                "--env-vars", "TOMAT_LABEL", eval_label,
-                "--env-vars", "TOMAT_MODEL", model,
-                "--env-vars", "TOMAT_CHECKPOINT", ckpt,
-                "--env-vars", "TOMAT_LMQ_PATH", LMQ_PATH,
-                "--env-vars", "TOMAT_EVAL_N_MATS", str(n_mats),
-                "--env-vars", "TOMAT_EVAL_SKIP", "0",
-                "--env-vars", "TOMAT_EVAL_BATCH", str(eval_batch),
-                "--env-vars", "TOMAT_EVAL_DECODER", decoder,
-                "--env-vars", "TOMAT_EVAL_MAT_SET", s,
-                "--env-vars", "TOMAT_EVAL_SPLIT", split,
-            ]
-            if mode == "free":
-                cmd += [
-                    "--env-vars", "TOMAT_EVAL_MODE", "free",
-                    "--env-vars", "TOMAT_EVAL_FREE_BATCH", str(free_batch),
+            for task_i in range(num_tasks):
+                task_skip = task_i * per_task
+                # Last task: may run fewer mats if n_mats doesn't divide evenly.
+                # eval_mat_nmae.py already caps at the global n_mats via SKIP+N_MATS,
+                # so emitting per_task for every job is correct.
+                task_n_mats = per_task
+                # Single-task fires keep the existing job-name shape so they
+                # remain compatible with the dashboard's run-name parser.
+                if num_tasks == 1:
+                    jn = f"tomat-{infix}-{run_label}-{s}-step-{step}"
+                else:
+                    jn = f"tomat-{infix}-{run_label}-{s}-step-{step}-task{task_i}"
+                cmd = [
+                    "uv", "run", "iris", "--cluster=marin", "job", "run",
+                    "--tpu", tpu, "--enable-extra-resources",
+                    "--cpu", "32", "--memory", "64GB",
+                    "--env-vars", "WANDB_API_KEY", wandb_key,
+                    "--env-vars", "TOMAT_LABEL", eval_label,
+                    "--env-vars", "TOMAT_MODEL", model,
+                    "--env-vars", "TOMAT_CHECKPOINT", ckpt,
+                    "--env-vars", "TOMAT_LMQ_PATH", LMQ_PATH,
+                    "--env-vars", "TOMAT_EVAL_N_MATS", str(task_n_mats),
+                    "--env-vars", "TOMAT_EVAL_SKIP", str(task_skip),
+                    "--env-vars", "TOMAT_EVAL_BATCH", str(eval_batch),
+                    "--env-vars", "TOMAT_EVAL_DECODER", decoder,
+                    "--env-vars", "TOMAT_EVAL_MAT_SET", s,
+                    "--env-vars", "TOMAT_EVAL_SPLIT", split,
                 ]
-            elif mode == "maskgit":
-                cmd += [
-                    "--env-vars", "TOMAT_EVAL_MODE", "maskgit",
-                    "--env-vars", "TOMAT_EVAL_MG_K_STEPS", str(mg_k_steps),
-                ]
-                if mg_partial_ratios:
+                # Tag the per-task result file so the N jobs' outputs don't
+                # collide in GCS. The eval script (see eval_mat_nmae.py) reads
+                # TOMAT_EVAL_OUTPUT_SUFFIX and appends it to the JSON path.
+                if num_tasks > 1:
                     cmd += [
-                        "--env-vars", "TOMAT_EVAL_MG_PARTIAL_RATIOS",
-                        mg_partial_ratios,
+                        "--env-vars", "TOMAT_EVAL_OUTPUT_SUFFIX",
+                        f"-task{task_i}",
                     ]
-            if debug_dump_mat:
+                if mode == "free":
+                    cmd += [
+                        "--env-vars", "TOMAT_EVAL_MODE", "free",
+                        "--env-vars", "TOMAT_EVAL_FREE_BATCH", str(free_batch),
+                    ]
+                elif mode == "maskgit":
+                    cmd += [
+                        "--env-vars", "TOMAT_EVAL_MODE", "maskgit",
+                        "--env-vars", "TOMAT_EVAL_MG_K_STEPS", str(mg_k_steps),
+                    ]
+                    if mg_partial_ratios:
+                        cmd += [
+                            "--env-vars", "TOMAT_EVAL_MG_PARTIAL_RATIOS",
+                            mg_partial_ratios,
+                        ]
+                if debug_dump_mat:
+                    cmd += [
+                        "--env-vars", "TOMAT_DEBUG_DUMP_MAT", debug_dump_mat,
+                    ]
                 cmd += [
-                    "--env-vars", "TOMAT_DEBUG_DUMP_MAT", debug_dump_mat,
+                    "--no-wait", "--no-terminate-on-exit",
+                    "--job-name", jn,
+                    "--", "python", "eval_mat_nmae.py",
                 ]
-            cmd += [
-                "--no-wait", "--no-terminate-on-exit",
-                "--job-name", jn,
-                "--", "python", "eval_mat_nmae.py",
-            ]
-            if dry_run:
-                # Print the cmd as a runnable shell line. Mask the actual
-                # WANDB_API_KEY value with a literal placeholder.
-                pretty = " ".join(
-                    "'<WANDB_API_KEY>'" if a == wandb_key else a
-                    for a in cmd
-                )
-                print(f"# {jn}")
-                print(f"  cd {MARIN_DIR}")
-                print(f"  {pretty}")
-                print()
+                if dry_run:
+                    # Print the cmd as a runnable shell line. Mask the actual
+                    # WANDB_API_KEY value with a literal placeholder.
+                    pretty = " ".join(
+                        "'<WANDB_API_KEY>'" if a == wandb_key else a
+                        for a in cmd
+                    )
+                    print(f"# {jn}")
+                    print(f"  cd {MARIN_DIR}")
+                    print(f"  {pretty}")
+                    print()
+                    fired_total += 1
+                    continue
+                r = subprocess.run(cmd, cwd=str(MARIN_DIR), capture_output=True, text=True)
+                if r.returncode != 0:
+                    err(f"[FAIL fire {jn}] rc={r.returncode}\n{r.stderr[-500:]}")
+                    continue
+                print(f"[fired {jn}]")
                 fired_total += 1
-                continue
-            r = subprocess.run(cmd, cwd=str(MARIN_DIR), capture_output=True, text=True)
-            if r.returncode != 0:
-                err(f"[FAIL fire {jn}] rc={r.returncode}\n{r.stderr[-500:]}")
-                continue
-            print(f"[fired {jn}]")
+            # The FIRED file gates the harvest watchdog; tracked per (set, step),
+            # NOT per task — multiple tasks for the same (set, step) share one
+            # entry. (Append after the per-task loop so we record once even when
+            # num_tasks > 1.)
             if mode == "teacher":
                 with open(TMP_DIR / f"{run_label}-{s}-evals-fired.txt", "a") as f:
                     f.write(f"{step}\n")
-            fired_total += 1
 
     suffix = " (dry-run)" if dry_run else ""
-    print(f"\n[done firing {fired_total}/{len(step_list)*len(set_list)} jobs{suffix}]")
+    print(f"\n[done firing {fired_total}/{len(step_list)*len(set_list)*num_tasks} jobs{suffix}]")
 
 
 @evals.command("harvest")
@@ -1547,24 +1589,39 @@ def evals_sync(substr: str | None, bucket: str, dry_run: bool, prefix: str):
                 if (n := p.rsplit("/", 1)[-1]).startswith("step-")
                 and n.endswith(".json")
             ]
-            rows = []
+            # Per-task fan-out writes `step-<N>-task<i>.json`. Pool the
+            # per_mat arrays across tasks for the same step before computing
+            # stats, so the aggregated row reflects the full mat set.
+            per_step_mats: dict[int, list[dict]] = {}
             for path, raw in fs.cat(paths).items():  # parallel fetch
                 d = json.loads(raw)
                 name = path.rsplit("/", 1)[-1]
-                row = {"step": int(name[len("step-"):-len(".json")]),
-                       "n_mats": d.get("n_mats")}
-                row.update({k: d.get(k) for k in stat_keys})
-                # p1/p25/p75 — spread percentiles for the dashboard's band
-                # plot (the JSON aggregate only carries mean/median/p99).
-                per_mat = d.get("per_mat") or []
+                stem = name[len("step-"):-len(".json")]
+                if "-task" in stem:
+                    stem = stem.split("-task", 1)[0]
+                try:
+                    step = int(stem)
+                except ValueError:
+                    continue
+                per_step_mats.setdefault(step, []).extend(d.get("per_mat") or [])
+            rows = []
+            for step, per_mat in per_step_mats.items():
+                row = {"step": step, "n_mats": len(per_mat)}
+                # Recompute mean/median/p99 + spread percentiles from the
+                # pooled per_mat arrays — the per-task JSONs' own
+                # `nmae_mean` etc. fields are partial-set means and don't
+                # combine arithmetically.
                 for metric in ("nmae", "nemd"):
                     vals = np.asarray(
                         [m[metric] for m in per_mat if m.get(metric) is not None],
                         dtype=float,
                     )
-                    if vals.size:
-                        for pct, key in ((1, "p1"), (25, "p25"), (75, "p75")):
-                            row[f"{metric}_{key}"] = float(np.percentile(vals, pct))
+                    if not vals.size:
+                        continue
+                    row[f"{metric}_mean"] = float(vals.mean())
+                    for pct, key in ((1, "p1"), (25, "p25"), (50, "median"),
+                                     (75, "p75"), (99, "p99")):
+                        row[f"{metric}_{key}"] = float(np.percentile(vals, pct))
                 rows.append(row)
             if rows:
                 sets[mat_set] = sorted(rows, key=lambda r: r["step"])

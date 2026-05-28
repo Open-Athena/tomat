@@ -1632,7 +1632,12 @@ def main():
             else:
                 mode_suffix = ""
             ms = (eval_mat_set or "default") + mode_suffix
-            results_path = f"{BUCKET}/eval/results/{run_label}/{ms}/{ckpt_tail}.json"
+            # `TOMAT_EVAL_OUTPUT_SUFFIX` (e.g. `-task3`) appended to the JSON
+            # basename — used by `tomat evals fire --num-tasks N` so the N
+            # parallel tasks don't clobber a shared file. `tomat evals sync`
+            # globs all `step-{N}*.json` and aggregates them.
+            out_suffix = os.environ.get("TOMAT_EVAL_OUTPUT_SUFFIX", "")
+            results_path = f"{BUCKET}/eval/results/{run_label}/{ms}/{ckpt_tail}{out_suffix}.json"
             try:
                 with fsspec.open(results_path, "w") as f:
                     json.dump(summary, f, indent=2)
