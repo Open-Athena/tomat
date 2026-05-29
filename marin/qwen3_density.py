@@ -332,7 +332,9 @@ class MaskGITLossArgs:
       - all other tokens: PENALTY
 
     `mask_id`:  the [MASK] token id (= old vocab_size before the +1 bump).
-    `prior`:    mask-ratio sampling schedule — "cosine" | "uniform" | "high".
+    `prior`:    mask-ratio sampling schedule — "cosine" | "uniform" | "high"
+                | "absorbing" (r=1 always; pure structure→density, no
+                in-patch GT conditioning ever; see spec 40).
     `loss_type`: "ce" (pure CE) or "ce_emd" (CE + Wasserstein-1 density term).
     `weight`:   λ on the EMD term (only used when loss_type == "ce_emd").
 
@@ -345,7 +347,7 @@ class MaskGITLossArgs:
     density_lo: int              # inclusive start of density vocab range
     density_hi: int              # exclusive end of density vocab range
     mask_id: int                 # [MASK] token id = old vocab_size
-    prior: str = "cosine"        # mask-ratio schedule: "cosine" | "uniform" | "high"
+    prior: str = "cosine"        # mask-ratio schedule: cosine|uniform|high|absorbing
     weight: float = 1.0          # λ multiplier on the EMD density term
     loss_type: str = "ce"        # "ce" or "ce_emd"
 
@@ -365,8 +367,8 @@ def build_maskgit_loss_args(
     """Build `MaskGITLossArgs` from codec + config."""
     if loss_type not in ("ce", "ce_emd", "emd"):
         raise ValueError(f"loss_type must be 'ce'/'ce_emd'/'emd', got {loss_type!r}")
-    if prior not in ("cosine", "uniform", "high"):
-        raise ValueError(f"prior must be 'cosine'/'uniform'/'high', got {prior!r}")
+    if prior not in ("cosine", "uniform", "high", "absorbing"):
+        raise ValueError(f"prior must be cosine/uniform/high/absorbing, got {prior!r}")
     decode_all_np = np.full(Vocab.size, float(penalty), dtype=np.float32)
     decode_all_np[density_offset : density_offset + n_density_bins] = codec_recon.astype(np.float32)
     decode_all = hax.named(decode_all_np, Vocab)
@@ -619,6 +621,11 @@ def _jax_apply_maskgit(
             r = jnp.cos(u * jnp.pi / 2.0)
         elif prior == "high":
             r = 0.5 + 0.5 * u
+        elif prior == "absorbing":
+            # r=1 always. Every density position is replaced by MASK; the
+            # model never sees in-patch GT density at training time. Pure
+            # structure→field objective. See spec 40 ("tomat zero").
+            r = jnp.ones_like(u)
         else:  # "uniform"
             r = u
         mask_count = jnp.ceil(r * P3.astype(jnp.float32)).astype(jnp.int32)

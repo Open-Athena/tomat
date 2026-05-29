@@ -496,9 +496,10 @@ def main():
     mg_mode = os.environ.get("TOMAT_MG_MODE", "0") == "1"
     mg_mask_prior = os.environ.get("TOMAT_MG_MASK_PRIOR", "cosine")
     mg_loss_type = os.environ.get("TOMAT_MG_LOSS_TYPE", "ce")
-    if mg_mask_prior not in ("cosine", "uniform", "high"):
+    if mg_mask_prior not in ("cosine", "uniform", "high", "absorbing"):
         raise ValueError(
-            f"TOMAT_MG_MASK_PRIOR must be cosine/uniform/high, got {mg_mask_prior!r}"
+            f"TOMAT_MG_MASK_PRIOR must be cosine/uniform/high/absorbing, "
+            f"got {mg_mask_prior!r}"
         )
     if mg_loss_type not in ("ce", "ce_emd", "emd"):
         raise ValueError(
