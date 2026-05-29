@@ -72,7 +72,7 @@ from haliax.partitioning import round_axis_for_partitioning
 
 import levanter
 from levanter.checkpoint import load_checkpoint
-from levanter.layers.attention import AttentionBackend
+from levanter.layers.attention import AttentionBackend, AttentionMask
 from levanter.layers.rotary import Llama3RotaryEmbeddingsConfig
 from levanter.models.qwen import Qwen3Config
 from levanter.trainer import TrainerConfig
@@ -768,9 +768,17 @@ def main():
         DENS_HI = density_offset + len(recon)
         decode_dens = jnp.asarray(recon, dtype=jnp.float32)  # (n_bins,) float
 
+        # Causal attention mask for AR-trained models — matches training-time
+        # mask built by `LmExample.causal(...)` (`lm_model.py:62`). Levanter's
+        # default of `attn_mask=None` materializes to FullMask (full
+        # bidirectional) in every backend, NOT causal — see spec 41 for the
+        # full audit. Passing `None` here would silently OOD-eval the model
+        # under a mask it never saw at training time.
+        _ar_causal_mask = AttentionMask.causal()
+
         @hax.named_jit(axis_resources=compute_mapping)
         def forward_decode(tokens_in):
-            act = model.activations(tokens_in, key=None, attn_mask=None)
+            act = model.activations(tokens_in, key=None, attn_mask=_ar_causal_mask)
             head = model.get_lm_head()
             logits = hax.dot(act, head, axis=model.Embed)
             logits_arr = logits.array.astype(jnp.float32)  # (B, Pos, V)
@@ -803,7 +811,7 @@ def main():
         def free_step(tokens_in, frontier, true_dens_i):
             # tokens_in: (Batch, Pos) prefix; frontier: i32 scalar output
             # position to read; true_dens_i: (Batch,) true voxel density.
-            act = model.activations(tokens_in, key=None, attn_mask=None)
+            act = model.activations(tokens_in, key=None, attn_mask=_ar_causal_mask)
             head = model.get_lm_head()
             logits = hax.dot(act, head, axis=model.Embed)
             logits_arr = logits.array.astype(jnp.float32)          # (B, Pos, V)
@@ -829,13 +837,11 @@ def main():
 
         # ---- MaskGIT iterative-refinement forward --------------------------
         # One full-sequence bidirectional forward: tokens_in has density
-        # positions that are either MASK_ID or already filled-in.
-        # Returns (B, Pos) density logits and confidence at every position.
-        # Bidirectional attn is achieved by passing an explicit
-        # AttentionMask(is_causal=False) — materializes to None → full bidir.
-        from levanter.layers.attention import AttentionMask as _AttentionMask
-
-        _mg_bidir_mask = _AttentionMask(is_causal=False)
+        # positions that are either MASK_ID or already filled-in. Matches
+        # the bidir mask used during MaskGIT training (see
+        # `Qwen3MaskGITLMHeadModel.compute_next_token_loss` in
+        # `marin/qwen3_density.py`).
+        _mg_bidir_mask = AttentionMask(is_causal=False)
 
         @hax.named_jit(axis_resources=compute_mapping)
         def maskgit_forward(tokens_in):
@@ -891,6 +897,18 @@ def main():
             err(f"[eval-mat] DEBUG: single-mat per-voxel dump → {debug_dump_mat}")
 
         per_mat_results = []
+        # Streaming knobs (introduced 2026-05-29 — see specs/41 §"Validation
+        # plan" / the eval-bidir-bug postmortem).
+        #   TOMAT_EVAL_DUMP_PREDICTIONS=1 → save per-mat (n_patches, P^3)
+        #     pred/true arrays as `.../predictions/<mp_id>{out_suffix}.npz`
+        #     siblings of the JSON summary. Used by `tomat analyze voxel-corr`
+        #     to build the position-position prediction-correlation matrix
+        #     (task #174, spec 41 §"Validation plan" point 4).
+        #   We always flush per-mat summary writes to GCS so partial progress
+        #     survives a SIGTERM / wall-clock deadline. Previously the eval
+        #     wrote only at the end → a hard 4h wall-clock on the iris job
+        #     wiped 100+ mats' work. Now N-1 mats are recoverable.
+        dump_predictions = bool(int(os.environ.get("TOMAT_EVAL_DUMP_PREDICTIONS", "0")))
         # Per-position diagnostics — accumulated across all mats so the
         # dashboard can plot mean error at each density-block position
         # (0..P^3-1, row-major within the patch). Sums divided by pp_count
@@ -902,6 +920,92 @@ def main():
         pp_emd_sum = np.zeros(P ** 3, dtype=np.float64)
         pp_abs_true_sum = np.zeros(P ** 3, dtype=np.float64)
         pp_count = 0
+
+        # ---- Streaming-write helpers (intermediate-progress recovery) ------
+        # Compute the output path once. Levanter writes
+        # <base>/<run_id>/step-N and `tomat evals fire` sets base =
+        # <BUCKET>/results/<RL>/checkpoints → parts[-4]=run_label, -1=step.
+        _ckpt_parts = checkpoint_path.rstrip("/").split("/")
+        _ckpt_tail = _ckpt_parts[-1]
+        _run_label = _ckpt_parts[-4]
+        _mode_suffix = {"free": "-free", "maskgit": "-maskgit"}.get(eval_mode, "")
+        _ms = (eval_mat_set or "default") + _mode_suffix
+        _out_suffix = os.environ.get("TOMAT_EVAL_OUTPUT_SUFFIX", "")
+        _results_path = f"{BUCKET}/eval/results/{_run_label}/{_ms}/{_ckpt_tail}{_out_suffix}.json"
+        _predictions_dir = f"{BUCKET}/eval/results/{_run_label}/{_ms}/predictions"
+
+        def _bootstrap_ci(xs: np.ndarray, n_boot: int = 1000, alpha: float = 0.05):
+            """(lo, hi) bootstrap CI for the mean. Fixed seed so successive
+            intermediate writes are comparable (CI tightens as mats land).
+            """
+            if len(xs) < 2:
+                return None
+            rng = np.random.default_rng(0)
+            idx = rng.integers(0, len(xs), size=(n_boot, len(xs)))
+            means = xs[idx].mean(axis=1)
+            return [
+                float(np.percentile(means, 100 * alpha / 2)),
+                float(np.percentile(means, 100 * (1 - alpha / 2))),
+            ]
+
+        def _build_summary() -> dict:
+            nmaes = np.array([r["nmae"] for r in per_mat_results], dtype=np.float64)
+            nemds = np.array([r["nemd"] for r in per_mat_results], dtype=np.float64)
+            n = len(per_mat_results)
+            return {
+                "checkpoint": checkpoint_path,
+                "label": label,
+                "model": model_preset,
+                "mode": eval_mode,
+                "mat_set": eval_mat_set,
+                "n_mats": n,
+                "nmae_mean": float(nmaes.mean()) if n else None,
+                "nmae_median": float(np.median(nmaes)) if n else None,
+                "nmae_p99": float(np.percentile(nmaes, 99)) if n else None,
+                "nmae_ci95": _bootstrap_ci(nmaes),
+                "nemd_mean": float(nemds.mean()) if n else None,
+                "nemd_median": float(np.median(nemds)) if n else None,
+                "nemd_p99": float(np.percentile(nemds, 99)) if n else None,
+                "nemd_ci95": _bootstrap_ci(nemds),
+                "per_pos_mae": (pp_mae_sum / pp_count).astype(np.float32).tolist() if pp_count else None,
+                "per_pos_emd": (pp_emd_sum / pp_count).astype(np.float32).tolist() if pp_count else None,
+                "per_pos_abs_true": (pp_abs_true_sum / pp_count).astype(np.float32).tolist() if pp_count else None,
+                "per_pos_n_patches": int(pp_count),
+                "per_mat": per_mat_results,
+            }
+
+        def _flush_results():
+            """Write current summary to GCS. Called after each mat."""
+            if debug_dump_mat or not per_mat_results:
+                return
+            try:
+                with fsspec.open(_results_path, "w") as f:
+                    json.dump(_build_summary(), f, indent=2)
+            except Exception as e:
+                err(f"[eval-mat] WARN: failed to persist results: {e}")
+
+        def _dump_mat_predictions(mp_id: str, pred: np.ndarray, true: np.ndarray,
+                                  offsets_arr: np.ndarray):
+            """Save per-mat (n_patches, P^3) prediction arrays for the
+            voxel-position correlation diagnostic (spec 41 §"Validation plan").
+            Skipped unless TOMAT_EVAL_DUMP_PREDICTIONS=1.
+            """
+            if not dump_predictions or debug_dump_mat:
+                return
+            path = f"{_predictions_dir}/{mp_id}{_out_suffix}.npz"
+            try:
+                import io as _io
+                buf = _io.BytesIO()
+                np.savez_compressed(
+                    buf, pred=pred.astype(np.float32),
+                    true=true.astype(np.float32),
+                    offsets=offsets_arr.astype(np.int32),
+                )
+                with fsspec.open(path, "wb") as f:
+                    f.write(buf.getvalue())
+            except Exception as e:
+                err(f"[eval-mat] WARN: failed to dump predictions for {mp_id}: {e}")
+
         for mp_id in mp_ids:
             # Load raw Zarr — download from GCS to local /tmp first to dodge
             # the gcsfs/aiohttp async-event-loop conflict with JAX's runtime.
@@ -1092,6 +1196,28 @@ def main():
                     "nmae": nmae,
                     "nemd": nemd,
                 })
+                # Free mode already accumulates rho_b_np per-patch
+                # generation-order — dump if requested.
+                if dump_predictions:
+                    rho_all = np.zeros((n_patches, P ** 3), dtype=np.float32)
+                    true_all = np.zeros((n_patches, P ** 3), dtype=np.float32)
+                    # Build (n_patches, P^3) by indexing the stitched grid
+                    # back per-patch. Mirrors the scatter at lines 1148-1153.
+                    iota = np.arange(P, dtype=np.int32)
+                    di, dj, dk = np.meshgrid(iota, iota, iota, indexing="ij")
+                    gx = np.asarray(grid_shape, dtype=np.int32)
+                    for gi in range(n_patches):
+                        ox, oy, oz = offsets[gi]
+                        ix = (ox + di) % gx[0]
+                        iy = (oy + dj) % gx[1]
+                        iz = (oz + dk) % gx[2]
+                        rho_all[gi] = rho_pred[ix, iy, iz].reshape(P ** 3)
+                        true_all[gi] = density[ix, iy, iz].reshape(P ** 3)
+                    _dump_mat_predictions(
+                        mp_id, rho_all, true_all,
+                        np.asarray(offsets, dtype=np.int32),
+                    )
+                _flush_results()
                 continue
 
             # ---- MaskGIT iterative-refinement branch ----------------------
@@ -1237,6 +1363,7 @@ def main():
                         "mean_abs_true": 0.0,
                         "partial_mask": pm_results,
                     })
+                    _flush_results()
                     continue  # skip the K-iter MaskGIT path for this mat
 
                 # Per-iter NMAE tracking (nice-to-have diagnostic).
@@ -1419,6 +1546,7 @@ def main():
                     "nmae_filled": nmae_filled,
                     "nemd": nemd,
                 })
+                _flush_results()
                 continue
 
             rho_pred = np.zeros(grid_shape, dtype=np.float32)
@@ -1488,6 +1616,11 @@ def main():
             depth = 2
             total = 0
             emd_grid = np.zeros(grid_shape, dtype=np.float32)
+            # Per-patch row-major predictions; only retained if dump_predictions.
+            all_pred_patch = (
+                np.zeros((n_patches, P ** 3), dtype=np.float32)
+                if dump_predictions else None
+            )
             for bi in range(n_full_batches):
                 inflight.append((bi, dispatch(bi)))
                 while len(inflight) > depth or (bi == n_full_batches - 1 and inflight):
@@ -1515,6 +1648,8 @@ def main():
                         pp_emd_sum += emd_dens_floats[k]
                         pp_abs_true_sum += np.abs(all_true_patch[global_idx])
                         pp_count += 1
+                        if all_pred_patch is not None:
+                            all_pred_patch[global_idx] = pred_dens_floats[k]
                         total += 1
             t_fwd = time.time() - t_fwd0
             err(f"[eval-mat] {mp_id}: processed {total} patches "
@@ -1555,6 +1690,14 @@ def main():
                 "nmae": float(nmae),
                 "nemd": float(nemd),
             })
+            if all_pred_patch is not None:
+                _dump_mat_predictions(
+                    mp_id,
+                    all_pred_patch[:total],
+                    all_true_patch[:total],
+                    np.asarray(offsets[:total], dtype=np.int32),
+                )
+            _flush_results()
 
         # Aggregate
         if per_mat_results:
@@ -1572,11 +1715,11 @@ def main():
         # Voxel 0 (= "P(ρ | structure-only)") is the cold-start prediction
         # — if it's flat over training, the model is only learning the AR
         # shortcut; if it's dropping, real structure→ρ learning is happening.
-        per_pos_mae = (pp_mae_sum / max(pp_count, 1)).astype(np.float32)
-        per_pos_emd = (pp_emd_sum / max(pp_count, 1)).astype(np.float32)
-        per_pos_abs_true = (pp_abs_true_sum / max(pp_count, 1)).astype(np.float32)
         if pp_count > 0:
             err(f"[eval-mat] per-position diagnostic ({pp_count} patches):")
+            per_pos_mae = (pp_mae_sum / pp_count).astype(np.float32)
+            per_pos_emd = (pp_emd_sum / pp_count).astype(np.float32)
+            per_pos_abs_true = (pp_abs_true_sum / pp_count).astype(np.float32)
             # A few canonical positions: voxel 0 (structure-only); voxel
             # P-1 (end of first 1D-row); voxel P (start of next 1D-row,
             # spatially adjacent to voxel 0 via y); voxel P^2 (start of
@@ -1588,62 +1731,14 @@ def main():
                 err(f"  i={i:>5d}: mae={per_pos_mae[i]:>9.3g}  emd={per_pos_emd[i]:>9.3g}"
                     f"  |true|={per_pos_abs_true[i]:>9.3g}  NMAE_global_denom={npm:.4%}")
 
-        # Machine-readable summary (also persists per-mat results to GCS so
-        # downstream noise-calibration / bootstrap analysis can use them
-        # without scraping iris job logs, which truncate per-mat lines).
-        summary = {
-            "checkpoint": checkpoint_path,
-            "label": label,
-            "model": model_preset,
-            "mode": eval_mode,
-            "mat_set": eval_mat_set,
-            "n_mats": len(per_mat_results),
-            "nmae_mean": float(nmaes.mean()) if per_mat_results else None,
-            "nmae_median": float(np.median(nmaes)) if per_mat_results else None,
-            "nmae_p99": float(np.percentile(nmaes, 99)) if per_mat_results else None,
-            "nemd_mean": float(nemds.mean()) if per_mat_results else None,
-            "nemd_median": float(np.median(nemds)) if per_mat_results else None,
-            "nemd_p99": float(np.percentile(nemds, 99)) if per_mat_results else None,
-            "per_pos_mae": per_pos_mae.tolist() if pp_count > 0 else None,
-            "per_pos_emd": per_pos_emd.tolist() if pp_count > 0 else None,
-            "per_pos_abs_true": per_pos_abs_true.tolist() if pp_count > 0 else None,
-            "per_pos_n_patches": int(pp_count),
-            "per_mat": per_mat_results,
-        }
+        # Final summary write + stdout dump. _flush_results() during the loop
+        # has already written N-1 incremental snapshots, so this is mostly a
+        # belt-and-suspenders; the new piece is the printed JSON.
+        summary = _build_summary()
         print(json.dumps(summary, indent=2))
-
-        # Persist to GCS keyed by checkpoint + mat-set, so bootstrap noise
-        # estimation can read per-mat values for any prior eval.
+        _flush_results()
         if per_mat_results and not debug_dump_mat:
-            # Levanter checkpointer lays out as <base_path>/<run_id>/step-N, where
-            # base_path here is `<BUCKET>/results/<RESULTS_LABEL>/checkpoints` and
-            # run_id == RESULTS_LABEL — so the path doubles the label, e.g.
-            #   .../results/<RL>/checkpoints/<RL>/step-1000
-            # Components from the tail: -1=step, -2=RL, -3=checkpoints, -4=RL.
-            parts = checkpoint_path.rstrip("/").split("/")
-            ckpt_tail = parts[-1]
-            run_label = parts[-4]
-            # Mode-specific results land in sibling subdirs to avoid collisions
-            # with the teacher-forced `<set>/` JSONs.
-            if eval_mode == "free":
-                mode_suffix = "-free"
-            elif eval_mode == "maskgit":
-                mode_suffix = "-maskgit"
-            else:
-                mode_suffix = ""
-            ms = (eval_mat_set or "default") + mode_suffix
-            # `TOMAT_EVAL_OUTPUT_SUFFIX` (e.g. `-task3`) appended to the JSON
-            # basename — used by `tomat evals fire --num-tasks N` so the N
-            # parallel tasks don't clobber a shared file. `tomat evals sync`
-            # globs all `step-{N}*.json` and aggregates them.
-            out_suffix = os.environ.get("TOMAT_EVAL_OUTPUT_SUFFIX", "")
-            results_path = f"{BUCKET}/eval/results/{run_label}/{ms}/{ckpt_tail}{out_suffix}.json"
-            try:
-                with fsspec.open(results_path, "w") as f:
-                    json.dump(summary, f, indent=2)
-                err(f"[eval-mat] persisted per-mat results to {results_path}")
-            except Exception as e:
-                err(f"[eval-mat] WARNING: failed to persist per-mat to GCS: {e}")
+            err(f"[eval-mat] persisted final per-mat results to {_results_path}")
 
 
 if __name__ == "__main__":

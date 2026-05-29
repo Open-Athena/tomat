@@ -21,9 +21,9 @@ export type RunTag = string
 export const RUN_TAGS: Record<string, RunTag[]> = {
   // ---- Post-init-fix (2026-05-25+): tags reflect what actually runs. ----
   'train-mg-4-cos-ce': ['MaskGIT', 'CE', 'production', 'post-init-fix'],
-  'train-ar-ce-emd-1': ['AR', 'CE+EMD', 'production', 'post-init-fix'],
+  'train-ar-ce-emd-1': ['AR', 'CE+EMD', 'production', 'post-init-fix', 'eval-bidir-bug'],
   'train-mg-3-cos-emd': ['MaskGIT', 'EMD', 'collapsed', 'post-init-fix'],
-  'train-ar-emd-real': ['AR', 'EMD', 'collapsed', 'post-init-fix'],
+  'train-ar-emd-real': ['AR', 'EMD', 'collapsed', 'post-init-fix', 'eval-bidir-bug'],
   'train-mg-fix-verify': ['MaskGIT', 'EMD', 'smoke', 'post-init-fix'],
   'train-mg-smk-A': ['smoke', 'pre-init-fix'],
   'train-mg-smk-B': ['smoke', 'pre-init-fix'],
@@ -33,28 +33,28 @@ export const RUN_TAGS: Record<string, RunTag[]> = {
   // Both are CE (TOMAT_DENSITY_L1_WEIGHT=0 → density path falls through to base
   // CE); only difference is preamble-zeroed vs preamble-intact, same seed.
   'train-full-v3-200M-bs128-ce-10k-v5p16-noprm':
-    ['AR', 'CE', 'noprm-experiment', 'post-init-fix'],
+    ['AR', 'CE', 'noprm-experiment', 'post-init-fix', 'eval-bidir-bug'],
   'train-full-v3-200M-bs128-ce-10k-v5p16-paired-base':
-    ['AR', 'CE', 'noprm-experiment', 'post-init-fix'],
+    ['AR', 'CE', 'noprm-experiment', 'post-init-fix', 'eval-bidir-bug'],
 
   // ---- SS sweep (2026-05-27): scheduled-sampling fine-tunes off cont33k ----
   // All warm-started from cont33k step-79999; vary ε distribution + sampler.
   'train-ss-cont80k-emax025-1':
-    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix'],
+    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix', 'eval-bidir-bug'],
   'train-ss-cont80k-emax050-1':
-    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix'],
+    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix', 'eval-bidir-bug'],
   'train-ss-cont80k-emax075-1':
-    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix'],
+    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix', 'eval-bidir-bug'],
   'train-ss-cont80k-emax100-1':
-    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix'],
+    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix', 'eval-bidir-bug'],
   // BUNK: launcher set TOMAT_SS_EPS_MAX=1.0 but NOT TOMAT_SS_EPS_MIN=1.0,
   // so ε sampled U(0, 1.0) — i.e. trained bit-identically to emax100-1
   // (verified: TL matches to 6 decimal places across all 5000 fine-tune
   // steps). See spec 37 + the SS print-statement fix in train_tomat_tpu.py.
   'train-ss-cont80k-eps1const-1':
-    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix', 'bunk'],
+    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix', 'bunk', 'eval-bidir-bug'],
   'train-ss-cont80k-hi-argmax-1':
-    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix'],
+    ['AR', 'EMD', 'SS', 'SS-sweep', 'post-init-fix', 'eval-bidir-bug'],
 
   // ---- VV: VQ-VAE tokenizer-only training (no atomic encoding, self-supervised) ----
   'vqvae-smoke-50k-02': ['VV', 'VV-smoke'],
@@ -63,79 +63,79 @@ export const RUN_TAGS: Record<string, RunTag[]> = {
 
   // ---- Pre-init-fix: all trained as CE on the next-token objective ----
   // mg-* runs added a vocab+1 MASK token but never reached masked-loss code.
-  'train-mg-1': ['AR', 'CE', 'pre-init-fix', 'bunk'],
-  'train-mg-2-cos-emd': ['AR', 'CE', 'pre-init-fix', 'bunk'],
-  'train-mg-2-hi-emd': ['AR', 'CE', 'pre-init-fix', 'bunk'],
-  'train-mg-2-uni-emd': ['AR', 'CE', 'pre-init-fix', 'bunk'],
+  'train-mg-1': ['AR', 'CE', 'pre-init-fix', 'bunk', 'eval-bidir-bug'],
+  'train-mg-2-cos-emd': ['AR', 'CE', 'pre-init-fix', 'bunk', 'eval-bidir-bug'],
+  'train-mg-2-hi-emd': ['AR', 'CE', 'pre-init-fix', 'bunk', 'eval-bidir-bug'],
+  'train-mg-2-uni-emd': ['AR', 'CE', 'pre-init-fix', 'bunk', 'eval-bidir-bug'],
 
   // Named "-emd-do-" but `density_only` + `emd` both routed through the base
   // class's CE — these are the real CE baselines.
   'train-full-v3-200M-bs128-emd-do-80k-v6e16-shuf1k-cont33k':
-    ['AR', 'CE', 'pre-init-fix', 'cont33k', 'production'],
+    ['AR', 'CE', 'pre-init-fix', 'cont33k', 'production', 'eval-bidir-bug'],
   'train-full-v3-200M-bs128-emd-do-10k-v5p16-shuf1k-z3':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
   'train-full-v3-200M-bs256-emd-do-15k-v5p16-shuf1k-z3':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
   'train-full-v3-200M-bs512-emd-do-15k-v5p16-shuf1k-z3':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
   'train-full-v3-200M-bs256-emd-do-10k-h100x8-r2-bs256-seed42':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
   'train-full-v3-200M-bs256-emd-do-10k-h100x8-bs256-seed42':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
   'train-full-v3-200M-bs256-emd-do-10k-h100x8-r2':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
 
   // cont7k / cont8k WSD cooldown variants.
   'train-full-v3-200M-bs128-emd-do-8k-tpu16-shuf1k-cont7k':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
   'train-full-v3-200M-bs128-emd-do-8k-tpu16-shuf1k-cont7k-ext':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
   'train-full-v3-200M-bs128-emd-do-8k-tpu16-shuf1k-cont6kwsd':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
   'train-full-v3-200M-bs128-emd-do-8k-tpu16-shuf1k-cont8kwsd':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
 
   // LR sweep series (lrsw-lr*).
   'train-full-v3-200M-bs128-emd-do-8k-v5p16-shuf1k-lrsw-lr3e4':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
   'train-full-v3-200M-bs128-emd-do-8k-v5p16-shuf1k-lrsw-lr3e4-r2':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
   'train-full-v3-200M-bs128-emd-do-8k-v5p16-shuf1k-lrsw-lr1e3':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
   'train-full-v3-200M-bs128-emd-do-8k-v5p16-shuf1k-lrsw-lr2e3':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
   'train-full-v3-200M-bs128-emd-do-8k-v5p16-shuf1k-lrsw-lr4e3':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
   'train-full-v3-200M-bs128-emd-do-8k-v5p16-shuf1k-lrsw-lr8e3':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
 
   // Other v3 and lmq-v2 runs.
   'train-full-v3-200M-bs128-emd-do-8k-v5p16-shuf1k':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
   'train-full-v3-200M-bs128-emd-do-8k-tpu16-shuf1k':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
   'train-full-v3-200M-bs128-emd-do-8k-tpu16':
-    ['AR', 'CE', 'pre-init-fix'],
+    ['AR', 'CE', 'pre-init-fix', 'eval-bidir-bug'],
   'train-full-v3-200M-bs128-emd-do-500-v5p16-shuf1k-pyspy-3':
-    ['AR', 'CE', 'pre-init-fix', 'smoke'],
+    ['AR', 'CE', 'pre-init-fix', 'smoke', 'eval-bidir-bug'],
 
   // Larger / failed-cascade era (kept tagged so they don't appear unlabeled).
   'train-full-v3-200M-bs256-emd-do-15k-v5p16-shuf1k-zf-r2':
-    ['AR', 'CE', 'pre-init-fix', 'bunk'],
+    ['AR', 'CE', 'pre-init-fix', 'bunk', 'eval-bidir-bug'],
   'train-full-v3-200M-bs512-emd-do-15k-v5p16-shuf1k-zf-r2':
-    ['AR', 'CE', 'pre-init-fix', 'bunk'],
+    ['AR', 'CE', 'pre-init-fix', 'bunk', 'eval-bidir-bug'],
   'train-full-v3-200M-bs1792-emd-do-15k-v5p32-shuf1k-zf-r2':
-    ['AR', 'CE', 'pre-init-fix', 'bunk'],
+    ['AR', 'CE', 'pre-init-fix', 'bunk', 'eval-bidir-bug'],
 
   // lmq-v2 era (older t10n) — orange in the dashboard.
   'tomat-train-cont-from-4711-1B-bs256-emd-do-12k-tpu32':
-    ['AR', 'CE', 'pre-init-fix', '1B'],
+    ['AR', 'CE', 'pre-init-fix', '1B', 'eval-bidir-bug'],
   'train-full-lmq-v2-1B-bs256-emd-do-16k-tpu32':
-    ['AR', 'CE', 'pre-init-fix', '1B', 'v2'],
+    ['AR', 'CE', 'pre-init-fix', '1B', 'v2', 'eval-bidir-bug'],
   'train-full-lmq-v2-200M-bs128-emd-do-16k-tpu16':
-    ['AR', 'CE', 'pre-init-fix', 'v2'],
+    ['AR', 'CE', 'pre-init-fix', 'v2', 'eval-bidir-bug'],
   'train-full-lmq-v2-200M-bs128-emd-do-8k-lat-tpu16':
-    ['AR', 'CE', 'pre-init-fix', 'v2'],
+    ['AR', 'CE', 'pre-init-fix', 'v2', 'eval-bidir-bug'],
 }
 
 /** All distinct tags present in the registry, in display order. */
@@ -144,7 +144,7 @@ export const ALL_TAGS: RunTag[] = (() => {
   const ordered: RunTag[] = [
     'AR', 'MaskGIT', 'SS', 'VV',
     'CE', 'EMD', 'CE+EMD',
-    'production', 'collapsed', 'bunk', 'smoke',
+    'production', 'collapsed', 'bunk', 'eval-bidir-bug', 'smoke',
     'SS-sweep', 'VV-sweep', 'VV-smoke', 'noprm-experiment',
     'cont33k', '1B', 'post-init-fix', 'pre-init-fix', 'v2',
   ]

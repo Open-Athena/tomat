@@ -1299,6 +1299,7 @@ def evals():
 @click.option("--mg-partial-ratios", default="", help="(--mode maskgit) diagnostic: comma-sep mask ratios (e.g. 0.1,0.5,0.9,1.0). When set, skip K-iter loop; mask R fraction at random, ONE forward, report NMAE on masked positions only. Tests whether model has learned at any mask ratio.")
 @click.option("--bucket", "bucket_override", default=None, help=f"GCS bucket where the run's ckpts live (default: {GCS_BUCKET}). Use when the run was trained with --bucket override (e.g. v5p in us-east5 → gs://marin-us-east5/tomat).")
 @click.option("--mirror-to", "mirror_to", default=None, help="Before firing, mirror the resolved ckpt(s) to this bucket via `tomat ckpt mirror` and run eval against the mirror. Prevents cross-region egress when eval TPU region differs from ckpt bucket. See [[cross-region-eval-egress]].")
+@click.option("-P", "--dump-predictions", "dump_predictions", is_flag=True, help="Sets TOMAT_EVAL_DUMP_PREDICTIONS=1. Each completed mat dumps a (n_patches, P^3) pred/true .npz sibling to the result JSON, for the voxel-position corr-matrix diagnostic (spec 41).")
 @click.argument("run_label")
 def evals_fire(
     run_label: str,
@@ -1319,6 +1320,7 @@ def evals_fire(
     mg_partial_ratios: str,
     bucket_override: str | None,
     mirror_to: str | None,
+    dump_predictions: bool,
 ):
     """Fire mat-NMAE eval jobs against a run's GCS checkpoints.
 
@@ -1471,6 +1473,10 @@ def evals_fire(
                 if debug_dump_mat:
                     cmd += [
                         "--env-vars", "TOMAT_DEBUG_DUMP_MAT", debug_dump_mat,
+                    ]
+                if dump_predictions:
+                    cmd += [
+                        "--env-vars", "TOMAT_EVAL_DUMP_PREDICTIONS", "1",
                     ]
                 cmd += [
                     "--no-wait", "--no-terminate-on-exit",
