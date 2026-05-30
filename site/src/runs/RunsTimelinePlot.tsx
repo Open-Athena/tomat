@@ -343,9 +343,13 @@ export function SmoothingChips({
           raw
         </button>
       </Tooltip>
-      <Tooltip content="exponential moving average: y[t] = α·x[t] + (1-α)·y[t-1]. Smaller α = smoother. URL: ?smooth=ema:α">
+      <Tooltip content="exponential moving average: y[t] = α·x[t] + (1-α)·y[t-1]. Smaller α = smoother. Click chip to toggle off. URL: ?smooth=ema:α">
         <button
-          onClick={() => setMode({ kind: 'ema', alpha: Number(emaDraft) || DEFAULT_EMA_ALPHA })}
+          onClick={() => setMode(
+            mode.kind === 'ema'
+              ? { kind: 'raw' }
+              : { kind: 'ema', alpha: Number(emaDraft) || DEFAULT_EMA_ALPHA }
+          )}
           style={chipStyle(mode.kind === 'ema')}
         >
           EMA α
@@ -360,9 +364,13 @@ export function SmoothingChips({
           />
         </button>
       </Tooltip>
-      <Tooltip content="centered rolling mean over N samples. URL: ?smooth=rolling:N">
+      <Tooltip content="centered rolling mean over N samples. Click chip to toggle off. URL: ?smooth=rolling:N">
         <button
-          onClick={() => setMode({ kind: 'rolling', window: Math.max(1, Math.round(Number(rollDraft))) || DEFAULT_ROLLING_WINDOW })}
+          onClick={() => setMode(
+            mode.kind === 'rolling'
+              ? { kind: 'raw' }
+              : { kind: 'rolling', window: Math.max(1, Math.round(Number(rollDraft))) || DEFAULT_ROLLING_WINDOW }
+          )}
           style={chipStyle(mode.kind === 'rolling')}
         >
           roll N

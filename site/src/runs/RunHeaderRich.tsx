@@ -252,10 +252,14 @@ function defaultShortLabel(id: string): string {
  *   - else, if we know the parent's wandb URL, open that in a new tab;
  *   - else, navigate to `#/runs/<parent>` (the parent's detail page). */
 function ParentChip({
-  runId, parentWandbUrl, onScrollToParent,
+  runId, parentWandbUrl, parentColor, onScrollToParent,
 }: {
   runId: string
   parentWandbUrl: string | null
+  /** Optional color swatch for the parent — when supplied, rendered as a
+   *  small left-edge dot so the chip visually ties to the parent's trace
+   *  color on the timeline. */
+  parentColor?: string | null
   onScrollToParent?: (parentId: string) => boolean
 }) {
   const lin = lineageFor(runId)
@@ -299,7 +303,18 @@ function ParentChip({
           border: '1px solid rgba(120,140,200,0.30)',
           borderRadius: 10,
           padding: '1px 8px',
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 5,
         }}>
+        {parentColor && (
+          <span style={{
+            display: 'inline-block',
+            width: 8, height: 8, borderRadius: '50%',
+            background: parentColor,
+            flex: '0 0 auto',
+          }} />
+        )}
         ← {defaultShortLabel(lin.parent)}{stepTail}
       </a>
     </Tooltip>
@@ -364,6 +379,10 @@ export interface RunHeaderRichProps {
   /** wandb URL for the parent run (looked up by the caller from the visible
    *  manifest map). When set, the ParentChip will use it as a fallback. */
   parentWandbUrl?: string | null
+  /** Trace color the parent uses on the timeline plot — rendered as a small
+   *  swatch on the ParentChip so the eye can map a child card to its parent
+   *  trace at a glance. */
+  parentColor?: string | null
   /** Try to scroll the parent's card into view (cards-only). When omitted
    *  (detail page), the ParentChip falls back to navigating to the parent's
    *  detail page. */
@@ -374,7 +393,7 @@ export interface RunHeaderRichProps {
 }
 
 export function RunHeaderRich({
-  data, parentWandbUrl, onScrollToParent, linkRunName = true,
+  data, parentWandbUrl, parentColor, onScrollToParent, linkRunName = true,
 }: RunHeaderRichProps) {
   const { id, manifest, job, history, evalJobs, err } = data
   const incomplete = isIncomplete(data)
@@ -495,6 +514,7 @@ export function RunHeaderRich({
           <ParentChip
             runId={id}
             parentWandbUrl={parentWandbUrl ?? null}
+            parentColor={parentColor}
             onScrollToParent={onScrollToParent}
           />
           <TagChips runId={id} />

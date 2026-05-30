@@ -67,6 +67,10 @@ interface CardProps {
    *  the visible manifest map). When the parent is in the visible card list,
    *  clicking the parent chip scrolls to it; otherwise it opens this URL. */
   parentWandbUrl?: string | null
+  /** Parent's trace color (when the parent is in the visible card list) —
+   *  rendered as a small swatch on the ParentChip so the eye can match a
+   *  child card to its parent's plot trace. */
+  parentColor?: string | null
   onHover: (id: string | null) => void
   onClick: (id: string) => void
   onScrollTargetRef: (id: string, el: HTMLDivElement | null) => void
@@ -74,7 +78,7 @@ interface CardProps {
   onScrollToParent: (parentId: string) => boolean
 }
 
-function RunCard({ data, activeRunId, pinnedRunId, parentWandbUrl, onHover, onClick, onScrollTargetRef, onScrollToParent }: CardProps) {
+function RunCard({ data, activeRunId, pinnedRunId, parentWandbUrl, parentColor, onHover, onClick, onScrollTargetRef, onScrollToParent }: CardProps) {
   const { id, color } = data
   // `color` matches the run's timeline-plot trace. Used as a left accent bar
   // (and active-state border) so the card is visually tied to its plot line.
@@ -148,6 +152,7 @@ function RunCard({ data, activeRunId, pinnedRunId, parentWandbUrl, onHover, onCl
         <RunHeaderRich
           data={data}
           parentWandbUrl={parentWandbUrl}
+          parentColor={parentColor}
           onScrollToParent={onScrollToParent}
         />
       </div>
@@ -587,10 +592,13 @@ function RunsIndex() {
         // (cards-only — `cards` is the unfiltered list, so even filtered-out
         // parents still expose their URL as a click-fallback target).
         const lin = lineageFor(c.id)
-        const parentManifest = lin && cards
-          ? cards.find((rc) => rc.id === lin.parent)?.manifest
+        const parentCard = lin && cards
+          ? cards.find((rc) => rc.id === lin.parent)
           : null
-        const parentWandbUrl = parentManifest?.run.url ?? null
+        const parentWandbUrl = parentCard?.manifest?.run.url ?? null
+        // Parent's trace color — when the parent is in `cards` (so the plot
+        // assigned it a stable color), surface that on the ParentChip swatch.
+        const parentColor = parentCard?.color ?? null
         return (
           <div key={c.id} style={faded ? { opacity: 0.35 } : undefined}>
             <RunCard
@@ -598,6 +606,7 @@ function RunsIndex() {
               activeRunId={activeRunId}
               pinnedRunId={pinnedRunId}
               parentWandbUrl={parentWandbUrl}
+              parentColor={parentColor}
               onHover={onCardHover}
               onClick={onCardClick}
               onScrollTargetRef={setCardRef}
