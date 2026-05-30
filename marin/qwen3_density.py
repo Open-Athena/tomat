@@ -669,6 +669,100 @@ def configure_maskgit_loss(args: "MaskGITLossArgs | None") -> None:
 # Scheduled-sampling (FR-aware AR training) — spec 31
 # ---------------------------------------------------------------------------
 
+# ε distribution mini-DSL — supports per-batch sampling from a mixture of
+# constants and uniforms. Examples:
+#   "1"             → ε = 1 always               (pure FR-style)
+#   "U(0,1)"        → ε ~ Uniform(0, 1)          (mix without ε=1 guarantee)
+#   ".3(1)+.7U(0,1)" → 30% ε=1 + 70% ε ~ U(0,1)  (mix WITH ε=1 mass)
+# Grammar:
+#   DIST      := COMPONENT ('+' COMPONENT)*
+#   COMPONENT := WEIGHT? BASE
+#   WEIGHT    := NUMBER '*'?           # e.g. '.3' or '.3*' or '0.3*'
+#   BASE      := NUMBER                # const, e.g. '1'
+#              | '(' NUMBER ')'        # parenthesized const, e.g. '(1)'
+#              | 'U(' NUMBER ',' NUMBER ')'  # uniform interval
+# Weights default to 1 and are normalized to sum to 1. Whitespace ignored.
+
+@dataclass(frozen=True)
+class _EpsComponent:
+    kind: str       # 'const' or 'uniform'
+    a: float        # constant value (kind='const'), or interval lo (kind='uniform')
+    b: float        # interval hi (kind='uniform'), or 0 (kind='const')
+
+
+@dataclass(frozen=True)
+class _EpsDist:
+    weights: tuple[float, ...]
+    components: tuple[_EpsComponent, ...]
+
+
+def _split_top_level(s: str, sep: str) -> list[str]:
+    """Split `s` on `sep`, ignoring separators inside parens."""
+    depth = 0
+    parts: list[str] = []
+    last = 0
+    for i, c in enumerate(s):
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        elif c == sep and depth == 0:
+            parts.append(s[last:i])
+            last = i + 1
+    parts.append(s[last:])
+    return parts
+
+
+def _parse_eps_component(s: str) -> tuple[float, _EpsComponent]:
+    import re as _re
+    s = s.strip()
+    # Try to peel off a leading weight followed by '*' or '('.
+    # Heuristic: if string contains 'U(' or starts with '(', the bit before is
+    # the (optional) weight; otherwise bare numbers are constants without weight.
+    m_uniform = _re.match(r'^([\d.]*)\*?\s*U\(\s*([\-\d.]+)\s*,\s*([\-\d.]+)\s*\)$', s)
+    m_paren_const = _re.match(r'^([\d.]+)\*?\s*\(\s*([\-\d.]+)\s*\)$', s)
+    m_just_paren = _re.match(r'^\(\s*([\-\d.]+)\s*\)$', s)
+    m_bare = _re.match(r'^([\-\d.]+)$', s)
+    if m_uniform:
+        w_str, a_str, b_str = m_uniform.groups()
+        weight = float(w_str) if w_str else 1.0
+        return weight, _EpsComponent('uniform', float(a_str), float(b_str))
+    if m_paren_const:
+        w_str, v_str = m_paren_const.groups()
+        return float(w_str), _EpsComponent('const', float(v_str), 0.0)
+    if m_just_paren:
+        return 1.0, _EpsComponent('const', float(m_just_paren.group(1)), 0.0)
+    if m_bare:
+        return 1.0, _EpsComponent('const', float(m_bare.group(1)), 0.0)
+    raise ValueError(f"Cannot parse ε component {s!r}")
+
+
+def parse_eps_dist(s: str) -> _EpsDist:
+    """Parse a `TOMAT_SS_EPS_DIST` mini-language string. See docstring above."""
+    parts = _split_top_level(s.replace(' ', ''), '+')
+    if not parts or any(not p for p in parts):
+        raise ValueError(f"Empty ε-dist: {s!r}")
+    weights = []
+    components = []
+    for part in parts:
+        w, comp = _parse_eps_component(part)
+        weights.append(w)
+        components.append(comp)
+    total = sum(weights)
+    if total <= 0:
+        raise ValueError(f"ε-dist weights sum to {total}: {s!r}")
+    # Validate every component yields ε ∈ [0, 1].
+    for c in components:
+        if c.kind == 'const' and not (0.0 <= c.a <= 1.0):
+            raise ValueError(f"const ε out of [0,1]: {c.a} in {s!r}")
+        if c.kind == 'uniform' and not (0.0 <= c.a <= c.b <= 1.0):
+            raise ValueError(f"uniform [a,b] not in [0,1]: ({c.a},{c.b}) in {s!r}")
+    return _EpsDist(
+        weights=tuple(w / total for w in weights),
+        components=tuple(components),
+    )
+
+
 @dataclass(frozen=True)
 class SSArgs:
     """Configuration for token-level scheduled sampling on density positions.
@@ -680,9 +774,10 @@ class SSArgs:
 
     `density_lo` / `density_hi`:  inclusive/exclusive density vocab range
                                   (same convention as `DensityLossArgs`).
-    `eps_max`:    Upper bound on the per-batch ε ~ Uniform(0, eps_max). ε is
-                  the Bernoulli probability that each density-target input is
-                  replaced with the model's own prediction at that step.
+    `eps_dist`:   Parsed `_EpsDist` describing the per-batch ε distribution.
+                  Replaces the legacy `eps_min`/`eps_max` knobs (which are
+                  translated to `U(eps_min, eps_max)` if `eps_dist` is None
+                  for back-compat).
     `sampler`:    "median" (default, matches FR eval) | "argmax" | "sample".
                   All operate on the density-bin slice of the predicted-logits
                   distribution (not the full vocab), so they always return a
@@ -691,8 +786,7 @@ class SSArgs:
 
     density_lo: int                  # inclusive start of density vocab range
     density_hi: int                  # exclusive end of density vocab range
-    eps_min: float = 0.0             # ε ~ Uniform(eps_min, eps_max) per batch
-    eps_max: float = 0.25            #   (set eps_min == eps_max for constant ε)
+    eps_dist: _EpsDist               # parsed ε mixture distribution
     sampler: str = "median"          # "median" | "argmax" | "sample"
 
 
@@ -700,24 +794,38 @@ def build_ss_args(
     *,
     density_offset: int,
     n_density_bins: int,
+    eps_dist: str | None = None,
     eps_min: float = 0.0,
     eps_max: float = 0.25,
     sampler: str = "median",
 ) -> SSArgs:
-    """Build SSArgs from codec config."""
+    """Build SSArgs from codec config.
+
+    Args:
+      eps_dist: mini-DSL string for the per-batch ε distribution (see
+        `parse_eps_dist` docstring). If None, falls back to the legacy
+        `U(eps_min, eps_max)` parameterization for back-compat.
+    """
     if sampler not in ("median", "argmax", "sample"):
         raise ValueError(f"sampler must be 'median'/'argmax'/'sample', got {sampler!r}")
-    if not (0.0 <= eps_min <= 1.0):
-        raise ValueError(f"eps_min must be in [0, 1], got {eps_min!r}")
-    if not (0.0 <= eps_max <= 1.0):
-        raise ValueError(f"eps_max must be in [0, 1], got {eps_max!r}")
-    if eps_min > eps_max:
-        raise ValueError(f"eps_min ({eps_min!r}) must be <= eps_max ({eps_max!r})")
+    if eps_dist is None:
+        # Legacy fallback.
+        if not (0.0 <= eps_min <= 1.0):
+            raise ValueError(f"eps_min must be in [0, 1], got {eps_min!r}")
+        if not (0.0 <= eps_max <= 1.0):
+            raise ValueError(f"eps_max must be in [0, 1], got {eps_max!r}")
+        if eps_min > eps_max:
+            raise ValueError(f"eps_min ({eps_min!r}) must be <= eps_max ({eps_max!r})")
+        if eps_min == eps_max:
+            parsed = parse_eps_dist(str(eps_min))
+        else:
+            parsed = parse_eps_dist(f"U({eps_min},{eps_max})")
+    else:
+        parsed = parse_eps_dist(eps_dist)
     return SSArgs(
         density_lo=density_offset,
         density_hi=density_offset + n_density_bins,
-        eps_min=float(eps_min),
-        eps_max=float(eps_max),
+        eps_dist=parsed,
         sampler=sampler,
     )
 
@@ -761,10 +869,27 @@ def _jax_apply_ss(
     hi = args.density_hi
     n_bins = hi - lo
 
-    # Sample per-batch ε ~ Uniform(eps_min, eps_max). Constant ε is achieved
-    # by setting eps_min == eps_max.
+    # Sample per-batch ε from the configured mixture distribution. See
+    # `parse_eps_dist` for the mini-DSL grammar. Inside JIT we always sample
+    # ONE ε per batch: pick one component index via weighted choice, then
+    # sample from that component's distribution.
     key_eps, key_mask, key_sample = jax.random.split(key, 3)
-    eps = jax.random.uniform(key_eps, shape=(), minval=args.eps_min, maxval=args.eps_max)
+    key_comp, key_val = jax.random.split(key_eps)
+    dist = args.eps_dist
+    weights = jnp.asarray(dist.weights, dtype=jnp.float32)
+    # Per-component samples (compiled-in; component count is small and static).
+    per_comp = []
+    for c in dist.components:
+        if c.kind == 'const':
+            per_comp.append(jnp.asarray(c.a, dtype=jnp.float32))
+        else:  # uniform
+            per_comp.append(
+                jax.random.uniform(key_val, shape=(), minval=c.a, maxval=c.b)
+                .astype(jnp.float32)
+            )
+    samples_stacked = jnp.stack(per_comp)
+    comp_idx = jax.random.choice(key_comp, len(dist.weights), p=weights)
+    eps = samples_stacked[comp_idx]
 
     # density_logits[t] is the predicted distribution for token at position t+1.
     # Restrict to the density vocab range so the decoded bin is always a valid
@@ -948,17 +1073,21 @@ class Qwen3SSLMHeadModel(Qwen3DensityLMHeadModel):
         # for the target sequence).
         args = _DENSITY_LOSS_ARGS
         if args is None or args.weight == 0.0:
-            # SS without density loss → CE on plain vocab, mixed input.
-            # Re-forward via the mixed example and let the parent compute CE.
-            return Qwen3LMHeadModel.compute_next_token_loss(
-                self,
-                mixed_example,
-                key=key,
-                reduction=reduction,
-                reduction_axis=reduction_axis,
-                logsumexp_weight=logsumexp_weight,
-                loss_dtype=loss_dtype,
-                logit_soft_cap=logit_soft_cap,
+            # Latent bug per task #155: the original early-return passed
+            # `mixed_example` to the parent CE loss, which uses
+            # `mixed_example.tokens` for BOTH the forward AND the
+            # `roll(-1)`-derived targets — so the SS objective became "predict
+            # your own next sample" instead of "predict GT next token". The
+            # correct fix splits input (mixed) from targets (original) but the
+            # parent's CE loss path doesn't support that without a refactor.
+            # Until that lands, fail fast rather than silently misbehave.
+            raise NotImplementedError(
+                "SS with TOMAT_DENSITY_L1_WEIGHT=0 (or no density-loss args) "
+                "is unsupported — the parent CE-loss path uses the mixed "
+                "input as its own target, defeating the SS objective. Either "
+                "set TOMAT_DENSITY_L1_WEIGHT>0 (use density-aware loss with "
+                "correct input/target split, the path below) or implement an "
+                "inline CE that takes mixed input + original targets."
             )
 
         activations = self.activations(mixed_example.tokens, mixed_example.attn_mask, key=key)

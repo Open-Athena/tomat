@@ -510,6 +510,14 @@ def main():
     # SS is mutually exclusive with MaskGIT (different model subclass, different
     # forward path); disallow both at once to keep the configuration sane.
     ss_mode = os.environ.get("TOMAT_SS_MODE", "0") == "1"
+    # New ε-distribution mini-DSL (TOMAT_SS_EPS_DIST). Examples:
+    #   "1"               ε=1 always
+    #   "U(0,1)"          ε ~ Uniform(0, 1)
+    #   ".3(1)+.7U(0,1)"  30% ε=1 + 70% ε ~ U(0,1)
+    # See `parse_eps_dist` in `qwen3_density.py`. Legacy `TOMAT_SS_EPS_MIN/MAX`
+    # remain supported; if `TOMAT_SS_EPS_DIST` is empty they're translated to
+    # `U(min,max)` internally.
+    ss_eps_dist = os.environ.get("TOMAT_SS_EPS_DIST", "").strip() or None
     ss_eps_min = float(os.environ.get("TOMAT_SS_EPS_MIN", "0.0"))
     ss_eps_max = float(os.environ.get("TOMAT_SS_EPS_MAX", "0.25"))
     ss_sampler = os.environ.get("TOMAT_SS_SAMPLER", "median")
@@ -517,18 +525,19 @@ def main():
         raise ValueError(
             f"TOMAT_SS_SAMPLER must be median/argmax/sample, got {ss_sampler!r}"
         )
-    if not (0.0 <= ss_eps_min <= 1.0):
-        raise ValueError(
-            f"TOMAT_SS_EPS_MIN must be in [0, 1], got {ss_eps_min!r}"
-        )
-    if not (0.0 <= ss_eps_max <= 1.0):
-        raise ValueError(
-            f"TOMAT_SS_EPS_MAX must be in [0, 1], got {ss_eps_max!r}"
-        )
-    if ss_eps_min > ss_eps_max:
-        raise ValueError(
-            f"TOMAT_SS_EPS_MIN ({ss_eps_min!r}) must be <= TOMAT_SS_EPS_MAX ({ss_eps_max!r})"
-        )
+    if ss_eps_dist is None:
+        if not (0.0 <= ss_eps_min <= 1.0):
+            raise ValueError(
+                f"TOMAT_SS_EPS_MIN must be in [0, 1], got {ss_eps_min!r}"
+            )
+        if not (0.0 <= ss_eps_max <= 1.0):
+            raise ValueError(
+                f"TOMAT_SS_EPS_MAX must be in [0, 1], got {ss_eps_max!r}"
+            )
+        if ss_eps_min > ss_eps_max:
+            raise ValueError(
+                f"TOMAT_SS_EPS_MIN ({ss_eps_min!r}) must be <= TOMAT_SS_EPS_MAX ({ss_eps_max!r})"
+            )
     if ss_mode and mg_mode:
         raise ValueError(
             "TOMAT_SS_MODE=1 and TOMAT_MG_MODE=1 are mutually exclusive "
@@ -860,13 +869,14 @@ def main():
             ss_args = build_ss_args(
                 density_offset=DENSITY_OFFSET,
                 n_density_bins=lmq_codec.n_bins,
+                eps_dist=ss_eps_dist,
                 eps_min=ss_eps_min,
                 eps_max=ss_eps_max,
                 sampler=ss_sampler,
             )
             configure_ss(ss_args)
             print(f"[tomat-tpu] scheduled-sampling configured: "
-                  f"eps_max={ss_args.eps_max} sampler={ss_args.sampler!r} "
+                  f"eps_dist={ss_args.eps_dist} sampler={ss_args.sampler!r} "
                   f"density_range=[{ss_args.density_lo}, {ss_args.density_hi})")
     else:
         model_config_cls = Qwen3Config
