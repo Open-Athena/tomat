@@ -55,20 +55,17 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 
-# Multihost-capable JAX init. On v6e-16+ Marin spins up 4+ VM replicas; Levanter's
-# `WandbConfig.init` calls `jax_utils.multihost_broadcast_sync` before
-# `jax.distributed.initialize()` fires internally, which crashes single-process-
-# view code paths. We initialize up-front so later multihost calls work. On
-# single-host v6e-4 / v6e-8 this is a no-op (one process, auto-discovery).
-import jax
-try:
-    jax.distributed.initialize()
-    print(f"[tomat-tpu] jax.distributed.initialize() done "
-          f"(process_index={jax.process_index()}/{jax.process_count()})")
-except Exception as e:
-    # Single-host envs may raise if no coordinator can be discovered — that's
-    # fine, Levanter's own init path handles single-process. Log and continue.
-    print(f"[tomat-tpu] jax.distributed.initialize() skipped: {type(e).__name__}: {e}")
+# Multihost-capable JAX init. Historically we called `jax.distributed.initialize()`
+# up-front here because Levanter's `WandbConfig.init` would call
+# `multihost_broadcast_sync` before jax was initialized and crash single-process
+# code paths. The new levanter / iris pin (rev 7115c21d) handles init itself
+# via `iris.runtime.jax_init.initialize_jax` (see `levanter/distributed.py`),
+# and our early call now silently fails AND poisons the XLA backend so
+# levanter's later attempt raises:
+#   RuntimeError: jax.distributed.initialize() must be called before any JAX
+#   calls that might initialise the XLA backend.
+# Skip our own call entirely; let levanter's init path run unmolested.
+import jax  # noqa: F401
 
 # Monkey-patch PassthroughTokenizer.encode to handle non-numeric input — Levanter's
 # BPB-computation path calls `tokenizer.encode(".")` to estimate bytes-per-token,
