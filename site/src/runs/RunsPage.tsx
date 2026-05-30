@@ -6,8 +6,9 @@ import type { EvalJob, EvalPoint, IrisJob, RunManifest } from './api'
 import { fetchRunHistory } from './parquet'
 import type { RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
-import { RunsTimelinePlot, colorForIndex, shortLabel, useNameFilter, useTagFilters, compileMultiTermFilter, runHaystack } from './RunsTimelinePlot'
+import { RunsTimelinePlot, colorForIndex, shortLabel, useNameFilter, useTagFilters, useAncestorsToggle, compileMultiTermFilter, runHaystack } from './RunsTimelinePlot'
 import { runPassesTagFilters, tagsFor } from './tags'
+import { ancestorsOf, lineageFor } from './lineage'
 import type { RunTimelineSeries } from './RunsTimelinePlot'
 import { useTraceHighlight } from 'pltly/react'
 
@@ -384,16 +385,72 @@ interface RunCardData {
   err: string | null
 }
 
+/** Compact "← from <parent> @ step-N" chip on each run card. Renders nothing
+ *  when the run has no recorded lineage entry in `RUN_LINEAGE`. Click behaviour:
+ *   - if the parent's card is currently in the DOM (visible / not filtered
+ *     out), scroll-into-view it (no filter-state mutation);
+ *   - else, if we know the parent's wandb URL, open that in a new tab;
+ *   - else, no-op (the chip's still informative as text). */
+function ParentChip({
+  runId, parentWandbUrl, onScrollToParent,
+}: {
+  runId: string
+  parentWandbUrl: string | null
+  onScrollToParent: (parentId: string) => boolean
+}) {
+  const lin = lineageFor(runId)
+  if (!lin) return null
+  const stepTail = lin.parent_step != null ? ` @ step-${lin.parent_step}` : ''
+  const tipBase = `resumed from ${shortLabel(lin.parent)}${stepTail}`
+  const tip = parentWandbUrl
+    ? `${tipBase}. Click to scroll to the parent's card (or open its wandb).`
+    : `${tipBase}. Click to scroll to the parent's card.`
+  return (
+    <Tooltip content={tip}>
+      <a
+        href={parentWandbUrl ?? '#'}
+        onClick={(e) => {
+          if (isModifiedClick(e)) return
+          // Don't bubble: the card body's onClick toggles pin.
+          e.stopPropagation()
+          e.preventDefault()
+          const scrolled = onScrollToParent(lin.parent)
+          if (!scrolled && parentWandbUrl) {
+            window.open(parentWandbUrl, '_blank', 'noopener')
+          }
+        }}
+        style={{
+          fontSize: '0.7rem',
+          fontFamily: 'monospace',
+          color: '#9aa6c2',
+          textDecoration: 'none',
+          background: 'rgba(120,140,200,0.10)',
+          border: '1px solid rgba(120,140,200,0.30)',
+          borderRadius: 10,
+          padding: '1px 8px',
+        }}>
+        ← {shortLabel(lin.parent)}{stepTail}
+      </a>
+    </Tooltip>
+  )
+}
+
 interface CardProps {
   data: RunCardData
   activeRunId: string | null
   pinnedRunId: string | null
+  /** wandb URL for this card's parent run (looked up by RunsIndex from
+   *  the visible manifest map). When the parent is in the visible card list,
+   *  clicking the parent chip scrolls to it; otherwise it opens this URL. */
+  parentWandbUrl?: string | null
   onHover: (id: string | null) => void
   onClick: (id: string) => void
   onScrollTargetRef: (id: string, el: HTMLDivElement | null) => void
+  /** Try to scroll the parent's card into view (returns true if found). */
+  onScrollToParent: (parentId: string) => boolean
 }
 
-function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTargetRef }: CardProps) {
+function RunCard({ data, activeRunId, pinnedRunId, parentWandbUrl, onHover, onClick, onScrollTargetRef, onScrollToParent }: CardProps) {
   const { id, manifest, job, history, evalJobs, color, err } = data
   // `color` matches the run's timeline-plot trace. Used as a left accent bar
   // (and active-state border) so the card is visually tied to its plot line.
@@ -560,6 +617,11 @@ function RunCard({ data, activeRunId, pinnedRunId, onHover, onClick, onScrollTar
             </Tooltip>
           )}
           <EvalChip jobs={evalJobs} />
+          <ParentChip
+            runId={id}
+            parentWandbUrl={parentWandbUrl ?? null}
+            onScrollToParent={onScrollToParent}
+          />
         </div>
         <div style={{ marginTop: '0.4rem', fontSize: '0.8rem', color: '#ccc',
                       display: 'flex', flexWrap: 'wrap', gap: '0.4rem 0.9rem' }}>
@@ -977,6 +1039,17 @@ function RunsIndex() {
     [highlight, idToLabel],
   )
 
+  // Scroll the parent's card into view if it's currently rendered. Returns
+  // false when the parent isn't in the DOM — letting the chip handler fall
+  // through to its wandb-URL fallback. (We don't pop tag/regex filters here;
+  // the user can flip the `+ancestors` toggle for that.)
+  const scrollToParent = useCallback((parentId: string): boolean => {
+    const el = cardRefs.current.get(parentId)
+    if (!el) return false
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    return true
+  }, [])
+
   // Click a card to pin it: the timeline plot solos to that run and Plotly
   // autoranges to its extent (small/short runs are invisible at the shared
   // 0–80k scale). Click again — or another card — to unpin / switch.
@@ -1039,6 +1112,11 @@ function RunsIndex() {
   // same hook via the controlled `tagFilters` / `onTagFiltersChange` props
   // below, so chip clicks update both the plot and the card list in lockstep.
   const [tagFilters, onTagFiltersChange] = useTagFilters()
+  // "Include ancestors of matching runs" toggle (URL: ?anc=1). When on, the
+  // ancestor closure of every regex- + tag-matched run is added back into the
+  // visible set, so filtering to a sweep (e.g. `SS-sweep`) automatically pulls
+  // the parent (cont33k) in as a baseline. Off by default.
+  const [ancestorsOn, setAncestorsOn] = useAncestorsToggle()
   // Runs whose tag set satisfies the tri-state constraint (overrides +
   // per-tag defaults). Distinct from regex-`matchedIds`, which only sorts:
   // tags hard-filter, so a run that fails the chip predicate is hidden
@@ -1053,6 +1131,25 @@ function RunsIndex() {
     return s
   }, [tagFilters, ordered])
 
+  // When `ancestorsOn`, expand the tag- and regex-match sets by walking the
+  // lineage map upward from each matching run. Ancestors join the visible set
+  // even if they fail the tag predicate (the whole point of the toggle is to
+  // pull the parent baseline back into view). For the regex matcher we add
+  // ancestors to `matchedIds` so they DON'T fade — they're explicitly the
+  // user-requested baselines, not "see also" noise.
+  const tagMatchedIdsExpanded = useMemo(() => {
+    if (!ordered || !tagMatchedIds || !ancestorsOn) return tagMatchedIds
+    const s = new Set(tagMatchedIds)
+    for (const id of tagMatchedIds) for (const a of ancestorsOf(id)) s.add(a)
+    return s
+  }, [tagMatchedIds, ordered, ancestorsOn])
+  const matchedIdsExpanded = useMemo(() => {
+    if (!ordered || !matchedIds || !ancestorsOn) return matchedIds
+    const s = new Set(matchedIds)
+    for (const id of matchedIds) for (const a of ancestorsOf(id)) s.add(a)
+    return s
+  }, [matchedIds, ordered, ancestorsOn])
+
   // Card order: pinned first, then the plot-hover card (if any, and not the
   // already-pinned run), then regex-matches, then everything else (each group
   // preserving activity-order from `ordered`). The hover slot floats up the
@@ -1066,8 +1163,8 @@ function RunsIndex() {
   // don't need explicit tag filtering here.
   const displayed = useMemo(() => {
     if (!ordered) return ordered
-    const tagFiltered = tagMatchedIds
-      ? ordered.filter((c) => tagMatchedIds.has(c.id))
+    const tagFiltered = tagMatchedIdsExpanded
+      ? ordered.filter((c) => tagMatchedIdsExpanded.has(c.id))
       : ordered
     const pinned = pinnedRunId ? tagFiltered.find((c) => c.id === pinnedRunId) : null
     const hovered = plotHoverRunId && plotHoverRunId !== pinnedRunId
@@ -1080,13 +1177,13 @@ function RunsIndex() {
     const top: typeof tagFiltered = []
     if (pinned) top.push(pinned)
     if (hovered) top.push(hovered)
-    if (!matchedIds || matchedIds.size === 0) {
+    if (!matchedIdsExpanded || matchedIdsExpanded.size === 0) {
       return [...top, ...rest]
     }
-    const matched = rest.filter((c) => matchedIds.has(c.id))
-    const others = rest.filter((c) => !matchedIds.has(c.id))
+    const matched = rest.filter((c) => matchedIdsExpanded.has(c.id))
+    const others = rest.filter((c) => !matchedIdsExpanded.has(c.id))
     return [...top, ...matched, ...others]
-  }, [ordered, pinnedRunId, plotHoverRunId, matchedIds, tagMatchedIds])
+  }, [ordered, pinnedRunId, plotHoverRunId, matchedIdsExpanded, tagMatchedIdsExpanded])
 
   // On (re)pin, scroll the now-top pinned card into view.
   useEffect(() => {
@@ -1149,20 +1246,32 @@ function RunsIndex() {
             onPlotHover={setPlotHoverLabel}
             tagFilters={tagFilters}
             onTagFiltersChange={onTagFiltersChange}
+            ancestorsOn={ancestorsOn}
+            onAncestorsChange={setAncestorsOn}
           />
         </div>
       )}
       {displayed && displayed.map((c) => {
-        const faded = matchedIds && matchedIds.size > 0 && !matchedIds.has(c.id)
+        const faded = matchedIdsExpanded && matchedIdsExpanded.size > 0 && !matchedIdsExpanded.has(c.id)
+        // Look up the parent's wandb URL from the snapshot's manifest map
+        // (cards-only — `cards` is the unfiltered list, so even filtered-out
+        // parents still expose their URL as a click-fallback target).
+        const lin = lineageFor(c.id)
+        const parentManifest = lin && cards
+          ? cards.find((rc) => rc.id === lin.parent)?.manifest
+          : null
+        const parentWandbUrl = parentManifest?.run.url ?? null
         return (
           <div key={c.id} style={faded ? { opacity: 0.35 } : undefined}>
             <RunCard
               data={c}
               activeRunId={activeRunId}
               pinnedRunId={pinnedRunId}
+              parentWandbUrl={parentWandbUrl}
               onHover={onCardHover}
               onClick={onCardClick}
               onScrollTargetRef={setCardRef}
+              onScrollToParent={scrollToParent}
             />
           </div>
         )

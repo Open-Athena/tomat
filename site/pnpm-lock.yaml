@@ -41,6 +41,9 @@ importers:
       react-router-dom:
         specifier: ^6.30.3
         version: 6.30.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
+      use-kbd:
+        specifier: ^0.12.0
+        version: 0.12.0(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
       use-prms:
         specifier: https://github.com/runsascoded/use-prms#da21b49c98e1ad372f88c4dee07eca483d17f1c8
         version: https://codeload.github.com/runsascoded/use-prms/tar.gz/da21b49c98e1ad372f88c4dee07eca483d17f1c8(react@19.2.5)
@@ -2802,6 +2805,12 @@ packages:
 
   update-diff@1.1.0:
     resolution: {integrity: sha512-rCiBPiHxZwT4+sBhEbChzpO5hYHjm91kScWgdHf4Qeafs6Ba7MBl+d9GlGv72bcTZQO0sLmtQS1pHSWoCLtN/A==}
+
+  use-kbd@0.12.0:
+    resolution: {integrity: sha512-mt5BchpLyYi1tm0brENlZYYk6ta92JIZlVmLzGBrdjHpjKR2aEzst7b1BbWJcVn/nzXfJxf8DOwibt0YsGOOeg==}
+    peerDependencies:
+      react: '>=18.0.0'
+      react-dom: '>=18.0.0'
 
   use-prms@0.4.1:
     resolution: {integrity: sha512-137eYoyglpP3bnQqU+BDnr4kJnPqkibcSBpjHAIZJugtRjtInRCi+Af+hsk5lElXcIqz+ReEA4me6YrOehg6XA==}
@@ -6000,6 +6009,14 @@ snapshots:
       picocolors: 1.1.1
 
   update-diff@1.1.0: {}
+
+  use-kbd@0.12.0(react-dom@19.2.5(react@19.2.5))(react@19.2.5):
+    dependencies:
+      debug: 4.4.3
+      react: 19.2.5
+      react-dom: 19.2.5(react@19.2.5)
+    transitivePeerDependencies:
+      - supports-color
 
   use-prms@0.4.1(react@18.3.1):
     optionalDependencies:

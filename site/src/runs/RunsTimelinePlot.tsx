@@ -13,7 +13,8 @@ import { Tooltip } from '../Tooltip'
 import type { UseTraceHighlightReturn } from 'pltly/react'
 import { themedHoverlabel } from '../theme'
 import type { RunHistory } from './parquet'
-import { ALL_TAGS, cycleTagFilter, effectiveTagState, parseTagFilters, parseTagFiltersUrl, runPassesTagFilters, serializeTagFilters, serializeTagFiltersUrl, tagsFor, type RunTag, type TagFilters } from './tags'
+import { ALL_TAGS, cycleTagFilter, effectiveTagState, parseTagFiltersLegacyLs, runPassesTagFilters, tagsFor, TAG_FILTER_PARAM, type RunTag, type TagFilters } from './tags'
+import { stringParam, useUrlState, type Param } from 'use-prms'
 import { compileMultiTermFilter } from './filter'
 // Re-export so RunsPage can `import { ... } from './RunsTimelinePlot'` —
 // keeps callers off the helper module's internal path.
@@ -57,6 +58,11 @@ interface Props {
    *  not have it, absent = don't care. See `runPassesTagFilters`. */
   tagFilters?: TagFilters
   onTagFiltersChange?: (next: TagFilters) => void
+  /** Controlled "include ancestors" toggle. When omitted the chip rail
+   *  doesn't render the toggle (it's only meaningful when the parent is
+   *  applying the toggle to its card-list filter). */
+  ancestorsOn?: boolean
+  onAncestorsChange?: (next: boolean) => void
 }
 
 /** Local-TZ datetime string for a Plotly date axis. Plotly treats a string
@@ -80,104 +86,33 @@ const X_MODES: { id: XMode; label: string; help: string }[] = [
 const X_MODE_KEY = 'tomat:runs-xmode'
 const LEGEND_COLLAPSED_KEY = 'tomat:runs-legend-collapsed'
 const NAME_FILTER_KEY = 'tomat:runs-name-filter'
-const NAME_FILTER_EVT = 'tomat:runs-name-filter-change'
 export const TAG_FILTER_KEY = 'tomat:runs-tag-filter'
 
-/**
- * Cross-component reactive store for the (multi-term regex) name-filter input.
- *
- * Sources of truth (precedence on load):
- *   1. URL `?regex=…` query param — shareable / linkable
- *   2. localStorage — survives page reloads
- *
- * The query-param name `regex` is preserved for backward compatibility with
- * pre-existing shareable links; the value's grammar is whatever the current
- * filter compiler accepts (today: whitespace=AND multi-term regex via
- * `compileMultiTermFilter` in ./filter.ts).
- *
- * On change: writes both back (URL via replaceState, no extra history entry).
- * Same-tab `localStorage`/popstate events don't always fire, so the setter
- * also dispatches a CustomEvent so every hook instance stays in sync.
- *
- * Read the URL via hash-router-aware extractor: the app uses HashRouter
- * (`#/runs?regex=…`), so we look at `window.location.hash`, not `.search`.
- */
-function readUrlRegex(): string | null {
-  if (typeof window === 'undefined') return null
-  // Hash is like `#/runs?regex=cont33k|mg-4`. Split on `?` and parse the rest.
-  const hash = window.location.hash || ''
-  const qIdx = hash.indexOf('?')
-  if (qIdx < 0) return null
-  try {
-    const params = new URLSearchParams(hash.slice(qIdx + 1))
-    return params.get('regex')
-  } catch { return null }
+// ── URL params (via use-prms; see `urlStrategy.ts` for the HashRouter strategy)
+//
+//   ?regex=…   multi-term regex name-filter (string)
+//   ?tags=…    tri-state tag-chip filter (use-prms `tagFilterParam`)
+//   ?anc=1     include-ancestors toggle (boolean; legacy `?anc=1` encoding
+//              preserved for back-compat — `boolParam`'s default ?anc form
+//              wouldn't break old links but reads less obviously to users
+//              who already learned the `=1` form)
+//
+// `useNameFilter` keeps a localStorage mirror of `?regex=` so the filter
+// survives reloads that drop the query string; the URL stays canonical.
+
+/** `?anc=0|1` boolean. Preserves the existing `=1` encoding (vs use-prms'
+ *  built-in `boolParam`, which encodes true as a valueless `?anc`). */
+const ancParam: Param<boolean> = {
+  encode: (v) => (v ? '1' : undefined),
+  decode: (s) => s === '1' || s === 'true' || s === '',  // '' = valueless ?anc
 }
 
-function writeUrlRegex(v: string): void {
-  if (typeof window === 'undefined') return
-  const hash = window.location.hash || '#/'
-  const qIdx = hash.indexOf('?')
-  const path = qIdx < 0 ? hash : hash.slice(0, qIdx)
-  let params: URLSearchParams
-  try { params = new URLSearchParams(qIdx < 0 ? '' : hash.slice(qIdx + 1)) }
-  catch { params = new URLSearchParams() }
-  if (v) params.set('regex', v); else params.delete('regex')
-  const qs = params.toString()
-  const next = qs ? `${path}?${qs}` : path
-  if (next !== hash) {
-    try { window.history.replaceState(null, '', next) } catch { /* ignore */ }
-  }
+/** Hook owning the `anc=1` URL toggle for "include ancestors of matching runs".
+ *  Default `false`. */
+export function useAncestorsToggle(): readonly [boolean, (v: boolean) => void] {
+  const [on, setOn] = useUrlState('anc', ancParam)
+  return [on, setOn] as const
 }
-
-/** URL-state for the tag-chip tri-state filter. Mirrors `useNameFilter`'s
- *  hash-aware encode/decode (HashRouter; we look at `location.hash`, not
- *  `.search`). Encoding (overrides only — see `tags.ts`):
- *    bare `tag`   → in
- *    `-tag`       → out
- *    `~tag`       → off (only emitted when overriding a non-`off` default,
- *                        e.g. dismissing the implicit `bunk = out`)
- *  Tokens joined by spaces; `URLSearchParams` encodes space as `+`.
- *
- *  The URL stores only NON-default state. A tag absent from the URL falls
- *  back to its `TAG_DEFAULTS` entry, so `?tags=CE` keeps `bunk` at its
- *  default `out` and the URL stays clean. Empty `?tags=` is identical to
- *  absent — both yield the all-defaults state — so there's no "explicit
- *  zero-filter" state separate from defaults. */
-function readUrlTags(): TagFilters | null {
-  if (typeof window === 'undefined') return null
-  const hash = window.location.hash || ''
-  const qIdx = hash.indexOf('?')
-  if (qIdx < 0) return null
-  try {
-    const params = new URLSearchParams(hash.slice(qIdx + 1))
-    const raw = params.get('tags')
-    if (raw === null) return null
-    return parseTagFiltersUrl(raw)
-  } catch { return null }
-}
-
-function writeUrlTags(filters: TagFilters): void {
-  if (typeof window === 'undefined') return
-  const hash = window.location.hash || '#/'
-  const qIdx = hash.indexOf('?')
-  const path = qIdx < 0 ? hash : hash.slice(0, qIdx)
-  let params: URLSearchParams
-  try { params = new URLSearchParams(qIdx < 0 ? '' : hash.slice(qIdx + 1)) }
-  catch { params = new URLSearchParams() }
-  // Empty override map = back to all-defaults, which is the absent state.
-  // Drop the param entirely so the URL stays clean (per the "URL stores
-  // only overrides" model — see `serializeTagFiltersUrl`).
-  if (filters.size === 0) params.delete('tags')
-  else params.set('tags', serializeTagFiltersUrl(filters))
-  const qs = params.toString()
-  const next = qs ? `${path}?${qs}` : path
-  if (next !== hash) {
-    try { window.history.replaceState(null, '', next) } catch { /* ignore */ }
-  }
-}
-
-const TAG_FILTER_EVT = 'tomat:runs-tag-filter-change'
 
 /** React hook owning the tag-filter OVERRIDE map. URL is canonical; legacy
  *  `localStorage` is migrated on first read then cleared. The Map holds
@@ -186,82 +121,50 @@ const TAG_FILTER_EVT = 'tomat:runs-tag-filter-change'
  *  No first-visit-default constant needed: defaults live in `TAG_DEFAULTS`
  *  and `effectiveTagState` reads them on demand. */
 export function useTagFilters(): readonly [TagFilters, (v: TagFilters) => void] {
-  const [filters, setFilters] = useState<TagFilters>(() => {
-    const fromUrl = readUrlTags()
-    if (fromUrl !== null) return fromUrl
-    try {
-      const raw = localStorage.getItem(TAG_FILTER_KEY)
-      if (raw) {
-        // Migrate to URL, then drop the localStorage entry (URL is canonical
-        // going forward). Future loads will read straight from the URL.
-        const ls = parseTagFilters(raw)
-        writeUrlTags(ls)
-        try { localStorage.removeItem(TAG_FILTER_KEY) } catch { /* ignore */ }
-        return ls
-      }
-    } catch { /* ignore */ }
-    return new Map()
-  })
+  const [filters, setFilters] = useUrlState('tags', TAG_FILTER_PARAM)
+  // One-time legacy-localStorage migration. On the first render after the
+  // URL upgrade, if the URL has no `?tags=` AND localStorage carries the
+  // pre-URL JSON payload, push it into the URL then drop the LS entry.
   useEffect(() => {
-    const onEvt = (e: Event) => {
-      const detail = (e as CustomEvent<TagFilters>).detail
-      if (detail instanceof Map) setFilters(detail)
-    }
-    const onHash = () => {
-      const v = readUrlTags()
-      if (v !== null) setFilters(v)
-    }
-    window.addEventListener(TAG_FILTER_EVT, onEvt)
-    window.addEventListener('hashchange', onHash)
-    return () => {
-      window.removeEventListener(TAG_FILTER_EVT, onEvt)
-      window.removeEventListener('hashchange', onHash)
-    }
+    if (typeof window === 'undefined') return
+    if (filters.size > 0) return  // URL already has overrides — nothing to do
+    let raw: string | null = null
+    try { raw = localStorage.getItem(TAG_FILTER_KEY) } catch { /* ignore */ }
+    if (!raw) return
+    const migrated = parseTagFiltersLegacyLs(raw)
+    if (migrated.size > 0) setFilters(migrated)
+    try { localStorage.removeItem(TAG_FILTER_KEY) } catch { /* ignore */ }
+    // Empty deps — fire once on mount. `setFilters` is stable per the
+    // useUrlState contract; including it would just re-run on render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
-  const update = (v: TagFilters) => {
-    setFilters(v)
-    writeUrlTags(v)
-    window.dispatchEvent(new CustomEvent(TAG_FILTER_EVT, { detail: v }))
-  }
-  return [filters, update] as const
+  return [filters, setFilters] as const
 }
 
 export function useNameFilter(): readonly [string, (v: string) => void] {
-  const [filter, setFilter] = useState(() => {
-    // Precedence: URL ?regex= → localStorage → empty.
-    const fromUrl = readUrlRegex()
-    if (fromUrl != null) return fromUrl
+  const [urlVal, setUrlVal] = useUrlState('regex', stringParam())
+  // localStorage mirror: persists across reloads that drop the query string.
+  // URL is canonical when present; LS is the fallback at first paint.
+  const [filter, setFilter] = useState<string>(() => {
+    if (urlVal != null) return urlVal
     try { return localStorage.getItem(NAME_FILTER_KEY) ?? '' } catch { return '' }
   })
   useEffect(() => {
-    // If the page loaded with a URL filter, sync it to localStorage on mount
-    // so it persists across tabs / reloads that drop the query string.
-    const fromUrl = readUrlRegex()
-    if (fromUrl != null) {
-      try { localStorage.setItem(NAME_FILTER_KEY, fromUrl) } catch { /* ignore */ }
+    if (urlVal != null) {
+      setFilter(urlVal)
+      try { localStorage.setItem(NAME_FILTER_KEY, urlVal) } catch { /* ignore */ }
+    } else {
+      // URL has no `?regex=` — keep the local state showing whatever the
+      // LS-restored / explicitly-cleared value is. Don't reset to '' on
+      // every render: the user may have just typed and the URL write
+      // hasn't landed yet (use-prms uses replaceState; same-render reads
+      // are fine, but a chain of writes can briefly see the old URL).
     }
-    const onEvt = (e: Event) => {
-      const detail = (e as CustomEvent<string>).detail
-      setFilter(typeof detail === 'string' ? detail : '')
-    }
-    // Hash change can fire from manual URL edits / back-forward navigation —
-    // re-read so the input stays in sync.
-    const onHash = () => {
-      const v = readUrlRegex()
-      if (v != null) setFilter(v)
-    }
-    window.addEventListener(NAME_FILTER_EVT, onEvt)
-    window.addEventListener('hashchange', onHash)
-    return () => {
-      window.removeEventListener(NAME_FILTER_EVT, onEvt)
-      window.removeEventListener('hashchange', onHash)
-    }
-  }, [])
+  }, [urlVal])
   const update = (v: string) => {
     setFilter(v)
     try { localStorage.setItem(NAME_FILTER_KEY, v) } catch { /* ignore */ }
-    writeUrlRegex(v)
-    window.dispatchEvent(new CustomEvent(NAME_FILTER_EVT, { detail: v }))
+    setUrlVal(v === '' ? undefined : v)
   }
   return [filter, update] as const
 }
@@ -350,7 +253,7 @@ function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
   return { x, y }
 }
 
-export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onPlotHover, tagFilters: tagFiltersExternal, onTagFiltersChange }: Props) {
+export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onPlotHover, tagFilters: tagFiltersExternal, onTagFiltersChange, ancestorsOn, onAncestorsChange }: Props) {
   const { isDark } = useTheme()
 
   // Legend collapse persists in localStorage — it's long, some users tuck it
@@ -408,28 +311,14 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
   // are hidden whenever any `'in'` tag is selected (no way to satisfy "must
   // have X" without tags).
   //
-  // Controlled when `tagFiltersExternal` is passed (parent owns state +
-  // persistence + can hard-filter the card list against it); falls back to
-  // own state + localStorage otherwise so the plot still works standalone.
-  const [tagFiltersInternal, setTagFiltersInternal] = useState<TagFilters>(() => {
-    if (tagFiltersExternal) return tagFiltersExternal
-    try {
-      const raw = localStorage.getItem(TAG_FILTER_KEY)
-      if (raw) return parseTagFilters(raw)
-    } catch { /* ignore */ }
-    return new Map()
-  })
-  const tagFilters = tagFiltersExternal ?? tagFiltersInternal
+  // Controlled when `tagFiltersExternal` is passed (parent owns state and can
+  // hard-filter the card list against it); falls back to the URL-backed
+  // `useTagFilters` so the plot still works standalone.
+  const [tagFiltersFallback, setTagFiltersFallback] = useTagFilters()
+  const tagFilters = tagFiltersExternal ?? tagFiltersFallback
   const setTagFiltersRaw = (next: TagFilters) => {
-    if (onTagFiltersChange) {
-      onTagFiltersChange(next)
-    } else {
-      setTagFiltersInternal(next)
-      try {
-        if (next.size === 0) localStorage.removeItem(TAG_FILTER_KEY)
-        else localStorage.setItem(TAG_FILTER_KEY, serializeTagFilters(next))
-      } catch { /* ignore */ }
-    }
+    if (onTagFiltersChange) onTagFiltersChange(next)
+    else setTagFiltersFallback(next)
   }
   const toggleTag = (t: RunTag) => setTagFiltersRaw(cycleTagFilter(tagFilters, t))
   // Only show chips for tags that ANY currently-visible (name-filtered) run
@@ -720,15 +609,7 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
           })}
           {tagFilters.size > 0 && (
             <button
-              onClick={() => {
-                setTagFiltersRaw(new Map())
-                // Internal-state path also clears localStorage; the controlled
-                // path's persistence is the parent's responsibility (so
-                // controlled mode skips the removeItem here).
-                if (!onTagFiltersChange) {
-                  try { localStorage.removeItem(TAG_FILTER_KEY) } catch { /* ignore */ }
-                }
-              }}
+              onClick={() => setTagFiltersRaw(new Map())}
               title="clear all tag filters"
               style={{
                 background: 'transparent', border: 'none', cursor: 'pointer',
@@ -738,6 +619,31 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
             >
               ✕ clear
             </button>
+          )}
+          {onAncestorsChange && (
+            <Tooltip content={
+              'when on, the lineage-ancestors of every matching run are also '
+              + 'shown — so filtering to a sweep auto-includes the parent it '
+              + 'fine-tuned off of, as a baseline. URL: ?anc=1'
+            }>
+              <button
+                onClick={() => onAncestorsChange(!ancestorsOn)}
+                style={{
+                  background: ancestorsOn
+                    ? (isDark ? '#2a4a7a' : '#cbe0f5') : 'transparent',
+                  border: `1px solid ${ancestorsOn
+                    ? (isDark ? '#3a6ab0' : '#7aa7d9')
+                    : (isDark ? '#333' : '#ccc')}`,
+                  borderRadius: 10, cursor: 'pointer', padding: '1px 8px',
+                  fontSize: '0.7rem', fontFamily: 'inherit',
+                  color: ancestorsOn
+                    ? (isDark ? '#cfe2ff' : '#1d3a64') : muted,
+                  marginLeft: 2,
+                }}
+              >
+                {ancestorsOn ? '← +ancestors' : '+ancestors'}
+              </button>
+            </Tooltip>
           )}
         </div>
       )}

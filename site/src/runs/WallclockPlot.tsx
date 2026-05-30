@@ -18,8 +18,9 @@
 // Lifecycle events render as vertical lines via `shapes` (yref='paper') so
 // they span both panels.
 
-import { useMemo, useState } from 'react'
+import { useMemo } from 'react'
 import { Plot, useTheme } from 'pltly/react'
+import { enumParam, useUrlState } from 'use-prms'
 import { themedHoverlabel } from '../theme'
 import type { RunHistory } from './parquet'
 import type { RunEval } from './api'
@@ -31,6 +32,14 @@ interface Props {
 }
 
 type XMode = 'time' | 'elapsed' | 'step'
+
+// URL-facing x-axis mode names (`?x=wallclock|elapsed|step`). The internal
+// XMode uses `'time'` for the wallclock axis; `wallclock` reads better in
+// shared links. Default is `wallclock` to preserve current behaviour.
+type UrlXMode = 'wallclock' | 'elapsed' | 'step'
+const URL_X_MODES = ['wallclock', 'elapsed', 'step'] as const
+const X_TO_URL: Record<XMode, UrlXMode> = { time: 'wallclock', elapsed: 'elapsed', step: 'step' }
+const URL_TO_X: Record<UrlXMode, XMode> = { wallclock: 'time', elapsed: 'elapsed', step: 'step' }
 
 const COLORS = {
   step: '#2196f3',
@@ -69,7 +78,11 @@ const TZ_LABEL: string = (() => {
 
 export function WallclockPlot({ history, evalSeries, runId }: Props) {
   const { isDark } = useTheme()
-  const [xMode, setXMode] = useState<XMode>('time')
+  // `?x=wallclock|elapsed|step` — URL-persisted so deep-links carry the view
+  // choice. Default `wallclock` to preserve pre-URL behaviour.
+  const [urlXMode, setUrlXMode] = useUrlState('x', enumParam<UrlXMode>('wallclock', URL_X_MODES))
+  const xMode: XMode = URL_TO_X[urlXMode]
+  const setXMode = (m: XMode) => setUrlXMode(X_TO_URL[m])
   const { timestamps, cols } = history
 
   const ordered = useMemo(

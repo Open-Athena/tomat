@@ -2,6 +2,7 @@ import { PlotlyProvider } from 'pltly/react'
 import { DeckPage } from './DeckPage'
 import { FilesPage } from './files/FilesPage'
 import { HomePage } from './HomePage'
+import { KbdShell } from './KbdSetup'
 import { RunsPage } from './runs/RunsPage'
 import { parseHash, useHash } from './useHash'
 
@@ -15,15 +16,17 @@ export function App() {
 
   return (
     <PlotlyProvider loader={plotlyLoader}>
-      {route === 'deck' ? (
-        <DeckPage />
-      ) : route === 'runs' ? (
-        <RunsPage parts={parts.slice(1)} />
-      ) : route === 'files' ? (
-        <FilesPage />
-      ) : (
-        <HomePage />
-      )}
+      <KbdShell>
+        {route === 'deck' ? (
+          <DeckPage />
+        ) : route === 'runs' ? (
+          <RunsPage parts={parts.slice(1)} />
+        ) : route === 'files' ? (
+          <FilesPage />
+        ) : (
+          <HomePage />
+        )}
+      </KbdShell>
     </PlotlyProvider>
   )
 }
