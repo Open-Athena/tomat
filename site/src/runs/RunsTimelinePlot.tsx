@@ -13,6 +13,7 @@ import { Tooltip } from '../Tooltip'
 import type { UseTraceHighlightReturn } from 'pltly/react'
 import { themedHoverlabel } from '../theme'
 import type { RunHistory } from './parquet'
+import { ancestorsOf } from './lineage'
 import { ALL_TAGS, cycleTagFilter, effectiveTagState, parseTagFiltersLegacyLs, runPassesTagFilters, tagsFor, TAG_FILTER_PARAM, type RunTag, type TagFilters } from './tags'
 import { stringParam, useUrlState, type Param } from 'use-prms'
 import { compileMultiTermFilter } from './filter'
@@ -455,9 +456,30 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
   // the prefix-stripped shortLabel — so pass `r.id` not `r.label`.
   const haystackFor = (r: RunTimelineSeries): string =>
     runHaystacks?.get(r.label) ?? [r.label, ...tagsFor(r.id)].join(' ')
-  const nameFilteredRuns = filterCompiled.empty || filterCompiled.error
+  const regexMatched = filterCompiled.empty || filterCompiled.error
     ? runs
     : runs.filter((r) => filterCompiled.matches(haystackFor(r)))
+  // When `+ancestors` is on, walk lineage upward from each matched run and
+  // add any ancestor that's also present in `runs` (so the plot shows the
+  // parent baseline alongside its sweep). Mirrors `matchedIdsExpanded` in
+  // RunsPage.tsx — the plot was previously missing this expansion, so the
+  // parent trace was absent even when the parent card was rendered.
+  const nameFilteredRuns = !ancestorsOn || regexMatched.length === runs.length
+    ? regexMatched
+    : (() => {
+        const have = new Set(runs.map((r) => r.id))
+        const idToRun = new Map(runs.map((r) => [r.id, r]))
+        const out = new Set(regexMatched)
+        for (const r of regexMatched) {
+          for (const aid of ancestorsOf(r.id)) {
+            if (have.has(aid)) {
+              const ancestor = idToRun.get(aid)
+              if (ancestor) out.add(ancestor)
+            }
+          }
+        }
+        return Array.from(out)
+      })()
 
   // Tag-chip filter. Tri-state per tag (off / 'in' / 'out'): a run is visible
   // iff it has every `'in'` tag AND none of the `'out'` tags. Untagged runs
@@ -782,15 +804,21 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
 
   return (
     <div>
-      {/* Tag chips. Click to AND-filter; visible tags only. */}
-      {chipTags.length > 0 && (
+      {/* Tag chips + ancestors toggle. The chip rail renders whenever ANY of
+          its contents is present: visible tag chips, the clear-tag-filters
+          button, or `onAncestorsChange` (the +ancestors toggle should be
+          available regardless of whether the current regex/tag selection
+          surfaces any tag chips — that was the prior bug). */}
+      {(chipTags.length > 0 || onAncestorsChange) && (
         <div style={{
           display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 4,
           alignItems: 'center', justifyContent: 'flex-end',
         }}>
-          <span style={{ fontSize: '0.7rem', color: muted, marginRight: 4 }}>
-            tags:
-          </span>
+          {chipTags.length > 0 && (
+            <span style={{ fontSize: '0.7rem', color: muted, marginRight: 4 }}>
+              tags:
+            </span>
+          )}
           {chipTags.map((t) => {
             // Tri-state visual driven by the *effective* state (override
             // when present, else per-tag default). Cycle: in → out → off →
