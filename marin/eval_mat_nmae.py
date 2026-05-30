@@ -72,6 +72,8 @@ from haliax.partitioning import round_axis_for_partitioning
 
 import levanter
 from levanter.checkpoint import load_checkpoint
+from levanter.inference.jit_scheduler import DecodeState
+from levanter.inference.page_table import PageTable
 from levanter.layers.attention import AttentionBackend, AttentionMask
 from levanter.layers.rotary import Llama3RotaryEmbeddingsConfig
 from levanter.models.qwen import Qwen3Config
@@ -660,6 +662,13 @@ def main():
     if eval_mode not in ("teacher", "free", "maskgit"):
         raise ValueError(f"TOMAT_EVAL_MODE must be teacher/free/maskgit, got {eval_mode!r}")
     free_batch = int(os.environ.get("TOMAT_EVAL_FREE_BATCH", "32"))
+    # Free-running decode path:
+    #   TOMAT_EVAL_FREE_LEGACY=1 → recompute the full prefix every step (the
+    #     pre-spec-39 path; ~80 min/mat on 200M). Kept as an A/B / fallback
+    #     escape hatch.
+    #   default → paged-KV decode via Levanter's `model.decode` (spec 39);
+    #     prefill once + 1-token-per-step decode, ~50-300× faster.
+    free_legacy = bool(int(os.environ.get("TOMAT_EVAL_FREE_LEGACY", "0")))
 
     # MaskGIT eval knobs.
     mg_k_steps = int(os.environ.get("TOMAT_EVAL_MG_K_STEPS", "12"))
@@ -834,6 +843,122 @@ def main():
             B = tokens_in.axes[0]
             return (hax.named(next_tok, (B,)), hax.named(rho, (B,)),
                     hax.named(emd, (B,)))
+
+        # ---- Paged-KV free-running decode (spec 39) ------------------------
+        # JIT'd kernels for prefill (B sequences × preamble_len tokens, flat)
+        # and per-step decode (B sequences × 1 token, flat). Replaces the
+        # recompute path's ~80 min/mat with a single prefill + P^3 cheap
+        # 1-token forwards. Levanter's paged kernel hardcodes the causal
+        # mask, matching our AR-trained model. The Qwen3 density subclasses
+        # inherit `decode`/`initial_cache` from base — no overrides needed.
+
+        @hax.named_jit(axis_resources=compute_mapping)
+        def paged_prefill(ds, cache, tokens_flat, slot_ids, pos_ids,
+                          last_pos_per_seq):
+            """Run prefill on B sequences flattened over a single `position`
+            axis. Returns updated (ds, cache) plus the per-sequence density
+            logits at each sequence's last prefill position (DENS_START).
+
+            Args:
+              ds: DecodeState
+              cache: ListCache[KvPageCache]
+              tokens_flat: NamedArray (position=B*preamble_len), int32
+              slot_ids: NamedArray (position=B*preamble_len), int32 — seq id per token
+              pos_ids: NamedArray (position=B*preamble_len), int32 — abs pos per token
+              last_pos_per_seq: NamedArray (position=B), int32 — flat index of
+                each seq's last token in the prefill batch (= b*preamble_len +
+                preamble_len - 1).
+
+            Returns: (ds, cache, density_logits[B, n_bins])
+            """
+            ds, binfo = ds.allocate_for_seq(slot_ids, pos_ids)
+            logits, cache = model.decode(tokens_flat, cache, binfo, pos_ids)
+            # logits: NamedArray (position=B*preamble_len, vocab)
+            arr = logits.array.astype(jnp.float32)  # (B*preamble_len, V)
+            last = arr[last_pos_per_seq.array]      # (B, V)
+            dens = last[:, DENS_LO:DENS_HI]         # (B, n_bins)
+            return ds, cache, dens
+
+        # Decode the (B, n_bins) raw density logits → (next_tok, rho, emd).
+        # Shared between the prefill seam (eager call after `paged_prefill`)
+        # and the per-step scan body in `paged_decode_scan` — formulas in one
+        # place avoid drift.
+        def _decode_logits_to_outputs(dl, td):
+            """dl: (B, n_bins) raw logits; td: (B,) true density target."""
+            p = jax.nn.softmax(dl, axis=-1)
+            cumP = jnp.cumsum(p, axis=-1)
+            med_bin = jnp.clip(
+                jnp.sum(cumP < 0.5, axis=-1).astype(jnp.int32),
+                0, len(recon) - 1,
+            )
+            next_tok = med_bin + DENS_LO
+            if decoder == "argmax":
+                rho = decode_dens[jnp.argmax(dl, axis=-1)]
+            elif decoder == "median":
+                rho = decode_dens[med_bin]
+            else:
+                rho = jnp.einsum("bv,v->b", p, decode_dens)
+            emd = jax.vmap(
+                lambda pv, t: jnp.dot(pv, jnp.abs(decode_dens - t))
+            )(p, td)
+            return next_tok, rho, emd
+
+        @hax.named_jit(axis_resources=compute_mapping)
+        def paged_decode_scan(ds, cache, prev_tok, slot_ids, abs_pos_seq,
+                              td_seq):
+            """Run the inner P^3-1 decode steps in one `lax.scan`.
+
+            Args:
+              ds: DecodeState
+              cache: ListCache[KvPageCache]
+              prev_tok: (B,) int32 — fed-back token from step 0 (prefill).
+              slot_ids: NamedArray (position=B), int32 — constant per step.
+              abs_pos_seq: (n_steps, B) int32 — absolute pos id per (step, seq).
+              td_seq: (n_steps, B) float32 — true density per (step, seq).
+
+            Returns (rho[n_steps, B], emd[n_steps, B], ds, cache).
+            Step 0 of the scan is global step 1 (step 0 came from prefill).
+            """
+            def body(carry, xs):
+                ds, cache, prev_tok = carry
+                abs_pos_i, td_i = xs
+                pos_ids = hax.named(abs_pos_i, "position")
+                tok = hax.named(prev_tok, "position")
+                ds, binfo = ds.allocate_for_seq(slot_ids, pos_ids)
+                logits, cache = model.decode(tok, cache, binfo, pos_ids)
+                arr = logits.array.astype(jnp.float32)
+                dl = arr[:, DENS_LO:DENS_HI]
+                next_tok, rho, emd = _decode_logits_to_outputs(dl, td_i)
+                return (ds, cache, next_tok), (rho, emd)
+
+            (ds, cache, _), (rho_seq, emd_seq) = jax.lax.scan(
+                body, (ds, cache, prev_tok), (abs_pos_seq, td_seq),
+            )
+            return ds, cache, rho_seq, emd_seq
+
+        # Initial paged-KV table + decode-state + cache (only when running
+        # the new paged path on a v3-tokenized run; safe to set up eagerly).
+        _paged_state = None  # tuple (PageTable_init, DecodeState_init, cache_init)
+        if eval_mode == "free" and not free_legacy and tokenizer_version == "v3":
+            _PAGE_SIZE = 128
+            _MAX_SEQ_LEN = 8192
+            _MAX_PAGES_PER_SEQ = (_MAX_SEQ_LEN + _PAGE_SIZE - 1) // _PAGE_SIZE  # 64
+            _MAX_SEQS = free_batch
+            _MAX_PAGES = _MAX_SEQS * _MAX_PAGES_PER_SEQ + 4  # small headroom
+            err(f"[eval-mat] paged-KV: page_size={_PAGE_SIZE}, "
+                f"max_pages_per_seq={_MAX_PAGES_PER_SEQ}, max_seqs={_MAX_SEQS}, "
+                f"max_pages={_MAX_PAGES}")
+            _pt0 = PageTable.init(
+                max_pages=_MAX_PAGES, max_seqs=_MAX_SEQS,
+                page_size=_PAGE_SIZE, max_pages_per_seq=_MAX_PAGES_PER_SEQ,
+            )
+            _ds0 = DecodeState.init(_pt0, pad_token_id=TOK["PAD"])
+            for _b in range(_MAX_SEQS):
+                _ds0, _ = _ds0.reserve_slot(_b)
+            _cache0 = hax.named_jit(model.initial_cache)(
+                _pt0.spec(), dtype=mp_policy.compute_dtype,
+            )
+            _paged_state = (_pt0, _ds0, _cache0)
 
         # ---- MaskGIT iterative-refinement forward --------------------------
         # One full-sequence bidirectional forward: tokens_in has density
@@ -1109,31 +1234,126 @@ def main():
                     ).astype(np.int32)
                     emd_target = recon[tbins].astype(np.float32)
 
-                    # On-device buffer, length padded to a FREE_BUCKET
-                    # multiple (flash attention needs a block-size-multiple
-                    # query axis); density region → PAD, regenerated.
-                    buf_len = _next_bucket(seq_len)
-                    tokens = jnp.asarray(full_ids[:, :buf_len].copy())
-                    tokens = tokens.at[:, d0 + 1:].set(TOK["PAD"])
-                    rho_b = jnp.zeros((B, P3), dtype=jnp.float32)
-                    emd_b = jnp.zeros((B, P3), dtype=jnp.float32)
-                    for i in range(P3):
-                        frontier = d0 + i
-                        bucket = _next_bucket(frontier + 1)
-                        if bucket not in seen_buckets:
-                            seen_buckets.add(bucket)
-                            err(f"[eval-mat] free: compiling bucket={bucket}")
-                        Pos = hax.Axis("position", bucket)
-                        tok_ha = hax.named(tokens[:, :bucket], (Batch, Pos))
-                        td_ha = hax.named(jnp.asarray(emd_target[:, i]), (Batch,))
-                        nt, rho_i, emd_i = free_step(
-                            tok_ha, jnp.asarray(frontier, jnp.int32), td_ha,
+                    if free_legacy:
+                        # ---- legacy recompute path (TOMAT_EVAL_FREE_LEGACY=1) -----
+                        # On-device buffer, length padded to a FREE_BUCKET
+                        # multiple (flash attention needs a block-size-multiple
+                        # query axis); density region → PAD, regenerated.
+                        buf_len = _next_bucket(seq_len)
+                        tokens = jnp.asarray(full_ids[:, :buf_len].copy())
+                        tokens = tokens.at[:, d0 + 1:].set(TOK["PAD"])
+                        rho_b = jnp.zeros((B, P3), dtype=jnp.float32)
+                        emd_b = jnp.zeros((B, P3), dtype=jnp.float32)
+                        for i in range(P3):
+                            frontier = d0 + i
+                            bucket = _next_bucket(frontier + 1)
+                            if bucket not in seen_buckets:
+                                seen_buckets.add(bucket)
+                                err(f"[eval-mat] free(legacy): compiling bucket={bucket}")
+                            Pos = hax.Axis("position", bucket)
+                            tok_ha = hax.named(tokens[:, :bucket], (Batch, Pos))
+                            td_ha = hax.named(jnp.asarray(emd_target[:, i]), (Batch,))
+                            nt, rho_i, emd_i = free_step(
+                                tok_ha, jnp.asarray(frontier, jnp.int32), td_ha,
+                            )
+                            tokens = tokens.at[:, d0 + 1 + i].set(nt.array)
+                            rho_b = rho_b.at[:, i].set(rho_i.array)
+                            emd_b = emd_b.at[:, i].set(emd_i.array)
+                        rho_b_np = np.asarray(rho_b)              # (B, P^3)
+                        emd_b_np = np.asarray(emd_b)
+                    else:
+                        # ---- paged-KV decode path (spec 39, default) --------
+                        # Prefill the preamble (BOS … DENS_START) once per
+                        # batch, then P^3 single-token decode steps. Each
+                        # call is shape `(B,)` over a flat `position` axis,
+                        # so we JIT-compile only twice (prefill shape +
+                        # decode shape) across the entire eval.
+                        assert _paged_state is not None
+                        # Fresh decode-state per batch (page-refcounts and
+                        # seq_lens reset; cache buffer reused — its contents
+                        # are overwritten as new pages get allocated).
+                        _pt_init, _ds_init, _cache_init = _paged_state
+                        pt_b, ds_b, cache_b = _pt_init, _ds_init, _cache_init
+                        preamble_len = d0 + 1  # BOS..DENS_START inclusive
+                        preamble = np.asarray(
+                            full_ids[:, :preamble_len], dtype=np.int32,
+                        )  # (B, preamble_len)
+                        # Flatten: row-major [seq0:positions..., seq1:positions..., ...]
+                        # so each sequence's tokens are contiguous (per
+                        # allocate_for_seq's contract).
+                        tokens_flat_np = preamble.reshape(-1)
+                        slot_ids_np = np.repeat(
+                            np.arange(B, dtype=np.int32), preamble_len,
                         )
-                        tokens = tokens.at[:, d0 + 1 + i].set(nt.array)
-                        rho_b = rho_b.at[:, i].set(rho_i.array)
-                        emd_b = emd_b.at[:, i].set(emd_i.array)
-                    rho_b_np = np.asarray(rho_b)              # (B, P^3)
-                    emd_b_np = np.asarray(emd_b)
+                        pos_ids_np = np.tile(
+                            np.arange(preamble_len, dtype=np.int32), B,
+                        )
+                        last_pos_np = (
+                            np.arange(B, dtype=np.int32) * preamble_len
+                            + (preamble_len - 1)
+                        )
+                        tokens_flat_ha = hax.named(
+                            jnp.asarray(tokens_flat_np), "position",
+                        )
+                        slot_ids_ha = hax.named(
+                            jnp.asarray(slot_ids_np), "position",
+                        )
+                        pos_ids_ha = hax.named(
+                            jnp.asarray(pos_ids_np), "position",
+                        )
+                        last_pos_ha = hax.named(
+                            jnp.asarray(last_pos_np), "position",
+                        )
+                        if "prefill" not in seen_buckets:
+                            seen_buckets.add("prefill")
+                            err(f"[eval-mat] free(paged): compiling prefill "
+                                f"(B={B}, preamble_len={preamble_len})")
+                        ds_b, cache_b, dens_logits0 = paged_prefill(
+                            ds_b, cache_b, tokens_flat_ha, slot_ids_ha,
+                            pos_ids_ha, last_pos_ha,
+                        )
+                        # Sample step 0's token from the prefill logits
+                        # (these are produced from the DENS_START position).
+                        td0 = jnp.asarray(emd_target[:, 0])
+                        nt0, rho0, emd0 = _decode_logits_to_outputs(
+                            dens_logits0, td0,
+                        )
+
+                        # Per-step decode for positions 1..P3-1 via lax.scan
+                        # (one JIT compile total — the scan body is the same
+                        # shape every step).
+                        slot_ids_step = hax.named(
+                            jnp.arange(B, dtype=jnp.int32), "position",
+                        )
+                        # abs_pos_seq: (P3-1, B) — pos_id for each step is the
+                        # buffer index of the token being decoded (the previous
+                        # fed-back token sits at position preamble_len + i - 1).
+                        abs_pos_seq = jnp.broadcast_to(
+                            jnp.arange(
+                                preamble_len, preamble_len + P3 - 1,
+                                dtype=jnp.int32,
+                            )[:, None],
+                            (P3 - 1, B),
+                        )
+                        td_seq = jnp.asarray(emd_target[:, 1:].T)  # (P3-1, B)
+                        if "decode" not in seen_buckets:
+                            seen_buckets.add("decode")
+                            err(f"[eval-mat] free(paged): compiling decode "
+                                f"scan (B={B}, n_steps={P3 - 1})")
+                        ds_b, cache_b, rho_rest, emd_rest = paged_decode_scan(
+                            ds_b, cache_b, nt0, slot_ids_step,
+                            abs_pos_seq, td_seq,
+                        )
+                        # rho_rest, emd_rest: (P3-1, B); stitch step 0 onto the
+                        # front and transpose to (B, P3).
+                        rho_b = jnp.concatenate(
+                            [rho0[None, :], rho_rest], axis=0,
+                        ).T  # (B, P3)
+                        emd_b = jnp.concatenate(
+                            [emd0[None, :], emd_rest], axis=0,
+                        ).T
+                        rho_b_np = np.asarray(rho_b)
+                        emd_b_np = np.asarray(emd_b)
                     rho_blocks = rho_b_np.reshape(B, P, P, P)
                     emd_blocks = emd_b_np.reshape(B, P, P, P)
                     # Scatter each real patch into the full grid via its
