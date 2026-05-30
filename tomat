@@ -95,6 +95,13 @@ GCS_BUCKET = "gs://marin-eu-west4/tomat"
 LMQ_PATH = f"{GCS_BUCKET}/codecs/lmq-v2-16k.npz"
 PROJECT_ROOT = Path(__file__).resolve().parent
 MARIN_DIR = PROJECT_ROOT / "marin"
+# Use marin/.venv/bin/iris directly (script's shebang points at marin/.venv/bin/python3
+# already) instead of `uv run iris`. `uv run` re-syncs deps on every invocation,
+# which reverts the BUILD_DATE stamp workaround in iris/_build_info.py and
+# also resolves to tomat/.venv (Python 3.12) instead of marin/.venv (Python 3.11)
+# because of direnv-set VIRTUAL_ENV in the parent shell. See memory
+# `iris-build-date-empty-bug` for context.
+IRIS_BIN = str(MARIN_DIR / ".venv" / "bin" / "iris")
 TMP_DIR = PROJECT_ROOT / "tmp"
 
 SPLITS = {
@@ -208,7 +215,7 @@ def _resolve_eval_step_list(
 
 def iris_run(*args: str, capture: bool = True, timeout: int = 180) -> subprocess.CompletedProcess:
     """Invoke `uv run iris --cluster=marin job <args>` from marin/."""
-    cmd = ["uv", "run", "iris", "--cluster=marin", "job", *args]
+    cmd = [IRIS_BIN, "--cluster=marin", "job", *args]
     return subprocess.run(
         cmd,
         cwd=str(MARIN_DIR),
@@ -1053,7 +1060,7 @@ def iris_avail(show_all: bool, as_json: bool, tpu: str | None):
     status (quota_exceeded, backoff, requesting, cooldown). Use `-a` for the
     full dump (~150 pools).
     """
-    cmd = ["uv", "run", "iris", "--cluster=marin", "rpc", "controller", "get-autoscaler-status"]
+    cmd = [IRIS_BIN, "--cluster=marin", "rpc", "controller", "get-autoscaler-status"]
     r = subprocess.run(cmd, cwd=str(MARIN_DIR), capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         err(f"iris rpc failed: rc={r.returncode}\n{r.stderr}")
@@ -1103,7 +1110,7 @@ def _iris_query_json(sql: str, timeout: int = 60) -> list[dict]:
     helper today is `tomat iris sync`, whose LEFT JOIN was exactly the
     pattern that prompted the complaint.
     """
-    cmd = ["uv", "run", "iris", "--cluster=marin", "query", sql, "-f", "json"]
+    cmd = [IRIS_BIN, "--cluster=marin", "query", sql, "-f", "json"]
     t0 = time.monotonic()
     r = subprocess.run(cmd, cwd=str(MARIN_DIR), capture_output=True, text=True, timeout=timeout)
     elapsed_ms = int((time.monotonic() - t0) * 1000)
@@ -1124,7 +1131,7 @@ def _iris_job_list_json(prefix: str, timeout: int = 60) -> list[dict]:
     See `memory/feedback_iris_controller_load.md` — RPC is fine, SQL JOINs
     on `jobs × tasks` are what melt the shared controller.
     """
-    cmd = ["uv", "run", "iris", "--cluster=marin", "job", "list",
+    cmd = [IRIS_BIN, "--cluster=marin", "job", "list",
            "--prefix", prefix, "--json"]
     t0 = time.monotonic()
     r = subprocess.run(cmd, cwd=str(MARIN_DIR), capture_output=True, text=True, timeout=timeout)
@@ -1432,7 +1439,7 @@ def evals_fire(
                 else:
                     jn = f"tomat-{infix}-{run_label}-{s}-step-{step}-task{task_i}"
                 cmd = [
-                    "uv", "run", "iris", "--cluster=marin", "job", "run",
+                    IRIS_BIN, "--cluster=marin", "job", "run",
                     "--tpu", tpu, "--enable-extra-resources",
                     "--cpu", "32", "--memory", "64GB",
                     "--env-vars", "WANDB_API_KEY", wandb_key,
@@ -2114,7 +2121,7 @@ def train(
         env_vars.append((k, v))
 
     cmd = [
-        "uv", "run", "iris", "--cluster=marin", "job", "run",
+        IRIS_BIN, "--cluster=marin", "job", "run",
         "--tpu", tpu, "--enable-extra-resources",
         "--cpu", str(cpu), "--memory", memory,
         "--max-retries", str(max_retries),
@@ -2163,7 +2170,7 @@ def train(
             # Probe iris-avail-as-json to check whether the target pool has
             # READY≥1 before bothering iris's scheduler.
             probe = subprocess.run(
-                ["uv", "run", "iris", "--cluster=marin", "rpc", "controller", "get-autoscaler-status"],
+                [IRIS_BIN, "--cluster=marin", "rpc", "controller", "get-autoscaler-status"],
                 cwd=str(MARIN_DIR), capture_output=True, text=True, timeout=90,
             )
             ready_pools: list[tuple[str, int]] = []
@@ -2501,7 +2508,7 @@ def cache_build(
         env_vars.append((k, v))
 
     cmd = [
-        "uv", "run", "iris", "--cluster=marin", "job", "run",
+        IRIS_BIN, "--cluster=marin", "job", "run",
         "--cpu", str(cpu), "--memory", memory,
     ]
     for z in (zone or "").split(","):
