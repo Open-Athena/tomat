@@ -7,7 +7,7 @@
 // Intended as the at-a-glance "what's happening across all my training jobs?"
 // visual at the top of the /runs index.
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactElement } from 'react'
 import { LegendItem, Plot, useTheme } from 'pltly/react'
 import { Tooltip } from '../Tooltip'
 import type { UseTraceHighlightReturn } from 'pltly/react'
@@ -16,6 +16,10 @@ import type { RunHistory } from './parquet'
 import { ALL_TAGS, cycleTagFilter, effectiveTagState, parseTagFiltersLegacyLs, runPassesTagFilters, tagsFor, TAG_FILTER_PARAM, type RunTag, type TagFilters } from './tags'
 import { stringParam, useUrlState, type Param } from 'use-prms'
 import { compileMultiTermFilter } from './filter'
+import {
+  applySmoothing, bandsParam, DEFAULT_EMA_ALPHA, DEFAULT_ROLLING_WINDOW,
+  smoothingStd, smoothKey, smoothParam, type SmoothMode,
+} from './smoothing'
 // Re-export so RunsPage can `import { ... } from './RunsTimelinePlot'` —
 // keeps callers off the helper module's internal path.
 export { compileMultiTermFilter, runHaystack, FILTER_EXAMPLES } from './filter'
@@ -114,6 +118,18 @@ export function useAncestorsToggle(): readonly [boolean, (v: boolean) => void] {
   return [on, setOn] as const
 }
 
+/** Hook owning the `?smooth=…` smoothing mode. Default `raw`. */
+export function useSmoothMode(): readonly [SmoothMode, (v: SmoothMode) => void] {
+  const [mode, setMode] = useUrlState('smooth', smoothParam)
+  return [mode, setMode] as const
+}
+
+/** Hook owning the `?bands=1` ±σ-band toggle. Default `false`. */
+export function useBandsToggle(): readonly [boolean, (v: boolean) => void] {
+  const [on, setOn] = useUrlState('bands', bandsParam)
+  return [on, setOn] as const
+}
+
 /** React hook owning the tag-filter OVERRIDE map. URL is canonical; legacy
  *  `localStorage` is migrated on first read then cleared. The Map holds
  *  only overrides — per-tag defaults (see `TAG_DEFAULTS`) apply for any
@@ -188,6 +204,17 @@ export function compileNameFilter(filter: string): { re: RegExp | null; error: b
 const IDLE_CAP_SEC = 300
 const LOGY_KEY = 'tomat:runs-logy'
 
+/** `#rrggbb` (or `#rgb`) → `"R, G, B"` for use inside `rgba(…)` strings.
+ *  Falls back to mid-grey on parse failure so band fills stay visible. */
+function hexToRgb(hex: string): string {
+  let h = hex.startsWith('#') ? hex.slice(1) : hex
+  if (h.length === 3) h = h.split('').map((c) => c + c).join('')
+  if (h.length !== 6) return '128, 128, 128'
+  const n = parseInt(h, 16)
+  if (!Number.isFinite(n)) return '128, 128, 128'
+  return `${(n >> 16) & 0xff}, ${(n >> 8) & 0xff}, ${n & 0xff}`
+}
+
 /** q-th quantile (0–1) of an ascending-sorted array. */
 function quantile(sorted: number[], q: number): number {
   if (sorted.length === 0) return 0
@@ -253,6 +280,124 @@ function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
   return { x, y }
 }
 
+interface SmoothingChipsProps {
+  mode: SmoothMode
+  setMode: (m: SmoothMode) => void
+  bandsOn: boolean
+  setBandsOn: (v: boolean) => void
+  isDark: boolean
+  fg: string
+  muted: string
+}
+
+/** Compact 3-button chip rail for the smoothing mode: `raw | EMA(α) | rolling(N)`,
+ *  plus a ±σ toggle (disabled while in raw mode). Numeric inputs commit on
+ *  Enter/blur — no debounce, no per-keystroke URL writes. Used by both the
+ *  cross-run timeline and the per-run wallclock plots. */
+export function SmoothingChips({
+  mode, setMode, bandsOn, setBandsOn, isDark, fg, muted,
+}: SmoothingChipsProps): ReactElement {
+  const [emaDraft, setEmaDraft] = useState(() =>
+    String(mode.kind === 'ema' ? mode.alpha : DEFAULT_EMA_ALPHA))
+  const [rollDraft, setRollDraft] = useState(() =>
+    String(mode.kind === 'rolling' ? mode.window : DEFAULT_ROLLING_WINDOW))
+  // Re-seed drafts when the mode changes from outside (URL paste, e.g.).
+  useEffect(() => {
+    if (mode.kind === 'ema') setEmaDraft(String(mode.alpha))
+    if (mode.kind === 'rolling') setRollDraft(String(mode.window))
+  }, [mode])
+
+  const chipStyle = (on: boolean): CSSProperties => ({
+    background: on ? (isDark ? '#2a2a2a' : '#e8e8e8') : 'transparent',
+    border: `1px solid ${on ? (isDark ? '#444' : '#bbb') : 'transparent'}`,
+    borderRadius: 4, cursor: 'pointer', padding: '2px 8px',
+    fontSize: '0.72rem', fontFamily: 'inherit',
+    color: on ? fg : muted,
+  })
+  const numInputStyle = (active: boolean): CSSProperties => ({
+    background: 'transparent',
+    border: `1px solid ${active ? (isDark ? '#666' : '#999') : (isDark ? '#333' : '#ddd')}`,
+    borderRadius: 3, padding: '1px 4px',
+    fontSize: '0.7rem', fontFamily: 'inherit',
+    color: active ? fg : muted,
+    width: 44, marginLeft: 4,
+  })
+
+  const commitEma = () => {
+    const a = Number(emaDraft)
+    if (Number.isFinite(a) && a > 0 && a <= 1) setMode({ kind: 'ema', alpha: a })
+    else setEmaDraft(String(mode.kind === 'ema' ? mode.alpha : DEFAULT_EMA_ALPHA))
+  }
+  const commitRoll = () => {
+    const n = Math.round(Number(rollDraft))
+    if (Number.isFinite(n) && n >= 1) setMode({ kind: 'rolling', window: n })
+    else setRollDraft(String(mode.kind === 'rolling' ? mode.window : DEFAULT_ROLLING_WINDOW))
+  }
+
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 2, marginLeft: 8 }}>
+      <span style={{ fontSize: '0.7rem', color: muted, marginRight: 2 }}>smooth:</span>
+      <Tooltip content="no smoothing (raw history)">
+        <button onClick={() => setMode({ kind: 'raw' })} style={chipStyle(mode.kind === 'raw')}>
+          raw
+        </button>
+      </Tooltip>
+      <Tooltip content="exponential moving average: y[t] = α·x[t] + (1-α)·y[t-1]. Smaller α = smoother. URL: ?smooth=ema:α">
+        <button
+          onClick={() => setMode({ kind: 'ema', alpha: Number(emaDraft) || DEFAULT_EMA_ALPHA })}
+          style={chipStyle(mode.kind === 'ema')}
+        >
+          EMA α
+          <input
+            type="number" step="0.05" min="0.01" max="1"
+            value={emaDraft}
+            onChange={(e) => setEmaDraft(e.target.value)}
+            onBlur={commitEma}
+            onKeyDown={(e) => { if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur() }}
+            onClick={(e) => e.stopPropagation()}
+            style={numInputStyle(mode.kind === 'ema')}
+          />
+        </button>
+      </Tooltip>
+      <Tooltip content="centered rolling mean over N samples. URL: ?smooth=rolling:N">
+        <button
+          onClick={() => setMode({ kind: 'rolling', window: Math.max(1, Math.round(Number(rollDraft))) || DEFAULT_ROLLING_WINDOW })}
+          style={chipStyle(mode.kind === 'rolling')}
+        >
+          roll N
+          <input
+            type="number" step="10" min="1"
+            value={rollDraft}
+            onChange={(e) => setRollDraft(e.target.value)}
+            onBlur={commitRoll}
+            onKeyDown={(e) => { if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur() }}
+            onClick={(e) => e.stopPropagation()}
+            style={numInputStyle(mode.kind === 'rolling')}
+          />
+        </button>
+      </Tooltip>
+      <Tooltip content={
+        mode.kind === 'raw'
+          ? '±σ bands require a smoothing mode (raw σ would just be raw vs raw)'
+          : '±σ bands around the smoothed line (rolling std). URL: ?bands=1'
+      }>
+        <button
+          onClick={() => setBandsOn(!bandsOn)}
+          disabled={mode.kind === 'raw'}
+          style={{
+            ...chipStyle(bandsOn && mode.kind !== 'raw'),
+            opacity: mode.kind === 'raw' ? 0.4 : 1,
+            cursor: mode.kind === 'raw' ? 'not-allowed' : 'pointer',
+            marginLeft: 4,
+          }}
+        >
+          ±σ
+        </button>
+      </Tooltip>
+    </span>
+  )
+}
+
 export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onPlotHover, tagFilters: tagFiltersExternal, onTagFiltersChange, ancestorsOn, onAncestorsChange }: Props) {
   const { isDark } = useTheme()
 
@@ -288,6 +433,13 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
     setLogYRaw(v)
     try { localStorage.setItem(LOGY_KEY, v ? '1' : '0') } catch { /* ignore */ }
   }
+
+  // Smoothing (URL-backed). `raw` (default) renders unchanged. `ema` / `rolling`
+  // replace each trace's y with the smoothed series; with `bands` on we add
+  // two ±σ fill traces per run, grouped under the line's name so the existing
+  // closest-trace highlight fades them together.
+  const [smooth, setSmooth] = useSmoothMode()
+  const [bandsOn, setBandsOn] = useBandsToggle()
 
   // Regex filter on run name. Persisted + cross-component-synced (RunsPage
   // reads the same hook to sort matching cards to top + fade non-matches).
@@ -345,40 +497,116 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
     ? filteredRuns.filter((r) => r.label === pinnedTrace)
     : filteredRuns
 
+  // Smoothing cache: keyed by (history identity, smoothKey, xMode, cutoff).
+  // Built ONCE per render via useMemo; the trace-data .map below reads from it
+  // so re-renders (hover-driven `activeTrace` changes) don't recompute EMA on
+  // every mousemove. xMode + cutoff baked into the key because `traceFor`
+  // itself depends on them.
+  const smoothK = smoothKey(smooth)
+  const seriesCache = useMemo(() => {
+    type Cached = {
+      x: (string | number)[]
+      yRaw: (number | null)[]
+      ySmoothed: (number | null)[]
+      yStd: (number | null)[] | null
+    }
+    const out = new Map<string, Cached>()
+    for (const r of plotted) {
+      const { x, y } = traceFor(r.history, xMode, cutoffSec)
+      if (x.length === 0) continue
+      // `traceFor` returns `number[]` today; widen to `(number|null)[]` so the
+      // smoothing helpers can pass nulls through if the upstream ever changes.
+      const yRaw: (number | null)[] = y as (number | null)[]
+      const ySmoothed = applySmoothing(yRaw, smooth)
+      const yStd = bandsOn ? smoothingStd(yRaw, smooth) : null
+      out.set(r.id, { x, yRaw, ySmoothed, yStd })
+    }
+    return out
+    // `plotted` identity changes on every render (it's a new array), but its
+    // contents are stable as long as runs / filters / pin don't change — so we
+    // key on the run-id join + smoothing/x-mode/cutoff. Same idiom used by
+    // `labelToId` in RunsPage.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [plotted.map((r) => r.id).join('|'), smoothK, bandsOn, xMode, cutoffSec])
+
   // Fade non-highlighted traces to a true neutral grey (pltly's built-in fade
   // only desaturates partway / keeps a tint); the highlighted run keeps full
   // colour + a thicker stroke so it pops.
-  const data = plotted
-    .map((r) => {
-      const { x, y } = traceFor(r.history, xMode, cutoffSec)
-      if (x.length === 0) return null
-      const isActive = r.label === activeTrace
-      const faded = activeTrace != null && !isActive
-      return {
-        x,
-        y,
-        name: r.label,
-        type: 'scatter' as const,
-        mode: 'lines' as const,
-        line: {
-          color: faded ? '#666' : r.color,
-          width: isActive ? 3 : 2,
-          // step-progress curves are step functions; loss is continuous.
-          shape: (xMode === 'loss' ? 'linear' : 'hv') as 'linear' | 'hv',
-        },
-        // x-unified TT row layout: `<color> <hovertemplate-result>`. The
-        // `<extra>` (right-side annotation) holds the trace name in non-unified
-        // mode but is omitted from unified-mode rows, so we have to embed
-        // `fullData.name` in the template ourselves. Without this, every row
-        // reads "loss 3.093" with no way to tell which run is which.
-        hovertemplate: xMode === 'loss'
-          ? `%{fullData.name} · %{y:.3f}<extra></extra>`
-          : `%{fullData.name} · %{y:,}<extra></extra>`,
-      }
-    })
-    .filter((d): d is NonNullable<typeof d> => d !== null)
+  //
+  // Band traces (when smoothing + `bandsOn`) share the line's `name` so the
+  // closest-trace hover routine matches all three together → fade-in-sync.
+  // They use `hoverinfo: 'skip'` so the hover-y-distance code (which iterates
+  // `event.points`) ignores them when picking the closest trace.
+  const wantBands = bandsOn && smooth.kind !== 'raw'
+  const data = plotted.flatMap((r) => {
+    const cached = seriesCache.get(r.id)
+    if (!cached) return []
+    const { x, ySmoothed, yStd } = cached
+    const isActive = r.label === activeTrace
+    const faded = activeTrace != null && !isActive
+    const lineColor = faded ? '#666' : r.color
+    const shape = (xMode === 'loss' ? 'linear' : 'hv') as 'linear' | 'hv'
+
+    const lineTrace = {
+      x,
+      y: ySmoothed,
+      name: r.label,
+      type: 'scatter' as const,
+      mode: 'lines' as const,
+      line: {
+        color: lineColor,
+        width: isActive ? 3 : 2,
+        shape,
+      },
+      // x-unified TT row layout: `<color> <hovertemplate-result>`. The
+      // `<extra>` (right-side annotation) holds the trace name in non-unified
+      // mode but is omitted from unified-mode rows, so we have to embed
+      // `fullData.name` in the template ourselves. Without this, every row
+      // reads "loss 3.093" with no way to tell which run is which.
+      hovertemplate: xMode === 'loss'
+        ? `%{fullData.name} · %{y:.3f}<extra></extra>`
+        : `%{fullData.name} · %{y:,}<extra></extra>`,
+    }
+
+    if (!wantBands || !yStd) return [lineTrace]
+
+    // ±σ bands: lower edge (no fill), upper edge (`fill: 'tonexty'`). Order
+    // matters — `tonexty` fills *down to the previous trace*, so the lower
+    // edge MUST precede the upper. We emit [lower, upper, line] so the line
+    // draws on top of the band; the band's z-order doesn't matter for hover
+    // (it's `hoverinfo: 'skip'`).
+    const yLower: (number | null)[] = []
+    const yUpper: (number | null)[] = []
+    for (let i = 0; i < ySmoothed.length; i++) {
+      const m = ySmoothed[i]
+      const s = yStd[i]
+      if (m == null || s == null) { yLower.push(null); yUpper.push(null); continue }
+      yLower.push(m - s)
+      yUpper.push(m + s)
+    }
+    // Band fill colour matches the line. When faded, use the same grey as the
+    // line at lower opacity so the trio reads as one group.
+    const bandRGB = faded ? '102, 102, 102' : hexToRgb(r.color)
+    const bandAlpha = isActive ? 0.18 : 0.10
+    const fillcolor = `rgba(${bandRGB}, ${bandAlpha})`
+    const edgeCommon = {
+      x,
+      name: r.label,
+      type: 'scatter' as const,
+      mode: 'lines' as const,
+      line: { color: 'rgba(0,0,0,0)', width: 0, shape },
+      hoverinfo: 'skip' as const,
+      showlegend: false,
+    }
+    return [
+      { ...edgeCommon, y: yLower },
+      { ...edgeCommon, y: yUpper, fill: 'tonexty' as const, fillcolor },
+      lineTrace,
+    ]
+  })
   // Draw the highlighted trace last so it sits on top of the rest (Plotly
   // z-order = data order). Array.sort is stable → others keep their order.
+  // Sort by name; bands have the same name as their line so they stay grouped.
   if (activeTrace) {
     data.sort((a, b) =>
       Number(a.name === activeTrace) - Number(b.name === activeTrace))
@@ -529,7 +757,9 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
   let lossHi = 10
   if (xMode === 'loss') {
     const vals: number[] = []
-    for (const d of data) for (const v of d.y) if (Number.isFinite(v)) vals.push(v)
+    for (const d of data) for (const v of d.y) {
+      if (v != null && Number.isFinite(v)) vals.push(v)
+    }
     vals.sort((a, b) => a - b)
     if (vals.length) {
       lossLo = Math.max(vals[0], 1e-4)
@@ -710,6 +940,11 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
             </button>
           </Tooltip>
         )}
+        <SmoothingChips
+          mode={smooth} setMode={setSmooth}
+          bandsOn={bandsOn} setBandsOn={setBandsOn}
+          isDark={isDark} fg={fg} muted={muted}
+        />
       </div>
       <div ref={plotWrapperRef}>
       <Plot
@@ -759,7 +994,11 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
             // instead of raggedly tracking each label's width.
             display: 'grid',
             gridTemplateColumns: 'repeat(auto-fill, minmax(330px, 1fr))',
-            columnGap: 14, rowGap: 1,
+            // No gaps — adjacent LegendItems own the inter-item space via their
+            // own padding so cursor sweeps across the legend never land in a
+            // dead zone (which caused flicker: leave A → 120ms debounce → enter
+            // B). With flush hover zones the leave/enter pair always overlaps.
+            columnGap: 0, rowGap: 0,
             marginTop: 2, color: fg,
           }}>
             {filteredRuns.map((r) => (
@@ -772,7 +1011,10 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
                 faded={!!highlight?.activeTrace && highlight.activeTrace !== r.label}
                 pinned={highlight?.pinnedTrace === r.label}
                 {...(highlight ? highlight.handlers(r.label) : {})}
-                style={{ fontSize: '0.72rem' }}
+                // Overrides LegendItem's default `0 0.4em` — pads vertically too
+                // (so vertically-adjacent rows are flush) and absorbs the
+                // ex-columnGap horizontally.
+                style={{ fontSize: '0.72rem', padding: '2px 7px' }}
               />
             ))}
           </div>
