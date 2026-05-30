@@ -299,12 +299,13 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
   const nameReError = filterCompiled.error
   // Haystack per run: parent-supplied (rich: includes dates, hardware,
   // lineage) when present, else fall back to label+tags (what we did before
-  // the multi-term filter landed).
-  const haystackFor = (label: string): string =>
-    runHaystacks?.get(label) ?? [label, ...tagsFor(label)].join(' ')
+  // the multi-term filter landed). `tagsFor` is keyed by the FULL id, not
+  // the prefix-stripped shortLabel — so pass `r.id` not `r.label`.
+  const haystackFor = (r: RunTimelineSeries): string =>
+    runHaystacks?.get(r.label) ?? [r.label, ...tagsFor(r.id)].join(' ')
   const nameFilteredRuns = filterCompiled.empty || filterCompiled.error
     ? runs
-    : runs.filter((r) => filterCompiled.matches(haystackFor(r.label)))
+    : runs.filter((r) => filterCompiled.matches(haystackFor(r)))
 
   // Tag-chip filter. Tri-state per tag (off / 'in' / 'out'): a run is visible
   // iff it has every `'in'` tag AND none of the `'out'` tags. Untagged runs
@@ -324,14 +325,14 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
   // Only show chips for tags that ANY currently-visible (name-filtered) run
   // carries — keeps the chip strip short and relevant.
   const visibleTagSet = new Set<RunTag>()
-  for (const r of nameFilteredRuns) for (const t of tagsFor(r.label)) visibleTagSet.add(t)
+  for (const r of nameFilteredRuns) for (const t of tagsFor(r.id)) visibleTagSet.add(t)
   const chipTags = ALL_TAGS.filter((t) => visibleTagSet.has(t))
 
   // No `.size === 0` fast-path: per-tag defaults (e.g. `bunk = out`) still
   // constrain even when the override Map is empty. `runPassesTagFilters`
   // short-circuits via its empty-constraint set when neither the Map nor
   // `TAG_DEFAULTS` carry anything.
-  const filteredRuns = nameFilteredRuns.filter((r) => runPassesTagFilters(tagsFor(r.label), tagFilters))
+  const filteredRuns = nameFilteredRuns.filter((r) => runPassesTagFilters(tagsFor(r.id), tagFilters))
 
   const cutoffSec = hoursBack ? (Date.now() / 1000 - hoursBack * 3600) : null
 
