@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Marin + TPU launch path for tomat's patch-tokenized density LM."
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    "marin",
+    "marin-core",
     "marin-levanter",
     "marin-iris",
     "marin-zephyr",
@@ -25,7 +25,7 @@ dependencies = [
     # tiny-stories' `dispatch_grug_training_run` pattern (coordinator → TPU
     # worker with --extra tpu), but for a direct `iris job run` this keeps
     # libtpu.so available on the entrypoint task.
-    "jax[tpu]==0.8.0 ; sys_platform == 'linux'",
+    "jax[tpu]>=0.9.2 ; sys_platform == 'linux'",
 ]
 
 # Iris's remote worker runs `uv sync --all-packages --no-group dev`, which
@@ -36,7 +36,7 @@ dependencies = [
 # lock` resolve on macOS (skips them entirely) while linux TPU workers
 # still get the full set via `uv sync --extra tpu`.
 tpu = [
-    "jax[tpu]==0.8.0 ; sys_platform == 'linux'",
+    "jax[tpu]>=0.9.2 ; sys_platform == 'linux'",
     "torch==2.9.0 ; sys_platform == 'linux'",
     "torchvision==0.24.0 ; sys_platform == 'linux'",
 ]
@@ -85,13 +85,13 @@ resiliparse = { index = "marin-resiliparse" }
 # `uv lock` against the find-links registries fails. The 20260428 wheels are
 # also unreachable (rotated out of marin-*-latest). Pin until upstream is
 # healthy again.
-marin           = { git = "https://github.com/marin-community/marin", rev = "674eb2a4f", subdirectory = "lib/marin" }
-marin-haliax    = { git = "https://github.com/marin-community/marin", rev = "674eb2a4f", subdirectory = "lib/haliax" }
-marin-levanter  = { git = "https://github.com/marin-community/marin", rev = "674eb2a4f", subdirectory = "lib/levanter" }
-marin-iris      = { git = "https://github.com/marin-community/marin", rev = "674eb2a4f", subdirectory = "lib/iris" }
-marin-zephyr    = { git = "https://github.com/marin-community/marin", rev = "674eb2a4f", subdirectory = "lib/zephyr" }
-marin-rigging   = { git = "https://github.com/marin-community/marin", rev = "674eb2a4f", subdirectory = "lib/rigging" }
-marin-fray      = { git = "https://github.com/marin-community/marin", rev = "674eb2a4f", subdirectory = "lib/fray" }
+marin-core      = { git = "https://github.com/marin-community/marin", rev = "7115c21d4721983982541906ae60ac13f49dde79", subdirectory = "lib/marin" }
+marin-haliax    = { git = "https://github.com/marin-community/marin", rev = "7115c21d4721983982541906ae60ac13f49dde79", subdirectory = "lib/haliax" }
+marin-levanter  = { git = "https://github.com/marin-community/marin", rev = "7115c21d4721983982541906ae60ac13f49dde79", subdirectory = "lib/levanter" }
+marin-iris      = { git = "https://github.com/marin-community/marin", rev = "7115c21d4721983982541906ae60ac13f49dde79", subdirectory = "lib/iris" }
+marin-zephyr    = { git = "https://github.com/marin-community/marin", rev = "7115c21d4721983982541906ae60ac13f49dde79", subdirectory = "lib/zephyr" }
+marin-rigging   = { git = "https://github.com/marin-community/marin", rev = "7115c21d4721983982541906ae60ac13f49dde79", subdirectory = "lib/rigging" }
+marin-fray      = { git = "https://github.com/marin-community/marin", rev = "7115c21d4721983982541906ae60ac13f49dde79", subdirectory = "lib/fray" }
 
 [tool.hatch.metadata]
 allow-direct-references = true
