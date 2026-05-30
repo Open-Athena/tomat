@@ -2,119 +2,21 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { Tooltip } from '../Tooltip'
 import { evalJobsByRun, evalPhase, fetchEval, fetchIrisState, fetchManifest, fetchRunsSnapshot, irisJobIdForRun, parquetUrl } from './api'
-import type { EvalJob, EvalPoint, IrisJob, RunManifest } from './api'
+import type { EvalJob, EvalPoint } from './api'
 import { fetchRunHistory } from './parquet'
-import type { RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
-import { RunsTimelinePlot, colorForIndex, shortLabel, useNameFilter, useTagFilters, useAncestorsToggle, compileMultiTermFilter, runHaystack } from './RunsTimelinePlot'
+import { RunsTimelinePlot, colorForIndex, useNameFilter, useTagFilters, useAncestorsToggle, compileMultiTermFilter, runHaystack, shortLabel } from './RunsTimelinePlot'
 import { runPassesTagFilters, tagsFor } from './tags'
 import { ancestorsOf, lineageFor } from './lineage'
 import type { RunTimelineSeries } from './RunsTimelinePlot'
 import { useTraceHighlight } from 'pltly/react'
-
-/** Small SVG line chart (no plotly). `pts` is xs/ys in raw values; we scale. */
-function Sparkline({
-  pts, width = 160, height = 36, color = '#22863a',
-}: {
-  pts: { x: number; y: number }[]
-  width?: number
-  height?: number
-  color?: string
-}) {
-  if (pts.length < 2) {
-    return <svg width={width} height={height} />
-  }
-  const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y)
-  const xmin = Math.min(...xs), xmax = Math.max(...xs)
-  const ymin = Math.min(...ys), ymax = Math.max(...ys)
-  const xspan = xmax - xmin || 1, yspan = ymax - ymin || 1
-  const pad = 2
-  const scaledX = (x: number) => pad + ((x - xmin) / xspan) * (width - 2 * pad)
-  const scaledY = (y: number) => height - pad - ((y - ymin) / yspan) * (height - 2 * pad)
-  const d = pts.map((p, i) => `${i === 0 ? 'M' : 'L'} ${scaledX(p.x).toFixed(1)} ${scaledY(p.y).toFixed(1)}`).join(' ')
-  return (
-    <svg width={width} height={height} style={{ display: 'block' }}>
-      <path d={d} fill="none" stroke={color} strokeWidth={1.5} />
-    </svg>
-  )
-}
-
-const LOOKBACK_HOURS = 6
-const LOOKBACK_SEC = LOOKBACK_HOURS * 3600
-
-/**
- * Compute steps completed within a wallclock window ending at the latest log.
- * Returns `null` if we don't have enough samples — common right after a fresh
- * resume, when the parquet's latest row was logged < windowSec ago.
- *
- * Step = `global_step` (Levanter's actual training step), not `_step` (wandb's
- * log-call counter) — the latter inflates 5–10× per row and isn't what users
- * mean when they ask "how many steps in the last hour?"
- */
-function stepsInWindow(history: RunHistory, windowSec: number): number | null {
-  const tsCol = history.timestamps
-  const gsCol = history.cols.get('global_step') ?? []
-  let latestTs: number | null = null
-  let latestStep: number | null = null
-  for (let i = 0; i < history.rowCount; i++) {
-    const t = tsCol[i], s = gsCol[i]
-    if (t == null || s == null) continue
-    if (latestTs == null || t > latestTs) { latestTs = t; latestStep = s }
-  }
-  if (latestTs == null || latestStep == null) return null
-  const cutoff = latestTs - windowSec
-  // Earliest step at-or-before the cutoff (so we measure exact window).
-  let baseStep: number | null = null
-  let baseTs: number | null = null
-  for (let i = 0; i < history.rowCount; i++) {
-    const t = tsCol[i], s = gsCol[i]
-    if (t == null || s == null) continue
-    if (t <= cutoff && (baseTs == null || t > baseTs)) { baseTs = t; baseStep = s }
-  }
-  if (baseStep == null) return null
-  return latestStep - baseStep
-}
-
-/** Filter history to last N seconds + downsample (max ~120 points for sparkline). */
-function recentStepPoints(history: RunHistory): { x: number; y: number }[] {
-  const tsCol = history.timestamps, stepCol = history.steps
-  const now = Date.now() / 1000
-  const cutoff = now - LOOKBACK_SEC
-  const all: { x: number; y: number }[] = []
-  for (let i = 0; i < history.rowCount; i++) {
-    const t = tsCol[i], s = stepCol[i]
-    if (t != null && s != null && t >= cutoff) {
-      all.push({ x: t, y: s })
-    }
-  }
-  // Sort by timestamp — parquet row order isn't guaranteed strictly
-  // chronological (wandb syncs in chunks, interleaves system + training
-  // metrics), so connecting points in row order produces a zigzag.
-  all.sort((a, b) => a.x - b.x)
-  if (all.length <= 120) return all
-  // Downsample by stride
-  const stride = Math.ceil(all.length / 120)
-  const out: { x: number; y: number }[] = []
-  for (let i = 0; i < all.length; i += stride) out.push(all[i])
-  if (out[out.length - 1] !== all[all.length - 1]) out.push(all[all.length - 1])
-  return out
-}
-
-/** "Xs ago" / "Xm ago" / "Xh ago" / "Xd ago"; nullable for unknown. */
-function secsAgo(unixSec: number): string {
-  const ago = Date.now() / 1000 - unixSec
-  if (ago < 60) return `${Math.round(ago)}s ago`
-  if (ago < 3600) return `${Math.round(ago / 60)}m ago`
-  if (ago < 86400) return `${(ago / 3600).toFixed(1)}h ago`
-  return `${(ago / 86400).toFixed(1)}d ago`
-}
-
-/** Freshness color: green < 2 min, yellow < 30 min, red older. */
-function freshnessColor(secAgo: number): string {
-  if (secAgo < 120) return '#22863a'
-  if (secAgo < 1800) return '#d4a017'
-  return '#cb2431'
-}
+import {
+  HW_COLORS,
+  parseRunName,
+  timeAgo,
+  tokenizerGen,
+} from './runMeta'
+import { DOT, isIncomplete, RunHeaderRich, type RunCardData } from './RunHeaderRich'
 
 // Auto-refresh cadences (ms) for the react-query polling on the runs
 // dashboard. The `tomat-iris-cron` VM re-syncs R2 roughly every minute;
@@ -157,284 +59,6 @@ export function RunsPage({ parts }: Props) {
   return runId ? <RunDetail runId={runId} /> : <RunsIndex />
 }
 
-// Fallback for runs not in the iris snapshot (e.g. Modal runs, or runs created
-// after the last `tomat iris sync`). State here comes from wandb's view —
-// "running" / "finished" / "crashed" / "failed" — and is laggier than iris.
-// Italic styling marks it as lower-trust.
-const WANDB_STATE_BG: Record<string, string> = {
-  running: '#22863a',
-  finished: '#0366d6',
-  crashed: '#cb2431',
-  failed: '#cb2431',
-  killed: '#6a737d',
-}
-
-const IRIS_STATE_STYLES: Record<string, { bg: string; fg: string }> = {
-  RUNNING:       { bg: '#22863a', fg: '#fff' },
-  PENDING:       { bg: '#d4a017', fg: '#fff' },
-  BUILDING:      { bg: '#d4a017', fg: '#fff' },
-  SUCCEEDED:     { bg: '#0366d6', fg: '#fff' },
-  FAILED:        { bg: '#cb2431', fg: '#fff' },
-  KILLED:        { bg: '#6a737d', fg: '#fff' },
-  WORKER_FAILED: { bg: '#cb2431', fg: '#fff' },
-  UNSCHEDULABLE: { bg: '#cb2431', fg: '#fff' },
-}
-
-function IrisBadge({ job, incomplete }: { job: IrisJob; incomplete?: boolean }) {
-  // `incomplete`: iris says SUCCEEDED but the run stopped well short of its
-  // step target — almost always a preemption whose clean SIGTERM exit (0)
-  // iris mis-buckets as success. Show it as its own burnt-orange state so the
-  // card doesn't read as a healthy finish (iris won't re-enqueue it).
-  const showIncomplete = incomplete && job.state === 'SUCCEEDED'
-  const style = showIncomplete
-    ? { bg: '#b4632a', fg: '#fff' }
-    : IRIS_STATE_STYLES[job.state] ?? { bg: '#888', fg: '#fff' }
-  const tail = job.preempts > 0 || job.failures > 0
-    ? ` (p=${job.preempts}, f=${job.failures})` : ''
-  return (
-    <Tooltip content={showIncomplete
-      ? `iris reported SUCCEEDED, but the run ended early — likely preempted with a clean SIGTERM exit. `
-        + `iris will not re-enqueue it. preempts=${job.preempts} failures=${job.failures}`
-      : (job.error || `iris state=${job.state} preempts=${job.preempts} failures=${job.failures}`)}>
-      <span
-        style={{
-          backgroundColor: style.bg, color: style.fg,
-          padding: '1px 6px', borderRadius: 3,
-          fontSize: '0.75rem', fontFamily: 'monospace',
-        }}
-      >
-        {showIncomplete ? 'INCOMPLETE' : job.state}{tail}
-      </span>
-    </Tooltip>
-  )
-}
-
-// ── status dots ────────────────────────────────────────────────────────────
-// Two dots per card — iris job state + wandb run state. Replaces the old
-// italic distinction: colour shows each source's health, so a healthy run
-// reads as two green dots and an iris/wandb disagreement is visible at a
-// glance. A hollow dot = that source has nothing (e.g. no iris job).
-const DOT = {
-  green: '#22c55e', amber: '#f59e0b', blue: '#3b82f6',
-  orange: '#b4632a', red: '#ef4444', grey: '#6a737d',
-}
-
-function irisDotColor(job: IrisJob, incomplete: boolean): string {
-  switch (job.state) {
-    case 'RUNNING': return DOT.green
-    case 'PENDING':
-    case 'BUILDING': return DOT.amber
-    case 'SUCCEEDED': return incomplete ? DOT.orange : DOT.blue
-    case 'FAILED':
-    case 'WORKER_FAILED':
-    case 'UNSCHEDULABLE': return DOT.red
-    default: return DOT.grey // KILLED / unknown
-  }
-}
-
-// wandb's `state` lags, and a crashed run often never flips off "running" —
-// so a "running" run that hasn't logged in >10 min is treated as stale (grey).
-function wandbDotColor(state: string, logAgeSec: number | null): string {
-  if (state === 'running') {
-    return logAgeSec != null && logAgeSec < 600 ? DOT.green : DOT.grey
-  }
-  if (state === 'finished') return DOT.blue
-  if (state === 'crashed' || state === 'failed') return DOT.red
-  return DOT.grey // killed / unknown
-}
-
-function Dot({ color, hollow, title }: { color?: string; hollow?: boolean; title: string }) {
-  return (
-    <Tooltip content={title}>
-      <span
-        style={{
-          display: 'inline-block', width: 9, height: 9, borderRadius: '50%',
-          flexShrink: 0,
-          backgroundColor: hollow ? 'transparent' : color,
-          border: hollow ? '1px solid #555' : 'none',
-        }}
-      />
-    </Tooltip>
-  )
-}
-
-function StatusDots({ job, manifest, incomplete, lastLogTs }: {
-  job: IrisJob | null
-  manifest: RunManifest | null
-  incomplete: boolean
-  lastLogTs: number | null
-}) {
-  const logAgeSec = lastLogTs != null ? Math.max(0, Date.now() / 1000 - lastLogTs) : null
-  const loggedStr = lastLogTs != null ? `last logged ${secsAgo(lastLogTs)}` : 'never logged'
-  return (
-    <span style={{ display: 'inline-flex', gap: 3, alignItems: 'center' }}>
-      {job
-        ? <Dot color={irisDotColor(job, incomplete)} title={`iris: ${job.state}`} />
-        : <Dot hollow title="iris: no job (e.g. a Modal run)" />}
-      {manifest
-        ? <Dot
-            color={wandbDotColor(manifest.run.state, logAgeSec)}
-            title={`wandb: ${manifest.run.state} · ${loggedStr}`}
-          />
-        : <Dot hollow title="wandb: no data yet" />}
-    </span>
-  )
-}
-
-// ── m-eval jobs ─────────────────────────────────────────────────────────────
-// m-eval (mat-NMAE) jobs are iris jobs named `tomat-eval-<run>-<set>-step-<N>`;
-// `evalJobsByRun` (api.ts) groups them per run. The chip surfaces only the
-// actionable states — in-flight or failed. Once every eval has finished, the
-// MT/MV numbers themselves are the signal, so the chip hides.
-function EvalChip({ jobs }: { jobs: EvalJob[] }) {
-  if (jobs.length === 0) return null
-  let flight = 0, failed = 0, done = 0
-  for (const ej of jobs) {
-    const p = evalPhase(ej.job)
-    if (p === 'flight') flight++
-    else if (p === 'failed') failed++
-    else done++
-  }
-  if (flight === 0 && failed === 0) return null
-  const label = flight > 0
-    ? `⏳ ${flight} m-eval${flight > 1 ? 's' : ''}`
-    : `⚠ ${failed} m-eval${failed > 1 ? 's' : ''} failed`
-  return (
-    <Tooltip content={`${jobs.length} m-eval job(s): ${flight} in flight · ${done} done · ${failed} failed`}>
-      <span style={{
-        backgroundColor: flight > 0 ? '#d4a017' : '#cb2431', color: '#fff',
-        padding: '1px 6px', borderRadius: 3,
-        fontSize: '0.75rem', fontFamily: 'monospace',
-      }}>
-        {label}
-      </span>
-    </Tooltip>
-  )
-}
-
-// Parse run name into structured fields. Tolerant of unknown patterns: anything
-// we can't recognize lands in `extra`.
-interface RunMeta {
-  model: string | null      // "200M", "1B"
-  batchSize: number | null
-  lossType: string | null   // "emd-do", "ce"
-  targetSteps: string | null // "10k", "500"
-  hardware: string | null   // "v5p-16", "v6e-16", "H100×8"
-  hardwareKind: 'tpu-v5p' | 'tpu-v6e' | 'modal-gpu' | null
-  suffix: string | null     // "z3", "cont7k-ext", etc.
-}
-
-function parseRunName(name: string): RunMeta {
-  // train-full-<dataset>-<model>-bs<n>-<loss>-do-<steps>-<hw>-shuf1k-<suffix>
-  const m = name.match(
-    /^train-(?:full|cont)-(?:[a-z0-9-]+?-)?(\d+[MBK])-bs(\d+)-([a-z-]+?)-(?:do-)?(\d+k?|\d+)-([a-z0-9]+)(?:-shuf\d+k)?(?:-(.+))?$/i,
-  )
-  if (!m) {
-    return {
-      model: null, batchSize: null, lossType: null, targetSteps: null,
-      hardware: null, hardwareKind: null, suffix: name,
-    }
-  }
-  const [, model, bs, loss, steps, hwRaw, suffix] = m
-  let hw: string | null = null
-  let kind: RunMeta['hardwareKind'] = null
-  const hwLower = hwRaw.toLowerCase()
-  if (hwLower.startsWith('v5p')) { hw = `v5p-${hwLower.slice(3)}`; kind = 'tpu-v5p' }
-  else if (hwLower.startsWith('v6e')) { hw = `v6e-${hwLower.slice(3)}`; kind = 'tpu-v6e' }
-  else if (hwLower.startsWith('tpu')) { hw = `v6e-${hwLower.slice(3)}`; kind = 'tpu-v6e' }
-  // slice(5) skips e.g. "h100x" (5 chars) — slice(4) leaked the 'x' through
-  // giving "H100×x8" instead of "H100×8".
-  else if (hwLower.startsWith('h100x')) { hw = `H100×${hwLower.slice(5)}`; kind = 'modal-gpu' }
-  else if (hwLower.startsWith('h200x')) { hw = `H200×${hwLower.slice(5)}`; kind = 'modal-gpu' }
-  else if (hwLower.startsWith('b200x')) { hw = `B200×${hwLower.slice(5)}`; kind = 'modal-gpu' }
-  return {
-    model, batchSize: parseInt(bs, 10),
-    lossType: loss === 'emd-do' ? 'EMD density-only'
-      : loss === 'l1-do' ? 'L1 density-only'
-      : loss === 'ce' ? 'CE'
-      : loss,
-    targetSteps: steps,
-    hardware: hw, hardwareKind: kind,
-    suffix: suffix ?? null,
-  }
-}
-
-const HW_COLORS: Record<NonNullable<RunMeta['hardwareKind']>, string> = {
-  'tpu-v5p': '#7c4dff',
-  'tpu-v6e': '#00838f',
-  'modal-gpu': '#f57c00',
-}
-
-function timeAgo(iso: string): string {
-  const t = new Date(iso).getTime()
-  if (!isFinite(t)) return ''
-  const sec = (Date.now() - t) / 1000
-  if (sec < 60) return `${Math.round(sec)}s ago`
-  if (sec < 3600) return `${Math.round(sec / 60)}m ago`
-  if (sec < 86400) return `${(sec / 3600).toFixed(1)}h ago`
-  return `${(sec / 86400).toFixed(1)}d ago`
-}
-
-interface RunCardData {
-  id: string
-  manifest: RunManifest | null
-  job: IrisJob | null
-  history: RunHistory | null
-  evalJobs: EvalJob[]
-  color: string
-  err: string | null
-}
-
-/** Compact "← from <parent> @ step-N" chip on each run card. Renders nothing
- *  when the run has no recorded lineage entry in `RUN_LINEAGE`. Click behaviour:
- *   - if the parent's card is currently in the DOM (visible / not filtered
- *     out), scroll-into-view it (no filter-state mutation);
- *   - else, if we know the parent's wandb URL, open that in a new tab;
- *   - else, no-op (the chip's still informative as text). */
-function ParentChip({
-  runId, parentWandbUrl, onScrollToParent,
-}: {
-  runId: string
-  parentWandbUrl: string | null
-  onScrollToParent: (parentId: string) => boolean
-}) {
-  const lin = lineageFor(runId)
-  if (!lin) return null
-  const stepTail = lin.parent_step != null ? ` @ step-${lin.parent_step}` : ''
-  const tipBase = `resumed from ${shortLabel(lin.parent)}${stepTail}`
-  const tip = parentWandbUrl
-    ? `${tipBase}. Click to scroll to the parent's card (or open its wandb).`
-    : `${tipBase}. Click to scroll to the parent's card.`
-  return (
-    <Tooltip content={tip}>
-      <a
-        href={parentWandbUrl ?? '#'}
-        onClick={(e) => {
-          if (isModifiedClick(e)) return
-          // Don't bubble: the card body's onClick toggles pin.
-          e.stopPropagation()
-          e.preventDefault()
-          const scrolled = onScrollToParent(lin.parent)
-          if (!scrolled && parentWandbUrl) {
-            window.open(parentWandbUrl, '_blank', 'noopener')
-          }
-        }}
-        style={{
-          fontSize: '0.7rem',
-          fontFamily: 'monospace',
-          color: '#9aa6c2',
-          textDecoration: 'none',
-          background: 'rgba(120,140,200,0.10)',
-          border: '1px solid rgba(120,140,200,0.30)',
-          borderRadius: 10,
-          padding: '1px 8px',
-        }}>
-        ← {shortLabel(lin.parent)}{stepTail}
-      </a>
-    </Tooltip>
-  )
-}
-
 interface CardProps {
   data: RunCardData
   activeRunId: string | null
@@ -451,72 +75,17 @@ interface CardProps {
 }
 
 function RunCard({ data, activeRunId, pinnedRunId, parentWandbUrl, onHover, onClick, onScrollTargetRef, onScrollToParent }: CardProps) {
-  const { id, manifest, job, history, evalJobs, color, err } = data
+  const { id, color } = data
   // `color` matches the run's timeline-plot trace. Used as a left accent bar
   // (and active-state border) so the card is visually tied to its plot line.
   const isActive = activeRunId === id
   const isPinned = pinnedRunId === id
   const otherActive = activeRunId != null && !isActive
-  const incomplete = isIncomplete(data)
-  // wandb's run state can sit at "running" long after a Modal job has died
-  // (it never flushed a terminal state). Treat a "running" run that hasn't
-  // logged in >10min as stale — so the badge greys instead of reading green.
-  const lastLogTs = manifest?.history.ts_max ?? null
-  const wandbStale = manifest?.run.state === 'running'
-    && lastLogTs != null && (Date.now() / 1000 - lastLogTs) >= 600
   const cardRef = useRef<HTMLDivElement | null>(null)
   useEffect(() => {
     onScrollTargetRef(id, cardRef.current)
     return () => onScrollTargetRef(id, null)
   }, [id, onScrollTargetRef])
-
-  const meta = parseRunName(id)
-  const hwColor = meta.hardwareKind ? HW_COLORS[meta.hardwareKind] : '#888'
-  const wbUrl = manifest?.run.url
-  // Prefer `trainer.num_train_steps` from the manifest config (authoritative,
-  // reflects most-recent resume target) over the run-name parse (which freezes
-  // the *original* target — e.g. cont7k-ext was named …-8k but is now resumed
-  // to 80k, so the name says "8k" while the trainer is targeting 80k).
-  const trainerNumSteps = numTrainStepsOf(manifest)
-  const targetSteps = trainerNumSteps ?? (meta.targetSteps ? parseTargetSteps(meta.targetSteps) : null)
-  const targetLabel = trainerNumSteps != null
-    ? formatStepCount(trainerNumSteps)
-    : (meta.targetSteps ?? null)
-  // Steps completed. Levanter's `global_step` is 0-indexed — a finished
-  // N-step run ends at `global_step = N-1` — so "steps done" is that + 1.
-  // Showing `global_step` raw is the confusing "79,999 / 80k" off-by-one.
-  // (Read from the run summary, not `history.step_max`, which is wandb's
-  // `_step` log-counter — a different quantity.)
-  const gsRaw = manifest?.summary['global_step']
-  const lastGlobalStep = typeof gsRaw === 'number' ? gsRaw : null
-  const stepsDone = lastGlobalStep != null
-    ? (targetSteps != null
-        ? Math.min(lastGlobalStep + 1, targetSteps)
-        : lastGlobalStep + 1)
-    : null
-  const progressPct = stepsDone != null && targetSteps != null
-    ? Math.min(100, (stepsDone / targetSteps) * 100)
-    : null
-  const trainLoss = manifest?.summary['train/loss']
-  const evalLoss = manifest?.summary['eval/loss']
-  const mfu = manifest?.summary['throughput/mfu']
-  // MT/MV — latest mat-NMAE on the {train,val}_200 snapshots. Stored already
-  // as a percentage (cont7k-ext logs 1.73 = 1.73%), so display as-is — no ×100.
-  const mtNmae = manifest?.summary['eval/mat_nmae/train_200/mean']
-  const mvNmae = manifest?.summary['eval/mat_nmae/val_200/mean']
-  const nEpochs = nEpochsOf(manifest)
-  const nFlops = nFlopsOf(manifest)
-
-  const sparkPts = useMemo(() => history ? recentStepPoints(history) : [], [history])
-  const lastTs = sparkPts.length > 0 ? sparkPts[sparkPts.length - 1].x : null
-  const freshSec = lastTs != null ? Math.max(0, Date.now() / 1000 - lastTs) : null
-
-  // "Steps in last 1m / 1h / 6h" — anchored to the latest log timestamp (so a
-  // run that logged its last step 2 min ago still reports its 1m rate from
-  // when it was actually stepping).
-  const rate1m = useMemo(() => history ? stepsInWindow(history, 60) : null, [history])
-  const rate1h = useMemo(() => history ? stepsInWindow(history, 3600) : null, [history])
-  const rate6h = useMemo(() => history ? stepsInWindow(history, 6 * 3600) : null, [history])
 
   return (
     <div
@@ -538,9 +107,6 @@ function RunCard({ data, activeRunId, pinnedRunId, parentWandbUrl, onHover, onCl
         marginBottom: '0.6rem',
         backgroundColor: '#181818',
         cursor: 'pointer',
-        display: 'grid',
-        gridTemplateColumns: '1fr auto',
-        gap: '0.5rem 1rem',
         overflow: 'hidden',
         transition: 'border-color 100ms, box-shadow 100ms',
         boxShadow: isPinned ? `0 0 0 2px ${color}`
@@ -565,179 +131,28 @@ function RunCard({ data, activeRunId, pinnedRunId, parentWandbUrl, onHover, onCl
         backgroundColor: 'rgba(24,24,24,0.6)', pointerEvents: 'none', zIndex: 2,
         opacity: otherActive ? 1 : 0, transition: 'opacity 100ms',
       }} />
-      <div style={{ minWidth: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
-          {isPinned && (
-            <Tooltip content="pinned — the plot is soloed + rescaled to this run; click the card again to unpin">
-              <span>📌</span>
-            </Tooltip>
-          )}
-          <StatusDots
-            job={job}
-            manifest={manifest}
-            incomplete={incomplete}
-            lastLogTs={lastLogTs}
-          />
-          {job && <IrisBadge job={job} incomplete={incomplete} />}
-          {!job && manifest && (
-            // No iris job (e.g. a Modal run) → fall back to wandb's run state.
-            // The status dots mark the source; a "running" run gone stale
-            // (no logs in >10min) shows greyed as STALE rather than green.
-            <Tooltip content={wandbStale
-              ? `wandb says running, but last logged ${secsAgo(lastLogTs!)} — likely dead`
-              : `wandb state (no iris job): ${manifest.run.state}`}>
-              <span
-                style={{
-                  backgroundColor: wandbStale
-                    ? '#6a737d' : (WANDB_STATE_BG[manifest.run.state] ?? '#555'),
-                  color: '#fff', padding: '1px 6px', borderRadius: 3,
-                  fontSize: '0.75rem', fontFamily: 'monospace',
-                }}>
-                {wandbStale ? 'STALE' : manifest.run.state.toUpperCase()}
-              </span>
-            </Tooltip>
-          )}
-          <a
-            href={`#/runs/${id}`}
-            onClick={(e) => {
-              if (isModifiedClick(e)) return
-              e.preventDefault()
-              navigate(`runs/${id}`)
-            }}
-            style={{ fontFamily: 'monospace', fontSize: '0.9rem' }}
-          >
-            {id}
-          </a>
-          {wbUrl && (
-            <Tooltip content="open this run in wandb">
-              <a href={wbUrl} target="_blank" rel="noreferrer"
-                style={{ fontSize: '0.75rem', color: '#888' }}>
-                wandb ↗
-              </a>
-            </Tooltip>
-          )}
-          <EvalChip jobs={evalJobs} />
-          <ParentChip
-            runId={id}
-            parentWandbUrl={parentWandbUrl ?? null}
-            onScrollToParent={onScrollToParent}
-          />
-        </div>
-        <div style={{ marginTop: '0.4rem', fontSize: '0.8rem', color: '#ccc',
-                      display: 'flex', flexWrap: 'wrap', gap: '0.4rem 0.9rem' }}>
-          {meta.hardware && (
-            <span><span style={{ color: hwColor, fontWeight: 600 }}>{meta.hardware}</span></span>
-          )}
-          {meta.model && <span>{meta.model}</span>}
-          {meta.batchSize && <span>BS={meta.batchSize}</span>}
-          {meta.lossType && <span>{meta.lossType}</span>}
-          {targetLabel && (
-            <Tooltip content={trainerNumSteps != null ? 'trainer.num_train_steps (authoritative)' : 'parsed from run name'}>
-              <span>target {targetLabel}</span>
-            </Tooltip>
-          )}
-          {meta.suffix && <span style={{ color: '#888' }}>· {meta.suffix}</span>}
-        </div>
-        <div style={{ marginTop: '0.3rem', fontSize: '0.75rem', color: '#888' }}>
-          {manifest && (
-            <>
-              created {timeAgo(manifest.run.created_at)}
-              {manifest.history.ts_max != null && (
-                <>
-                  {' · '}
-                  <span style={{
-                    color: freshnessColor(
-                      Math.max(0, Date.now() / 1000 - manifest.history.ts_max)),
-                  }}>
-                    logged {secsAgo(manifest.history.ts_max)}
-                  </span>
-                </>
-              )}
-              {' · '}synced {timeAgo(manifest.synced_at)}
-              {manifest.run.entity && manifest.run.project && (
-                <> · {manifest.run.entity}/{manifest.run.project}</>
-              )}
-            </>
-          )}
-          {err && <span style={{ color: 'crimson' }}>err: {err}</span>}
-        </div>
-      </div>
-      <div style={{ minWidth: 200, fontSize: '0.8rem', color: '#ccc', textAlign: 'right' }}>
-        {/* Top: step counter + progress bar */}
-        {stepsDone != null && (
-          <div>
-            {/* Once complete (steps done == target) just show it once,
-                compact — "step 80k" rather than "step 80,000 / 80k". */}
-            {stepsDone === targetSteps && targetLabel
-              ? <>step <b>{targetLabel}</b></>
-              : <>step <b>{stepsDone.toLocaleString()}</b>{targetLabel ? ` / ${targetLabel}` : ''}</>}
-            {progressPct != null && (
-              <div style={{
-                height: 4, marginTop: 4, backgroundColor: '#333', borderRadius: 2,
-              }}>
-                <div style={{
-                  width: `${progressPct}%`, height: '100%',
-                  backgroundColor: hwColor, borderRadius: 2,
-                }} />
-              </div>
-            )}
-          </div>
-        )}
-        {/* Sparkline: step vs wallclock over last 6h. Flat = preempt/restart. */}
-        {sparkPts.length >= 2 && freshSec != null && (
-          <div style={{ marginTop: 6, display: 'flex', justifyContent: 'flex-end',
-                        alignItems: 'center', gap: 6 }}>
-            <Tooltip content={`last log: ${new Date(lastTs! * 1000).toLocaleString()}`}>
-              <span
-                style={{
-                  fontSize: '0.68rem', color: freshnessColor(freshSec),
-                  fontFamily: 'monospace',
-                }}>
-                ● {secsAgo(lastTs!)}
-              </span>
-            </Tooltip>
-            <Sparkline pts={sparkPts} color={freshnessColor(freshSec)} />
-          </div>
-        )}
-        {/* Step-rate over last 1m / 1h / 6h. Anchored to last log timestamp
-            (a run that died 2m ago shows steps in the 1m before that). */}
-        {(rate1m != null || rate1h != null || rate6h != null) && (
-          <Tooltip content="steps in last 1m / 1h / 6h, ending at latest log">
-            <div style={{ marginTop: 2, fontFamily: 'monospace', fontSize: '0.7rem',
-                          color: '#aaa' }}>
-              {rate1m != null && <>+{rate1m}/min</>}
-              {rate1h != null && <> · +{rate1h.toLocaleString()}/h</>}
-              {rate6h != null && <> · +{rate6h.toLocaleString()}/6h</>}
-            </div>
+      {isPinned && (
+        // Card-only chrome: the pin icon (anchored top-left, past the accent).
+        // RunHeaderRich is shared with the detail page and doesn't carry pin
+        // state, so the icon lives out here in the card body.
+        <div style={{
+          position: 'absolute', left: 10, top: 8, zIndex: 4,
+          fontSize: '0.9rem',
+        }}>
+          <Tooltip content="pinned — the plot is soloed + rescaled to this run; click the card again to unpin">
+            <span>📌</span>
           </Tooltip>
-        )}
-        {/* Latest summary metrics */}
-        <div style={{ marginTop: 4, fontFamily: 'monospace', fontSize: '0.72rem' }}>
-          {typeof trainLoss === 'number' && <>tr {trainLoss.toFixed(3)}</>}
-          {typeof evalLoss === 'number' && <> · ev {evalLoss.toFixed(3)}</>}
-          {typeof mfu === 'number' && <> · MFU {mfu.toFixed(1)}%</>}
-          {typeof mtNmae === 'number' && <> · MT {mtNmae.toFixed(2)}%</>}
-          {typeof mvNmae === 'number' && <> · MV {mvNmae.toFixed(2)}%</>}
-          {nEpochs != null && <> · {nEpochs.toFixed(2)} ep</>}
-          {nFlops != null && <> · {formatFlops(nFlops)} FLOP</>}
         </div>
+      )}
+      <div style={{ marginLeft: isPinned ? 22 : 0 }}>
+        <RunHeaderRich
+          data={data}
+          parentWandbUrl={parentWandbUrl}
+          onScrollToParent={onScrollToParent}
+        />
       </div>
     </div>
   )
-}
-
-function parseTargetSteps(s: string): number {
-  // "10k" → 10000, "500" → 500
-  const m = s.match(/^(\d+)(k|K)?$/)
-  if (!m) return Number.POSITIVE_INFINITY
-  return parseInt(m[1], 10) * (m[2] ? 1000 : 1)
-}
-
-/** Compact step count: 80000 → "80k", 1234 → "1,234". */
-function formatStepCount(n: number): string {
-  if (n >= 1000 && n % 1000 === 0) return `${n / 1000}k`
-  if (n >= 10000) return `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k`
-  return n.toLocaleString()
 }
 
 // Genuinely executing right now: iris RUNNING, or a job-less run (e.g. Modal)
@@ -754,95 +169,10 @@ function isQueued(c: RunCardData): boolean {
   return c.job?.state === 'PENDING' || c.job?.state === 'BUILDING'
 }
 
-/** Authoritative step target: `trainer.num_train_steps` from the run config. */
-function numTrainStepsOf(manifest: RunManifest | null): number | null {
-  const v = (manifest?.run.config as Record<string, unknown> | undefined)?.trainer
-  if (v && typeof v === 'object' && 'num_train_steps' in v) {
-    const n = (v as { num_train_steps?: unknown }).num_train_steps
-    if (typeof n === 'number' && n > 0) return n
-  }
-  return null
-}
-
-// ── n_epochs / n_flops ──────────────────────────────────────────────────────
-// Sequences per epoch (Levanter cache `total_num_rows`), keyed by data label —
-// the `cache/<label>/` segment of `config.data.cache_dir`. From each cache's
-// `train/shard_ledger.json`. TODO: fold into the manifest so a new data label
-// doesn't need a code change here.
-const EPOCH_SEQUENCES: Record<string, number> = {
-  'train-full-v3': 4954176,
-}
-
-/** Data label (tokenization) of a run — the `cache/<label>/` path segment. */
-function dataLabelOf(manifest: RunManifest | null): string | null {
-  const data = (manifest?.run.config as Record<string, unknown> | undefined)?.data
-  const cd = data && typeof data === 'object'
-    ? (data as { cache_dir?: unknown }).cache_dir : undefined
-  if (typeof cd !== 'string') return null
-  const m = cd.match(/\/cache\/([^/]+)\/?$/)
-  return m ? m[1] : null
-}
-
-/** Tokens trained on so far (`throughput/total_tokens` from the run summary). */
-function totalTokensOf(manifest: RunManifest | null): number | null {
-  const t = manifest?.summary['throughput/total_tokens']
-  return typeof t === 'number' && t > 0 ? t : null
-}
-
-/** Forward+backward FLOPs — the standard 6·N·D estimate (N params, D tokens). */
-function nFlopsOf(manifest: RunManifest | null): number | null {
-  const n = manifest?.summary['parameter_count']
-  const tok = totalTokensOf(manifest)
-  if (typeof n !== 'number' || tok == null) return null
-  return 6 * n * tok
-}
-
-/** Passes over the training set = tokens / (epoch_sequences · seq_len).
- *  Null when the data label's epoch size isn't in EPOCH_SEQUENCES. */
-function nEpochsOf(manifest: RunManifest | null): number | null {
-  const tok = totalTokensOf(manifest)
-  const label = dataLabelOf(manifest)
-  const seqLen = (manifest?.run.config as Record<string, unknown> | undefined)?.train_seq_len
-  if (tok == null || label == null || typeof seqLen !== 'number' || seqLen <= 0) return null
-  const epochSeqs = EPOCH_SEQUENCES[label]
-  if (!epochSeqs) return null
-  return tok / (epochSeqs * seqLen)
-}
-
-/** FLOP count → "1.1e20". */
-function formatFlops(f: number): string {
-  const exp = Math.floor(Math.log10(f))
-  return `${(f / 10 ** exp).toFixed(1)}e${exp}`
-}
-
-/** Tokenizer generation, from the authoritative wandb project name
- *  (`tomat-…-P14` = v2 patch tokenizer, `…-P19` = v3). The run *name* is not
- *  reliable — some `train-full-v3-…` runs trained on v2 data (project P14). */
-function tokenizerGen(manifest: RunManifest | null): 'v2' | 'v3' | null {
-  const p = manifest?.run.project ?? ''
-  if (/P14/.test(p)) return 'v2'
-  if (/P19/.test(p)) return 'v3'
-  return null
-}
-
 /** v2 (P14) runs are obsolete + a recurring source of `train-full-v3-…`
  *  mislabel confusion — hide them from the dashboard entirely. */
 function isV2Run(c: RunCardData): boolean {
   return tokenizerGen(c.manifest) === 'v2'
-}
-
-// iris reports SUCCEEDED whenever the job process exits 0 — including a run
-// that was preempted and shut down cleanly on SIGTERM. So a "SUCCEEDED" run
-// that never reached its step target is really incomplete + inactive (iris
-// will not re-enqueue it). Flag that so it doesn't read as a healthy finish.
-function isIncomplete(c: RunCardData): boolean {
-  if (c.job?.state !== 'SUCCEEDED') return false
-  // `global_step` is 0-indexed (a finished N-step run ends at N-1), so steps
-  // completed = global_step + 1; "incomplete" = that falls short of target.
-  const gs = c.manifest?.summary['global_step']
-  const lastGlobalStep = typeof gs === 'number' ? gs : null
-  const target = numTrainStepsOf(c.manifest)
-  return lastGlobalStep != null && target != null && lastGlobalStep + 1 < target
 }
 
 // Hide noisy/stale runs from the dashboard. Bare-names list for now — graduate
@@ -1464,8 +794,20 @@ function RunDetail({ runId }: { runId: string }) {
   }, [evalQ.data])
   const errObj = manifestQ.error || historyQ.error
   const err = errObj ? String(errObj) : null
-  const nEpochs = nEpochsOf(manifest)
-  const nFlops = nFlopsOf(manifest)
+
+  // Build a RunCardData for the shared header. iris job lookup mirrors the
+  // index view's `cards: ... irisJobIdForRun(id)`. The color isn't shown on
+  // the detail page's outer chrome (no accent bar), but the header doesn't
+  // use it directly — leave it as a neutral colour for prop-shape parity.
+  const headerData: RunCardData = {
+    id: runId,
+    manifest,
+    job: irisQ.data?.jobs[irisJobIdForRun(runId)] ?? null,
+    history,
+    evalJobs,
+    color: '#888',
+    err,
+  }
 
   return (
     <div style={{ maxWidth: 1600, margin: '2rem auto', padding: '0 1rem' }}>
@@ -1481,20 +823,19 @@ function RunDetail({ runId }: { runId: string }) {
           ← runs
         </a>
       </p>
-      <h1 style={{ fontSize: '1.2rem', fontFamily: 'monospace' }}>{runId}</h1>
-      {err && <p style={{ color: 'crimson' }}>error: {err}</p>}
-      {manifest && (
-        <div style={{ color: '#888', fontSize: '0.9rem', marginBottom: '1rem' }}>
-          state: {manifest.run.state} ·{' '}
-          history: {manifest.history.rows} rows, steps [
-          {manifest.history.step_min ?? '-'}, {manifest.history.step_max ?? '-'}] ·{' '}
-          synced: {manifest.synced_at}
-          {nEpochs != null && <> · {nEpochs.toFixed(2)} epochs</>}
-          {nFlops != null && <> · {formatFlops(nFlops)} FLOPs</>}
-          {' · '}
-          <a href={manifest.run.url} target="_blank" rel="noreferrer">wandb ↗</a>
-        </div>
-      )}
+      <div style={{
+        // Match the card's chrome (border + padding + dark bg) so the detail
+        // header reads as "the same block as the pinned card" — the user can
+        // see at a glance that it's the same data, just at the top of a
+        // different page.
+        border: '1px solid #2a2a2a',
+        borderRadius: 6,
+        padding: '0.8rem 1rem',
+        marginBottom: '1rem',
+        backgroundColor: '#181818',
+      }}>
+        <RunHeaderRich data={headerData} linkRunName={false} />
+      </div>
       {(evalJobs.length > 0 || evalByStep.size > 0) && (
         <EvalJobsTable jobs={evalJobs} evalByStep={evalByStep} />
       )}

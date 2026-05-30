@@ -29,13 +29,18 @@ interface Props {
   history: RunHistory
   evalSeries: RunEval | null
   runId: string
+  /** Initial x-axis mode when the URL has no `?x=…`. Defaults to `'step'`
+   *  for the run-detail page (training-progress is the obvious x for a
+   *  single-run view); callers using this on a multi-run context can
+   *  override to `'wallclock'` or `'elapsed'`. */
+  defaultXMode?: UrlXMode
 }
 
 type XMode = 'time' | 'elapsed' | 'step'
 
 // URL-facing x-axis mode names (`?x=wallclock|elapsed|step`). The internal
 // XMode uses `'time'` for the wallclock axis; `wallclock` reads better in
-// shared links. Default is `wallclock` to preserve current behaviour.
+// shared links.
 type UrlXMode = 'wallclock' | 'elapsed' | 'step'
 const URL_X_MODES = ['wallclock', 'elapsed', 'step'] as const
 const X_TO_URL: Record<XMode, UrlXMode> = { time: 'wallclock', elapsed: 'elapsed', step: 'step' }
@@ -76,11 +81,12 @@ const TZ_LABEL: string = (() => {
   }
 })()
 
-export function WallclockPlot({ history, evalSeries, runId }: Props) {
+export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step' }: Props) {
   const { isDark } = useTheme()
   // `?x=wallclock|elapsed|step` — URL-persisted so deep-links carry the view
-  // choice. Default `wallclock` to preserve pre-URL behaviour.
-  const [urlXMode, setUrlXMode] = useUrlState('x', enumParam<UrlXMode>('wallclock', URL_X_MODES))
+  // choice. The run-detail page defaults to `'step'` (training progress is
+  // the obvious x for a single run); callers can override.
+  const [urlXMode, setUrlXMode] = useUrlState('x', enumParam<UrlXMode>(defaultXMode, URL_X_MODES))
   const xMode: XMode = URL_TO_X[urlXMode]
   const setXMode = (m: XMode) => setUrlXMode(X_TO_URL[m])
   const { timestamps, cols } = history
