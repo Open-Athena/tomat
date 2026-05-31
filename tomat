@@ -1919,7 +1919,8 @@ def _latest_ckpt_step(run_label: str, bucket: str = GCS_BUCKET) -> int | None:
 @click.option("--pyspy/--no-pyspy", default=False, help="TOMAT_PYSPY=1 → trainer daemon-dumps py-spy stacks to GCS every TOMAT_PYSPY_INTERVAL s (default 60). Use for diagnosing host-side stalls (the 65s/step v5p issue).")
 @click.option("--pyspy-interval", default=60, type=int, help="TOMAT_PYSPY_INTERVAL seconds between py-spy dumps (default 60).")
 @click.option("--pyspy-record-seconds", default=0, type=int, help="TOMAT_PYSPY_RECORD_SECONDS > 0 switches from `py-spy dump` (text) to `py-spy record` (flame-graph SVG) of that length per cycle.")
-@click.option("-f", "--force", is_flag=True, help="allow from-scratch overwrite of existing results dir")
+@click.option("-f", "--force", is_flag=True, help="allow from-scratch overwrite of existing results dir. By itself, refuses when the run is COMPLETED (latest ckpt step ≥ --steps target) — common footgun: iris kept retrying a finished run because each clean exit counted as a failure; --force would silently wipe a 10k-step ckpt. Pass `--force-completed` to override.")
+@click.option("--force-completed", "force_completed", is_flag=True, help="explicitly allow `--force` to wipe a results dir whose latest ckpt step ≥ --steps (i.e. the run is already complete). Required guard added 2026-05-30 after losing 10h v6e-16 of abs-ce-1 training to a blanket --force re-fire.")
 @click.option("-d", "--dry-run", is_flag=True, help="print iris cmd without firing")
 @click.option("--bucket", "bucket_override", default=None,
               help="override TOMAT_BUCKET (default = per-tpu-family region). Use when running a v5p/v6e job from a non-default region (e.g. firing v5p in us-east5 instead of us-central1). Ckpts go to <bucket>/results/.")
@@ -1963,6 +1964,7 @@ def train(
     pyspy_interval: int,
     pyspy_record_seconds: int,
     force: bool,
+    force_completed: bool,
     dry_run: bool,
     bucket_override: str | None,
     queue: bool,
@@ -2056,6 +2058,15 @@ def train(
         if latest is not None and not force:
             err(f"results dir for {label!r} already has step-{latest} ckpt at {bucket}; "
                 f"use --resume to continue, or --force to overwrite")
+            sys.exit(1)
+        if latest is not None and force and (latest + 1) >= steps and not force_completed:
+            err(f"refusing --force on {label!r}: run is already COMPLETED "
+                f"(step-{latest} → {latest + 1} steps done, target {steps}). "
+                f"Wiping a finished run loses ckpt + retraining cost. "
+                f"If you really want to redo it from scratch, pass "
+                f"--force-completed. If iris was retrying after completion "
+                f"(clean-exit cycles inflating the failure count), cancel "
+                f"the job instead: `tomat iris cancel {label}`.")
             sys.exit(1)
 
     wandb_key = os.environ.get("WANDB_API_KEY", "<WANDB_API_KEY>")
