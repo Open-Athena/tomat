@@ -1364,6 +1364,14 @@ def iris_sync(bucket: str, key: str, dry_run: bool,
                 continue
             state_full = row.get("state", "")  # e.g. "JOB_STATE_RUNNING"
             state = state_full.removeprefix("JOB_STATE_") if state_full else "UNKNOWN"
+            # `task_state_counts` is iris's per-state task histogram (keys are
+            # `task_state_friendly` strings: 'running', 'pending', 'building',
+            # 'completed', 'failed', 'killed', ...). Surface it raw — the dashboard
+            # uses it to disambiguate `RUNNING (1r/3p)` cascade-restart loops from
+            # genuine all-healthy RUNNING. Drop zero entries to keep the payload
+            # tight; the frontend treats missing keys as zero.
+            tsc_raw = row.get("task_state_counts") or {}
+            tsc = {k: int(v) for k, v in tsc_raw.items() if int(v) > 0}
             jobs[jid] = {
                 "state": state,
                 "state_code": 0,  # legacy; sql path filled this in
@@ -1375,6 +1383,7 @@ def iris_sync(bucket: str, key: str, dry_run: bool,
                 "started_at_ms": int((row.get("started_at") or {}).get("epoch_ms") or 0) or None,
                 "finished_at_ms": int((row.get("finished_at") or {}).get("epoch_ms") or 0) or None,
                 "num_tasks": int(row.get("task_count") or 0),
+                "task_state_counts": tsc,
             }
     payload = {
         "schema_version": 1,

@@ -149,6 +149,17 @@ export interface IrisJob {
   started_at_ms: number | null
   finished_at_ms: number | null
   num_tasks: number
+  /** Per-state task histogram, keyed by iris's `task_state_friendly`
+   *  strings: `running`, `pending`, `building`, `completed`, `failed`,
+   *  `killed`, `preempted`, ... Zero entries are dropped server-side;
+   *  treat missing keys as zero.
+   *
+   *  Critical for distinguishing "RUNNING (all 4 healthy)" from a
+   *  cascade-restart loop where job-level state says RUNNING but every
+   *  task is `pending` (briefly running per cycle, never long enough for
+   *  the job-level read). Optional: older snapshots written before this
+   *  field was added won't carry it. */
+  task_state_counts?: Record<string, number>
 }
 
 export interface IrisState {

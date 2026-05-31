@@ -104,6 +104,88 @@ const IRIS_STATE_STYLES: Record<string, { bg: string; fg: string }> = {
   UNSCHEDULABLE: { bg: '#cb2431', fg: '#fff' },
 }
 
+// Map iris task-state names → 1-letter abbreviations for the compact
+// per-task histogram chip (e.g. `RUNNING (1r/3p)` = 1 running, 3 pending).
+// Order here is the order we render — running first, then pending /
+// building (in-flight states), then terminal/failure states. Keys NOT in
+// this map fall back to their first letter (last-ditch fallback).
+const TASK_STATE_LETTER: Record<string, string> = {
+  running: 'r',
+  pending: 'p',
+  building: 'b',
+  completed: 'c',
+  failed: 'f',
+  killed: 'k',
+  preempted: 'x',
+  unschedulable: 'u',
+}
+const TASK_STATE_ORDER = [
+  'running', 'pending', 'building', 'completed',
+  'failed', 'killed', 'preempted', 'unschedulable',
+]
+
+/** Render the per-task-state histogram tail like ` (1r/3p)`. Returns ''
+ *  when every task is in the job-level state (so the badge stays clean
+ *  for the all-healthy case). Returns '' too when the snapshot pre-dates
+ *  `task_state_counts`. */
+function taskStateTail(job: IrisJob): string {
+  const tsc = job.task_state_counts
+  if (!tsc) return ''
+  const entries = Object.entries(tsc).filter(([, v]) => v > 0)
+  if (entries.length === 0) return ''
+  // All-healthy: job is RUNNING and every task is also running. Skip the tail.
+  if (job.state === 'RUNNING'
+      && entries.length === 1
+      && entries[0][0] === 'running'
+      && entries[0][1] === job.num_tasks) {
+    return ''
+  }
+  // Same idea for terminal states: if every task matches the job state,
+  // the chip would be redundant noise. (PENDING/BUILDING jobs typically
+  // have N pending/building tasks; collapse those too.)
+  const jobStateLower = job.state.toLowerCase()
+  if (entries.length === 1
+      && entries[0][0] === jobStateLower
+      && entries[0][1] === job.num_tasks) {
+    return ''
+  }
+  const parts: string[] = []
+  const seen = new Set<string>()
+  for (const k of TASK_STATE_ORDER) {
+    const v = tsc[k]
+    if (v && v > 0) {
+      parts.push(`${v}${TASK_STATE_LETTER[k] ?? k[0]}`)
+      seen.add(k)
+    }
+  }
+  // Any leftover (unknown) states — show with first-letter fallback.
+  for (const [k, v] of entries) {
+    if (!seen.has(k) && v > 0) {
+      parts.push(`${v}${TASK_STATE_LETTER[k] ?? k[0]}`)
+    }
+  }
+  return parts.length > 0 ? ` (${parts.join('/')})` : ''
+}
+
+/** Verbose tooltip line: `tasks: 4 pending` etc. */
+function taskStateLine(job: IrisJob): string {
+  const tsc = job.task_state_counts
+  if (!tsc) return ''
+  const entries = Object.entries(tsc).filter(([, v]) => v > 0)
+  if (entries.length === 0) return ''
+  // Render in our canonical order, then any leftovers alphabetically.
+  const sorted: [string, number][] = []
+  const seen = new Set<string>()
+  for (const k of TASK_STATE_ORDER) {
+    const v = tsc[k]
+    if (v && v > 0) { sorted.push([k, v]); seen.add(k) }
+  }
+  for (const [k, v] of [...entries].sort()) {
+    if (!seen.has(k) && v > 0) sorted.push([k, v])
+  }
+  return `tasks (${job.num_tasks}): ` + sorted.map(([k, v]) => `${v} ${k}`).join(', ')
+}
+
 export function IrisBadge({ job, incomplete }: { job: IrisJob; incomplete?: boolean }) {
   // `incomplete`: iris says SUCCEEDED but the run stopped well short of its
   // step target — almost always a preemption whose clean SIGTERM exit (0)
@@ -113,13 +195,33 @@ export function IrisBadge({ job, incomplete }: { job: IrisJob; incomplete?: bool
   const style = showIncomplete
     ? { bg: '#b4632a', fg: '#fff' }
     : IRIS_STATE_STYLES[job.state] ?? { bg: '#888', fg: '#fff' }
-  const tail = job.preempts > 0 || job.failures > 0
-    ? ` (p=${job.preempts}, f=${job.failures})` : ''
+  // Compact per-task-state histogram. Replaces the old `(p=N, f=M)`
+  // preemption/failure counters — those still appear in the tooltip but
+  // are noisy on the badge itself once a run has churned for hours.
+  // Falls back to the old `(p,f)` format when `task_state_counts` is
+  // missing (older snapshots) so nothing regresses.
+  const stateTail = taskStateTail(job)
+  const legacyTail = stateTail
+    ? ''
+    : (job.preempts > 0 || job.failures > 0
+       ? ` (p=${job.preempts}, f=${job.failures})` : '')
+  const tail = stateTail || legacyTail
+  const tooltipParts: string[] = []
+  if (showIncomplete) {
+    tooltipParts.push(
+      `iris reported SUCCEEDED, but the run ended early — likely preempted `
+      + `with a clean SIGTERM exit. iris will not re-enqueue it.`,
+    )
+  } else if (job.error) {
+    tooltipParts.push(job.error)
+  } else {
+    tooltipParts.push(`iris state=${job.state}`)
+  }
+  const taskLine = taskStateLine(job)
+  if (taskLine) tooltipParts.push(taskLine)
+  tooltipParts.push(`preempts=${job.preempts} failures=${job.failures}`)
   return (
-    <Tooltip content={showIncomplete
-      ? `iris reported SUCCEEDED, but the run ended early — likely preempted with a clean SIGTERM exit. `
-        + `iris will not re-enqueue it. preempts=${job.preempts} failures=${job.failures}`
-      : (job.error || `iris state=${job.state} preempts=${job.preempts} failures=${job.failures}`)}>
+    <Tooltip content={tooltipParts.join(' · ')}>
       <span
         style={{
           backgroundColor: style.bg, color: style.fg,
@@ -144,7 +246,17 @@ export const DOT = {
 
 function irisDotColor(job: IrisJob, incomplete: boolean): string {
   switch (job.state) {
-    case 'RUNNING': return DOT.green
+    case 'RUNNING': {
+      // Cascade-restart: job-level state lingers on RUNNING because some
+      // task is briefly RUNNING each cycle, but the per-task histogram says
+      // 0 are actually running. Drop to amber so the dot doesn't lie.
+      const tsc = job.task_state_counts
+      if (tsc && job.num_tasks > 0) {
+        const running = tsc.running ?? 0
+        if (running === 0) return DOT.amber
+      }
+      return DOT.green
+    }
     case 'PENDING':
     case 'BUILDING': return DOT.amber
     case 'SUCCEEDED': return incomplete ? DOT.orange : DOT.blue
@@ -192,7 +304,15 @@ function StatusDots({ job, manifest, incomplete, lastLogTs }: {
   return (
     <span style={{ display: 'inline-flex', gap: 3, alignItems: 'center' }}>
       {job
-        ? <Dot color={irisDotColor(job, incomplete)} title={`iris: ${job.state}`} />
+        ? <Dot
+            color={irisDotColor(job, incomplete)}
+            title={(() => {
+              const lines = [`iris: ${job.state}`]
+              const tl = taskStateLine(job)
+              if (tl) lines.push(tl)
+              return lines.join(' · ')
+            })()}
+          />
         : <Dot hollow title="iris: no job (e.g. a Modal run)" />}
       {manifest
         ? <Dot
