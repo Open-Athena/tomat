@@ -2989,5 +2989,248 @@ def cost(prefix: str, filter_re: str):
     print(" multiply chips × wall-clock manually. Auto-summing TBD.)")
 
 
+@cli.group("marin")
+def marin_grp():
+    """Manage the marin-* (marin/levanter/iris/...) SHA pin in marin/pyproject.toml."""
+
+
+_MARIN_PIN_RE = re.compile(
+    r'^(marin-\S+\s*=\s*\{\s*git\s*=\s*"https://github\.com/marin-community/marin",\s*rev\s*=\s*")[0-9a-f]{40}(",\s*subdirectory\s*=\s*"lib/\S+"\s*\})\s*$',
+    re.MULTILINE,
+)
+
+
+def _read_current_marin_pin() -> str:
+    """Read the current pinned SHA from marin/pyproject.toml. Asserts all 7
+    marin-* lines pin the same SHA (which they always have)."""
+    txt = (MARIN_DIR / "pyproject.toml").read_text()
+    shas = re.findall(r'rev = "([0-9a-f]{40})"', txt)
+    if not shas:
+        raise click.ClickException("no marin-* SHA pins found in marin/pyproject.toml")
+    if len(set(shas)) > 1:
+        raise click.ClickException(f"marin-* pins disagree (found {len(set(shas))} distinct SHAs); fix manually")
+    return shas[0]
+
+
+def _rewrite_marin_pin(new_sha: str) -> int:
+    """In-place rewrite all marin-* SHA pins. Returns number of lines changed."""
+    pyp = MARIN_DIR / "pyproject.toml"
+    txt = pyp.read_text()
+    new_txt, n = _MARIN_PIN_RE.subn(rf"\g<1>{new_sha}\g<2>", txt)
+    if n == 0:
+        raise click.ClickException("no marin-* pin lines matched the rewrite regex; file format may have changed")
+    pyp.write_text(new_txt)
+    return n
+
+
+def _resolve_marin_sha(sha: str) -> str:
+    """Resolve 'latest', a branch name, or a short SHA to a full 40-char SHA
+    via `gh api`. Raises if the ref doesn't exist."""
+    ref = "main" if sha == "latest" else sha
+    r = subprocess.run(
+        ["gh", "api", f"repos/marin-community/marin/commits/{ref}", "--jq", ".sha"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        raise click.ClickException(f"gh api failed to resolve marin-community/marin@{ref}: {r.stderr.strip()}")
+    full = r.stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", full):
+        raise click.ClickException(f"unexpected gh api response for {ref}: {full!r}")
+    return full
+
+
+@marin_grp.command("status")
+def marin_status():
+    """Show the current marin-* pin, the latest upstream main SHA, and
+    how many commits we're behind."""
+    cur = _read_current_marin_pin()
+    print(f"current pin: {cur}")
+    r = subprocess.run(
+        ["gh", "api", f"repos/marin-community/marin/compare/{cur}...main",
+         "--jq", "{behind: .behind_by, ahead: .ahead_by, latest: .merge_base_commit.sha}"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        err(f"gh api compare failed: {r.stderr.strip()}")
+        return
+    info = json.loads(r.stdout)
+    latest = _resolve_marin_sha("latest")
+    print(f"latest main: {latest}")
+    # gh api `compare/{base}...{head}` returns ahead_by = commits head has
+    # that base doesn't = how many commits "main" is ahead of our pin.
+    print(f"behind main: {info.get('ahead', '?')} commits  (commits in main we don't have — bump candidates)")
+    print(f"ahead of main: {info.get('behind', '?')} commits  (should be 0; non-zero = we've diverged)")
+
+
+def _fire_smoke_and_wait(
+    label: str,
+    tpu: str,
+    steps: int,
+    timeout_s: int,
+    poll_s: int = 30,
+) -> bool:
+    """Fire a `tomat train` smoke and poll iris until it (a) emits a clear
+    pass signal (task RUNNING for ≥60s, OR wandb shows step ≥ 1), (b) any
+    task FAILS, or (c) timeout elapses.
+
+    Returns True on success, False otherwise.
+    """
+    import time
+    # Fire the smoke. Use --max-retries 0 so any failure surfaces immediately
+    # (we want to catch real bugs, not retry past them).
+    fire_cmd = [
+        sys.executable, str(PROJECT_ROOT / "tomat"),
+        "train", label,
+        "--steps", str(steps),
+        "--tpu", tpu,
+        "--force",
+        "--no-watch-preempts",
+        "--max-retries", "0",
+        "--queue",  # wait for capacity
+        "--queue-poll", "60",
+    ]
+    err(f"[marin bump] firing: {' '.join(fire_cmd[1:])}")
+    fire_log = PROJECT_ROOT / "tmp" / f"marin-bump-fire-{label}.log"
+    fire_log.parent.mkdir(parents=True, exist_ok=True)
+    with fire_log.open("w") as f:
+        fire = subprocess.run(fire_cmd, stdout=f, stderr=subprocess.STDOUT)
+    if fire.returncode != 0:
+        err(f"[marin bump] `tomat train` exited {fire.returncode}; see {fire_log}")
+        return False
+
+    err(f"[marin bump] smoke submitted; polling every {poll_s}s up to {timeout_s}s …")
+    deadline = time.time() + timeout_s
+    last_state = ""
+    running_since = None
+    while time.time() < deadline:
+        time.sleep(poll_s)
+        # Pull summary
+        r = subprocess.run(
+            [IRIS_BIN, "job", "summary", label],
+            capture_output=True, text=True, timeout=60,
+        )
+        out = strip_iris_log(r.stdout)
+        # Check for FAILED task with non-zero exit (the bug we want to catch)
+        if re.search(r"^\s*\d+\s+failed", out, re.MULTILINE):
+            err(f"[marin bump] task FAILED — JAX-init-style bug or other smoke fault")
+            err(f"  tail of fire log: {fire_log}")
+            err(f"  iris logs:        ./tomat iris logs {label} -n 100")
+            return False
+        # Check for RUNNING task that's been alive ≥60s (signal: JAX init OK)
+        # `iris job summary` lines look like:
+        #   TASK  STATE    EXIT  DURATION   PEAK MEM  CUR MEM   ERROR
+        #      0  running  -     0:02:13    ...
+        for m in re.finditer(r"^\s*\d+\s+running\s+\S+\s+(\d+):(\d+):(\d+)", out, re.MULTILINE):
+            hh, mm, ss = (int(x) for x in m.groups())
+            dur_s = hh * 3600 + mm * 60 + ss
+            if dur_s >= 60:
+                err(f"[marin bump] task running for {dur_s}s — smoke ✓ (passed JAX init)")
+                return True
+            running_since = dur_s
+        # Show one-line progress
+        state = "pending"
+        if "running" in out:
+            state = f"running ({running_since}s)" if running_since else "running"
+        elif "pending" in out:
+            state = "pending"
+        if state != last_state:
+            err(f"[marin bump] state: {state}")
+            last_state = state
+    err(f"[marin bump] timed out after {timeout_s}s; current state: {last_state}")
+    err(f"  ./tomat iris summary {label}")
+    return False
+
+
+@marin_grp.command("bump")
+@click.argument("sha")
+@click.option("--smoke/--no-smoke", "smoke", default=True,
+              help="fire a quick iris job after `uv sync` to verify the new pin runs on real TPU before letting you commit. (Default on — this is the whole point of the cmd.)")
+@click.option("-c", "--commit", "auto_commit", is_flag=True,
+              help="auto-`git commit` the pin change + uv.lock after smoke passes. Off by default — print git-add cmd + leave WT dirty for review.")
+@click.option("--smoke-tpu", default="v6e-8", show_default=True,
+              help="TPU pool for the smoke run; should be the smallest available so capacity is easy to grab.")
+@click.option("--smoke-steps", default=50, show_default=True, type=int,
+              help="`tomat train --steps` for the smoke. We cancel as soon as the task has been RUNNING ≥60s, so this just bounds the worst case.")
+@click.option("--smoke-timeout", default=1800, show_default=True, type=int,
+              help="overall smoke deadline in seconds, INCLUDING queueing time. Default 30 min.")
+def marin_bump(sha: str, smoke: bool, auto_commit: bool,
+               smoke_tpu: str, smoke_steps: int, smoke_timeout: int):
+    """Bump the marin-* SHA pin in marin/pyproject.toml, verify on real TPU,
+    and (optionally) commit.
+
+    Designed to catch dep-bump regressions in ~5 min, instead of after
+    multiple multi-hour real runs fail (cf. 2026-05-30 JAX-distributed-init
+    surprise that killed 6 jobs).
+
+    SHA can be a full 40-char SHA, a short SHA (≥7), a branch name, or the
+    literal `latest` (resolves to upstream main HEAD).
+
+    On success:
+      1. Rewrites all 7 marin-* SHA refs in marin/pyproject.toml
+      2. `uv sync` in marin/  (fails fast if dep resolution breaks)
+      3. Fires `tomat train smoke-<sha7>` on smallest TPU
+      4. Polls iris until task is RUNNING ≥60s (= JAX init survived)
+      5. Cancels the smoke (no need to burn TPU once init is verified)
+      6. Optionally `git commit`s the change
+
+    On failure (any step), leaves the WT dirty so you can debug.
+
+    Examples:
+      tomat marin bump latest                # bump to upstream main, smoke, leave dirty
+      tomat marin bump latest -c             # bump + smoke + auto-commit
+      tomat marin bump 7115c21d --no-smoke   # bump only, no real-TPU verify
+    """
+    import time
+    full_sha = _resolve_marin_sha(sha)
+    old_sha = _read_current_marin_pin()
+    if old_sha == full_sha:
+        err(f"[marin bump] pin already at {full_sha[:7]} — nothing to do")
+        return
+
+    err(f"[marin bump] {old_sha[:7]} → {full_sha[:7]}")
+    n = _rewrite_marin_pin(full_sha)
+    err(f"[marin bump] rewrote {n} pin lines in marin/pyproject.toml")
+
+    err(f"[marin bump] uv sync in {MARIN_DIR}…")
+    sync = subprocess.run(["uv", "sync"], cwd=MARIN_DIR)
+    if sync.returncode != 0:
+        err(f"[marin bump] uv sync FAILED — pin change left in place. Inspect:")
+        err(f"  git diff marin/pyproject.toml")
+        sys.exit(1)
+
+    if smoke:
+        label = f"smoke-{full_sha[:7]}"
+        t0 = time.time()
+        ok = _fire_smoke_and_wait(label, smoke_tpu, smoke_steps, smoke_timeout)
+        dt = int(time.time() - t0)
+        if not ok:
+            err(f"[marin bump] SMOKE FAILED (after {dt}s) — pin change left in place for debug")
+            sys.exit(1)
+        err(f"[marin bump] smoke passed (took {dt}s, including queueing)")
+        err(f"[marin bump] cancelling smoke job to free the TPU …")
+        cancel = subprocess.run([IRIS_BIN, "job", "cancel", label],
+                                capture_output=True, text=True, timeout=60)
+        if cancel.returncode != 0:
+            err(f"[marin bump] WARNING: cancel exited {cancel.returncode}: {cancel.stderr.strip()}")
+            err(f"  Run manually: {IRIS_BIN} job cancel {label}")
+
+    if auto_commit:
+        err(f"[marin bump] committing pin change …")
+        subprocess.run(["git", "add", "marin/pyproject.toml", "marin/uv.lock"],
+                       cwd=PROJECT_ROOT, check=True)
+        msg_lines = [f"marin: bump pin {old_sha[:7]} → {full_sha[:7]}"]
+        if smoke:
+            msg_lines.append(f"")
+            msg_lines.append(f"Verified via `tomat marin bump` smoke on {smoke_tpu}:")
+            msg_lines.append(f"  ./tomat iris logs smoke-{full_sha[:7]} -n 100")
+        msg = "\n".join(msg_lines)
+        subprocess.run(["git", "commit", "-m", msg], cwd=PROJECT_ROOT, check=True)
+    else:
+        err(f"[marin bump] done. Review then commit:")
+        err(f"  git diff marin/pyproject.toml marin/uv.lock")
+        err(f"  git add marin/pyproject.toml marin/uv.lock")
+        err(f"  git commit -m 'marin: bump pin {old_sha[:7]} → {full_sha[:7]}'")
+
+
 if __name__ == "__main__":
     cli()
