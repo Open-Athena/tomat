@@ -8,6 +8,7 @@
  *   GET  /api/runs/:id/raw.parquet       — full history parquet
  *   GET  /api/runs/:id/eval.json         — per-step mat-NMAE/NEMD series (both mat-sets)
  *   GET  /api/iris-state.json            — iris snapshot (synced by tomat iris sync)
+ *   GET  /api/iris-attempts/:label.json  — per-task per-attempt history (death events) for one training run
  *   GET  /api/files/list?prefix=&cursor= — generic R2 list (under FILES_PREFIX allow-list)
  *   GET  /api/files/get?path=…           — generic R2 get with Range support
  *   GET  /health
@@ -461,6 +462,15 @@ export default {
 		if (path === '/api/iris-state.json') {
 			// Static R2 object updated out-of-band by `tomat iris sync`.
 			return serveR2Object(req, env, 'tomat/iris-state.json');
+		}
+
+		// /api/iris-attempts/<label>.json — per-task attempt history sidecar,
+		// emitted alongside iris-state.json by the same `tomat iris sync` pass.
+		// Drives the death-cause vlines + % training chip on /runs/<label>.
+		const attemptsMatch = path.match(/^\/api\/iris-attempts\/([^/]+)\.json$/);
+		if (attemptsMatch) {
+			const [, label] = attemptsMatch;
+			return serveR2Object(req, env, `tomat/iris-attempts/${label}.json`);
 		}
 
 		// /api/runs/:id/<file>

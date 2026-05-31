@@ -1208,6 +1208,45 @@ _IRIS_JOB_STATE = {
 }
 
 
+def _iris_attempts_dump(job_id: str, tail: int = 0, timeout: int = 90) -> dict | None:
+    """Invoke `scripts/iris_attempts_dump.py` via marin's venv python.
+
+    The helper registers a custom `attempts-dump` subcommand on iris's own
+    Click group, which inherits all of iris's `--cluster=marin` /
+    controller-URL / token-provider setup automatically. See its docstring.
+
+    Returns the parsed payload, or `None` on subprocess failure (so a single
+    bad label doesn't break a sweep across all training runs in `iris sync`).
+    """
+    helper = PROJECT_ROOT / "scripts" / "iris_attempts_dump.py"
+    py = str(MARIN_DIR / ".venv" / "bin" / "python")
+    cmd = [py, str(helper), "--cluster=marin", "attempts-dump",
+           "--tail", str(tail), job_id]
+    t0 = time.monotonic()
+    try:
+        r = subprocess.run(cmd, cwd=str(MARIN_DIR), capture_output=True,
+                           text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        err(f"[iris-attempts {job_id}] TIMEOUT after {timeout}s")
+        return None
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    err(f"[iris-attempts {job_id} {elapsed_ms}ms]"
+        + (" SLOW" if elapsed_ms > 10_000 else ""))
+    if r.returncode != 0:
+        err(f"iris attempts dump failed for {job_id}: rc={r.returncode}\n{r.stderr[-500:]}")
+        return None
+    # iris log lines may precede the JSON.
+    i = r.stdout.find("{")
+    if i < 0:
+        err(f"iris attempts dump for {job_id}: no JSON in stdout")
+        return None
+    try:
+        return json.loads(r.stdout[i:])
+    except json.JSONDecodeError as e:
+        err(f"iris attempts dump for {job_id}: JSON decode failed: {e}")
+        return None
+
+
 def _iris_query_json(sql: str, timeout: int = 60) -> list[dict]:
     """Run a controller SQL query and parse the JSON result.
 
@@ -1253,16 +1292,65 @@ def _iris_job_list_json(prefix: str, timeout: int = 60) -> list[dict]:
     return json.loads(strip_iris_log(r.stdout).strip())
 
 
+# Regex mirrors site/src/runs/RunsPage.tsx :: `trainingRunIdFromIrisJob`.
+# Used by `iris sync` to decide which parent jobs warrant a per-label
+# attempts sidecar (training runs only — not the m-eval / tomat-eval
+# sidecar jobs, which would just bloat the snapshot).
+TRAINING_JOB_RE = re.compile(r"^/[^/]+/(train-[^/]+)$")
+
+
+@iris_grp.command("attempts")
+@click.argument("label")
+@click.option("-o", "--out", default=None,
+              help="write JSON here (default: stdout)")
+@click.option("-t", "--tail", default=0, type=int,
+              help="recent log lines per task (default 0 → skip log fetch; "
+              "bug-report defaults to 50, but logs are slow and not needed)")
+def iris_attempts(label: str, out: str | None, tail: int):
+    """Dump per-attempt history for an iris job, as JSON.
+
+    LABEL is either a full job id (`/ryan/train-mg-tz-11`) or just the
+    trailing label (`train-mg-tz-11`, expanded to `/ryan/train-mg-tz-11`).
+
+    Output shape mirrors iris's `AttemptReport` dataclass, with epoch_ms
+    fields added for direct JS consumption. See `scripts/iris_attempts_dump.py`
+    for the schema.
+    """
+    job_id = label if label.startswith("/") else f"/{IRIS_USER}/{label}"
+    payload = _iris_attempts_dump(job_id, tail=tail)
+    if payload is None:
+        sys.exit(1)
+    data = json.dumps(payload, indent=1)
+    if out:
+        Path(out).write_text(data + "\n")
+        err(f"[iris attempts] {job_id} → {out}")
+    else:
+        print(data)
+
+
 @iris_grp.command("sync")
 @click.option("-b", "--bucket", default=R2_BUCKET, help="R2 bucket")
 @click.option("-k", "--key", default="tomat/iris-state.json", help="R2 key")
 @click.option("-d", "--dry-run", is_flag=True, help="print the JSON without uploading")
-def iris_sync(bucket: str, key: str, dry_run: bool):
+@click.option("--no-attempts", is_flag=True,
+              help="skip the per-training-job attempts sidecar fetch+upload")
+@click.option("--attempts-prefix", default="tomat/iris-attempts",
+              help="R2 prefix for per-label attempts sidecars")
+@click.option("--attempts-workers", default=6, type=int,
+              help="parallel `iris attempts-dump` invocations (each opens its "
+              "own controller tunnel; keep modest to spare the controller)")
+def iris_sync(bucket: str, key: str, dry_run: bool,
+              no_attempts: bool, attempts_prefix: str, attempts_workers: int):
     """Snapshot iris job state for /ryan/{tomat,train,eval}/* parent jobs → R2.
 
     Powers the iris-state column on tomat.oa.dev/runs. Uses `iris job list
     --json` over RPC per prefix — SAFE to run on a cadence (e.g. cron every
     minute). The prior SQL-based version was banned for controller load.
+
+    Also writes one `tomat/iris-attempts/<label>.json` sidecar per training
+    job (`/ryan/train-*`), with per-attempt death timestamps + causes from
+    iris's bug-report machinery. Skipped by `--no-attempts` (useful when
+    iterating only the state index).
     """
     jobs: dict[str, dict] = {}
     for prefix in DEFAULT_IRIS_PREFIXES:
@@ -1298,9 +1386,40 @@ def iris_sync(bucket: str, key: str, dry_run: bool):
     print(f"[iris sync] {len(jobs)} jobs → s3://{bucket}/{key} ({len(data)} bytes)")
     if dry_run:
         print(data.decode())
+    else:
+        _r2_put_bytes(bucket, key, data, "application/json")
+        print(f"[iris sync] {R2_ENDPOINT}/{bucket}/{key}")
+
+    if no_attempts:
         return
-    _r2_put_bytes(bucket, key, data, "application/json")
-    print(f"[iris sync] {R2_ENDPOINT}/{bucket}/{key}")
+
+    # Per-label attempts sidecars. Only training runs (`/ryan/train-*`); the
+    # `tomat-eval-*` and other sidecar jobs aren't shown on the runs dashboard
+    # so per-attempt detail for them would just waste R2 + controller cycles.
+    training_jids = sorted(j for j in jobs if TRAINING_JOB_RE.match(j))
+    print(f"[iris sync] {len(training_jids)} training jobs → "
+          f"per-label attempts sidecars under s3://{bucket}/{attempts_prefix}/")
+    if not training_jids:
+        return
+
+    n_ok = n_fail = 0
+    with ThreadPoolExecutor(max_workers=max(1, attempts_workers)) as ex:
+        futures = {ex.submit(_iris_attempts_dump, jid, 0): jid for jid in training_jids}
+        for fut in as_completed(futures):
+            jid = futures[fut]
+            payload = fut.result()
+            if payload is None:
+                n_fail += 1
+                continue
+            label = payload.get("label") or jid.removeprefix(f"/{IRIS_USER}/")
+            key_i = f"{attempts_prefix}/{label}.json"
+            data_i = json.dumps(payload, indent=1).encode("utf-8")
+            if dry_run:
+                err(f"[iris sync] dry-run: would upload {len(data_i)}B to {key_i}")
+            else:
+                _r2_put_bytes(bucket, key_i, data_i, "application/json")
+            n_ok += 1
+    print(f"[iris sync] attempts sidecars: {n_ok} uploaded, {n_fail} failed")
 
 
 @iris_grp.command("ls")
