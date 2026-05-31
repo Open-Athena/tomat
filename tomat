@@ -645,6 +645,36 @@ def runs_links(substr: str | None, limit: int, md: bool):
             print()
 
 
+def _trim_to_latest_trajectory(rows: list[dict]) -> list[dict]:
+    """Drop rows from abandoned trajectories before a `global_step` reset.
+
+    `rows` must already be sorted by `_timestamp` (the call site does this).
+    Walk in time-order, find the LAST index where `global_step` decreased
+    vs the previous non-null `global_step` row — that's the start of a fresh
+    training trajectory (caused by `--force`, a wandb-resume that reset, etc.).
+    Keep only rows from that index onward.
+
+    No reset detected → no change. Single trajectory → no change.
+    """
+    if not rows:
+        return rows
+    last_restart = 0
+    prev_gs: int | float | None = None
+    for i, row in enumerate(rows):
+        gs = row.get("global_step")
+        if gs is None:
+            continue
+        if prev_gs is not None and gs < prev_gs:
+            last_restart = i
+        prev_gs = gs
+    if last_restart == 0:
+        return rows
+    err(f"[sync] trajectory reset detected at row {last_restart}/{len(rows)}: "
+        f"dropping {last_restart} rows from abandoned trajectories "
+        f"(common after --force re-fire)")
+    return rows[last_restart:]
+
+
 def _run_parquet_arrow_schema():
     """Lazy-build the per-run history parquet schema (pyarrow). Mirrors
     `_RUN_PARQUET_KEYS` order. `_step` is non-null; everything else nullable."""
@@ -815,6 +845,13 @@ def runs_sync(substr: str, bucket: str, prefix: str, project: str | None, dry_ru
         err(f"  [sync] {r.project}: +{len(rows) - before} rows")
     # Order merged rows by _timestamp so plots-over-time read naturally.
     rows.sort(key=lambda d: (d.get("_timestamp") or 0, d.get("_step") or 0))
+    # Drop rows from abandoned trajectories. `--force` re-fires (or other
+    # restart-from-step-0 events) leave wandb with TWO interleaved histories
+    # for the same run id: the original ascending global_step trajectory,
+    # then a fresh one starting back from 0. The dashboard plots are
+    # unreadable with both overlaid. Detect the LAST `global_step` decrease
+    # in time-order and keep only rows from there onward.
+    rows = _trim_to_latest_trajectory(rows)
     err(f"[sync] pulled {len(rows)} merged history rows")
     r = primary  # downstream code reads `r.name`, `r.url`, etc.
 
@@ -839,6 +876,28 @@ def runs_sync(substr: str, bucket: str, prefix: str, project: str | None, dry_ru
     step_col = table.column("_step")
     ts_col = table.column("_timestamp")
     summary = dict(r.summary)
+    # Latest *training* step. Two reasons we can't just read summary.global_step:
+    #   1. `summary.global_step` is logged only at ckpt-save / eval-end boundaries
+    #      (every ~500 steps for fresh-from-scratch runs), so for a run actively
+    #      training between boundaries it's stale (or missing entirely if the
+    #      run hasn't hit the first ckpt yet).
+    #   2. `summary._step` IS in summary but is wandb's auto log-counter,
+    #      bumped by EVERY `wandb.log(...)` including unrelated `cluster/*`
+    #      preempt-watch pings — so it overcounts the actual training step.
+    # The parquet history's `global_step` column is the truth: dense training-
+    # step values logged with each `train/loss` row. Carry the max into the
+    # manifest so cards on /runs show real progress on fresh running runs.
+    gs_col = (table.column("global_step")
+              if "global_step" in table.schema.names else None)
+    last_train_step: int | None = None
+    if gs_col is not None and table.num_rows:
+        # Reverse-scan for the last non-null global_step (the most recent
+        # training-step row, even if eval rows have been emitted after it).
+        gs_arr = gs_col.to_pylist()
+        for v in reversed(gs_arr):
+            if v is not None:
+                last_train_step = int(v)
+                break
     manifest = {
         "schema_version": _RUN_PARQUET_SCHEMA_VERSION,
         "synced_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -855,6 +914,7 @@ def runs_sync(substr: str, bucket: str, prefix: str, project: str | None, dry_ru
             "rows": table.num_rows,
             "step_min": int(step_col[0].as_py()) if table.num_rows else None,
             "step_max": int(step_col[-1].as_py()) if table.num_rows else None,
+            "last_train_step": last_train_step,
             "ts_min": float(ts_col[0].as_py()) if table.num_rows and ts_col[0].is_valid else None,
             "ts_max": float(ts_col[-1].as_py()) if table.num_rows and ts_col[-1].is_valid else None,
         },

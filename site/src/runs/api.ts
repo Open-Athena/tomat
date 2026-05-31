@@ -46,6 +46,12 @@ export interface RunManifest {
     rows: number
     step_min: number | null
     step_max: number | null
+    /** Latest non-null `global_step` from the history parquet. Authoritative
+     *  training-step counter — populated even when `summary.global_step` is
+     *  missing (fresh runs that haven't hit their first ckpt boundary).
+     *  Optional: older manifests synced before this field was added won't
+     *  carry it. */
+    last_train_step?: number | null
     ts_min: number | null
     ts_max: number | null
   }

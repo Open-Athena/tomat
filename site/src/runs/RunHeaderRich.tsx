@@ -416,17 +416,27 @@ export function RunHeaderRich({
   const targetLabel = trainerNumSteps != null
     ? formatStepCount(trainerNumSteps)
     : (meta.targetSteps ?? null)
-  // Steps completed. Levanter's `global_step` is 0-indexed — a finished
-  // N-step run ends at `global_step = N-1` — so "steps done" is that + 1.
-  // Showing `global_step` raw is the confusing "79,999 / 80k" off-by-one.
-  // (Read from the run summary, not `history.step_max`, which is wandb's
-  // `_step` log-counter — a different quantity.)
+  // Steps completed. Three possible sources, in order of preference:
+  //   1. `history.last_train_step` — max non-null `global_step` from the
+  //      parquet's train-step rows. Updated EVERY sync from the parquet
+  //      column, so it's current even between ckpt boundaries.
+  //      Authoritative; preferred. Optional on older manifests.
+  //   2. `summary.global_step` — Levanter's training step from wandb summary.
+  //      Only updated on ckpt save / eval-end, so stale or missing on
+  //      runs that haven't hit their first ckpt boundary yet.
+  //   3. `summary._step` — wandb's auto log counter. AVOID: bumped by
+  //      `cluster/*` preempt-watch pings too, so it overcounts real training
+  //      progress for runs whose training has stalled or hasn't started.
+  // Both (1) and (2) are 0-indexed (Levanter convention) so we display +1.
+  const ltsRaw = manifest?.history?.last_train_step
   const gsRaw = manifest?.summary['global_step']
-  const lastGlobalStep = typeof gsRaw === 'number' ? gsRaw : null
-  const stepsDone = lastGlobalStep != null
-    ? (targetSteps != null
-        ? Math.min(lastGlobalStep + 1, targetSteps)
-        : lastGlobalStep + 1)
+  const lastGlobalStep =
+    typeof ltsRaw === 'number' ? ltsRaw
+    : typeof gsRaw === 'number' ? gsRaw
+    : null
+  const stepsDoneRaw = lastGlobalStep != null ? lastGlobalStep + 1 : null
+  const stepsDone = stepsDoneRaw != null
+    ? (targetSteps != null ? Math.min(stepsDoneRaw, targetSteps) : stepsDoneRaw)
     : null
   const progressPct = stepsDone != null && targetSteps != null
     ? Math.min(100, (stepsDone / targetSteps) * 100)

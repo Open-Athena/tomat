@@ -181,17 +181,62 @@ def _r2_get_parquet_rows(s3, key: str) -> list[dict]:
     return pq.read_table(io.BytesIO(obj["Body"].read())).to_pylist()
 
 
+def _trim_to_latest_trajectory(rows: list[dict]) -> list[dict]:
+    """Drop rows from abandoned trajectories before a `global_step` reset.
+
+    Mirrors `tomat:_trim_to_latest_trajectory`. `rows` must be sorted by
+    `_step` ascending (the call site does this). Walk in order, find the
+    LAST index where `global_step` decreased vs the prior non-null gstep
+    row — that's a fresh-from-scratch restart (e.g. `tomat train --force`
+    after a previous attempt logged progress). Keep only rows from there
+    onward. No restart detected → no change.
+    """
+    if not rows:
+        return rows
+    last_restart = 0
+    prev_gs = None
+    for i, row in enumerate(rows):
+        gs = row.get("global_step")
+        if gs is None:
+            continue
+        if prev_gs is not None and gs < prev_gs:
+            last_restart = i
+        prev_gs = gs
+    if last_restart == 0:
+        return rows
+    print(f"[sync] trajectory reset at row {last_restart}/{len(rows)}: "
+          f"dropping {last_restart} pre-restart rows",
+          file=sys.stderr)
+    return rows[last_restart:]
+
+
 def _history_block(table) -> dict:
-    """The `history` sub-dict of a manifest, derived from the parquet table."""
+    """The `history` sub-dict of a manifest, derived from the parquet table.
+
+    `last_train_step` = max non-null `global_step` (Levanter's training-step
+    counter, logged with each train/loss row). Dashboard uses it for the
+    "step X / Yk" card display — has to come from the parquet because
+    `summary.global_step` only updates at ckpt boundaries, and `summary._step`
+    overcounts (it's wandb's auto log-counter, bumped by cluster/* pings too).
+    """
     if table.num_rows == 0:
         return {"rows": 0, "step_min": None, "step_max": None,
+                "last_train_step": None,
                 "ts_min": None, "ts_max": None}
     step_col = table.column("_step")
     ts_col = table.column("_timestamp")
+    last_train_step: int | None = None
+    if "global_step" in table.schema.names:
+        gs_arr = table.column("global_step").to_pylist()
+        for v in reversed(gs_arr):
+            if v is not None:
+                last_train_step = int(v)
+                break
     return {
         "rows": table.num_rows,
         "step_min": int(step_col[0].as_py()),
         "step_max": int(step_col[-1].as_py()),
+        "last_train_step": last_train_step,
         "ts_min": float(ts_col[0].as_py()) if ts_col[0].is_valid else None,
         "ts_max": float(ts_col[-1].as_py()) if ts_col[-1].is_valid else None,
     }
@@ -289,6 +334,7 @@ def sync_one_run(s3, run_name: str, copies: list) -> tuple[str, int, int]:
         rows = list(by_step.values())
 
     rows.sort(key=lambda d: d.get("_step") if d.get("_step") is not None else -1)
+    rows = _trim_to_latest_trajectory(rows)
 
     schema = run_parquet_schema()
     if rows:
