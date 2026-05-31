@@ -4,6 +4,7 @@ import { FilesPage } from './files/FilesPage'
 import { HomePage } from './HomePage'
 import { KbdShell } from './KbdSetup'
 import { RunsPage } from './runs/RunsPage'
+import { VoxelCorrPage } from './voxel-corr/VoxelCorrPage'
 import { parseHash, useHash } from './useHash'
 
 // Use the fork's `lib/index-basic.js` src-mode entry: bar + pie + calendars on
@@ -32,6 +33,8 @@ export function App() {
           <RunsPage parts={parts.slice(1)} />
         ) : route === 'files' ? (
           <FilesPage />
+        ) : route === 'voxel-corr' ? (
+          <VoxelCorrPage parts={parts.slice(1)} />
         ) : (
           <HomePage />
         )}

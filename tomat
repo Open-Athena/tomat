@@ -2945,6 +2945,149 @@ def wb_gql(query: str, var: tuple[str, ...]):
     print(json.dumps(out, indent=2))
 
 
+@cli.group("analyze")
+def analyze_grp():
+    """Offline analysis subcommands (corr matrices, post-hoc diagnostics)."""
+
+
+@analyze_grp.command("voxel-corr-blob")
+@click.option("-P", "--patch-size", "patch_size", type=int, default=19,
+              help="patch side P; P³ must match the .npz pred-axis dim")
+@click.option("-k", "--kind", type=click.Choice(["pred", "true", "residual"]), default="pred",
+              help="which series to correlate")
+@click.option("-o", "--out-dir", default="site/public/voxel-corr",
+              help="output dir; writes <run-label>.bin (int8 corr matrix), .json (1D curve + metadata)")
+@click.option("-l", "--run-label", default="cont33k",
+              help="frontend label / output basename (matches frontend route)")
+@click.argument("preds_dir")
+def analyze_voxel_corr_blob(
+    preds_dir: str,
+    patch_size: int,
+    kind: str,
+    out_dir: str,
+    run_label: str,
+) -> None:
+    """Compute P³×P³ voxel-position corr matrix → int8 blob + JSON sidecar.
+
+    Stacks all `<preds_dir>/*.npz` predictions, computes the full corr matrix,
+    quantizes to int8 (corr ∈ [-1, 1] → [-127, 127]), and writes to
+    `<out-dir>/<run-label>.bin` (P³ × P³ bytes, row-major). Sidecar
+    `<run-label>.json` carries P, n_patches, the 1D offset curve, and the
+    int8↔float linear-scale factors so the frontend can decode.
+
+    Frontend (`site/src/voxel-corr/VoxelCorrPage.tsx`) loads the blob into a
+    Uint8Array, renders it into an offscreen ImageData (color-mapped), then
+    paints it to a visible canvas with CSS transform for zoom + pan.
+    """
+    import numpy as np
+
+    src = Path(preds_dir)
+    P = patch_size
+    P3 = P ** 3
+    files = sorted(src.glob("*.npz"))
+    if not files:
+        raise click.ClickException(f"no .npz files under {src}")
+
+    err = lambda *a, **kw: print(*a, file=sys.stderr, **kw)
+    err(f"[voxel-corr-blob] loading {len(files)} .npz files…")
+
+    if kind == "residual":
+        chunks_p, chunks_t = [], []
+        for f in files:
+            with np.load(f) as z:
+                chunks_p.append(z["pred"].astype(np.float32))
+                chunks_t.append(z["true"].astype(np.float32))
+        X = np.concatenate(chunks_p, axis=0) - np.concatenate(chunks_t, axis=0)
+    else:
+        chunks = []
+        for f in files:
+            with np.load(f) as z:
+                chunks.append(z[kind].astype(np.float32))
+        X = np.concatenate(chunks, axis=0)
+
+    n_patches = X.shape[0]
+    if X.shape[1] != P3:
+        raise click.ClickException(f"P³={P3} but data has {X.shape[1]} voxel positions")
+
+    err(f"[voxel-corr-blob] {n_patches} patches × {P3} positions ({kind}, P={P})")
+    err(f"[voxel-corr-blob] standardizing + computing corr matrix…")
+
+    mu = X.mean(axis=0, keepdims=True)
+    sd = X.std(axis=0, keepdims=True)
+    sd = np.where(sd < 1e-8, 1.0, sd)
+    Z = (X - mu) / sd
+    # Z.T @ Z / N — (P³, P³), ≈190 MB float32 at P=19.
+    C = (Z.T @ Z) / n_patches
+
+    err(f"[voxel-corr-blob] computing 1D offset curve…")
+    curve = np.zeros(P3, dtype=np.float32)
+    for k in range(P3):
+        curve[k] = float(np.mean(np.diagonal(C, offset=k)))
+
+    # Quantize to int8: clip to [-1, 1], then scale by 127.
+    err(f"[voxel-corr-blob] quantizing to int8…")
+    C_clip = np.clip(C, -1.0, 1.0)
+    C_int8 = np.round(C_clip * 127.0).astype(np.int8)
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    json_path = out / f"{run_label}.json"
+
+    # Gzip the raw int8 bytes — corr matrices are very compressible (smooth
+    # values + tail entropy), so we get ~50% off (47 MB → ~24 MB at -9).
+    # Frontend fetches `.bin.gzip` and decompresses via DecompressionStream.
+    #
+    # The `.gzip` extension (NOT `.gz`) is deliberate: Vite's static handler
+    # auto-sets `Content-Encoding: gzip` for `.gz` URLs, which causes the
+    # browser to auto-decompress on receipt — then our JS-side
+    # DecompressionStream tries to re-decompress already-decompressed bytes
+    # and crashes. Using `.gzip` keeps the server out of the loop and makes
+    # the load path portable across dev (Vite) and prod (CFP, GH Pages, etc.).
+    import gzip
+    raw = C_int8.tobytes(order="C")
+    bin_gz_path = out / f"{run_label}.bin.gzip"
+    with gzip.open(bin_gz_path, "wb", compresslevel=9) as gz:
+        gz.write(raw)
+    # Drop any stale uncompressed sibling so the frontend doesn't get confused.
+    for stale_name in (f"{run_label}.bin", f"{run_label}.bin.gz"):
+        stale = out / stale_name
+        if stale.exists():
+            stale.unlink()
+    err(f"[voxel-corr-blob] wrote {bin_gz_path} "
+        f"({bin_gz_path.stat().st_size / 1e6:.1f} MB, raw {len(raw) / 1e6:.1f} MB)")
+
+    metadata = {
+        "run_label": run_label,
+        "kind": kind,
+        "patch_size": P,
+        "n_voxels": P3,
+        "n_patches": int(n_patches),
+        "n_mats": len(files),
+        "int8_scale": 1.0 / 127.0,  # decoded = int8 * scale → float in [-1, 1]
+        "blob_compression": "gzip",
+        "blob_size": int(bin_gz_path.stat().st_size),
+        "curve": curve.tolist(),
+        "canonical_offsets": {
+            "1": "primary axis (k=1)",
+            str(P): f"secondary axis (k=P={P})",
+            str(P * P): f"tertiary axis (k=P²={P * P})",
+        },
+    }
+    json_path.write_text(json.dumps(metadata))
+    err(f"[voxel-corr-blob] wrote {json_path} "
+        f"({json_path.stat().st_size / 1e3:.1f} kB)")
+
+    print()
+    print("offset k  |  avg corr  |  note")
+    print("-" * 40)
+    for k in [1, P, P * P]:
+        if k < P3:
+            note = ("primary axis" if k == 1
+                    else f"secondary axis (+P)" if k == P
+                    else "tertiary axis (+P²)")
+            print(f"{k:>8d}  |  {curve[k]:>8.4f}  |  {note}")
+
+
 @cli.command("cost")
 @click.option("-p", "--prefix", default="/ryan", help="iris job prefix to inspect")
 @click.option("-f", "--filter", "filter_re", default="tomat|train-full|train-cont", help="regex on job name")

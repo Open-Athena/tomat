@@ -424,6 +424,122 @@ body.in-deck #root { max-width: none; padding: 0; margin: 0; }
   .token-layout,
   .token-example {
     max-width: 100%;
-    overflow: hidden;
   }
+}
+
+/* --- Voxel-corr page ----------------------------------------------------- */
+.voxel-corr-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.75rem 0 0.5rem;
+}
+.voxel-corr-controls select { font-family: inherit; padding: 0.2rem 0.4rem; }
+.voxel-corr-controls button {
+  font-family: inherit;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--border);
+  background: var(--card-bg);
+  color: var(--fg);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.voxel-corr-controls button:hover { background: var(--code-bg); }
+.voxel-corr-canvas-wrap {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  padding: 0.5rem 0;
+}
+/* Grid-laid container: x-ticks on top, y-ticks on left, canvas in cell. */
+.voxel-corr-axes {
+  display: grid;
+  grid-template-columns: 38px min(calc(100% - 38px), 720px);
+  grid-template-rows: 18px auto;
+  gap: 0;
+}
+.voxel-corr-axes .voxel-corr-canvas { grid-row: 2; grid-column: 2; }
+.voxel-corr-ruler {
+  position: relative;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.65rem;
+  color: var(--muted, #888);
+  user-select: none;
+}
+.voxel-corr-ruler-x { grid-row: 1; grid-column: 2; border-bottom: 1px solid var(--border); }
+.voxel-corr-ruler-y { grid-row: 2; grid-column: 1; border-right: 1px solid var(--border); }
+.voxel-corr-tick { position: absolute; line-height: 1; }
+.voxel-corr-ruler-x .voxel-corr-tick {
+  bottom: 0;
+  transform: translateX(-50%);
+  /* tick mark line */
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+}
+.voxel-corr-ruler-x .voxel-corr-tick::before {
+  content: '';
+  display: block;
+  width: 1px;
+  height: 4px;
+  background: var(--border);
+}
+.voxel-corr-ruler-x .voxel-corr-tick.is-p::before { background: #ff8a65; height: 4px; opacity: 0.55; }
+.voxel-corr-ruler-x .voxel-corr-tick.is-pp::before { background: #ffd54f; height: 9px; width: 1.5px; }
+.voxel-corr-ruler-x .voxel-corr-tick span { display: block; margin-bottom: 1px; }
+.voxel-corr-ruler-x .voxel-corr-tick.is-pp span { color: #ffd54f; font-weight: 600; }
+.voxel-corr-ruler-x .voxel-corr-tick.is-p span { color: #ff8a65; opacity: 0.75; }
+.voxel-corr-ruler-x .voxel-corr-tick.is-unlabeled span { display: none; }
+.voxel-corr-ruler-y .voxel-corr-tick {
+  right: 0;
+  transform: translateY(-50%);
+  height: auto;
+  display: flex;
+  flex-direction: row-reverse;
+  align-items: center;
+}
+.voxel-corr-ruler-y .voxel-corr-tick::before {
+  content: '';
+  display: block;
+  width: 4px;
+  height: 1px;
+  background: var(--border);
+}
+.voxel-corr-ruler-y .voxel-corr-tick.is-p::before { background: #ff8a65; width: 4px; opacity: 0.55; }
+.voxel-corr-ruler-y .voxel-corr-tick.is-pp::before { background: #ffd54f; width: 9px; height: 1.5px; }
+.voxel-corr-ruler-y .voxel-corr-tick span { display: block; margin-right: 3px; }
+.voxel-corr-ruler-y .voxel-corr-tick.is-pp span { color: #ffd54f; font-weight: 600; }
+.voxel-corr-ruler-y .voxel-corr-tick.is-p span { color: #ff8a65; opacity: 0.75; }
+.voxel-corr-ruler-y .voxel-corr-tick.is-unlabeled span { display: none; }
+.voxel-corr-canvas {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1 / 1;
+  image-rendering: pixelated;
+  border: 1px solid var(--border);
+  cursor: grab;
+  background: var(--card-bg);
+  touch-action: none;  /* let our wheel handler take touchpad pinch events on mobile */
+}
+.voxel-corr-canvas:active { cursor: grabbing; }
+.voxel-corr-cursor {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+  min-height: 1.3em;
+}
+.voxel-corr-floating-tt {
+  z-index: 1000;
+  background: #0f0f0f;
+  color: #ddd;
+  border: 1px solid #383838;
+  border-radius: 5px;
+  padding: 5px 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.74rem;
+  line-height: 1.35;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+  white-space: nowrap;
 }
