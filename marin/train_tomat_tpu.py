@@ -58,13 +58,17 @@ from pathlib import Path
 # Multihost-capable JAX init. Historically we called `jax.distributed.initialize()`
 # up-front here because Levanter's `WandbConfig.init` would call
 # `multihost_broadcast_sync` before jax was initialized and crash single-process
-# code paths. The new levanter / iris pin (rev 7115c21d) handles init itself
-# via `iris.runtime.jax_init.initialize_jax` (see `levanter/distributed.py`),
-# and our early call now silently fails AND poisons the XLA backend so
-# levanter's later attempt raises:
-#   RuntimeError: jax.distributed.initialize() must be called before any JAX
-#   calls that might initialise the XLA backend.
-# Skip our own call entirely; let levanter's init path run unmolested.
+# code paths. The new levanter / iris pin handles init itself via
+# `iris.runtime.jax_init.initialize_jax` (see `levanter/distributed.py`).
+# *Currently broken*: PR marin#5594 hoisted `from iris.runtime.jax_init import
+# initialize_jax as initialize_iris_jax` to module-top in
+# `levanter/distributed.py`; on TPU, something in that import chain touches
+# the XLA backend, so when levanter later calls `jax.distributed.initialize()`
+# we get `RuntimeError: jax.distributed.initialize() must be called before
+# any JAX calls that might initialise the XLA backend`. Filed upstream;
+# no local workaround works (calling init ourselves before the TPU coordinator
+# is up lands the JIT context on CPU and breaks at training time). For now,
+# the only fix is upstream.
 import jax  # noqa: F401
 
 # Monkey-patch PassthroughTokenizer.encode to handle non-numeric input — Levanter's
@@ -440,6 +444,16 @@ MODEL_PRESETS = {
 
 
 def main():
+    # JAX-init MUST happen before anything that materializes a JAX array (e.g.
+    # `hax.named(np_arr, Vocab)` inside `build_maskgit_loss_args`, which calls
+    # `jnp.asarray` and initializes the TPU XLA backend). JAX 0.9+ raises if
+    # `jax.distributed.initialize()` is called after the backend is touched,
+    # so we own the init timing here: by start-of-main() iris has set up the
+    # TPU coordinator, but our trainer code hasn't run any JAX yet.
+    # iris.runtime.jax_init.initialize_jax is idempotent (per OA-fork commit
+    # a9ea84d), so levanter's later call lands as a no-op.
+    from iris.runtime.jax_init import initialize_jax as _iris_initialize_jax
+    _iris_initialize_jax()
     _maybe_spawn_pyspy_daemon()
     label = os.environ.get("TOMAT_LABEL", "val-full")
     steps = int(os.environ.get("TOMAT_STEPS", "1000"))
