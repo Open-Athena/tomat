@@ -38,6 +38,7 @@ import datetime
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -460,6 +461,52 @@ def runs_nmae(substr: str, sets: str):
             ne_s = fmt(ne) if ne is not None else "  -  "
             line += f"  {fmt(d.get(s + '/mean'))}/{fmt(d.get(s + '/median'))}/{fmt(d.get(s + '/p99'))}  {ne_s}"
         print(line)
+
+
+@runs.command("submissions")
+@click.option("-n", "--limit", type=int, default=20, help="show last N records")
+@click.option("--label", default=None, help="filter to label substring")
+@click.option("--json", "as_json", is_flag=True, help="print raw JSON one per line")
+def runs_submissions(limit: int, label: str | None, as_json: bool):
+    """Show local SubmissionRecord history (spec 42 Phase A).
+
+    `tomat train` appends one record per successful iris fire to
+    `~/.tomat/submissions.jsonl`. This view sorts by `invoked_at` desc and
+    shows the queue-wait duration that wandb's `_runtime` hides.
+    """
+    if not SUBMISSIONS_PATH.exists():
+        err(f"no submissions yet at {SUBMISSIONS_PATH}")
+        return
+    records: list[dict] = []
+    with open(SUBMISSIONS_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                err(f"skipping malformed line: {e}")
+    if label is not None:
+        records = [r for r in records if label in r.get("label", "")]
+    records.sort(key=lambda r: r.get("invoked_at") or 0, reverse=True)
+    records = records[:limit]
+    if as_json:
+        for r in records:
+            print(json.dumps(r))
+        return
+    if not records:
+        print("(no matching records)")
+        return
+    print(f"{'invoked':19}  {'queue':>7}  {'tpu':14}  {'mode':12}  label")
+    for r in records:
+        ts = datetime.datetime.fromtimestamp(
+            r["invoked_at"], tz=datetime.timezone.utc,
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        qw = r.get("queue_wait_s") or 0
+        qw_s = f"{int(qw // 60)}m{int(qw % 60):02d}s" if qw >= 60 else f"{qw:.1f}s"
+        print(f"{ts}  {qw_s:>7}  {r.get('tpu', '?'):14}  "
+              f"{r.get('mode', '?'):12}  {r.get('label', '?')}")
 
 
 _TRAJ_DEFAULT_KEYS = "train/loss,eval/loss,throughput/mfu"
@@ -1882,6 +1929,78 @@ def _latest_ckpt_step(run_label: str, bucket: str = GCS_BUCKET) -> int | None:
     return max(steps) if steps else None
 
 
+SUBMISSIONS_PATH = Path.home() / ".tomat" / "submissions.jsonl"
+
+
+def _write_submission_record(
+    label: str,
+    tpu: str,
+    cmd: list[str],
+    invoked_at: float,
+    accepted_at: float,
+    mode: str,
+) -> None:
+    """Append a SubmissionRecord to ~/.tomat/submissions.jsonl (spec 42 Phase A).
+
+    Captures the wall-clock submission boundary that wandb's `_runtime`
+    misses (queue wait + provisioning + deps + JAX init + JIT). Best-effort:
+    failures log a warning, never block the fire.
+
+    Phase A persists locally; Phase B will POST to the dashboard D1.
+    """
+    try:
+        marin_pin: str | None = None
+        try:
+            txt = (MARIN_DIR / "pyproject.toml").read_text()
+            shas = set(re.findall(r'rev = "([0-9a-f]{40})"', txt))
+            if len(shas) == 1:
+                marin_pin = next(iter(shas))
+        except Exception:
+            pass
+
+        git_sha: str | None = None
+        try:
+            r = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(PROJECT_ROOT), capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                git_sha = r.stdout.strip()
+        except Exception:
+            pass
+
+        try:
+            fire_host = socket.gethostname()
+        except Exception:
+            fire_host = None
+
+        # Redact WANDB_API_KEY from the stored argv.
+        api_key = os.environ.get("WANDB_API_KEY") or ""
+        argv = [
+            "<WANDB_API_KEY>" if (api_key and a == api_key) else a
+            for a in cmd
+        ]
+
+        record = {
+            "label": label,
+            "cluster": "marin",
+            "tpu": tpu,
+            "mode": mode,
+            "invoked_at": round(invoked_at, 3),
+            "iris_accepted_at": round(accepted_at, 3),
+            "queue_wait_s": round(accepted_at - invoked_at, 3),
+            "fire_host": fire_host,
+            "git_sha": git_sha,
+            "marin_pin": marin_pin,
+            "fire_argv": argv,
+        }
+        SUBMISSIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(SUBMISSIONS_PATH, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        err(f"[tomat train] failed to write submission record: {e!r} (continuing)")
+
+
 @cli.command("train")
 @click.option("-r", "--resume", "resume_mode", is_flag=True,
               help="resume existing run (same LABEL → Levanter auto-discovers latest ckpt + continues with intact optimizer state)")
@@ -1983,6 +2102,11 @@ def train(
     it caused the 1B cont-from-4711 spike. If you want it back, add it as
     an explicit flag with safer LR defaults.
     """
+    # Local wall-clock at invocation. Captures the moment the user said "fire"
+    # — used by the SubmissionRecord (spec 42 Phase A) to surface queue-wait
+    # time (--queue polling, iris RPC) as a distinct segment from `_runtime`.
+    invoked_at = time.time()
+
     # Pick a region-local bucket to avoid cross-region transfer budget
     # blowups (rigging's MARIN_MIRROR_BUDGET_GB=10 default trips at the
     # first ckpt save for a v5p job writing back to marin-eu-west4).
@@ -2287,6 +2411,15 @@ def train(
         if r.returncode != 0:
             err(f"[FAIL launch {label}] rc={r.returncode}\n{r.stderr[-1000:]}")
             sys.exit(r.returncode)
+    iris_accepted_at = time.time()
+    _write_submission_record(
+        label=label,
+        tpu=tpu,
+        cmd=cmd,
+        invoked_at=invoked_at,
+        accepted_at=iris_accepted_at,
+        mode="resume" if resume_mode else "from-scratch",
+    )
     print(f"[launched {label} on {tpu}, {steps} steps"
           f"{f' (resume from step-{latest})' if resume_mode else ''}]")
     print(f"  wandb: https://wandb.ai/{WANDB_PROJECT}/runs/{label}")
