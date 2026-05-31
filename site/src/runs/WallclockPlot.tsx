@@ -20,12 +20,13 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Plot, useTheme } from 'pltly/react'
+import { rolling } from 'pltly/core'
 import { enumParam, useUrlState } from 'use-prms'
 import { themedHoverlabel } from '../theme'
 import type { RunHistory } from './parquet'
 import type { RunEval } from './api'
 import { SmoothingChips, useBandsToggle, useSmoothMode } from './RunsTimelinePlot'
-import { applySmoothing, smoothingStd } from './smoothing'
+import { applySmoothing, type SmoothMode } from './smoothing'
 
 interface Props {
   history: RunHistory
@@ -280,9 +281,40 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   // TL/VL traces render unchanged; otherwise replace y, and optionally emit
   // ±σ fill bands in the same `legendgroup` so the existing legendgroup-fade
   // machinery (above) brushes the bands with their parent line.
+  //
+  // `rolling` mode goes through pltly's `rolling()` (Welford's O(n)) so the
+  // ±σ band is the real within-window stddev. `ema` keeps tomat's local
+  // implementation (pltly ships rolling but not EMA); since EMA has no natural
+  // σ companion, bands are unavailable in that mode (matching the chip rail's
+  // disabled-state).
   const [smooth, setSmooth] = useSmoothMode()
   const [bandsOn, setBandsOn] = useBandsToggle()
-  const wantSmooth = smooth.kind !== 'raw'
+
+  /** Smoothed mean + (rolling-only) σ for the supplied y-array. Sample-index
+   *  window — matches the legacy `?smooth=rolling:N` semantics where N counts
+   *  log rows, not x-units. */
+  function smoothedMeanStd(
+    ys: (number | null)[], mode: SmoothMode,
+  ): { mean: (number | null)[]; std: (number | null)[] | null } {
+    if (mode.kind !== 'rolling') {
+      return { mean: applySmoothing(ys, mode), std: null }
+    }
+    const idx = ys.map((_, i) => i)
+    const sm = rolling(idx, {
+      getX: (i) => i,
+      metrics: ['y'],
+      getValue: (i) => ys[i],
+      windowSize: mode.window,
+    })
+    const mean: (number | null)[] = []
+    const std: (number | null)[] = []
+    for (const pt of sm) {
+      const m = pt.smoothed.y
+      mean.push(Number.isNaN(m.mean) ? null : m.mean)
+      std.push(Number.isNaN(m.stddev) ? null : m.stddev)
+    }
+    return { mean, std }
+  }
 
   // Smooth a parquet-derived Series in place + (optionally) build paired
   // ±σ band traces. Bands inherit the line's `name` (so the closest-trace
@@ -292,7 +324,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   function smoothedSeriesTraces(
     s: Series, name: string, color: string, lineWidth: number, lg: string,
   ): SmoothedTrace[] {
-    const ySmoothed = applySmoothing(s.ys, smooth)
+    const { mean: ySmoothed, std: yStd } = smoothedMeanStd(s.ys, smooth)
     const lineTrace: SmoothedTrace = {
       x: s.xs, y: ySmoothed, name,
       type: 'scatter', mode: 'lines',
@@ -302,9 +334,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       customdata: customGsteps(s),
       hovertemplate: `${name} %{y:.3f}<br>gstep %{customdata}<extra></extra>`,
     }
-    if (!wantSmooth || !bandsOn) return [lineTrace]
-    const yStd = smoothingStd(s.ys, smooth)
-    if (!yStd) return [lineTrace]
+    if (!bandsOn || !yStd) return [lineTrace]
     const yLower: (number | null)[] = []
     const yUpper: (number | null)[] = []
     for (let i = 0; i < ySmoothed.length; i++) {
@@ -375,7 +405,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     // p1–p99 spread bands across the 200 mats, so the user's `bands=1` ±σ
     // toggle is NOT applied here — adding rolling σ on top of inter-mat IQR
     // would conflate two different sources of spread and confuse the reader).
-    const medianSmoothed = applySmoothing(pct.median, smooth)
+    const medianSmoothed = smoothedMeanStd(pct.median, smooth).mean
     return [
       edge('p1', null),     // lower edge of the p1–p99 band
       edge('p99', 0.09),    // upper edge → fills down to p1

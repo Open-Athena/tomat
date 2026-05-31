@@ -9,6 +9,7 @@
 
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactElement } from 'react'
 import { LegendItem, Plot, useTheme } from 'pltly/react'
+import { rolling } from 'pltly/core'
 import { Tooltip } from '../Tooltip'
 import type { UseTraceHighlightReturn } from 'pltly/react'
 import { themedHoverlabel } from '../theme'
@@ -19,7 +20,7 @@ import { stringParam, useUrlState, type Param } from 'use-prms'
 import { compileMultiTermFilter } from './filter'
 import {
   applySmoothing, bandsParam, DEFAULT_EMA_ALPHA, DEFAULT_ROLLING_WINDOW,
-  smoothingStd, smoothKey, smoothParam, type SmoothMode,
+  smoothKey, smoothParam, type SmoothMode,
 } from './smoothing'
 // Re-export so RunsPage can `import { ... } from './RunsTimelinePlot'` —
 // keeps callers off the helper module's internal path.
@@ -225,9 +226,12 @@ function quantile(sorted: number[], q: number): number {
 
 /** One run's (x, y) series for the given x-axis mode.
  *  clock/rel: y = running-max `global_step` (flats = idle/preempt).
- *  loss:      y = `train/loss` vs `global_step`. */
+ *  loss:      y = `train/loss` vs `global_step`.
+ *  `x` is ALWAYS numeric: ms-since-epoch for `clock`, hours for `rel`/`active`,
+ *  step for `loss`. Date strings (when needed for the Plotly date axis) are
+ *  built downstream from the ms values via `localDateStr`. */
 function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
-  x: (string | number)[]; y: number[]
+  x: number[]; y: number[]
 } {
   const { timestamps, cols, rowCount } = history
   const globalStep = cols.get('global_step') ?? []
@@ -252,7 +256,7 @@ function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
     .filter((r) => r.ts !== null && (cutoffSec == null || (r.ts as number) >= cutoffSec))
     .sort((a, b) => (a.ts as number) - (b.ts as number))
   const t0 = ordered.length ? (ordered[0].ts as number) : 0
-  const x: (string | number)[] = []
+  const x: number[] = []
   const y: number[] = []
   let runningMax = -Infinity
   let prevTs: number | null = null
@@ -272,7 +276,7 @@ function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
       activeCum += Math.min(tsec - prevTs, IDLE_CAP_SEC)
     }
     runningMax = Math.max(runningMax, s)
-    if (mode === 'clock') x.push(localDateStr(tsec * 1000))
+    if (mode === 'clock') x.push(tsec * 1000)        // ms since epoch
     else if (mode === 'rel') x.push((tsec - t0) / 3600)
     else x.push(activeCum / 3600)
     y.push(runningMax)
@@ -386,17 +390,19 @@ export function SmoothingChips({
         </button>
       </Tooltip>
       <Tooltip content={
-        mode.kind === 'raw'
-          ? '±σ bands require a smoothing mode (raw σ would just be raw vs raw)'
-          : '±σ bands around the smoothed line (rolling std). URL: ?bands=1'
+        mode.kind === 'rolling'
+          ? '±σ bands around the rolling mean — pltly’s within-window stddev. URL: ?bands=1'
+          : mode.kind === 'ema'
+            ? 'EMA has no natural σ companion; switch to rolling for ±σ bands'
+            : '±σ bands require rolling smoothing (raw σ would just be raw vs raw)'
       }>
         <button
           onClick={() => setBandsOn(!bandsOn)}
-          disabled={mode.kind === 'raw'}
+          disabled={mode.kind !== 'rolling'}
           style={{
-            ...chipStyle(bandsOn && mode.kind !== 'raw'),
-            opacity: mode.kind === 'raw' ? 0.4 : 1,
-            cursor: mode.kind === 'raw' ? 'not-allowed' : 'pointer',
+            ...chipStyle(bandsOn && mode.kind === 'rolling'),
+            opacity: mode.kind === 'rolling' ? 1 : 0.4,
+            cursor: mode.kind === 'rolling' ? 'pointer' : 'not-allowed',
             marginLeft: 4,
           }}
         >
@@ -529,14 +535,19 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
 
   // Smoothing cache: keyed by (history identity, smoothKey, xMode, cutoff).
   // Built ONCE per render via useMemo; the trace-data .map below reads from it
-  // so re-renders (hover-driven `activeTrace` changes) don't recompute EMA on
+  // so re-renders (hover-driven `activeTrace` changes) don't recompute on
   // every mousemove. xMode + cutoff baked into the key because `traceFor`
   // itself depends on them.
+  //
+  // `rolling` mode delegates to pltly's `rolling()` (Welford's, O(n)) — the
+  // per-sample-index `smoothed[i].smoothed.y.stddev` gives a real σ band that
+  // matches what the line is smoothing over. `ema` mode uses tomat's local
+  // EMA (pltly ships rolling but not EMA); EMA has no natural σ companion, so
+  // bands are unavailable for it (the chip rail's ±σ button is disabled there).
   const smoothK = smoothKey(smooth)
   const seriesCache = useMemo(() => {
     type Cached = {
-      x: (string | number)[]
-      yRaw: (number | null)[]
+      x: number[]
       ySmoothed: (number | null)[]
       yStd: (number | null)[] | null
     }
@@ -544,12 +555,32 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
     for (const r of plotted) {
       const { x, y } = traceFor(r.history, xMode, cutoffSec)
       if (x.length === 0) continue
-      // `traceFor` returns `number[]` today; widen to `(number|null)[]` so the
-      // smoothing helpers can pass nulls through if the upstream ever changes.
       const yRaw: (number | null)[] = y as (number | null)[]
-      const ySmoothed = applySmoothing(yRaw, smooth)
-      const yStd = bandsOn ? smoothingStd(yRaw, smooth) : null
-      out.set(r.id, { x, yRaw, ySmoothed, yStd })
+      if (smooth.kind === 'rolling') {
+        // Sample-index window (preserves the legacy `?smooth=rolling:N`
+        // semantics — N is "samples on either side of i within ±N/2", not a
+        // window in current-x-axis-units which would mean different things in
+        // clock-ms vs step-vs-loss modes).
+        const idx = yRaw.map((_, i) => i)
+        const sm = rolling(idx, {
+          getX: (i) => i,
+          metrics: ['y'],
+          getValue: (i) => yRaw[i],
+          windowSize: smooth.window,
+        })
+        const ySmoothed: (number | null)[] = []
+        const yStd: (number | null)[] = []
+        for (const pt of sm) {
+          const m = pt.smoothed.y
+          ySmoothed.push(Number.isNaN(m.mean) ? null : m.mean)
+          yStd.push(Number.isNaN(m.stddev) ? null : m.stddev)
+        }
+        out.set(r.id, { x, ySmoothed, yStd: bandsOn ? yStd : null })
+      } else {
+        // raw / ema: no pltly involvement; no σ companion for these modes.
+        const ySmoothed = applySmoothing(yRaw, smooth)
+        out.set(r.id, { x, ySmoothed, yStd: null })
+      }
     }
     return out
     // `plotted` identity changes on every render (it's a new array), but its
@@ -567,11 +598,21 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
   // closest-trace hover routine matches all three together → fade-in-sync.
   // They use `hoverinfo: 'skip'` so the hover-y-distance code (which iterates
   // `event.points`) ignores them when picking the closest trace.
-  const wantBands = bandsOn && smooth.kind !== 'raw'
+  //
+  // Only `rolling` mode supplies a real σ companion (via pltly); `ema` keeps
+  // its existing chip but has no band — its proxy-from-fake-rolling-σ helper
+  // was dropped along with `rollingStd` when pltly took over the rolling path.
+  const wantBands = bandsOn && smooth.kind === 'rolling'
   const data = plotted.flatMap((r) => {
     const cached = seriesCache.get(r.id)
     if (!cached) return []
-    const { x, ySmoothed, yStd } = cached
+    const { x: xNum, ySmoothed, yStd } = cached
+    // For the clock x-axis, format ms → tz-naive local string so Plotly's date
+    // axis renders in the viewer's timezone (Plotly's `type:'date'` with raw
+    // numeric ms renders in UTC). Other modes use the numeric values directly.
+    const x: (string | number)[] = xMode === 'clock'
+      ? xNum.map((ms) => localDateStr(ms))
+      : xNum
     const isActive = r.label === activeTrace
     const faded = activeTrace != null && !isActive
     const lineColor = faded ? '#666' : r.color
