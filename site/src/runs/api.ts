@@ -164,6 +164,64 @@ export async function fetchIrisState(): Promise<IrisState> {
   return r.json()
 }
 
+// ── per-attempt history (death events) ──────────────────────────────────────
+// Mirror of iris's `AttemptReport`, plus epoch_ms fields added by
+// `scripts/iris_attempts_dump.py` so the dashboard doesn't have to parse ISO
+// timestamps. `state` is iris's `task_state_friendly` string (e.g.
+// 'preempted', 'completed', 'running', 'failed').
+
+export interface IrisAttempt {
+  attempt_id: number
+  worker_id: string
+  state: string
+  exit_code: number
+  error: string
+  is_worker_failure: boolean
+  started_at: string
+  started_at_ms: number | null
+  finished_at: string
+  finished_at_ms: number | null
+}
+
+export interface IrisAttemptsTask {
+  task_id: string
+  state: string
+  started_at: string
+  started_at_ms: number | null
+  finished_at: string
+  finished_at_ms: number | null
+  exit_code: number
+  error: string
+  attempts: IrisAttempt[]
+}
+
+export interface IrisAttempts {
+  schema_version: number
+  label: string
+  job_id: string
+  synced_at: string
+  job_state: string
+  job_failure_count: number
+  job_preemption_count: number
+  completed_count: number
+  submitted_at: string
+  submitted_at_ms: number | null
+  started_at: string
+  started_at_ms: number | null
+  finished_at: string
+  finished_at_ms: number | null
+  tasks: IrisAttemptsTask[]
+}
+
+/** Fetch the per-task attempt history sidecar for one training label.
+ *  Null when the sidecar doesn't exist yet (new run, or not a training job). */
+export async function fetchIrisAttempts(label: string): Promise<IrisAttempts | null> {
+  const r = await fetch(`${API_BASE}/api/iris-attempts/${encodeURIComponent(label)}.json`)
+  if (r.status === 404) return null
+  if (!r.ok) throw new Error(`fetchIrisAttempts(${label}) ${r.status}`)
+  return r.json()
+}
+
 /** wandb run name → iris job id. Our convention: iris job is `/ryan/<name>`. */
 export function irisJobIdForRun(runName: string): string {
   return `/ryan/${runName}`

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { Tooltip } from '../Tooltip'
-import { evalJobsByRun, evalPhase, fetchEval, fetchIrisState, fetchManifest, fetchRunsSnapshot, irisJobIdForRun, parquetUrl } from './api'
+import { evalJobsByRun, evalPhase, fetchEval, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchRunsSnapshot, irisJobIdForRun, parquetUrl } from './api'
 import type { EvalJob, EvalPoint } from './api'
 import { fetchRunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
@@ -831,6 +831,15 @@ function RunDetail({ runId }: { runId: string }) {
   const irisQ = useQuery({
     queryKey: ['iris'], queryFn: fetchIrisState, refetchInterval: REFETCH_MS.iris,
   })
+  // Per-task attempt history sidecar — written by `tomat iris sync` alongside
+  // iris-state.json. 404s are normal (e.g. before the cron has caught a new
+  // training run) and resolve to null without poisoning the query.
+  const attemptsQ = useQuery({
+    queryKey: ['iris-attempts', runId],
+    queryFn: () => fetchIrisAttempts(runId),
+    refetchInterval: (q) => errBackoff(q) ?? REFETCH_MS.iris,
+    retry: 1,
+  })
   // Canonical per-step mat-NMAE/NEMD series — `tomat evals sync` → R2
   // `eval.json`. (The parquet's `eval/mat_nmae/*` columns are the harvested
   // wandb points, which collapse to a single value in runs-sync's merge.)
@@ -875,6 +884,7 @@ function RunDetail({ runId }: { runId: string }) {
     evalJobs,
     color: '#888',
     err,
+    attempts: attemptsQ.data ?? null,
   }
 
   return (
@@ -909,7 +919,12 @@ function RunDetail({ runId }: { runId: string }) {
       )}
       {!history && !err && <p>loading parquet…</p>}
       {history && (
-        <WallclockPlot history={history} evalSeries={evalQ.data ?? null} runId={runId} />
+        <WallclockPlot
+          history={history}
+          evalSeries={evalQ.data ?? null}
+          runId={runId}
+          attempts={attemptsQ.data ?? null}
+        />
       )}
     </div>
   )

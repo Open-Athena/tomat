@@ -15,7 +15,8 @@
 
 import { useMemo } from 'react'
 import { Tooltip } from '../Tooltip'
-import { evalPhase, type EvalJob, type IrisJob, type RunManifest } from './api'
+import { evalPhase, type EvalJob, type IrisAttempts, type IrisJob, type RunManifest } from './api'
+import { computeTrainingFraction, formatDurationShort } from './trainingFraction'
 import { lineageFor } from './lineage'
 import type { RunHistory } from './parquet'
 import {
@@ -72,6 +73,10 @@ export interface RunCardData {
   evalJobs: EvalJob[]
   color: string
   err: string | null
+  /** Per-task attempt history sidecar (death events + per-attempt windows).
+   *  Currently only fetched on the run-detail page; index cards leave this
+   *  null. Used by RunHeaderRich to render a "% training" chip. */
+  attempts?: IrisAttempts | null
 }
 
 // ── status badges/dots ──────────────────────────────────────────────────────
@@ -395,7 +400,7 @@ export interface RunHeaderRichProps {
 export function RunHeaderRich({
   data, parentWandbUrl, parentColor, onScrollToParent, linkRunName = true,
 }: RunHeaderRichProps) {
-  const { id, manifest, job, history, evalJobs, err } = data
+  const { id, manifest, job, history, evalJobs, err, attempts } = data
   const incomplete = isIncomplete(data)
   // wandb's run state can sit at "running" long after a Modal job has died
   // (it never flushed a terminal state). Treat a "running" run that hasn't
@@ -454,6 +459,15 @@ export function RunHeaderRich({
   const sparkPts = useMemo(() => history ? recentStepPoints(history) : [], [history])
   const lastTs = sparkPts.length > 0 ? sparkPts[sparkPts.length - 1].x : null
   const freshSec = lastTs != null ? Math.max(0, Date.now() / 1000 - lastTs) : null
+
+  // % training: fraction of submitted→finished wallclock spent in
+  // training-active windows (per the attempts sidecar × the train/loss-row
+  // span). null when we don't have the sidecar / no training has happened
+  // yet — in which case the chip just hides.
+  const trainFrac = useMemo(
+    () => computeTrainingFraction(job, attempts ?? null, history),
+    [job, attempts, history],
+  )
 
   // "Steps in last 1m / 1h / 6h" — anchored to the latest log timestamp (so a
   // run that logged its last step 2 min ago still reports its 1m rate from
@@ -627,6 +641,27 @@ export function RunHeaderRich({
           {nEpochs != null && <> · {nEpochs.toFixed(2)} ep</>}
           {nFlops != null && <> · {formatFlops(nFlops)} FLOP</>}
         </div>
+        {/* % training chip — sum(train-active windows ∩ attempt windows) /
+            (now or finished_at − submitted_at). Only renders when we have
+            the attempts sidecar AND a parquet train/loss span to overlap
+            with; otherwise the chip is silently dropped. */}
+        {trainFrac.pct != null && trainFrac.totalSec != null && trainFrac.trainSec != null && (
+          <Tooltip content={
+            `training time / iris wallclock\n`
+            + `numerator: Σ (per-attempt window) ∩ (train/loss row span)\n`
+            + `denominator: ${trainFrac.inProgress ? 'now' : 'finished_at'} − submitted_at\n`
+            + `\nan approximation: it credits compile/startup time up to the\n`
+            + `first train-step row as non-training (good), but credits any\n`
+            + `compile-and-die attempt as zero training (also good).`
+          }>
+            <div style={{ marginTop: 3, fontFamily: 'monospace', fontSize: '0.72rem',
+                          color: '#9aa6c2' }}>
+              training: <b style={{ color: '#ddd' }}>{(trainFrac.pct * 100).toFixed(0)}%</b>
+              {' '}({formatDurationShort(trainFrac.trainSec)} / {formatDurationShort(trainFrac.totalSec)})
+              {trainFrac.inProgress && <span style={{ color: '#888' }}> · so far</span>}
+            </div>
+          </Tooltip>
+        )}
       </div>
     </div>
   )

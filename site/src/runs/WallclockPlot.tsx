@@ -24,7 +24,8 @@ import { rolling } from 'pltly/core'
 import { enumParam, useUrlState } from 'use-prms'
 import { themedHoverlabel } from '../theme'
 import type { RunHistory } from './parquet'
-import type { RunEval } from './api'
+import type { IrisAttempts, RunEval } from './api'
+import { classifyDeath, DEATH_COLORS, type DeathCause } from './deathEvents'
 import { SmoothingChips, useBandsToggle, useSmoothMode } from './RunsTimelinePlot'
 import { applySmoothing, type SmoothMode } from './smoothing'
 
@@ -37,6 +38,10 @@ interface Props {
    *  single-run view); callers using this on a multi-run context can
    *  override to `'wallclock'` or `'elapsed'`. */
   defaultXMode?: UrlXMode
+  /** Per-task attempt history (death events). Drives the death-cause vlines
+   *  + legend entries that augment (but don't replace) the existing
+   *  trainer_started / sigterm / cluster_preempt overlays. */
+  attempts?: IrisAttempts | null
 }
 
 type XMode = 'time' | 'elapsed' | 'step'
@@ -95,7 +100,7 @@ const TZ_LABEL: string = (() => {
   }
 })()
 
-export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step' }: Props) {
+export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step', attempts }: Props) {
   const { isDark } = useTheme()
   // Wrapper around <Plot> so we can DOM-walk to the `.js-plotly-plot` element
   // and call `Plotly.restyle` on the band traces directly. Bands have
@@ -487,6 +492,31 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   addShapes(sigtermTs, COLORS.sigterm, 'dot')
   addShapes(preemptTs, COLORS.preempt, 'solid')
 
+  // Death-cause vlines, sourced from the iris-attempts sidecar. These layer on
+  // top of (do NOT replace) the trainer_started / sigterm / cluster_preempt
+  // overlays above: those come from wandb-logged lifecycle counters, these
+  // come from iris's per-task per-attempt bug-report data and surface the
+  // CAUSE of each attempt's death (cascade vs preempt vs other failure).
+  type DeathBucket = { ts: number; cause: DeathCause; error: string; taskId: string }
+  const deathBuckets: Record<DeathCause, DeathBucket[]> = {
+    preempt: [], cascade: [], failed: [], completed: [],
+  }
+  if (attempts) {
+    for (const t of attempts.tasks) {
+      for (const a of t.attempts) {
+        if (a.finished_at_ms == null) continue
+        const cause = classifyDeath(a)
+        if (cause === 'completed') continue
+        deathBuckets[cause].push({
+          ts: a.finished_at_ms / 1000, cause, error: a.error ?? '', taskId: t.task_id,
+        })
+      }
+    }
+  }
+  for (const cause of ['preempt', 'cascade', 'failed'] as const) {
+    addShapes(deathBuckets[cause].map((b) => b.ts), DEATH_COLORS[cause], 'solid')
+  }
+
   // Legend-only invisible point so the event vlines show up in the legend
   // (real lines are `shapes`, which don't legend-ify).
   const legendOnly = (name: string, color: string, dash: 'dash' | 'dot' | 'solid') => ({
@@ -560,10 +590,26 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
           legendOnly(`trainer_started (${startTs.length})`, COLORS.start, 'dash'),
           legendOnly(`sigterm (${sigtermTs.length})`, COLORS.sigterm, 'dot'),
           legendOnly(`cluster preempt (${preemptTs.length})`, COLORS.preempt, 'solid'),
+          // Death-cause legend entries — one row per non-empty bucket. Hidden
+          // when the sidecar hasn't loaded yet (`attempts == null`) so the
+          // legend doesn't grow until the data's in.
+          ...(attempts ? (['preempt', 'cascade', 'failed'] as const)
+            .filter((c) => deathBuckets[c].length > 0)
+            .map((c) => legendOnly(
+              `death: ${c} (${deathBuckets[c].length})`,
+              DEATH_COLORS[c], 'solid',
+            )) : []),
         ]}
         layout={{
           title: {
-            text: `${runId}  ·  ${startTs.length} starts, ${sigtermTs.length} sigterms, ${preemptTs.length} preempts`,
+            text: (() => {
+              const head = `${runId}  ·  ${startTs.length} starts, ${sigtermTs.length} sigterms, ${preemptTs.length} preempts`
+              if (!attempts) return head
+              const parts = (['preempt', 'cascade', 'failed'] as const)
+                .filter((c) => deathBuckets[c].length > 0)
+                .map((c) => `${deathBuckets[c].length} ${c}`)
+              return parts.length > 0 ? `${head}  ·  ${parts.join(', ')}` : head
+            })(),
             font: { size: 14 },
           },
           autosize: true,
