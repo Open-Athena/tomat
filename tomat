@@ -2369,17 +2369,34 @@ def train(
                 cwd=str(MARIN_DIR), capture_output=True, text=True, timeout=90,
             )
             ready_pools: list[tuple[str, int]] = []
+            # Pool names have allocation-class infix: `tpu_<chip>-<class>_<size>-<zone>`
+            # (e.g. `tpu_v6e-preemptible_16-europe-west4-a`,
+            # `tpu_v5e-serving_4-europe-west4-b`). Our `--tpu` arg is the
+            # short form `<chip>-<size>` (e.g. `v6e-16`); iris matches it
+            # against whatever allocation class is provisioned. Build a
+            # regex anchored on `<chip>-\w+_<size>-` to capture all classes
+            # without enumerating them. Past mistake: substring-matching
+            # `f"tpu_{tpu}-"` never hits because of the infix — wasted ~45min
+            # of queue polling on tz-11 before catching it.
+            try:
+                chip, size = tpu.rsplit("-", 1)
+            except ValueError:
+                chip, size = tpu, ""
+            pool_re = re.compile(
+                rf"^tpu_{re.escape(chip)}-\w+_{re.escape(size)}-(.+)$"
+            )
             if probe.returncode == 0:
                 try:
                     data = json.loads(strip_iris_log(probe.stdout).strip())
                     for p in _walk_pools(data):
                         if p["status"] != "available" or p["ready"] <= 0:
                             continue
-                        # Match variant + (optional) zone.
                         name = p["name"]
-                        if f"tpu_{tpu}-" not in name:
+                        m = pool_re.match(name)
+                        if not m:
                             continue
-                        if target_zones and not any(name.endswith(f"-{z}") for z in target_zones):
+                        pool_zone = m.group(1)
+                        if target_zones and pool_zone not in target_zones:
                             continue
                         ready_pools.append((name, p["ready"]))
                 except Exception as e:
