@@ -192,14 +192,19 @@ const EXCLUDED_RUNS: ReadonlySet<string> = new Set([
 ])
 
 // Order: running first, then by "most recently active" (`history.ts_max`).
-// Falls back to `created_at` when ts_max is missing. This puts cont7k-ext
-// at the top after it last logged today, even though it was created May 11.
+// Falls back to `created_at`, then iris `submitted_at_ms` for pending cards
+// that have no wandb manifest yet. Puts cont7k-ext at the top after it last
+// logged today (even though created May 11), AND a fresh `tomat train` fire
+// at the very top while it's still queueing.
 function orderRuns(cards: RunCardData[]): RunCardData[] {
   const activityTs = (c: RunCardData): number => {
     const tsMax = c.manifest?.history.ts_max
     if (typeof tsMax === 'number') return tsMax * 1000
     const ca = c.manifest?.run.created_at
-    return ca ? Date.parse(ca) : 0
+    if (ca) return Date.parse(ca)
+    // Manifest-less pending/building card: sort by iris submission time so
+    // the most recent fire is at the top of the queued bucket.
+    return c.job?.submitted_at_ms ?? 0
   }
   // Sort buckets: running first, then queued, then everything else; within a
   // bucket by most-recent activity.
@@ -210,6 +215,24 @@ function orderRuns(cards: RunCardData[]): RunCardData[] {
     if (dr !== 0) return dr
     return activityTs(b) - activityTs(a)
   })
+}
+
+/** iris job ids → run ids for `tomat train`-style training jobs.
+ *
+ * Convention: `iris job run --job-name <label>` from `tomat train` produces
+ * `/ryan/train-<...>`. We exclude m-eval jobs (`/ryan/tomat-eval-*`) and
+ * other tomat sidecar jobs that aren't training runs.
+ *
+ * Returns the run-id (label) for matches, null otherwise.
+ */
+function trainingRunIdFromIrisJob(jobId: string): string | null {
+  // `/ryan/train-mg-tz-11` → `train-mg-tz-11`
+  const m = jobId.match(/^\/[^/]+\/(train-.+)$/)
+  if (!m) return null
+  const id = m[1]
+  // Defensive: never want to confuse a child task or an eval job for a run.
+  if (id.includes('/')) return null
+  return id
 }
 
 function RunsIndex() {
@@ -301,9 +324,45 @@ function RunsIndex() {
       }))
     : null
 
+  // Placeholder cards for `tomat train` fires that iris knows about but
+  // wandb hasn't logged a metric for yet (pending → building → JIT-compile).
+  // These would otherwise be silently dropped by the `runs[id] != null`
+  // filter in `visible`. We render them with manifest=null + the iris job,
+  // and RunHeaderRich shows the iris state badge + submission timing chips
+  // while wandb-derived metrics gracefully degrade to "—".
+  //
+  // Cards are merged into `ordered` after the v2-filter; `orderRuns` already
+  // sorts queued (PENDING/BUILDING) below running but above inactive, and
+  // we extended its tie-break to fall back to `job.submitted_at_ms`, so a
+  // fresh fire floats to the top of the queued bucket.
+  const visibleSet = useMemo(() => new Set(visible), [visible])
+  const pendingCards: RunCardData[] = useMemo(() => {
+    if (!iris) return []
+    const out: RunCardData[] = []
+    for (const [jobId, job] of Object.entries(iris.jobs)) {
+      const runId = trainingRunIdFromIrisJob(jobId)
+      if (runId == null) continue
+      if (visibleSet.has(runId)) continue
+      if (EXCLUDED_RUNS.has(runId)) continue
+      if (job.state !== 'PENDING' && job.state !== 'BUILDING' && job.state !== 'RUNNING') continue
+      out.push({
+        id: runId,
+        manifest: null,
+        job,
+        history: null,
+        evalJobs: evalByRun.get(runId) ?? [],
+        color: '#888',
+        err: null,
+      })
+    }
+    return out
+  }, [iris, visibleSet, evalByRun])
+
   // Drop v2 (P14) runs — obsolete tokenizer, and a few are mislabeled
   // `train-full-v3-…` (trained on v2 data) which is pure confusion on the board.
-  const ordered = cards ? orderRuns(cards.filter((c) => !isV2Run(c))) : null
+  const ordered = cards
+    ? orderRuns([...cards, ...pendingCards].filter((c) => !isV2Run(c)))
+    : null
   const runningCount = ordered?.filter(isRunning).length ?? 0
   const queuedCount = ordered?.filter(isQueued).length ?? 0
   const incompleteCount = ordered?.filter(isIncomplete).length ?? 0
