@@ -2,13 +2,14 @@
  * tomat-runs-api — CFW backing tomat.oa.dev/runs.
  *
  * Endpoints (all read-only, public for now):
- *   GET  /api/runs-snapshot.json         — aggregated: runs index + all manifests + iris state, in one shot
+ *   GET  /api/runs-snapshot.json         — aggregated: runs index + all manifests + iris state + modal state, in one shot
  *   GET  /api/runs                       — list of synced run ids
  *   GET  /api/runs/:id/manifest.json     — per-run metadata (config, summary, history range)
  *   GET  /api/runs/:id/raw.parquet       — full history parquet
  *   GET  /api/runs/:id/eval.json         — per-step mat-NMAE/NEMD series (both mat-sets)
  *   GET  /api/iris-state.json            — iris snapshot (synced by tomat iris sync)
  *   GET  /api/iris-attempts/:label.json  — per-task per-attempt history (death events) for one training run
+ *   GET  /api/modal-state.json           — Modal app + function-call snapshot (synced by tomat modal sync)
  *   GET  /api/files/list?prefix=&cursor= — generic R2 list (under FILES_PREFIX allow-list)
  *   GET  /api/files/get?path=…           — generic R2 get with Range support
  *   GET  /health
@@ -162,6 +163,7 @@ async function buildRunsSnapshot(env: Env): Promise<{
 	count: number;
 	runs: Record<string, unknown | null>;
 	iris: unknown | null;
+	modal: unknown | null;
 }> {
 	const runIds = await listRuns(env);
 
@@ -169,32 +171,41 @@ async function buildRunsSnapshot(env: Env): Promise<{
 	// is well within the Worker's subrequest budget (50/req soft cap; 1000/req
 	// hard cap on paid plans) and finishes in roughly one R2 round-trip.
 	const manifestKeys = runIds.map((id) => `${env.R2_RUNS_PREFIX}/${id}/manifest.json`);
-	const manifestResults = await Promise.all(
-		manifestKeys.map(async (k): Promise<unknown | null> => {
-			const obj = await env.R2.get(k);
-			if (!obj) return null;
-			try {
-				return await obj.json();
-			} catch {
-				return null;
-			}
-		}),
-	);
+	const [manifestResults, irisObj, modalObj] = await Promise.all([
+		Promise.all(
+			manifestKeys.map(async (k): Promise<unknown | null> => {
+				const obj = await env.R2.get(k);
+				if (!obj) return null;
+				try {
+					return await obj.json();
+				} catch {
+					return null;
+				}
+			}),
+		),
+		env.R2.get('tomat/iris-state.json'),
+		env.R2.get('tomat/modal-state.json'),
+	]);
 
 	const runs: Record<string, unknown | null> = {};
 	for (let i = 0; i < runIds.length; i++) {
 		runs[runIds[i]] = manifestResults[i];
 	}
 
-	// Inline the iris snapshot too — same R2 bucket, one more parallel GET
-	// would also work but this is already serial-after-the-fanout and cheap.
 	let iris: unknown | null = null;
-	const irisObj = await env.R2.get('tomat/iris-state.json');
 	if (irisObj) {
 		try {
 			iris = await irisObj.json();
 		} catch {
 			iris = null;
+		}
+	}
+	let modal: unknown | null = null;
+	if (modalObj) {
+		try {
+			modal = await modalObj.json();
+		} catch {
+			modal = null;
 		}
 	}
 
@@ -203,6 +214,7 @@ async function buildRunsSnapshot(env: Env): Promise<{
 		count: runIds.length,
 		runs,
 		iris,
+		modal,
 	};
 }
 
@@ -462,6 +474,14 @@ export default {
 		if (path === '/api/iris-state.json') {
 			// Static R2 object updated out-of-band by `tomat iris sync`.
 			return serveR2Object(req, env, 'tomat/iris-state.json');
+		}
+
+		if (path === '/api/modal-state.json') {
+			// Static R2 object updated out-of-band by `tomat modal sync`.
+			// Modal app + function-call snapshot — feeds the Modal-state
+			// badge on /runs (replaces the wandb-session-state fallback for
+			// runs whose iris job slot is empty).
+			return serveR2Object(req, env, 'tomat/modal-state.json');
 		}
 
 		// /api/iris-attempts/<label>.json — per-task attempt history sidecar,

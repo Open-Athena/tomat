@@ -84,6 +84,7 @@ export interface RunsSnapshot {
   count: number
   runs: Record<string, RunManifest | null>
   iris: IrisState | null
+  modal: ModalState | null
 }
 
 export async function fetchRunsSnapshot(): Promise<RunsSnapshot> {
@@ -286,4 +287,76 @@ export function evalPhase(job: IrisJob): EvalPhase {
     default:  // QUEUED, RUNNING, PENDING, SUBMITTED, UNKNOWN, …
       return 'flight'
   }
+}
+
+// ── Modal snapshot (tomat modal sync) ───────────────────────────────────────
+// Mirrors the python schema in `tomat::modal_sync`. App state names are
+// lowercase `AppState` enum stems (`deployed`, `stopped`, `initializing`,
+// `stopping`, ...). Input statuses are lowercase `GenericResult.GenericStatus`
+// stems (`pending`, `success`, `failure`, `terminated`, `timeout`,
+// `init_failure`, `internal_failure`, `idle_timeout`).
+
+export interface ModalInput {
+  input_id: string
+  task_id: string | null
+  status: string
+  status_code: number
+}
+
+export interface ModalFunctionCall {
+  function_call_id: string
+  function_name: string
+  module_name: string
+  inputs: ModalInput[]
+  /** Set when the call-graph probe failed (e.g. invalid fc-id, deleted). */
+  error?: string
+}
+
+export interface ModalApp {
+  description: string
+  state: string
+  state_code: number
+  n_running_tasks: number
+  created_at_ms: number | null
+  stopped_at_ms: number | null
+  /** fc-id → probe result. Empty when no --fc-id was passed to `tomat modal sync`. */
+  function_calls: Record<string, ModalFunctionCall>
+}
+
+export interface ModalState {
+  schema_version: number
+  synced_at: string
+  count: number
+  apps: Record<string, ModalApp>
+}
+
+export async function fetchModalState(): Promise<ModalState> {
+  const r = await fetch(`${API_BASE}/api/modal-state.json`)
+  if (!r.ok) throw new Error(`fetchModalState ${r.status}`)
+  return r.json()
+}
+
+/** A run is "Modal-hosted" when its name carries our convention's
+ *  `-modal-` infix (e.g. `train-mg-modal-h200x8-tz-v3-bs128-seed42`).
+ *  This is a name-pattern heuristic, not a wandb-tag check — keeps the
+ *  match dead-simple and avoids waiting for the wandb session to open. */
+export function isModalRun(runName: string): boolean {
+  return /-modal-/.test(runName)
+}
+
+/** Pick the most-relevant Modal app for a Modal run. We have one
+ *  app (`tomat-train-smoke`) that hosts all training fires for now,
+ *  so this just returns the most recently created `deployed` app
+ *  matching that description — falling back to the most-recent
+ *  `stopped` if none are deployed. */
+export function modalAppForRun(modal: ModalState | null | undefined, runName: string): ModalApp | null {
+  if (!modal) return null
+  if (!isModalRun(runName)) return null
+  const candidates = Object.values(modal.apps).filter((a) =>
+    a.description === 'tomat-train-smoke',
+  )
+  if (candidates.length === 0) return null
+  candidates.sort((a, b) => (b.created_at_ms ?? 0) - (a.created_at_ms ?? 0))
+  const deployed = candidates.find((a) => a.state === 'deployed')
+  return deployed ?? candidates[0]
 }

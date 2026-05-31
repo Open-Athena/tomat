@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { Tooltip } from '../Tooltip'
-import { evalJobsByRun, evalPhase, fetchEval, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchRunsSnapshot, irisJobIdForRun, parquetUrl } from './api'
+import { evalJobsByRun, evalPhase, fetchEval, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchRunsSnapshot, irisJobIdForRun, modalAppForRun, parquetUrl } from './api'
 import type { EvalJob, EvalPoint } from './api'
 import { fetchRunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
@@ -272,6 +272,7 @@ function RunsIndex() {
   }, [snapshotQ.data])
 
   const iris = snapshotQ.data?.iris ?? null
+  const modal = snapshotQ.data?.modal ?? null
 
   // Active-run set drives the per-run history poll interval. While iris hasn't
   // loaded yet, treat every run as active (fail-open to fast polling for
@@ -317,6 +318,7 @@ function RunsIndex() {
         id,
         manifest: snapshotQ.data.runs[id],
         job: iris?.jobs[irisJobIdForRun(id)] ?? null,
+        modalApp: modalAppForRun(modal, id),
         history: historyQs[idx]?.data ?? null,
         evalJobs: evalByRun.get(id) ?? [],
         color: colorForIndex(idx),
@@ -349,6 +351,7 @@ function RunsIndex() {
         id: runId,
         manifest: null,
         job,
+        modalApp: modalAppForRun(modal, runId),
         history: null,
         evalJobs: evalByRun.get(runId) ?? [],
         color: '#888',
@@ -356,7 +359,7 @@ function RunsIndex() {
       })
     }
     return out
-  }, [iris, visibleSet, evalByRun])
+  }, [iris, modal, visibleSet, evalByRun])
 
   // Drop v2 (P14) runs — obsolete tokenizer, and a few are mislabeled
   // `train-full-v3-…` (trained on v2 data) which is pure confusion on the board.
@@ -831,6 +834,13 @@ function RunDetail({ runId }: { runId: string }) {
   const irisQ = useQuery({
     queryKey: ['iris'], queryFn: fetchIrisState, refetchInterval: REFETCH_MS.iris,
   })
+  // Modal app + function-call snapshot. Same R2-sourced state as the
+  // index page consumes via the aggregated snapshot — re-fetched standalone
+  // here so the detail-page header can show the live Modal badge without
+  // round-tripping through the snapshot's edge cache.
+  const modalQ = useQuery({
+    queryKey: ['modal'], queryFn: fetchModalState, refetchInterval: REFETCH_MS.iris,
+  })
   // Per-task attempt history sidecar — written by `tomat iris sync` alongside
   // iris-state.json. 404s are normal (e.g. before the cron has caught a new
   // training run) and resolve to null without poisoning the query.
@@ -880,6 +890,7 @@ function RunDetail({ runId }: { runId: string }) {
     id: runId,
     manifest,
     job: irisQ.data?.jobs[irisJobIdForRun(runId)] ?? null,
+    modalApp: modalAppForRun(modalQ.data ?? null, runId),
     history,
     evalJobs,
     color: '#888',

@@ -15,7 +15,7 @@
 
 import { useMemo } from 'react'
 import { Tooltip } from '../Tooltip'
-import { evalPhase, type EvalJob, type IrisAttempts, type IrisJob, type RunManifest } from './api'
+import { evalPhase, type EvalJob, type IrisAttempts, type IrisJob, type ModalApp, type ModalFunctionCall, type RunManifest } from './api'
 import { computeTrainingFraction, formatDurationShort } from './trainingFraction'
 import { lineageFor } from './lineage'
 import type { RunHistory } from './parquet'
@@ -77,6 +77,12 @@ export interface RunCardData {
    *  Currently only fetched on the run-detail page; index cards leave this
    *  null. Used by RunHeaderRich to render a "% training" chip. */
   attempts?: IrisAttempts | null
+  /** Modal app (+ any probed function calls) hosting this run, when the
+   *  run name matches the `-modal-` convention. Null for TPU runs or
+   *  when the modal snapshot doesn't have a matching app. Used by
+   *  `ModalBadge` to replace the wandb-state fallback with real Modal
+   *  state (cache-build / queued / running / failed). */
+  modalApp?: ModalApp | null
 }
 
 // ── status badges/dots ──────────────────────────────────────────────────────
@@ -235,13 +241,136 @@ export function IrisBadge({ job, incomplete }: { job: IrisJob; incomplete?: bool
   )
 }
 
-// Two dots per card — iris job state + wandb run state. Replaces the old
-// italic distinction: colour shows each source's health, so a healthy run
-// reads as two green dots and an iris/wandb disagreement is visible at a
-// glance. A hollow dot = that source has nothing (e.g. no iris job).
+// ── Modal badge ─────────────────────────────────────────────────────────────
+// For runs hosted on Modal (no iris job, name matches `-modal-`), surface
+// real Modal state — app deployed/stopped + per-input fc state — instead of
+// the stale wandb-session-state fallback. Replaces the old wandb-running
+// chip for Modal runs; the iris case is untouched.
+const MODAL_APP_STATE_STYLES: Record<string, { bg: string; fg: string }> = {
+  deployed:      { bg: '#22863a', fg: '#fff' },
+  initializing:  { bg: '#d4a017', fg: '#fff' },
+  ephemeral:     { bg: '#22863a', fg: '#fff' },
+  detached:      { bg: '#0366d6', fg: '#fff' },
+  stopping:      { bg: '#b4632a', fg: '#fff' },
+  stopped:       { bg: '#6a737d', fg: '#fff' },
+  disabled:      { bg: '#6a737d', fg: '#fff' },
+}
+
+// Modal `GenericResult.GenericStatus` letters for the per-input tail chip,
+// e.g. `deployed (1p)` = 1 pending input, `deployed (1f)` = 1 failed input.
+// We collapse `success → S`, `failure → F`, etc.; `pending` (status 0) is
+// the most actionable signal — a queued fc that hasn't started its container.
+const MODAL_INPUT_STATUS_LETTER: Record<string, string> = {
+  pending: 'p',
+  success: 'S',
+  failure: 'F',
+  terminated: 'T',
+  timeout: 'O',
+  init_failure: 'I',
+  internal_failure: 'X',
+  idle_timeout: 'D',
+}
+
+function modalInputTail(call: ModalFunctionCall): string {
+  if (call.inputs.length === 0) return ''
+  // Aggregate per-status. We render only the non-success ones if there's
+  // at least one terminal-bad status, since the success count is implied
+  // by the app being `deployed` + the chip itself being shown.
+  const counts: Record<string, number> = {}
+  for (const inp of call.inputs) {
+    counts[inp.status] = (counts[inp.status] ?? 0) + 1
+  }
+  const parts: string[] = []
+  for (const [k, v] of Object.entries(counts)) {
+    parts.push(`${v}${MODAL_INPUT_STATUS_LETTER[k] ?? k[0]}`)
+  }
+  return parts.length > 0 ? ` (${parts.join('/')})` : ''
+}
+
+export function ModalBadge({ app }: { app: ModalApp }) {
+  const style = MODAL_APP_STATE_STYLES[app.state] ?? { bg: '#888', fg: '#fff' }
+  // Surface the most-recent fc's input statuses on the badge tail.
+  // We sort fc-ids descendingly (ULID-ish so this is created-time order)
+  // and take the latest; the tooltip lists all of them.
+  const fcs = Object.values(app.function_calls)
+  fcs.sort((a, b) => b.function_call_id.localeCompare(a.function_call_id))
+  const latestFc = fcs[0]
+  const tail = latestFc
+    ? modalInputTail(latestFc)
+    : (app.n_running_tasks > 0 ? ` (${app.n_running_tasks}r)` : '')
+  // Build a verbose tooltip.
+  const tooltipLines: string[] = [
+    `modal: app=${app.description} state=${app.state}`,
+  ]
+  if (app.n_running_tasks > 0) {
+    tooltipLines.push(`running tasks: ${app.n_running_tasks}`)
+  }
+  for (const fc of fcs) {
+    if (fc.error) {
+      tooltipLines.push(`fc ${fc.function_call_id.slice(0, 16)}…: ERROR ${fc.error}`)
+      continue
+    }
+    const summary = fc.inputs.map((i) =>
+      `${i.status}${i.task_id ? ` (${i.task_id.slice(0, 10)}…)` : ''}`,
+    ).join(', ')
+    tooltipLines.push(
+      `fc ${fc.function_call_id.slice(0, 16)}… (${fc.function_name}): ${summary || 'no inputs'}`,
+    )
+  }
+  return (
+    <Tooltip content={tooltipLines.join(' · ')}>
+      <span
+        style={{
+          backgroundColor: style.bg, color: style.fg,
+          padding: '1px 6px', borderRadius: 3,
+          fontSize: '0.75rem', fontFamily: 'monospace',
+        }}
+      >
+        {app.state.toUpperCase()}{tail}
+      </span>
+    </Tooltip>
+  )
+}
+
+// Two/three dots per card — iris job state + wandb run state, plus a
+// modal dot when the run is Modal-hosted. Replaces the old italic
+// distinction: colour shows each source's health, so a healthy run
+// reads as green-green dots and an iris/wandb disagreement is visible
+// at a glance. A hollow dot = that source has nothing (e.g. no iris
+// job for Modal runs; no modal app for TPU runs).
 export const DOT = {
   green: '#22c55e', amber: '#f59e0b', blue: '#3b82f6',
   orange: '#b4632a', red: '#ef4444', grey: '#6a737d',
+}
+
+function modalDotColor(app: ModalApp): string {
+  // Real state preference: any non-success fc input → red; pending → amber;
+  // deployed + n_running_tasks > 0 → green; deployed but no running task and
+  // no fc activity → amber (deployed-but-idle, e.g. between fires);
+  // stopped/stopping → grey.
+  const allInputs = Object.values(app.function_calls).flatMap((fc) => fc.inputs)
+  if (allInputs.some((i) =>
+    i.status === 'failure' || i.status === 'init_failure'
+    || i.status === 'internal_failure' || i.status === 'terminated'
+    || i.status === 'timeout' || i.status === 'idle_timeout',
+  )) return DOT.red
+  if (allInputs.some((i) => i.status === 'pending')) return DOT.amber
+  if (allInputs.length > 0 && allInputs.every((i) => i.status === 'success')) {
+    return DOT.blue
+  }
+  switch (app.state) {
+    case 'deployed':
+    case 'ephemeral':
+      return app.n_running_tasks > 0 ? DOT.green : DOT.amber
+    case 'initializing':
+      return DOT.amber
+    case 'stopping':
+      return DOT.orange
+    case 'stopped':
+    case 'disabled':
+      return DOT.grey
+    default: return DOT.grey
+  }
 }
 
 function irisDotColor(job: IrisJob, incomplete: boolean): string {
@@ -293,14 +422,19 @@ function Dot({ color, hollow, title }: { color?: string; hollow?: boolean; title
   )
 }
 
-function StatusDots({ job, manifest, incomplete, lastLogTs }: {
+function StatusDots({ job, modalApp, manifest, incomplete, lastLogTs }: {
   job: IrisJob | null
+  modalApp: ModalApp | null
   manifest: RunManifest | null
   incomplete: boolean
   lastLogTs: number | null
 }) {
   const logAgeSec = lastLogTs != null ? Math.max(0, Date.now() / 1000 - lastLogTs) : null
   const loggedStr = lastLogTs != null ? `last logged ${secsAgo(lastLogTs)}` : 'never logged'
+  // For Modal runs we surface a Modal dot in place of the iris-slot's
+  // hollow-empty dot. Runs not matching the `-modal-` pattern (TPU
+  // runs) leave the modal slot off the row entirely — no point
+  // claiming "no Modal app" for a run that was never meant to run there.
   return (
     <span style={{ display: 'inline-flex', gap: 3, alignItems: 'center' }}>
       {job
@@ -313,7 +447,12 @@ function StatusDots({ job, manifest, incomplete, lastLogTs }: {
               return lines.join(' · ')
             })()}
           />
-        : <Dot hollow title="iris: no job (e.g. a Modal run)" />}
+        : (modalApp
+            ? <Dot
+                color={modalDotColor(modalApp)}
+                title={`modal: ${modalApp.description} ${modalApp.state}`}
+              />
+            : <Dot hollow title="iris: no job (e.g. a Modal run)" />)}
       {manifest
         ? <Dot
             color={wandbDotColor(manifest.run.state, logAgeSec)}
@@ -520,7 +659,7 @@ export interface RunHeaderRichProps {
 export function RunHeaderRich({
   data, parentWandbUrl, parentColor, onScrollToParent, linkRunName = true,
 }: RunHeaderRichProps) {
-  const { id, manifest, job, history, evalJobs, err, attempts } = data
+  const { id, manifest, job, history, evalJobs, err, attempts, modalApp } = data
   const incomplete = isIncomplete(data)
   // wandb's run state can sit at "running" long after a Modal job has died
   // (it never flushed a terminal state). Treat a "running" run that hasn't
@@ -607,18 +746,21 @@ export function RunHeaderRich({
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
           <StatusDots
             job={job}
+            modalApp={modalApp ?? null}
             manifest={manifest}
             incomplete={incomplete}
             lastLogTs={lastLogTs}
           />
           {job && <IrisBadge job={job} incomplete={incomplete} />}
-          {!job && manifest && (
-            // No iris job (e.g. a Modal run) → fall back to wandb's run state.
-            // The status dots mark the source; a "running" run gone stale
-            // (no logs in >10min) shows greyed as STALE rather than green.
+          {!job && modalApp && <ModalBadge app={modalApp} />}
+          {!job && !modalApp && manifest && (
+            // No iris job AND no matched Modal app — fall back to wandb's
+            // run state. The status dots mark the source; a "running" run
+            // gone stale (no logs in >10min) shows greyed as STALE rather
+            // than green.
             <Tooltip content={wandbStale
               ? `wandb says running, but last logged ${secsAgo(lastLogTs!)} — likely dead`
-              : `wandb state (no iris job): ${manifest.run.state}`}>
+              : `wandb state (no iris job, no modal app): ${manifest.run.state}`}>
               <span
                 style={{
                   backgroundColor: wandbStale
