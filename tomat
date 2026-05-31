@@ -1514,6 +1514,255 @@ def iris_summary(substr: str):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# tomat modal
+# ──────────────────────────────────────────────────────────────────────
+
+
+@cli.group("modal")
+def modal_grp():
+    """Modal app/container state snapshot for the /runs dashboard.
+
+    The runs dashboard's "RUNNING" badge for Modal-hosted training
+    (e.g. `train-mg-modal-h200x8-*`) used to come from wandb's session
+    state, which is open for the entire cache-build / JIT-compile
+    phase — well before training has actually started. `tomat modal
+    sync` queries Modal's API for real app + container state and lands
+    it on R2 so the dashboard can render an honest badge.
+    """
+
+
+# Modal apps we care about for the dashboard. Currently just the smoke
+# training app, which also hosts the H100/H200/B200 bakeoff runs (see
+# `scripts/train_smoke_modal.py:train_bakeoff_*`). Extend as we add more.
+# The matching is exact-on-description; ANY app whose description matches
+# one of these gets included in the snapshot.
+TOMAT_MODAL_APP_NAMES = ("tomat-train-smoke",)
+
+# Map `GenericStatus` enum int → friendly lowercase string. Mirrors
+# modal/call_graph.py's `InputStatus`, but the wire format is the raw
+# enum so we convert here. Values 0 (UNSPECIFIED) / unknown all map to
+# `pending` to match Modal's `InputStatus._missing_` behavior — an input
+# that hasn't started + has no terminal status is conceptually pending.
+_MODAL_INPUT_STATUS_NAMES = {
+    0: "pending",            # UNSPECIFIED — treat as pending
+    1: "success",            # SUCCESS
+    2: "failure",            # FAILURE
+    3: "terminated",         # TERMINATED
+    4: "timeout",            # TIMEOUT
+    5: "init_failure",       # INIT_FAILURE
+    6: "internal_failure",   # INTERNAL_FAILURE
+    7: "idle_timeout",       # IDLE_TIMEOUT
+}
+
+# Modal AppState enum int → friendly lowercase. Mirrors modal/cli/utils.py.
+_MODAL_APP_STATE_NAMES = {
+    0: "unspecified",
+    1: "ephemeral",
+    2: "detached",
+    3: "deployed",
+    4: "stopping",
+    5: "stopped",
+    6: "initializing",
+    7: "disabled",
+    8: "detached_disconnected",
+    9: "derived",
+}
+
+
+def _modal_snapshot_via_sdk(
+    app_names: tuple[str, ...] = TOMAT_MODAL_APP_NAMES,
+    extra_fc_ids: tuple[str, ...] = (),
+) -> dict[str, dict]:
+    """Query Modal's gRPC API (in-process, via the synchronous client wrapper)
+    for our app + function-call state. Returns the `apps` dict for the snapshot.
+
+    `extra_fc_ids` lets the caller probe specific function-call IDs (e.g.
+    fc-IDs registered out-of-band by `tomat train modal …`) — useful because
+    `FunctionCallList` per function is server-side-disabled for general use
+    ("please contact support" error), but `FunctionCallFromId` and
+    `FunctionGetCallGraph` per-fc are fine.
+    """
+    import asyncio
+    try:
+        from modal.client import _Client
+        from modal_proto import api_pb2
+    except ImportError as e:
+        err(f"[modal sync] modal SDK not importable: {e}")
+        return {}
+
+    async def go() -> dict[str, dict]:
+        client = await _Client.from_env()
+        t0 = time.monotonic()
+        app_resp: api_pb2.AppListResponse = await client.stub.AppList(
+            api_pb2.AppListRequest(environment_name=""),
+        )
+        err(f"[modal-rpc AppList {int((time.monotonic()-t0)*1000)}ms]")
+        # Index probed fc-IDs by app — every fc-id belongs to a single app
+        # via its function_id, but we don't currently resolve that mapping;
+        # we attach the probe results to whichever app the fc-id matches
+        # OR to a synthetic `_other` bucket if no app matches.
+        fc_probes: dict[str, dict] = {}
+        for fc_id in extra_fc_ids:
+            try:
+                t1 = time.monotonic()
+                cg = await client.stub.FunctionGetCallGraph(
+                    api_pb2.FunctionGetCallGraphRequest(function_call_id=fc_id),
+                )
+                err(f"[modal-rpc FunctionGetCallGraph {fc_id} {int((time.monotonic()-t1)*1000)}ms]")
+                if not cg.function_calls:
+                    fc_probes[fc_id] = {"error": "no function_calls in graph"}
+                    continue
+                fc_proto = cg.function_calls[0]
+                inputs = []
+                for inp in cg.inputs:
+                    if inp.function_call_id != fc_id:
+                        continue
+                    inputs.append({
+                        "input_id": inp.input_id,
+                        "task_id": inp.task_id or None,
+                        "status": _MODAL_INPUT_STATUS_NAMES.get(inp.status, f"unknown_{inp.status}"),
+                        "status_code": int(inp.status),
+                    })
+                fc_probes[fc_id] = {
+                    "function_call_id": fc_id,
+                    "function_name": fc_proto.function_name,
+                    "module_name": fc_proto.module_name,
+                    "inputs": inputs,
+                }
+            except Exception as e:
+                err(f"[modal sync] FunctionGetCallGraph({fc_id}) failed: {e}")
+                fc_probes[fc_id] = {"error": str(e)[:200]}
+
+        apps: dict[str, dict] = {}
+        for a in app_resp.apps:
+            if a.description not in app_names:
+                continue
+            state_name = _MODAL_APP_STATE_NAMES.get(int(a.state), f"unknown_{a.state}")
+            app_entry = {
+                "description": a.description,
+                "state": state_name,
+                "state_code": int(a.state),
+                "n_running_tasks": int(a.n_running_tasks),
+                "created_at_ms": int(a.created_at * 1000) if a.created_at else None,
+                "stopped_at_ms": int(a.stopped_at * 1000) if a.stopped_at else None,
+                "function_calls": {},  # fc_id → probe result (populated below)
+            }
+            apps[a.app_id] = app_entry
+
+        # Attach any fc probes to the right app. We don't know fc → app
+        # mapping a priori, so just stash all fc probes on every matched
+        # app for now — frontend filters by `function_name` / fc-id.
+        # Better: dedup by attaching to the app whose name matches the
+        # fc's `module_name` (every modal app has a single Python module
+        # entrypoint, so this is a sound match for our setup).
+        for fc_id, probe in fc_probes.items():
+            mod = probe.get("module_name") if isinstance(probe, dict) else None
+            # Module name is the python module the function lives in
+            # (e.g. `train_smoke_modal`). Modal app descriptions are
+            # custom (e.g. `tomat-train-smoke`); they often share a stem
+            # — match by substring.
+            target_app_id: str | None = None
+            if mod:
+                for aid, ae in apps.items():
+                    desc = ae["description"].replace("-", "_").lower()
+                    if mod.lower() in desc or desc in mod.lower():
+                        target_app_id = aid
+                        break
+            if target_app_id is None and apps:
+                # Fallback: attach to the first matched app (typically only one).
+                target_app_id = next(iter(apps))
+            if target_app_id is None:
+                # No matched app — stash under a synthetic bucket so the
+                # probe data isn't lost (frontend can still surface it).
+                apps.setdefault("_unmatched", {
+                    "description": "<unmatched-fc-probes>",
+                    "state": "unknown",
+                    "n_running_tasks": 0,
+                    "created_at_ms": None,
+                    "stopped_at_ms": None,
+                    "function_calls": {},
+                })
+                target_app_id = "_unmatched"
+            apps[target_app_id]["function_calls"][fc_id] = probe
+        return apps
+    return asyncio.run(go())
+
+
+@modal_grp.command("sync")
+@click.option("-b", "--bucket", default=R2_BUCKET, help="R2 bucket")
+@click.option("-k", "--key", default="tomat/modal-state.json", help="R2 key")
+@click.option("-d", "--dry-run", is_flag=True, help="print the JSON without uploading")
+@click.option("-f", "--fc-id", "fc_ids", multiple=True,
+              help="Modal function-call ID (fc-…) to probe for per-input "
+              "status. Repeatable. Useful when a recent `tomat train` "
+              "spawn returned an fc-id and we want its build / queue / "
+              "run status visible on the dashboard ahead of the wandb "
+              "session opening. App-level state is sourced regardless.")
+def modal_sync(bucket: str, key: str, dry_run: bool, fc_ids: tuple[str, ...]):
+    """Snapshot Modal app + function-call state → R2.
+
+    Powers the Modal-state badge on tomat.oa.dev/runs (analog to the iris
+    badge). Uses the Modal gRPC API (async, in-process via modal SDK) —
+    one `AppList` + one `FunctionGetCallGraph` per --fc-id.
+
+    Schema::
+
+        {
+          "schema_version": 1,
+          "synced_at": "...",
+          "count": <n_matched_apps>,
+          "apps": {
+            <app_id>: {
+              "description": "tomat-train-smoke",
+              "state": "deployed",   # APP_STATE_* minus prefix, lowercase
+              "state_code": 3,
+              "n_running_tasks": 1,
+              "created_at_ms": ...,
+              "stopped_at_ms": null,
+              "function_calls": {
+                <fc_id>: {
+                  "function_call_id": "fc-…",
+                  "function_name": "train_bakeoff_h200x8",
+                  "module_name": "train_smoke_modal",
+                  "inputs": [
+                    {"input_id": "in-…", "task_id": "ta-…" | None,
+                     "status": "pending" | "success" | "failure" | …,
+                     "status_code": <int>}
+                  ]
+                }
+              }
+            }
+          }
+        }
+
+    Notes:
+      - `FunctionCallList` (enumerate ALL fc's per function) is server-side
+        disabled for our account ("please contact support" — error code
+        4E19UZIM). Per-fc probing via `FunctionGetCallGraph(fc_id)` works
+        fine; pass `--fc-id fc-…` for the specific calls you care about.
+      - When no --fc-id is passed we still write the app-state snapshot,
+        which is what the runs dashboard's badge falls back to.
+    """
+    apps = _modal_snapshot_via_sdk(
+        app_names=TOMAT_MODAL_APP_NAMES,
+        extra_fc_ids=fc_ids,
+    )
+    payload = {
+        "schema_version": 1,
+        "synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "count": len(apps),
+        "apps": apps,
+    }
+    data = json.dumps(payload, indent=1).encode("utf-8")
+    print(f"[modal sync] {len(apps)} apps → s3://{bucket}/{key} ({len(data)} bytes)")
+    if dry_run:
+        print(data.decode())
+    else:
+        _r2_put_bytes(bucket, key, data, "application/json")
+        print(f"[modal sync] {R2_ENDPOINT}/{bucket}/{key}")
+
+
+# ──────────────────────────────────────────────────────────────────────
 # tomat evals
 # ──────────────────────────────────────────────────────────────────────
 
