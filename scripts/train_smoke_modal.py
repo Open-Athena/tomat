@@ -424,6 +424,10 @@ def _train_bakeoff_impl(
     lmq_path: str | None = None,  # gs://...codec.npz; enables EMD-density loss
     density_loss_type: str = "emd",  # "emd" (W₁) or "l1" (legacy)
     density_only: bool = True,
+    maskgit_mode: bool = False,
+    maskgit_prior: str = "absorbing",
+    maskgit_loss_type: str = "ce",
+    wandb_project: str | None = None,
 ) -> dict:
     """200M-or-other preset training body for the bakeoff probe.
 
@@ -439,6 +443,12 @@ def _train_bakeoff_impl(
     runs configure_density_loss, and swaps Qwen3Config →
     Qwen3DensityConfig. This is what real (non-MFU-probe) training
     needs.
+
+    When ``maskgit_mode=True`` (mutually exclusive with the density-EMD
+    branch via ``density_loss_type``/``density_only`` — we forbid both
+    set together), mirrors the TPU trainer's MG wiring: bumps vocab by 1
+    for [MASK], builds MaskGITLossArgs, runs configure_maskgit_loss, and
+    swaps Qwen3Config → Qwen3MaskGITConfig. Requires ``lmq_path``.
     """
     import json
     import os
@@ -469,6 +479,39 @@ def _train_bakeoff_impl(
         with open(sa_path, "w") as f:
             f.write(sa_json)
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = sa_path
+
+    # MaskGIT / density-EMD mutual exclusion. MG sets a different loss path +
+    # different model subclass; combining is undefined.
+    if maskgit_mode:
+        if maskgit_prior not in ("cosine", "uniform", "high", "absorbing"):
+            raise ValueError(
+                f"maskgit_prior must be cosine/uniform/high/absorbing, got "
+                f"{maskgit_prior!r}"
+            )
+        if maskgit_loss_type not in ("ce", "ce_emd", "emd"):
+            raise ValueError(
+                f"maskgit_loss_type must be ce/ce_emd/emd, got "
+                f"{maskgit_loss_type!r}"
+            )
+        if not lmq_path:
+            raise ValueError(
+                "maskgit_mode=True requires lmq_path (codec needed to identify "
+                "density positions for MASK_ID + EMD term)"
+            )
+        # The MG loss path replaces the density-EMD path entirely; reject
+        # configurations that ask for both at once.
+        if density_only is False:
+            raise ValueError(
+                "maskgit_mode=True is mutually exclusive with density_only=False "
+                "(density-EMD additive recipe). MG defines its own loss."
+            )
+        # Set the env var the MG model checks at trace time (the runtime guard
+        # in Qwen3MaskGITLMHeadModel.compute_next_token_loss errors if
+        # TOMAT_MG_MODE=1 but _MASKGIT_LOSS_ARGS is None — keeps the
+        # configure_maskgit_loss() call honest).
+        os.environ["TOMAT_MG_MODE"] = "1"
+        os.environ["TOMAT_MG_MASK_PRIOR"] = maskgit_prior
+        os.environ["TOMAT_MG_LOSS_TYPE"] = maskgit_loss_type
 
     # Install gcsfs at runtime (skipped in image build because adding it to the
     # image-level pip line busts the layer cache and re-resolves the marin-*
@@ -509,12 +552,8 @@ def _train_bakeoff_impl(
 
     preset = MODEL_PRESETS[model_preset]
     if lmq_path:
-        # Mirror train_tomat_tpu.py:523-600 density-loss setup.
-        from marin.qwen3_density import (
-            Qwen3DensityConfig,
-            build_density_loss_args,
-            configure_density_loss,
-        )
+        # Codec load + density-offset compute is shared between the density
+        # and MG branches; pull it out.
         import fsspec
         with fsspec.open(lmq_path, "rb") as f:
             codec_data = np.load(f, allow_pickle=True)
@@ -522,9 +561,12 @@ def _train_bakeoff_impl(
             codec_recon = np.asarray(codec_data["recon_points"], dtype=np.float32)
             codec_clip = float(codec_data["clip_max"])
 
-        # Compute density vocab offset per PatchVocab layout
-        # (specials=18, atoms=118, ints=1024, pos=pos_total, density=n_bins).
-        n_specials = 18
+        # Compute density vocab offset per PatchVocab layout. Match the TPU
+        # trainer's `_compute_density_offset`: specials are 18 by default but
+        # bump to 20 if `[LATTICE_START]` is in the vocab specials.
+        specials = meta["vocab"].get("specials", {})
+        has_lattice = "[LATTICE_START]" in specials or "LATTICE_START" in specials
+        n_specials = 20 if has_lattice else 18
         n_atoms = 118
         n_ints = 1024
         pc = meta["vocab"]["position_codec"]
@@ -533,26 +575,78 @@ def _train_bakeoff_impl(
         pos_total = sum(pos_signed_vocabs)
         density_offset = n_specials + n_atoms + n_ints + pos_total
         n_density_bins = len(codec_recon)
-
-        import haliax as hax
-        Vocab = hax.Axis("vocab", vocab_size)
         penalty = 10.0 * float(codec_recon.max())
-        density_loss_args = build_density_loss_args(
-            Vocab=Vocab,
-            density_offset=density_offset,
-            n_density_bins=n_density_bins,
-            codec_recon=codec_recon,
-            penalty=penalty,
-            weight=1.0,
-            mode="add",
-            loss_type=density_loss_type,
-            density_only=density_only,
-        )
-        configure_density_loss(density_loss_args)
-        err(f"[bakeoff] density loss: type={density_loss_type} only={density_only} "
-            f"offset={density_offset} bins={n_density_bins} penalty={penalty:.3f}")
-        model_config_cls = Qwen3DensityConfig
+
+        if maskgit_mode:
+            # MaskGIT path: bump vocab by 1 for [MASK], build MG loss args,
+            # swap to Qwen3MaskGITConfig. Mirrors train_tomat_tpu.py:578-817.
+            from marin.qwen3_density import (
+                Qwen3MaskGITConfig,
+                build_maskgit_loss_args,
+                configure_maskgit_loss,
+            )
+            mask_id = vocab_size
+            vocab_size = vocab_size + 1
+            err(f"[bakeoff] MaskGIT mode: MASK_ID={mask_id}, "
+                f"new vocab_size={vocab_size}, prior={maskgit_prior}, "
+                f"loss_type={maskgit_loss_type}")
+
+            import haliax as hax
+            Vocab_mg = hax.Axis("vocab", vocab_size)
+            mg_loss_args = build_maskgit_loss_args(
+                Vocab=Vocab_mg,
+                density_offset=density_offset,
+                n_density_bins=n_density_bins,
+                codec_recon=codec_recon,
+                penalty=penalty,
+                mask_id=mask_id,
+                prior=maskgit_prior,
+                weight=1.0,
+                loss_type=maskgit_loss_type,
+            )
+            configure_maskgit_loss(mg_loss_args)
+            err(f"[bakeoff] MaskGIT loss configured: penalty={penalty:.3f} "
+                f"offset={density_offset} bins={n_density_bins}")
+            model_config_cls = Qwen3MaskGITConfig
+            # Re-bind data config: vocab_size grew by 1.
+            data = LmDataConfig(
+                tokenizer="passthrough",
+                vocab_size=vocab_size,
+                cache_dir=cache_dir,
+                components={"tomat": component},
+                block_cross_document_attention=False,
+            )
+        else:
+            # Mirror train_tomat_tpu.py density-loss setup.
+            from marin.qwen3_density import (
+                Qwen3DensityConfig,
+                build_density_loss_args,
+                configure_density_loss,
+            )
+
+            import haliax as hax
+            Vocab = hax.Axis("vocab", vocab_size)
+            density_loss_args = build_density_loss_args(
+                Vocab=Vocab,
+                density_offset=density_offset,
+                n_density_bins=n_density_bins,
+                codec_recon=codec_recon,
+                penalty=penalty,
+                weight=1.0,
+                mode="add",
+                loss_type=density_loss_type,
+                density_only=density_only,
+            )
+            configure_density_loss(density_loss_args)
+            err(f"[bakeoff] density loss: type={density_loss_type} only={density_only} "
+                f"offset={density_offset} bins={n_density_bins} penalty={penalty:.3f}")
+            model_config_cls = Qwen3DensityConfig
     else:
+        if maskgit_mode:
+            raise ValueError(
+                "maskgit_mode=True requires lmq_path (already enforced above; "
+                "guard duplicated for clarity)"
+            )
         model_config_cls = Qwen3Config
     model = model_config_cls(
         max_seq_len=8192,
@@ -562,16 +656,22 @@ def _train_bakeoff_impl(
         **preset,
     )
 
-    project = f"tomat-{meta['density_codec_name']}-P{meta['patch_size']}"
+    # Allow caller to override the W&B project (e.g. land MG-bakeoff runs in
+    # the same project as their TPU counterpart for direct comparison —
+    # `tomat-lmq-P19` is the canonical P19/v3 project).
+    project = wandb_project or f"tomat-{meta['density_codec_name']}-P{meta['patch_size']}"
     group = f"bakeoff-modal-{model_preset}"
     run_id = f"{results_label}-bs{batch_size}-seed{seed}"
+    tags = ["bakeoff", "modal", f"model{model_preset}",
+            f"bs{batch_size}", f"seed{seed}"]
+    if maskgit_mode:
+        tags += ["maskgit", f"mg-prior-{maskgit_prior}", f"mg-loss-{maskgit_loss_type}"]
     trackers = (
         WandbConfig(
             entity="open-athena",  # corporate team; new tomat runs go here.
             id=run_id, resume="allow",
             project=project, group=group,
-            tags=["bakeoff", "modal", f"model{model_preset}",
-                  f"bs{batch_size}", f"seed{seed}"],
+            tags=tags,
             save_code=False,
         ),
         JsonLoggerConfig(),
@@ -687,7 +787,7 @@ def main_bakeoff_h100x8(
     gpu="H200:8",
     volumes={MOUNT: train_volume},
     secrets=[wandb_secret, gcp_secret],
-    timeout=14400,
+    timeout=72000,  # 20h — matches h100x8; MG 10k @ bs=128 should fit comfortably.
 )
 def train_bakeoff_h200x8(
     steps: int,
@@ -702,6 +802,10 @@ def train_bakeoff_h200x8(
     lmq_path: str | None = None,
     density_loss_type: str = "emd",
     density_only: bool = True,
+    maskgit_mode: bool = False,
+    maskgit_prior: str = "absorbing",
+    maskgit_loss_type: str = "ce",
+    wandb_project: str | None = None,
 ) -> dict:
     """8× H200 bakeoff probe; same SM as H100, 1.4× HBM bandwidth."""
     return _train_bakeoff_impl(
@@ -711,6 +815,10 @@ def train_bakeoff_h200x8(
         lmq_path=lmq_path,
         density_loss_type=density_loss_type,
         density_only=density_only,
+        maskgit_mode=maskgit_mode,
+        maskgit_prior=maskgit_prior,
+        maskgit_loss_type=maskgit_loss_type,
+        wandb_project=wandb_project,
     )
 
 
@@ -727,22 +835,62 @@ def main_bakeoff_h200x8(
     lmq_path: str = "",  # empty = vanilla CE; otherwise gs://.../lmq-v2-16k.npz
     density_loss_type: str = "emd",
     density_only: bool = True,
+    maskgit_mode: bool = False,
+    maskgit_prior: str = "absorbing",
+    maskgit_loss_type: str = "ce",
+    wandb_project: str = "",
 ) -> None:
     parquet_root = f"{MOUNT}/tokenized/{label}"
+    # MG mode requires an LMQ codec; default to the canonical lmq-v2-16k.npz
+    # if the caller didn't specify one (matches what `tomat ... train ...`
+    # uses on TPU — see LMQ_PATH constant in the tomat CLI).
+    if maskgit_mode and not lmq_path:
+        lmq_path = "gs://marin-eu-west4/tomat/codecs/lmq-v2-16k.npz"
     err(f"[modal] H200:8 bakeoff: {model_preset} × {steps} steps, "
         f"bs={batch_size} (per-GPU {batch_size // 8}), "
         f"ckpt={int(gradient_checkpointing)}, dtype={compute_dtype}, label={label}")
-    result = train_bakeoff_h200x8.remote(
-        steps=steps, batch_size=batch_size, seed=seed,
-        label=label, results_label=results_label,
-        model_preset=model_preset, parquet_root=parquet_root,
-        gradient_checkpointing=gradient_checkpointing,
-        compute_dtype=compute_dtype,
-        lmq_path=lmq_path or None,
-        density_loss_type=density_loss_type,
-        density_only=density_only,
-    )
-    err(f"[modal] done: {result['results_dir']} (vocab={result['vocab_size']})")
+    if maskgit_mode:
+        err(f"[modal] MaskGIT mode: prior={maskgit_prior}, "
+            f"loss_type={maskgit_loss_type}, lmq_path={lmq_path}")
+    # Use .spawn() under `modal run --detach`; falls back to a blocking
+    # .remote() if invoked without --detach so a backgrounded `modal run`
+    # call survives at least as long as the local process. Toggle via
+    # TOMAT_MODAL_SPAWN=0 to force the blocking path.
+    import os as _os
+    use_spawn = _os.environ.get("TOMAT_MODAL_SPAWN", "1") == "1"
+    if use_spawn:
+        call = train_bakeoff_h200x8.spawn(
+            steps=steps, batch_size=batch_size, seed=seed,
+            label=label, results_label=results_label,
+            model_preset=model_preset, parquet_root=parquet_root,
+            gradient_checkpointing=gradient_checkpointing,
+            compute_dtype=compute_dtype,
+            lmq_path=lmq_path or None,
+            density_loss_type=density_loss_type,
+            density_only=density_only,
+            maskgit_mode=maskgit_mode,
+            maskgit_prior=maskgit_prior,
+            maskgit_loss_type=maskgit_loss_type,
+            wandb_project=wandb_project or None,
+        )
+        err(f"[modal] spawned call_id={call.object_id} — function runs independently of this process")
+    else:
+        err(f"[modal] using blocking .remote() (TOMAT_MODAL_SPAWN=0); local process must stay alive")
+        result = train_bakeoff_h200x8.remote(
+            steps=steps, batch_size=batch_size, seed=seed,
+            label=label, results_label=results_label,
+            model_preset=model_preset, parquet_root=parquet_root,
+            gradient_checkpointing=gradient_checkpointing,
+            compute_dtype=compute_dtype,
+            lmq_path=lmq_path or None,
+            density_loss_type=density_loss_type,
+            density_only=density_only,
+            maskgit_mode=maskgit_mode,
+            maskgit_prior=maskgit_prior,
+            maskgit_loss_type=maskgit_loss_type,
+            wandb_project=wandb_project or None,
+        )
+        err(f"[modal] done: {result['results_dir']} (vocab={result['vocab_size']})")
 
 
 @app.function(
