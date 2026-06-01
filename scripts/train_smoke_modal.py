@@ -37,33 +37,32 @@ MODEL_PRESETS = {
     "1B":   dict(hidden_dim=2048, num_layers=20, num_heads=16, num_kv_heads=16, intermediate_dim=5632),
 }
 
-# marin-levanter + friends are NOT on PyPI — they live on GitHub Releases'
-# expanded_assets pages. See `marin-experiments/tiny-stories/pyproject.toml`
-# for the exact list. jax[cuda12] needed for A100 training.
-MARIN_FIND_LINKS = [
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-haliax-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-levanter-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-iris-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-zephyr-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-rigging-latest",
-    "https://github.com/marin-community/marin/releases/expanded_assets/marin-fray-latest",
+# marin-levanter + friends from Open-Athena/marin (our fork) — installs
+# from git so the iris-jax-init + flash-None patches reach the Modal image.
+# Upstream marin-community releases (find-links) shipped a Levanter that
+# crashes MaskGIT's bidir mask=None case on GPU. Pin keeps the v4 fire's
+# image deterministic; bump with each marin SHA bump in marin/pyproject.toml.
+OA_MARIN_SHA = "97eea237598bfe0d0af1143dce92c0c00526a8f0"
+OA_MARIN_GIT = f"git+https://github.com/Open-Athena/marin.git@{OA_MARIN_SHA}"
+_marin_git_pkgs = " ".join(
+    f"'marin-{p} @ {OA_MARIN_GIT}#subdirectory=lib/{p}'"
+    for p in ("haliax", "levanter", "fray")
+)
+
+# dupekit + kitoken still come from upstream (no fork divergence there).
+EXTRA_FIND_LINKS = [
     "https://github.com/marin-community/marin/releases/expanded_assets/dupekit-0.1.0-40ac799",
     "https://github.com/marin-community/kitoken/releases/expanded_assets/kitoken-0.10.2-a3012f4",
 ]
-
-_find_links_args = " ".join(f"--find-links {u}" for u in MARIN_FIND_LINKS)
+_extra_find_links_args = " ".join(f"--find-links {u}" for u in EXTRA_FIND_LINKS)
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")  # levanter.tracker pulls in GitPython which needs the CLI
     .pip_install("uv")
     .run_commands(
-        # uv pip install with all find-links URLs + --pre (marin wheels are
-        # tagged as prereleases). Kept separate from Modal's native pip_install
-        # because the latter takes find_links as a single str, not a list.
-        f"uv pip install --system --pre {_find_links_args} "
-        "marin-levanter marin-haliax marin-fray dupekit "
+        f"uv pip install --system --pre {_extra_find_links_args} "
+        f"{_marin_git_pkgs} dupekit "
         "'jax[cuda12]' 'pyarrow>=15' fsspec",
     )
     .add_local_python_source("tomat")
