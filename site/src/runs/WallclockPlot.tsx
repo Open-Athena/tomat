@@ -439,11 +439,16 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     segments.forEach((s, segIdx) => {
       if (s.xs.length === 0) return
       const isLatest = segIdx === lastNonEmpty
-      // Linear ramp anchored on lastNonEmpty: oldest = 0.18, latest = 1.0.
-      // Segments newer than lastNonEmpty (empty) would never render so we
-      // don't need to handle them here.
+      // Linear ramp anchored on lastNonEmpty: oldest = 0.40, latest = 1.0.
+      // Floor at 0.40 (was 0.18) so older trajectories stay readable as
+      // individual lines, not just an overlapping smear. Aggregate alpha
+      // from many overlapping segments is still bounded by 1.0.
       const opacity = lastNonEmpty <= 0 ? 1
-        : 0.18 + 0.82 * (segIdx / lastNonEmpty)
+        : 0.40 + 0.60 * (segIdx / lastNonEmpty)
+      // Label per-segment as `<name> #k/N` (1-based, matches the
+      // restart-segment header count). The hovertemplate uses `segName`
+      // too so the x-unified tooltip shows distinct lines per segment
+      // instead of three identical "TL (train/loss)" rows.
       const segName = N > 1 && !isLatest ? `${name} #${segIdx + 1}/${N}` : name
       const { mean: ySmoothed, std: yStd } = smoothedMeanStd(s.ys, smooth)
       const lineTrace: SmoothedTrace = {
@@ -455,7 +460,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         legendgroup: lg,
         showlegend: isLatest,
         customdata: customGsteps(s),
-        hovertemplate: `${name} %{y:.3f}<br>gstep %{customdata}<extra></extra>`,
+        hovertemplate: `${segName} %{y:.3f}<br>gstep %{customdata}<extra></extra>`,
       }
       // Only show ±σ bands on the latest segment — drawing 28 overlapping
       // bands would just be noise, and the older trajectories already smear
