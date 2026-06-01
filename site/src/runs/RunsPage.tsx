@@ -163,10 +163,24 @@ function RunCard({ data, activeRunId, pinnedRunId, parentWandbUrl, parentColor, 
 }
 
 // Genuinely executing right now: iris RUNNING, or a job-less run (e.g. Modal)
-// that wandb still reports as running.
+// that wandb still reports as running AND has logged recently.
+//
+// Without the recency gate, wandb-zombies (runs that died without a clean
+// shutdown — common for preempt-killed jobs) keep `manifest.run.state =
+// 'running'` indefinitely, and every dashboard sort that buckets "running
+// first" floats them ahead of genuinely-active runs. 10 minutes is well
+// past the wandb heartbeat cadence (~30s for our trainers) so a still-alive
+// run will always be inside the window.
+const RUNNING_RECENCY_MS = 10 * 60 * 1000
 function isRunning(c: RunCardData): boolean {
   if (c.job?.state === 'RUNNING') return true
-  if (!c.job && c.manifest?.run.state === 'running') return true
+  if (!c.job && c.manifest?.run.state === 'running') {
+    const tsMax = c.manifest?.history?.ts_max
+    if (typeof tsMax === 'number'
+        && Date.now() - tsMax * 1000 < RUNNING_RECENCY_MS) {
+      return true
+    }
+  }
   return false
 }
 
