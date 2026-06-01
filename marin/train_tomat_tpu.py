@@ -949,8 +949,58 @@ def main():
         JsonLoggerConfig(),
     )
 
+    # Region-local temp checkpoints. The TPU worker probes its GCE region at
+    # startup (via marin's `rigging.filesystem.marin_region`), so the
+    # 10-minute temporary ckpts land in `gs://marin-<region>/tmp/ttl=14d/...`
+    # — the worker's local bucket, with a lifecycle rule auto-deleting
+    # after 14 days. Permanent ckpts (every 1000 steps) still go to the
+    # pinned canonical `BUCKET` (e.g. `gs://marin-eu-west4/tomat/results/...`)
+    # so a single cross-region write per 1000 steps is all we incur.
+    #
+    # This is the same pattern marin's grug experiments use (see
+    # `lib/marin/src/marin/training/training.py:bake_output_path` +
+    # `temporary_checkpoint_base_path`). Closing the "if the worker lands
+    # in a different region, every 10-min temp ckpt is a cross-region
+    # transfer" hole that pinned us to `--zone` for a long time.
+    # `marin.training.training.temporary_checkpoint_base_path` would be the
+    # upstream-marin one-liner, but our venv only has the rigging subset.
+    # `rigging.filesystem.marin_temp_bucket` is the underlying helper it
+    # calls — `gs://marin-{region}/tmp/ttl=14d/<prefix>` assembly, with
+    # the region picked from the WORKER's GCE metadata at runtime.
+    #
+    # We deliberately DON'T pass `source_prefix=output_path` (which is what
+    # the upstream marin helper does): that would force the temp region to
+    # match the canonical output region, defeating the point for runs whose
+    # canonical bucket is far from where iris parked the worker. By
+    # omitting it we let `marin_region()` probe the GCE metadata server and
+    # return the worker's actual zone, so temp ckpts land local-zone
+    # regardless of where the canonical `BUCKET` is pinned.
+    output_path = f"{BUCKET}/results/{results_label}"
+    try:
+        from rigging.filesystem import marin_temp_bucket
+        from urllib.parse import urlparse
+        # Mirror the marin convention: include the canonical output's
+        # bucket-relative path in the temp prefix so two runs sharing a
+        # canonical `BUCKET` don't collide in the temp area.
+        _parsed = urlparse(output_path)
+        _component = f"{_parsed.netloc}{_parsed.path}".strip("/")
+        temp_base_path = marin_temp_bucket(
+            ttl_days=14,
+            prefix=f"checkpoints-temp/{_component}/checkpoints",
+        )
+    except Exception as e:
+        # Defensive: import failure would be a broken venv, not a runtime
+        # corner case. Log and fall back to writing temp ckpts to the
+        # canonical bucket so the run still saves (cross-region egress)
+        # rather than crashing on import alone.
+        print(f"[checkpoint] WARN: rigging.filesystem import failed "
+              f"({type(e).__name__}: {e}); temp ckpts will write to canonical "
+              f"{output_path}/checkpoints (may incur cross-region egress).",
+              file=sys.stderr, flush=True)
+        temp_base_path = None
     checkpointer = CheckpointerConfig(
-        base_path=f"{BUCKET}/results/{results_label}/checkpoints",
+        base_path=f"{output_path}/checkpoints",
+        temporary_base_path=temp_base_path,
         save_interval=timedelta(minutes=10),
         # Retain every-1000 ckpts long-term + every-100 for recent-resume.
         # Prior `keep=[{"every": 1000}]` lost the v5p smoke (step 588) when
