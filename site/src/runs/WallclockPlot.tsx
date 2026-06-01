@@ -188,11 +188,18 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   const setXMode = (m: XMode) => setUrlXMode(X_TO_URL[m])
 
   // User-set x-range captured from box-zoom (`plotly_relayout`). Persists
-  // across smoothing-chip clicks and other re-renders that would otherwise
-  // reset the axis to autorange. `null` = no user range; render with
-  // autorange. Double-click on the plot clears the range (plotly emits
+  // across smoothing-chip clicks and poll-driven re-renders that would
+  // otherwise reset the axis to autorange. `null` = no user range; render
+  // with autorange. Double-click on the plot clears the range (plotly emits
   // `xaxis.autorange: true`); we mirror that into local state.
-  const [userXRange, setUserXRange] = useState<[number, number] | null>(null)
+  //
+  // Values come back as `number` for linear axes (`x=step|elapsed`) and as
+  // date-string for the `date`-type wallclock axis (`x=wallclock`). Accept
+  // both — initially we filtered on `typeof === 'number'`, which silently
+  // dropped every wallclock zoom and caused the range to reset on every
+  // 30 s react-query poll.
+  type AxisVal = number | string
+  const [userXRange, setUserXRange] = useState<[AxisVal, AxisVal] | null>(null)
   useEffect(() => {
     const root = plotWrapperRef.current
     if (!root) return
@@ -208,8 +215,10 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       }
       const lo = ev['xaxis.range[0]']
       const hi = ev['xaxis.range[1]']
-      if (typeof lo === 'number' && typeof hi === 'number') {
-        setUserXRange([lo, hi])
+      const validLo = typeof lo === 'number' || typeof lo === 'string'
+      const validHi = typeof hi === 'number' || typeof hi === 'string'
+      if (validLo && validHi) {
+        setUserXRange([lo as AxisVal, hi as AxisVal])
       }
     }
     plotDiv.on('plotly_relayout', onRelayout)
