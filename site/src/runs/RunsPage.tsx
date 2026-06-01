@@ -977,11 +977,21 @@ function RunDetail({ runId }: { runId: string }) {
   // index view's `cards: ... irisJobIdForRun(id)`. The color isn't shown on
   // the detail page's outer chrome (no accent bar), but the header doesn't
   // use it directly — leave it as a neutral colour for prop-shape parity.
+  //
+  // Apply the same `RUNNING_RECENCY_MS` freshness gate as the index page's
+  // card construction: `modalAppForRun` matches a single deployed app to
+  // any `-modal-` run, so without this gate every finished Modal-launched
+  // run on its detail page inherits the live app and the badge reads
+  // "DEPLOYED (1S)" even hours after the run completed.
+  const detailModalCandidate = modalAppForRun(modalQ.data ?? null, runId)
+  const detailTsMax = manifest?.history?.ts_max
+  const detailModalRecent = typeof detailTsMax === 'number'
+    && Date.now() - detailTsMax * 1000 < RUNNING_RECENCY_MS
   const headerData: RunCardData = {
     id: runId,
     manifest,
     job: irisQ.data?.jobs[irisJobIdForRun(runId)] ?? null,
-    modalApp: modalAppForRun(modalQ.data ?? null, runId),
+    modalApp: detailModalCandidate && detailModalRecent ? detailModalCandidate : null,
     history,
     evalJobs,
     color: '#888',

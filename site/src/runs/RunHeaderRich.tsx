@@ -294,20 +294,30 @@ export function ModalBadge({ app }: { app: ModalApp }) {
   const fcs = Object.values(app.function_calls)
   fcs.sort((a, b) => b.function_call_id.localeCompare(a.function_call_id))
   const latestFc = fcs[0]
-  // Distinguish three cases the bare app-state hides:
+  // Distinguish four cases the bare app-state hides:
   //   1. `deployed + n_running_tasks > 0`: containers are actually executing
-  //      → label "RUNNING (Nr)" in green. The Modal app-state remains
-  //      `deployed` regardless of whether work is happening, so without this
-  //      override every actively-training run reads as "DEPLOYED (1p)" and
-  //      a casual reader can't tell training from idle.
-  //   2. `deployed + no fc activity AND no running tasks`: zombie app, no
-  //      work happening → label "IDLE" in amber. This is the post-completion
-  //      state (Modal leaves apps deployed for ~10 min after fcs finish).
-  //   3. Anything else: pass through (`stopped`, `stopping`, etc.).
-  // The fc-tail (`(1p)` etc.) stays only for cases (3) where it's still
-  // informative; (1) replaces it with the running-tasks count.
+  //      → label "RUNNING (Nr)" in green. The Modal app-state stays
+  //      `deployed` regardless of whether work is happening, so without
+  //      this branch every actively-training run reads as "DEPLOYED (1p)"
+  //      and a casual reader can't tell training from idle.
+  //   2. `deployed + no running tasks + all fcs successful`: the fc(s)
+  //      finished. Modal leaves the app deployed for ~10 min before
+  //      tearing it down, so a successfully-completed run would otherwise
+  //      read "DEPLOYED (1S)" — actively misleading for a done job. Label
+  //      "SUCCEEDED" in green.
+  //   3. `deployed + no running tasks + no fcs at all`: zombie/idle app
+  //      between fires. Label "IDLE" in amber.
+  //   4. Anything else: pass through (`stopped`, `stopping`, mid-failure
+  //      fcs, etc.) so unusual states stay visible.
   const isActuallyRunning = app.state === 'deployed' && app.n_running_tasks > 0
-  const isDeployedIdle = app.state === 'deployed' && app.n_running_tasks === 0
+  const allInputs = fcs.flatMap((fc) => fc.inputs)
+  const isAllSucceeded = app.state === 'deployed'
+    && app.n_running_tasks === 0
+    && fcs.length > 0
+    && allInputs.length > 0
+    && allInputs.every((i) => i.status === 'success')
+  const isDeployedIdle = app.state === 'deployed'
+    && app.n_running_tasks === 0
     && fcs.length === 0
   let label: string
   let style: { bg: string; fg: string }
@@ -316,6 +326,10 @@ export function ModalBadge({ app }: { app: ModalApp }) {
     label = 'RUNNING'
     style = { bg: '#22863a', fg: '#fff' }
     tail = ` (${app.n_running_tasks}r)`
+  } else if (isAllSucceeded) {
+    label = 'SUCCEEDED'
+    style = { bg: '#22863a', fg: '#fff' }
+    tail = ''
   } else if (isDeployedIdle) {
     label = 'IDLE'
     style = { bg: '#b08800', fg: '#fff' }
