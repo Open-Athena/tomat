@@ -5,6 +5,7 @@ import { evalJobsByRun, evalPhase, fetchEval, fetchIrisAttempts, fetchIrisState,
 import type { EvalJob, EvalPoint } from './api'
 import { fetchRunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
+import { RecentEvents } from './RecentEvents'
 import { RunsTimelinePlot, colorForIndex, useNameFilter, useTagFilters, useAncestorsToggle, compileMultiTermFilter, runHaystack, shortLabel } from './RunsTimelinePlot'
 import { runPassesTagFilters, tagsFor } from './tags'
 import { ancestorsOf, lineageFor } from './lineage'
@@ -937,6 +938,11 @@ function RunDetail({ runId }: { runId: string }) {
           attempts={attemptsQ.data ?? null}
         />
       )}
+      <RecentEvents
+        attempts={attemptsQ.data ?? null}
+        modalApp={modalAppForRun(modalQ.data ?? null, runId)}
+        history={history}
+      />
     </div>
   )
 }

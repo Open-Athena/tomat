@@ -452,6 +452,19 @@ def main():
     # TPU coordinator, but our trainer code hasn't run any JAX yet.
     # iris.runtime.jax_init.initialize_jax is idempotent (per OA-fork commit
     # a9ea84d), so levanter's later call lands as a no-op.
+    #
+    # Force JAX to use the TPU platform BEFORE calling `_iris_initialize_jax`.
+    # On a cascade-restart, iris's worker bootstrap may not have set
+    # `PJRT_DEVICE=TPU` by the time our code runs, so iris's `initialize_jax`
+    # falls through its TPU-detection branch and inits JAX with default
+    # platform (CPU on x86, GPU on CUDA). On TPU hosts the result is silent
+    # failure: JAX init succeeds, then JIT compiles a CPU mesh while data
+    # arrives from TPU → `ValueError: Received incompatible devices for
+    # jitted computation` at first train step. This bit tz-11 24+ times on
+    # 2026-05-31 (see memory: feedback_pull_task_logs_on_first_cascade).
+    # Setting `JAX_PLATFORMS=tpu` here ensures the TPU path is taken
+    # regardless of iris bootstrap timing.
+    os.environ.setdefault("JAX_PLATFORMS", "tpu")
     from iris.runtime.jax_init import initialize_jax as _iris_initialize_jax
     _iris_initialize_jax()
     _maybe_spawn_pyspy_daemon()
