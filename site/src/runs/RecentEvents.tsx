@@ -22,6 +22,46 @@ const SRC_COLOR: Record<Event['source'], string> = {
   modal: '#22c55e',    // green
 }
 
+// Source-column rendering: brand icons for wandb / modal, text for iris
+// (no first-party logo, and the colored-text reads cleanly anyway).
+//
+// The wandb.svg ships as the full horizontal lockup ("icon + Weights &
+// Biases + tagline", 1360×269). We crop to just the leftmost ~14×14 square
+// via a width-constrained overflow:hidden wrapper, so only the W-mark
+// shows.
+function SourceCell({ source }: { source: Event['source'] }) {
+  if (source === 'wandb') {
+    return (
+      <span
+        title="wandb"
+        style={{
+          display: 'inline-block',
+          width: 18, height: 18,
+          overflow: 'hidden',
+          verticalAlign: 'middle',
+        }}
+      >
+        <img
+          src="/wandb.svg"
+          alt="wandb"
+          style={{ height: 18, width: 'auto', display: 'block' }}
+        />
+      </span>
+    )
+  }
+  if (source === 'modal') {
+    return (
+      <img
+        src="/modal.png"
+        alt="modal"
+        title="modal"
+        style={{ height: 18, width: 'auto', verticalAlign: 'middle' }}
+      />
+    )
+  }
+  return <span style={{ color: SRC_COLOR.iris }}>iris</span>
+}
+
 const CLS_BG: Record<NonNullable<Event['cls']>, string> = {
   info: 'transparent',
   warn: 'rgba(245, 158, 11, 0.08)',
@@ -212,14 +252,15 @@ export function RecentEvents({ attempts, modalApp, history }: {
         fontSize: '0.8rem', color: '#aaa', display: 'flex', justifyContent: 'space-between',
       }}>
         <span>recent events ({events.length}) · newest first</span>
-        <span style={{ fontSize: '0.7rem' }}>
-          <span style={{ color: SRC_COLOR.iris }}>● iris</span>{' '}
-          <span style={{ color: SRC_COLOR.modal }}>● modal</span>{' '}
-          <span style={{ color: SRC_COLOR.wandb }}>● wandb</span>
+        <span style={{ fontSize: '0.7rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          <span style={{ color: SRC_COLOR.iris }}>● iris</span>
+          <SourceCell source="modal" />
+          <SourceCell source="wandb" />
         </span>
       </div>
       <div style={{
-        maxHeight: 360, overflowY: 'auto',
+        // No maxHeight cap — let the list expand so the user doesn't have to
+        // scroll a nested container to see history. The page itself scrolls.
         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
         fontSize: '0.75rem',
       }}>
@@ -237,7 +278,7 @@ export function RecentEvents({ attempts, modalApp, history }: {
             }}
           >
             <span style={{ color: '#888' }}>{formatTs(e.ts_ms)}</span>
-            <span style={{ color: SRC_COLOR[e.source] }}>{e.source}</span>
+            <span><SourceCell source={e.source} /></span>
             <span>
               <span>{e.label}</span>
               {e.detail && (

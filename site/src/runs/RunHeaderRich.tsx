@@ -791,11 +791,42 @@ export function RunHeaderRich({
           {wbUrl && (
             <Tooltip content="open this run in wandb">
               <a href={wbUrl} target="_blank" rel="noreferrer"
-                style={{ fontSize: '0.75rem', color: '#888' }}>
-                wandb ↗
+                style={{ fontSize: '0.75rem', color: '#888',
+                  display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+                {/* wandb.svg ships as the full horizontal lockup
+                    (icon + text + tagline); crop to just the leftmost
+                    icon square via overflow:hidden + width constraint. */}
+                <span style={{ display: 'inline-block', width: 14, height: 14,
+                  overflow: 'hidden', verticalAlign: 'middle' }}>
+                  <img src="/wandb.svg" alt="wandb"
+                    style={{ height: 14, width: 'auto', display: 'block' }} />
+                </span>
+                ↗
               </a>
             </Tooltip>
           )}
+          {data.modalApp && (() => {
+            // Modal URL pattern: /apps/<workspace>/main/deployed/<app_name>
+            // Workspace is open-athena per `modal profile current`. Workspace
+            // could be made configurable via a build-time env var later.
+            const appName = data.modalApp.description ?? data.modalApp.app_id ?? ''
+            const appUrl = `https://modal.com/apps/open-athena/main/deployed/${appName}?activeTab=logs`
+            const fcs = Object.values(data.modalApp.function_calls)
+            fcs.sort((a, b) => b.function_call_id.localeCompare(a.function_call_id))
+            const latestFc = fcs[0]
+            return (
+              <Tooltip content={`open Modal app logs (${data.modalApp.app_id ?? appName})`
+                + (latestFc ? `\nlatest fc: ${latestFc.function_call_id}` : '')}>
+                <a href={appUrl} target="_blank" rel="noreferrer"
+                  style={{ fontSize: '0.75rem', color: '#888',
+                    display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+                  <img src="/modal.png" alt="modal"
+                    style={{ height: 14, width: 'auto', verticalAlign: 'middle' }} />
+                  ↗
+                </a>
+              </Tooltip>
+            )
+          })()}
           <EvalChip jobs={evalJobs} />
           <ParentChip
             runId={id}
