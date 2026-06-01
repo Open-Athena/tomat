@@ -145,7 +145,14 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     let changed = false
     for (let i = 0; i < plotDiv.data.length; i++) {
       const t = plotDiv.data[i]
+      // Only touch the band-EDGE traces (eval p1/p99/p25/p75, smoothing ±σ
+      // edges). They all set `hoverinfo: 'skip'` to suppress their own
+      // tooltips. Restart-segment traces (showlegend: false but
+      // hoverinfo undefined) must NOT be touched — they carry their own
+      // recency-ramp opacity, and forcing them to 1 here would flatten the
+      // ramp.
       if (t.showlegend !== false) continue
+      if (t.hoverinfo !== 'skip') continue
       indices.push(i)
       const want = activeTraceName == null || (activeLG != null && (t.legendgroup as string | undefined) === activeLG) ? 1 : 0.3
       opacities.push(want)
@@ -172,12 +179,45 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     plotDiv.on('plotly_afterplot', applyBandFade)
     return () => plotDiv.removeListener?.('plotly_afterplot', applyBandFade)
   }, [applyBandFade])
+
   // `?x=wallclock|elapsed|step` — URL-persisted so deep-links carry the view
   // choice. The run-detail page defaults to `'step'` (training progress is
   // the obvious x for a single run); callers can override.
   const [urlXMode, setUrlXMode] = useUrlState('x', enumParam<UrlXMode>(defaultXMode, URL_X_MODES))
   const xMode: XMode = URL_TO_X[urlXMode]
   const setXMode = (m: XMode) => setUrlXMode(X_TO_URL[m])
+
+  // User-set x-range captured from box-zoom (`plotly_relayout`). Persists
+  // across smoothing-chip clicks and other re-renders that would otherwise
+  // reset the axis to autorange. `null` = no user range; render with
+  // autorange. Double-click on the plot clears the range (plotly emits
+  // `xaxis.autorange: true`); we mirror that into local state.
+  const [userXRange, setUserXRange] = useState<[number, number] | null>(null)
+  useEffect(() => {
+    const root = plotWrapperRef.current
+    if (!root) return
+    const plotDiv = root.querySelector('.js-plotly-plot') as (HTMLElement & {
+      on?: (evt: string, fn: (ev: Record<string, unknown>) => void) => void
+      removeListener?: (evt: string, fn: (ev: Record<string, unknown>) => void) => void
+    }) | null
+    if (!plotDiv?.on) return
+    const onRelayout = (ev: Record<string, unknown>) => {
+      if (ev['xaxis.autorange'] === true) {
+        setUserXRange(null)
+        return
+      }
+      const lo = ev['xaxis.range[0]']
+      const hi = ev['xaxis.range[1]']
+      if (typeof lo === 'number' && typeof hi === 'number') {
+        setUserXRange([lo, hi])
+      }
+    }
+    plotDiv.on('plotly_relayout', onRelayout)
+    return () => plotDiv.removeListener?.('plotly_relayout', onRelayout)
+  }, [])
+  // x-mode changes are unit changes (step ↔ elapsed ↔ wallclock) — preserving
+  // a numeric range across them would land you somewhere meaningless. Clear.
+  useEffect(() => { setUserXRange(null) }, [xMode])
   const { timestamps, cols } = history
 
   const ordered = useMemo(
@@ -245,19 +285,71 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
 
   // Per-metric parquet series (TL/VL): xs, ys, gsteps (gstep for the tooltip).
   type Series = { xs: (string | number)[]; ys: number[]; gsteps: (number | null)[] }
-  function series(key: string): Series {
+
+  // Restart-segment boundaries: indices into `ordered` keyed on
+  // `lifecycle/trainer_started` events (each one marks a new trainer
+  // process). Splitting at these boundaries lets us render older restart
+  // trajectories at low opacity so they don't deface the plot, while the
+  // latest segment stays fully visible.
+  //
+  // Per-row `global_step` regression OVER-segments — interleaved train/eval
+  // rows in async timestamp order can show gstep flipping back and forth
+  // within a single restart, especially when an eval log lands after the
+  // next train step. `lifecycle/trainer_started` is the unambiguous signal:
+  // one entry per trainer process boot.
+  //
+  // With one start, this returns `[0]` and the whole run renders as a
+  // single trace as before.
+  const segmentStarts = useMemo<number[]>(() => {
+    const startedCol = cols.get('lifecycle/trainer_started') ?? []
+    const startTsRaw: number[] = []
+    for (let i = 0; i < startedCol.length; i++) {
+      if (startedCol[i] === 1 && timestamps[i] != null) {
+        startTsRaw.push(timestamps[i] as number)
+      }
+    }
+    startTsRaw.sort((a, b) => a - b)
+    if (startTsRaw.length === 0) return [0]
+    // First segment always starts at index 0. For each subsequent
+    // trainer_started ts, find the first `ordered` index whose ts >= that ts.
+    const out: number[] = [0]
+    let k = 0
+    for (let s = 1; s < startTsRaw.length; s++) {
+      while (k < ordered.length && (ordered[k].ts as number) < startTsRaw[s]) k++
+      if (out[out.length - 1] !== k && k < ordered.length) out.push(k)
+    }
+    return out
+  }, [ordered, cols, timestamps])
+  const numSegments = segmentStarts.length
+
+  // Segment index for a given index into `ordered`. Binary search over
+  // `segmentStarts` (monotonic).
+  function segmentOf(orderedIdx: number): number {
+    let lo = 0, hi = segmentStarts.length - 1, best = 0
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      if (segmentStarts[mid] <= orderedIdx) { best = mid; lo = mid + 1 }
+      else hi = mid - 1
+    }
+    return best
+  }
+
+  // Returns one Series per restart segment. Empty segments are preserved at
+  // their index so opacity / naming line up with `numSegments`.
+  function series(key: string): Series[] {
     const col = cols.get(key) ?? []
-    const xs: (string | number)[] = []
-    const ys: number[] = []
-    const gsteps: (number | null)[] = []
-    for (const { ts, i } of ordered) {
+    const out: Series[] = Array.from({ length: numSegments },
+      () => ({ xs: [], ys: [], gsteps: [] }))
+    for (let k = 0; k < ordered.length; k++) {
+      const { ts, i } = ordered[k]
       const v = col[i]
       if (v === null || v === undefined) continue
-      gsteps.push(gstepAtTs(ts as number))
-      xs.push(xOfTs(ts as number))
-      ys.push(v as number)
+      const seg = out[segmentOf(k)]
+      seg.gsteps.push(gstepAtTs(ts as number))
+      seg.xs.push(xOfTs(ts as number))
+      seg.ys.push(v as number)
     }
-    return { xs, ys, gsteps }
+    return out
   }
 
   // Step (top-panel) trace: running-max of global_step.
@@ -325,45 +417,78 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   // ±σ band traces. Bands inherit the line's `name` (so the closest-trace
   // matching logic upstream remains correct) and a shared `legendgroup` so
   // pltly's solo/fade + our `applyBandFade` desaturate them together.
+  //
+  // For runs with restart segments (`segments.length > 1`), older segments
+  // render at low opacity so the latest segment dominates visually. Only the
+  // latest segment gets a legend entry; the older segments share its
+  // `legendgroup` so the legend toggle hides/shows the whole stack.
   type SmoothedTrace = Record<string, unknown>
   function smoothedSeriesTraces(
-    s: Series, name: string, color: string, lineWidth: number, lg: string,
+    segments: Series[], name: string, color: string, lineWidth: number, lg: string,
   ): SmoothedTrace[] {
-    const { mean: ySmoothed, std: yStd } = smoothedMeanStd(s.ys, smooth)
-    const lineTrace: SmoothedTrace = {
-      x: s.xs, y: ySmoothed, name,
-      type: 'scatter', mode: 'lines',
-      line: { color, width: lineWidth },
-      yaxis: 'y2',
-      legendgroup: lg,
-      customdata: customGsteps(s),
-      hovertemplate: `${name} %{y:.3f}<br>gstep %{customdata}<extra></extra>`,
+    const N = segments.length
+    // Most-recent segment with data — gets the legend entry + full opacity.
+    // Without this anchor (just using `N - 1`), a fresh resume that hasn't
+    // logged any rows yet would render no legend entry and no full-opacity
+    // trace — the entire plot would be older segments at fade.
+    let lastNonEmpty = -1
+    for (let i = N - 1; i >= 0; i--) {
+      if (segments[i].xs.length > 0) { lastNonEmpty = i; break }
     }
-    if (!bandsOn || !yStd) return [lineTrace]
-    const yLower: (number | null)[] = []
-    const yUpper: (number | null)[] = []
-    for (let i = 0; i < ySmoothed.length; i++) {
-      const m = ySmoothed[i]
-      const sd = yStd[i]
-      if (m == null || sd == null) { yLower.push(null); yUpper.push(null); continue }
-      // y2 is log-scaled — keep band edges strictly positive so plotly doesn't
-      // drop them (`log(<=0) = NaN`). 1e-6 is well below any real loss value.
-      yLower.push(Math.max(1e-6, m - sd))
-      yUpper.push(m + sd)
-    }
-    const edge = (y: (number | null)[], fillKey: string | null): SmoothedTrace => ({
-      x: s.xs, y, name,
-      type: 'scatter', mode: 'lines',
-      line: { width: 0, color: 'rgba(0,0,0,0)' },
-      yaxis: 'y2', legendgroup: lg,
-      showlegend: false,
-      hoverinfo: 'skip',
-      ...(fillKey ? { fill: 'tonexty', fillcolor: fillKey } : {}),
+    const out: SmoothedTrace[] = []
+    segments.forEach((s, segIdx) => {
+      if (s.xs.length === 0) return
+      const isLatest = segIdx === lastNonEmpty
+      // Linear ramp anchored on lastNonEmpty: oldest = 0.18, latest = 1.0.
+      // Segments newer than lastNonEmpty (empty) would never render so we
+      // don't need to handle them here.
+      const opacity = lastNonEmpty <= 0 ? 1
+        : 0.18 + 0.82 * (segIdx / lastNonEmpty)
+      const segName = N > 1 && !isLatest ? `${name} #${segIdx + 1}/${N}` : name
+      const { mean: ySmoothed, std: yStd } = smoothedMeanStd(s.ys, smooth)
+      const lineTrace: SmoothedTrace = {
+        x: s.xs, y: ySmoothed, name: segName,
+        type: 'scatter', mode: 'lines',
+        line: { color, width: lineWidth },
+        opacity,
+        yaxis: 'y2',
+        legendgroup: lg,
+        showlegend: isLatest,
+        customdata: customGsteps(s),
+        hovertemplate: `${name} %{y:.3f}<br>gstep %{customdata}<extra></extra>`,
+      }
+      // Only show ±σ bands on the latest segment — drawing 28 overlapping
+      // bands would just be noise, and the older trajectories already smear
+      // visually via opacity.
+      if (!bandsOn || !yStd || !isLatest) {
+        out.push(lineTrace)
+        return
+      }
+      const yLower: (number | null)[] = []
+      const yUpper: (number | null)[] = []
+      for (let i = 0; i < ySmoothed.length; i++) {
+        const m = ySmoothed[i]
+        const sd = yStd[i]
+        if (m == null || sd == null) { yLower.push(null); yUpper.push(null); continue }
+        // y2 is log-scaled — keep band edges strictly positive so plotly doesn't
+        // drop them (`log(<=0) = NaN`). 1e-6 is well below any real loss value.
+        yLower.push(Math.max(1e-6, m - sd))
+        yUpper.push(m + sd)
+      }
+      const edge = (y: (number | null)[], fillKey: string | null): SmoothedTrace => ({
+        x: s.xs, y, name: segName,
+        type: 'scatter', mode: 'lines',
+        line: { width: 0, color: 'rgba(0,0,0,0)' },
+        yaxis: 'y2', legendgroup: lg,
+        showlegend: false,
+        hoverinfo: 'skip',
+        ...(fillKey ? { fill: 'tonexty', fillcolor: fillKey } : {}),
+      })
+      const rgb = hexToRgbTuple(color)
+      const fillcolor = `rgba(${rgb}, 0.18)`
+      out.push(edge(yLower, null), edge(yUpper, fillcolor), lineTrace)
     })
-    // Match the eval-band convention (alpha 0.20 for the inner ribbon).
-    const rgb = hexToRgbTuple(color)
-    const fillcolor = `rgba(${rgb}, 0.18)`
-    return [edge(yLower, null), edge(yUpper, fillcolor), lineTrace]
+    return out
   }
 
   // ── eval bands from eval.json ──
@@ -466,6 +591,13 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   const zerolinecolor = isDark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.15)'
 
   // Event vlines spanning both panels via paper-coord shapes.
+  //
+  // Shapes also fade on legend hover: if the user hovers a real trace (TL /
+  // VL / etc.), all event vlines dim to alpha 0.18 so the trace stands out.
+  // If the user hovers an event LI ("trainer_started", "sigterm", "cluster
+  // preempt", "death: preempt/cascade/failed"), shapes matching that event's
+  // color stay full opacity; the rest dim. With no hover, all shapes render
+  // at full opacity.
   type Shape = {
     type: 'line'
     xref: 'x'
@@ -476,6 +608,27 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     y1: number
     line: { color: string; width: number; dash: 'dash' | 'dot' | 'solid' }
   }
+  // Map active-trace legend-item name → base color for the shapes it
+  // represents. Anything not in this map (TL, VL, NMAE, NEMD, step, etc.)
+  // means "user hovered a non-event trace" → fade ALL shapes.
+  function activeShapeColor(activeName: string | null): string | null {
+    if (activeName === null) return null  // no hover → full opacity for all
+    if (activeName.startsWith('trainer_started')) return COLORS.start
+    if (activeName.startsWith('sigterm')) return COLORS.sigterm
+    if (activeName.startsWith('cluster preempt')) return COLORS.preempt
+    if (activeName.startsWith('death: preempt')) return DEATH_COLORS.preempt
+    if (activeName.startsWith('death: cascade')) return DEATH_COLORS.cascade
+    if (activeName.startsWith('death: failed')) return DEATH_COLORS.failed
+    return ''  // hovered a non-event trace → fade everything
+  }
+  const activeColor = activeShapeColor(activeTraceName)
+  function shapeColor(baseColor: string): string {
+    if (activeColor === null) return baseColor
+    if (activeColor === baseColor) return baseColor
+    // Convert hex → rgba(…, 0.18) so non-matching shapes dim out.
+    const rgb = hexToRgbTuple(baseColor)
+    return `rgba(${rgb}, 0.18)`
+  }
   const eventShapes: Shape[] = []
   const addShapes = (ts: number[], color: string, dash: 'dash' | 'dot' | 'solid') => {
     for (const t of ts) {
@@ -484,7 +637,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       eventShapes.push({
         type: 'line', xref: 'x', yref: 'paper',
         x0: x, x1: x, y0: 0, y1: 1,
-        line: { color, width: dash === 'solid' ? 1 : 1.2, dash },
+        line: { color: shapeColor(color), width: dash === 'solid' ? 1 : 1.2, dash },
       })
     }
   }
@@ -603,7 +756,8 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         layout={{
           title: {
             text: (() => {
-              const head = `${runId}  ·  ${startTs.length} starts, ${sigtermTs.length} sigterms, ${preemptTs.length} preempts`
+              const segChunk = numSegments > 1 ? ` (${numSegments} seg)` : ''
+              const head = `${runId}  ·  ${startTs.length} starts${segChunk}, ${sigtermTs.length} sigterms, ${preemptTs.length} preempts`
               if (!attempts) return head
               const parts = (['preempt', 'cascade', 'failed'] as const)
                 .filter((c) => deathBuckets[c].length > 0)
@@ -619,6 +773,9 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
             type: xMode === 'time' ? 'date' : 'linear',
             ...(xMode === 'time' ? { tickformat: '%-m/%-d %H:%M' } : {}),
             gridcolor, zerolinecolor, linecolor: gridcolor,
+            // Restore user-picked range across re-renders triggered by
+            // smoothing / bands toggles. `null` → omit → plotly autoranges.
+            ...(userXRange ? { range: userXRange, autorange: false } : {}),
           },
           yaxis: {
             title: { text: 'step', font: { color: COLORS.step } },
@@ -626,12 +783,17 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
             domain: stepDomain,
             gridcolor, zerolinecolor, linecolor: gridcolor,
             visible: showTopPanel,
+            // Lock y-zoom: click-drag should zoom x-only (constraint imposed
+            // by `fixedrange: true` on every y-axis; plotly's box-zoom then
+            // spans the full y range automatically).
+            fixedrange: true,
           },
           yaxis2: {
             title: { text: 'loss / NMAE·NEMD % (log)' },
             type: logType,
             domain: lossDomain,
             gridcolor, zerolinecolor, linecolor: gridcolor,
+            fixedrange: true,
           },
           shapes: eventShapes,
           margin: { t: 50, l: 70, r: 170, b: 50 },
