@@ -288,16 +288,45 @@ function modalInputTail(call: ModalFunctionCall): string {
 }
 
 export function ModalBadge({ app }: { app: ModalApp }) {
-  const style = MODAL_APP_STATE_STYLES[app.state] ?? { bg: '#888', fg: '#fff' }
   // Surface the most-recent fc's input statuses on the badge tail.
   // We sort fc-ids descendingly (ULID-ish so this is created-time order)
   // and take the latest; the tooltip lists all of them.
   const fcs = Object.values(app.function_calls)
   fcs.sort((a, b) => b.function_call_id.localeCompare(a.function_call_id))
   const latestFc = fcs[0]
-  const tail = latestFc
-    ? modalInputTail(latestFc)
-    : (app.n_running_tasks > 0 ? ` (${app.n_running_tasks}r)` : '')
+  // Distinguish three cases the bare app-state hides:
+  //   1. `deployed + n_running_tasks > 0`: containers are actually executing
+  //      → label "RUNNING (Nr)" in green. The Modal app-state remains
+  //      `deployed` regardless of whether work is happening, so without this
+  //      override every actively-training run reads as "DEPLOYED (1p)" and
+  //      a casual reader can't tell training from idle.
+  //   2. `deployed + no fc activity AND no running tasks`: zombie app, no
+  //      work happening → label "IDLE" in amber. This is the post-completion
+  //      state (Modal leaves apps deployed for ~10 min after fcs finish).
+  //   3. Anything else: pass through (`stopped`, `stopping`, etc.).
+  // The fc-tail (`(1p)` etc.) stays only for cases (3) where it's still
+  // informative; (1) replaces it with the running-tasks count.
+  const isActuallyRunning = app.state === 'deployed' && app.n_running_tasks > 0
+  const isDeployedIdle = app.state === 'deployed' && app.n_running_tasks === 0
+    && fcs.length === 0
+  let label: string
+  let style: { bg: string; fg: string }
+  let tail: string
+  if (isActuallyRunning) {
+    label = 'RUNNING'
+    style = { bg: '#22863a', fg: '#fff' }
+    tail = ` (${app.n_running_tasks}r)`
+  } else if (isDeployedIdle) {
+    label = 'IDLE'
+    style = { bg: '#b08800', fg: '#fff' }
+    tail = ''
+  } else {
+    label = app.state.toUpperCase()
+    style = MODAL_APP_STATE_STYLES[app.state] ?? { bg: '#888', fg: '#fff' }
+    tail = latestFc
+      ? modalInputTail(latestFc)
+      : (app.n_running_tasks > 0 ? ` (${app.n_running_tasks}r)` : '')
+  }
   // Build a verbose tooltip.
   const tooltipLines: string[] = [
     `modal: app=${app.description} state=${app.state}`,
@@ -326,7 +355,7 @@ export function ModalBadge({ app }: { app: ModalApp }) {
           fontSize: '0.75rem', fontFamily: 'monospace',
         }}
       >
-        {app.state.toUpperCase()}{tail}
+        {label}{tail}
       </span>
     </Tooltip>
   )

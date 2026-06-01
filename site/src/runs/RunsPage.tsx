@@ -363,16 +363,30 @@ function RunsIndex() {
   // histories from their per-run parquet queries. Failed history fetch is
   // non-fatal (the card just lacks its sparkline/plot).
   const cards: RunCardData[] | null = snapshotQ.data
-    ? visible.map((id, idx) => ({
-        id,
-        manifest: snapshotQ.data.runs[id],
-        job: iris?.jobs[irisJobIdForRun(id)] ?? null,
-        modalApp: modalAppForRun(modal, id),
-        history: historyQs[idx]?.data ?? null,
-        evalJobs: evalByRun.get(id) ?? [],
-        color: colorForIndex(idx),
-        err: null,
-      }))
+    ? visible.map((id, idx) => {
+        const manifest = snapshotQ.data.runs[id]
+        // `modalAppForRun` matches the (single) deployed `tomat-train-smoke`
+        // app to ANY `-modal-` run name — there's no proper run→fc mapping in
+        // the snapshot. Without an extra freshness gate, all prior Modal runs
+        // (v1/v2/v3 etc.) inherit the currently-deployed app's running-tasks
+        // count and read as RUNNING even when they finished days ago. Drop the
+        // association when this run hasn't logged inside `RUNNING_RECENCY_MS`.
+        const candidate = modalAppForRun(modal, id)
+        const ts = manifest?.history?.ts_max
+        const recent = typeof ts === 'number'
+          && Date.now() - ts * 1000 < RUNNING_RECENCY_MS
+        const modalApp = candidate && recent ? candidate : null
+        return {
+          id,
+          manifest,
+          job: iris?.jobs[irisJobIdForRun(id)] ?? null,
+          modalApp,
+          history: historyQs[idx]?.data ?? null,
+          evalJobs: evalByRun.get(id) ?? [],
+          color: colorForIndex(idx),
+          err: null,
+        }
+      })
     : null
 
   // Placeholder cards for `tomat train` fires that iris knows about but
