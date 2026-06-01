@@ -9,6 +9,8 @@
  *   GET  /api/runs/:id/eval.json         — per-step mat-NMAE/NEMD series (both mat-sets)
  *   GET  /api/iris-state.json            — iris snapshot (synced by tomat iris sync)
  *   GET  /api/iris-attempts/:label.json  — per-task per-attempt history (death events) for one training run
+ *   GET  /api/voxel-corr/:label.json     — voxel-position corr-matrix sidecar (int8 scale, 1D curve, blob_format)
+ *   GET  /api/voxel-corr/:label.bin.gzip — gzipped int8 corr-matrix blob (upper-triangle)
  *   GET  /api/modal-state.json           — Modal app + function-call snapshot (synced by tomat modal sync)
  *   GET  /api/files/list?prefix=&cursor= — generic R2 list (under FILES_PREFIX allow-list)
  *   GET  /api/files/get?path=…           — generic R2 get with Range support
@@ -55,7 +57,12 @@ function jsonResponse(data: unknown, env: Env, init?: ResponseInit): Response {
 	});
 }
 
-async function serveR2Object(req: Request, env: Env, key: string): Promise<Response> {
+async function serveR2Object(
+	req: Request,
+	env: Env,
+	key: string,
+	cacheControl: string = 'public, max-age=60',
+): Promise<Response> {
 	// Honor Range requests — required for hyparquet, which fetches the
 	// parquet footer first before issuing typed-column reads.
 	const rangeHeader = req.headers.get('Range');
@@ -72,7 +79,7 @@ async function serveR2Object(req: Request, env: Env, key: string): Promise<Respo
 	const headers = new Headers();
 	obj.writeHttpMetadata(headers);
 	headers.set('etag', obj.httpEtag);
-	headers.set('Cache-Control', 'public, max-age=60');
+	headers.set('Cache-Control', cacheControl);
 	headers.set('Accept-Ranges', 'bytes');
 	const totalSize = obj.size;
 	let status = 200;
@@ -491,6 +498,19 @@ export default {
 		if (attemptsMatch) {
 			const [, label] = attemptsMatch;
 			return serveR2Object(req, env, `tomat/iris-attempts/${label}.json`);
+		}
+
+		// /api/voxel-corr/<label>.{json,bin.gzip} — per-run voxel-position
+		// correlation blob + sidecar (emitted by `tomat analyze voxel-corr-blob
+		// --r2`). Effectively immutable per label, so we cache long (1h at the
+		// edge; the underlying R2 object's etag handles invalidation).
+		const voxelCorrMatch = path.match(/^\/api\/voxel-corr\/([^/]+)\.(json|bin\.gzip)$/);
+		if (voxelCorrMatch) {
+			const [, label, ext] = voxelCorrMatch;
+			return serveR2Object(
+				req, env, `tomat/voxel-corr/${label}.${ext}`,
+				'public, max-age=3600',
+			);
 		}
 
 		// /api/runs/:id/<file>

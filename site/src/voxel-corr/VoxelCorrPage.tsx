@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Plot, useTheme } from 'pltly/react'
 import { themedHoverlabel, ThemeToggle } from '../theme'
+import { API_BASE } from '../runs/api'
 
 /** JSON sidecar shape — matches `tomat analyze voxel-corr-blob`. */
 interface CorrMetadata {
@@ -18,6 +19,15 @@ interface CorrMetadata {
   blob_compression?: 'gzip' | null
   /** Compressed-blob byte length (for the "Loading…" message). */
   blob_size?: number
+  /**
+   * How the int8 buffer is laid out:
+   *   - `'upper_triangle'` (current): P³(P³+1)/2 entries, row-major over
+   *     the upper triangle (i <= j). Halves the wire size; the FE mirrors
+   *     into the full matrix on load.
+   *   - `'full'` (legacy, omitted in older blobs): P³ × P³ entries,
+   *     row-major. Treated as the default when the field is absent.
+   */
+  blob_format?: 'upper_triangle' | 'full'
 }
 
 interface CorrData {
@@ -269,8 +279,11 @@ function buildTicks(v0: number, v1: number, P: number, N: number): AxisTick[] {
   return ticks
 }
 
-async function loadCorrData(runLabel: string, base: string): Promise<CorrData> {
-  const jsonUrl = `${base}/voxel-corr/${runLabel}.json`
+async function loadCorrData(runLabel: string): Promise<CorrData> {
+  // Blob + sidecar live on R2 (`tomat/voxel-corr/<label>.{json,bin.gzip}`),
+  // served via the runs-API worker so the static site stays free of the ~12MB
+  // matrix files. See worker route `/api/voxel-corr/:label.{json,bin.gzip}`.
+  const jsonUrl = `${API_BASE}/api/voxel-corr/${runLabel}.json`
   const metaRes = await fetch(jsonUrl)
   if (!metaRes.ok) throw new Error(`fetch ${jsonUrl}: ${metaRes.status}`)
   const meta = (await metaRes.json()) as CorrMetadata
@@ -279,9 +292,10 @@ async function loadCorrData(runLabel: string, base: string): Promise<CorrData> {
   // which the CLI wrote.
   const compressed = meta.blob_compression === 'gzip'
   // `.gzip` extension (not `.gz`): see CLI comment in `tomat analyze
-  // voxel-corr-blob` — `.gz` triggers Vite's auto Content-Encoding which
-  // double-decompresses through our DecompressionStream.
-  const binUrl = `${base}/voxel-corr/${runLabel}.bin${compressed ? '.gzip' : ''}`
+  // voxel-corr-blob` — `.gz` triggers an auto Content-Encoding setter on
+  // some static hosts and would double-decompress through our
+  // DecompressionStream. We keep the `.gzip` extension end-to-end.
+  const binUrl = `${API_BASE}/api/voxel-corr/${runLabel}.bin${compressed ? '.gzip' : ''}`
   const binRes = await fetch(binUrl)
   if (!binRes.ok) throw new Error(`fetch ${binUrl}: ${binRes.status}`)
   let buf: ArrayBuffer
@@ -295,11 +309,35 @@ async function loadCorrData(runLabel: string, base: string): Promise<CorrData> {
   } else {
     buf = await binRes.arrayBuffer()
   }
-  const expected = meta.n_voxels * meta.n_voxels
+  const N = meta.n_voxels
+  const format = meta.blob_format ?? 'full'
+  if (format === 'upper_triangle') {
+    // Upper triangle: N*(N+1)/2 int8 entries, row-major over (i <= j).
+    // Reflect into a full N×N matrix on the client. ~50% wire-size savings.
+    const expectedHalf = (N * (N + 1)) / 2
+    if (buf.byteLength !== expectedHalf) {
+      throw new Error(
+        `corr blob size mismatch (upper_triangle): got ${buf.byteLength} bytes, ` +
+        `expected ${expectedHalf} (N=${N}, N(N+1)/2)`,
+      )
+    }
+    const upper = new Int8Array(buf)
+    const full = new Int8Array(N * N)
+    let k = 0
+    for (let i = 0; i < N; i++) {
+      for (let j = i; j < N; j++) {
+        const v = upper[k++]
+        full[i * N + j] = v
+        if (i !== j) full[j * N + i] = v
+      }
+    }
+    return { meta, matrix: full }
+  }
+  const expected = N * N
   if (buf.byteLength !== expected) {
     throw new Error(
       `corr blob size mismatch: got ${buf.byteLength} bytes, expected ${expected} ` +
-      `(N=${meta.n_voxels})`,
+      `(N=${N})`,
     )
   }
   return { meta, matrix: new Int8Array(buf) }
@@ -325,7 +363,6 @@ interface CursorState {
 }
 
 export function VoxelCorrPage({ parts }: Props) {
-  const base = (import.meta.env.BASE_URL || '/').replace(/\/$/, '')
   const runLabel = parts[0] ?? KNOWN_RUNS[0].label
   const { isDark } = useTheme()
 
@@ -345,7 +382,7 @@ export function VoxelCorrPage({ parts }: Props) {
     setError(null)
     setData(null)
     setViewport(null)
-    loadCorrData(runLabel, base)
+    loadCorrData(runLabel)
       .then(d => {
         setData(d)
         setViewport(fullViewport(d.meta.n_voxels))
@@ -355,7 +392,7 @@ export function VoxelCorrPage({ parts }: Props) {
         setError(e instanceof Error ? e : new Error(String(e)))
         setLoading(false)
       })
-  }, [runLabel, base])
+  }, [runLabel])
 
   useEffect(() => {
     const canvas = canvasRef.current

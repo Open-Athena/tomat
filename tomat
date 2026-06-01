@@ -795,7 +795,13 @@ def _run_parquet_arrow_schema():
     ])
 
 
-def _r2_put_bytes(bucket: str, key: str, data: bytes, content_type: str):
+def _r2_put_bytes(
+    bucket: str,
+    key: str,
+    data: bytes,
+    content_type: str,
+    cache_control: str = "public, max-age=60",
+):
     """Upload `data` to `s3://bucket/key` on OA's R2 via `aws s3 cp` (cfo profile).
 
     Shell-out matches the existing `scripts/publish_mpdb.py` pattern;
@@ -809,7 +815,7 @@ def _r2_put_bytes(bucket: str, key: str, data: bytes, content_type: str):
             ["aws", "--profile", "cfo", "--endpoint-url", R2_ENDPOINT,
              "s3", "cp", path, f"s3://{bucket}/{key}",
              "--content-type", content_type,
-             "--cache-control", "public, max-age=60"],
+             "--cache-control", cache_control],
             capture_output=True, text=True, timeout=120,
         )
         if r.returncode != 0:
@@ -3521,6 +3527,11 @@ def analyze_grp():
               help="output dir; writes <run-label>.bin (int8 corr matrix), .json (1D curve + metadata)")
 @click.option("-l", "--run-label", default="cont33k",
               help="frontend label / output basename (matches frontend route)")
+@click.option("-r", "--r2", "r2_upload", is_flag=True,
+              help="also upload the blob + sidecar to OA R2 under tomat/voxel-corr/")
+@click.option("-b", "--bucket", default=R2_BUCKET, help="R2 bucket (with --r2)")
+@click.option("-p", "--r2-prefix", default="tomat/voxel-corr",
+              help="R2 key prefix (with --r2)")
 @click.argument("preds_dir")
 def analyze_voxel_corr_blob(
     preds_dir: str,
@@ -3528,6 +3539,9 @@ def analyze_voxel_corr_blob(
     kind: str,
     out_dir: str,
     run_label: str,
+    r2_upload: bool,
+    bucket: str,
+    r2_prefix: str,
 ) -> None:
     """Compute P³×P³ voxel-position corr matrix → int8 blob + JSON sidecar.
 
@@ -3591,13 +3605,22 @@ def analyze_voxel_corr_blob(
     C_clip = np.clip(C, -1.0, 1.0)
     C_int8 = np.round(C_clip * 127.0).astype(np.int8)
 
+    # The matrix is symmetric (C[i,j] == C[j,i] by construction), so store
+    # only the upper triangle INCLUDING the diagonal as a flat row-major
+    # array of length P³(P³+1)/2. For P=19 that's 23.5M entries (vs 47M for
+    # the full matrix) — halves both the raw size and the gzipped blob the
+    # browser fetches. Frontend reflects on load.
+    iu, ju = np.triu_indices(P3)
+    C_int8_upper = C_int8[iu, ju]
+
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     json_path = out / f"{run_label}.json"
 
     # Gzip the raw int8 bytes — corr matrices are very compressible (smooth
-    # values + tail entropy), so we get ~50% off (47 MB → ~24 MB at -9).
-    # Frontend fetches `.bin.gzip` and decompresses via DecompressionStream.
+    # values + tail entropy). Even after upper-triangle halving we typically
+    # see another ~50% off from gzip -9. Frontend fetches `.bin.gzip` and
+    # decompresses via DecompressionStream.
     #
     # The `.gzip` extension (NOT `.gz`) is deliberate: Vite's static handler
     # auto-sets `Content-Encoding: gzip` for `.gz` URLs, which causes the
@@ -3606,7 +3629,7 @@ def analyze_voxel_corr_blob(
     # and crashes. Using `.gzip` keeps the server out of the loop and makes
     # the load path portable across dev (Vite) and prod (CFP, GH Pages, etc.).
     import gzip
-    raw = C_int8.tobytes(order="C")
+    raw = C_int8_upper.tobytes(order="C")
     bin_gz_path = out / f"{run_label}.bin.gzip"
     with gzip.open(bin_gz_path, "wb", compresslevel=9) as gz:
         gz.write(raw)
@@ -3626,6 +3649,11 @@ def analyze_voxel_corr_blob(
         "n_patches": int(n_patches),
         "n_mats": len(files),
         "int8_scale": 1.0 / 127.0,  # decoded = int8 * scale → float in [-1, 1]
+        # `blob_format` tells the frontend how to interpret the int8 buffer.
+        # `upper_triangle`: P³(P³+1)/2 entries, row-major over the upper
+        # triangle (i <= j); the FE mirrors into the full matrix on load.
+        # `full` (legacy, no field): P³ × P³ entries, row-major.
+        "blob_format": "upper_triangle",
         "blob_compression": "gzip",
         "blob_size": int(bin_gz_path.stat().st_size),
         "curve": curve.tolist(),
@@ -3638,6 +3666,25 @@ def analyze_voxel_corr_blob(
     json_path.write_text(json.dumps(metadata))
     err(f"[voxel-corr-blob] wrote {json_path} "
         f"({json_path.stat().st_size / 1e3:.1f} kB)")
+
+    if r2_upload:
+        # 1h cache: blobs are deploy-time-immutable per run-label, but a 1h TTL
+        # gives us a reasonable upper bound if we ever re-emit a label in place
+        # (and the worker still serves its own short-TTL by default).
+        cache_control = "public, max-age=3600"
+        bin_key = f"{r2_prefix}/{run_label}.bin.gzip"
+        json_key = f"{r2_prefix}/{run_label}.json"
+        err(f"[voxel-corr-blob] uploading to r2://{bucket}/{bin_key}")
+        _r2_put_bytes(
+            bucket, bin_key, bin_gz_path.read_bytes(),
+            "application/octet-stream", cache_control=cache_control,
+        )
+        err(f"[voxel-corr-blob] uploading to r2://{bucket}/{json_key}")
+        _r2_put_bytes(
+            bucket, json_key, json_path.read_bytes(),
+            "application/json", cache_control=cache_control,
+        )
+        err(f"[voxel-corr-blob] r2 upload complete")
 
     print()
     print("offset k  |  avg corr  |  note")
