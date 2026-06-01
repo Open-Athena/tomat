@@ -825,10 +825,10 @@ export function RunHeaderRich({
                 {/* wandb.svg ships as the full horizontal lockup
                     (icon + text + tagline); crop to just the leftmost
                     icon square via overflow:hidden + width constraint. */}
-                <span style={{ display: 'inline-block', width: 14, height: 14,
+                <span style={{ display: 'inline-block', width: 18, height: 18,
                   overflow: 'hidden', verticalAlign: 'middle' }}>
                   <img src="/wandb.svg" alt="wandb"
-                    style={{ height: 14, width: 'auto', display: 'block' }} />
+                    style={{ height: 18, width: 'auto', display: 'block' }} />
                 </span>
                 ↗
               </a>
@@ -850,7 +850,23 @@ export function RunHeaderRich({
                   style={{ fontSize: '0.75rem', color: '#888',
                     display: 'inline-flex', alignItems: 'center', gap: 2 }}>
                   <img src="/modal.png" alt="modal"
-                    style={{ height: 14, width: 'auto', verticalAlign: 'middle' }} />
+                    style={{ height: 18, width: 'auto', verticalAlign: 'middle' }} />
+                  ↗
+                </a>
+              </Tooltip>
+            )
+          })()}
+          {data.job && (() => {
+            // iris dashboard URL pattern: `https://iris.oa.dev/#/job/%2Fryan%2F<id>`
+            // (per iris-dashboard-share-pattern memory).
+            const irisUrl = `https://iris.oa.dev/#/job/${encodeURIComponent(data.job.job_id)}`
+            return (
+              <Tooltip content={`open iris job (${data.job.job_id})`}>
+                <a href={irisUrl} target="_blank" rel="noreferrer"
+                  style={{ fontSize: '0.75rem', color: '#888',
+                    display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+                  <img src="/tpu.png" alt="iris"
+                    style={{ height: 18, width: 'auto', verticalAlign: 'middle' }} />
                   ↗
                 </a>
               </Tooltip>
