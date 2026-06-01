@@ -298,6 +298,9 @@ def _summarize(r, keys: list[str]) -> dict:
         "url": r.url,
         "_runtime": s.get("_runtime"),
         "_step": s.get("_step"),
+        # Stash the Run so callers (e.g. `runs_status`) can do follow-up
+        # history scans without re-querying by name.
+        "_run": r,
     }
     for k in keys:
         out[k] = s.get(k)
@@ -329,6 +332,7 @@ def runs_ls():
 
 
 _STATUS_KEYS = [
+    "global_step",
     "throughput/mfu",
     "throughput/p50_mfu",
     "throughput/duration",
@@ -352,18 +356,49 @@ def runs_status(substr: str | None):
     summaries = _fetch_summaries(rs, _STATUS_KEYS)
     summaries.sort(key=lambda d: d["created_at"], reverse=True)
     one_line = substr is None or len(summaries) > 1
+    # Prefer the actual training step (`global_step`) over wandb's
+    # auto-incrementing row counter `_step`. When a run is thrashing on
+    # preempts, every `trainer_started` / `cluster_preempt` lifecycle
+    # marker fires a separate `log()` call that bumps `_step` without
+    # advancing training — last seen: tz-11 showed `_step=3250` while
+    # `max(global_step)` was actually 2500. Reporting `_step` overstates
+    # progress dramatically in that case.
+    #
+    # wandb's `summary.global_step` is unreliable too: it captures the
+    # LAST value the run logged, which is often a lifecycle marker
+    # without `global_step` — comes back `None`. So we walk the history
+    # backwards (newest first) for the most recent row that has a real
+    # `global_step` value. Bounded to ~50 rows so the call stays fast.
+    def _max_global_step(r) -> int | None:
+        try:
+            # `scan_history` doesn't take a "reverse" knob, but
+            # `r.history(samples=N, pandas=False)` returns the last N rows
+            # newest-first. Cheaper than scanning the full history.
+            rows = r.history(samples=200, keys=["global_step"], pandas=False)
+            return max(
+                (int(row["global_step"]) for row in rows
+                 if row.get("global_step") is not None),
+                default=None,
+            )
+        except Exception:
+            return None
+
     for d in summaries:
+        step = d.get("global_step")
+        if step is None:
+            step = _max_global_step(d["_run"])
+        if step is None:
+            step = d.get("_step")
         if one_line:
             mfu = d.get("throughput/mfu")
             mfu_s = f"{mfu:5.2f}%" if isinstance(mfu, (int, float)) else "   -  "
-            step = d["_step"]
             step_s = f"{step:>6}" if isinstance(step, int) else "     ?"
             runtime_h = (d["_runtime"] or 0) / 3600
             print(f"  [{d['state']:8s}] step={step_s} runtime={runtime_h:5.1f}h mfu={mfu_s}  {d['name']}")
         else:
             print(f"name:    {d['name']}")
             print(f"state:   {d['state']}")
-            print(f"step:    {d['_step']}")
+            print(f"step:    {step}")
             print(f"runtime: {(d['_runtime'] or 0)/3600:.2f} hr")
             for k in _STATUS_KEYS:
                 v = d.get(k)
