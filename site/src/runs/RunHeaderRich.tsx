@@ -15,7 +15,7 @@
 
 import { useMemo } from 'react'
 import { Tooltip } from '../Tooltip'
-import { evalPhase, type EvalJob, type IrisAttempts, type IrisJob, type ModalApp, type ModalFunctionCall, type RunManifest } from './api'
+import { evalPhase, isModalRun, type EvalJob, type IrisAttempts, type IrisJob, type ModalApp, type ModalFunctionCall, type RunManifest } from './api'
 import { computeTrainingFraction, formatDurationShort } from './trainingFraction'
 import { lineageFor } from './lineage'
 import type { RunHistory } from './parquet'
@@ -834,18 +834,31 @@ export function RunHeaderRich({
               </a>
             </Tooltip>
           )}
-          {data.modalApp && (() => {
+          {isModalRun(id) && (() => {
+            // The modal-logs LINK is independent of whether the run still has
+            // a live `modalApp` association. The badge-side `RunsPage` drops
+            // `data.modalApp` for stale runs (so the badge stops misclaiming
+            // RUNNING), but a finished Modal run's logs are still useful to
+            // open — gate on the run-name pattern instead.
+            //
             // Modal URL pattern: /apps/<workspace>/main/deployed/<app_name>
-            // Workspace is open-athena per `modal profile current`. Workspace
-            // could be made configurable via a build-time env var later.
-            const appName = data.modalApp.description ?? data.modalApp.app_id ?? ''
+            // Workspace is open-athena per `modal profile current`. We host
+            // all training fires under one app (`tomat-train-smoke`); the
+            // live `data.modalApp.description` matches that when present,
+            // and `modalAppForRun` filters by the same constant, so falling
+            // back to it is safe even without a live association.
+            const liveApp = data.modalApp
+            const appName = liveApp?.description ?? 'tomat-train-smoke'
             const appUrl = `https://modal.com/apps/open-athena/main/deployed/${appName}?activeTab=logs`
-            const fcs = Object.values(data.modalApp.function_calls)
+            const fcs = liveApp ? Object.values(liveApp.function_calls) : []
             fcs.sort((a, b) => b.function_call_id.localeCompare(a.function_call_id))
             const latestFc = fcs[0]
+            const tooltip = liveApp
+              ? `open Modal app logs (${liveApp.app_id ?? appName})`
+                + (latestFc ? `\nlatest fc: ${latestFc.function_call_id}` : '')
+              : `open Modal app logs (${appName})\n(this run has finished — no live app association)`
             return (
-              <Tooltip content={`open Modal app logs (${data.modalApp.app_id ?? appName})`
-                + (latestFc ? `\nlatest fc: ${latestFc.function_call_id}` : '')}>
+              <Tooltip content={tooltip}>
                 <a href={appUrl} target="_blank" rel="noreferrer"
                   style={{ fontSize: '0.75rem', color: '#888',
                     display: 'inline-flex', alignItems: 'center', gap: 2 }}>
