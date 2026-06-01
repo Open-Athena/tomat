@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
+import { enumParam, useUrlState } from 'use-prms'
 import { Tooltip } from '../Tooltip'
 import { evalJobsByRun, evalPhase, fetchEval, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchRunsSnapshot, irisJobIdForRun, modalAppForRun, parquetUrl } from './api'
 import type { EvalJob, EvalPoint } from './api'
@@ -192,23 +193,56 @@ const EXCLUDED_RUNS: ReadonlySet<string> = new Set([
   'train-full-v3-200M-bs128-emd-do-500-v5p16-shuf1k-pyspy-3',
 ])
 
-// Order: running first, then by "most recently active" (`history.ts_max`).
-// Falls back to `created_at`, then iris `submitted_at_ms` for pending cards
-// that have no wandb manifest yet. Puts cont7k-ext at the top after it last
-// logged today (even though created May 11), AND a fresh `tomat train` fire
-// at the very top while it's still queueing.
-function orderRuns(cards: RunCardData[]): RunCardData[] {
-  const activityTs = (c: RunCardData): number => {
-    const tsMax = c.manifest?.history.ts_max
-    if (typeof tsMax === 'number') return tsMax * 1000
-    const ca = c.manifest?.run.created_at
-    if (ca) return Date.parse(ca)
-    // Manifest-less pending/building card: sort by iris submission time so
-    // the most recent fire is at the top of the queued bucket.
-    return c.job?.submitted_at_ms ?? 0
+/** Sort mode for the runs card list, URL-persisted via `?sort=`.
+ *  - `active`: bucket-by-state (running → queued → other), within each by
+ *    most-recently active. The default — keeps fresh activity at the top.
+ *  - `updated`: pure last-updated desc (no bucket grouping).
+ *  - `created`: by run creation time desc (newest first).
+ *  - `name`: alphabetical asc.
+ *  - `step`: by `last_train_step` desc (furthest-trained first). */
+const SORT_MODES = ['active', 'updated', 'created', 'name', 'step'] as const
+type SortMode = (typeof SORT_MODES)[number]
+
+function activityTs(c: RunCardData): number {
+  const tsMax = c.manifest?.history.ts_max
+  if (typeof tsMax === 'number') return tsMax * 1000
+  const ca = c.manifest?.run.created_at
+  if (ca) return Date.parse(ca)
+  // Manifest-less pending/building card: sort by iris submission time so
+  // the most recent fire is at the top of the queued bucket.
+  return c.job?.submitted_at_ms ?? 0
+}
+
+function createdTs(c: RunCardData): number {
+  const ca = c.manifest?.run.created_at
+  if (ca) return Date.parse(ca)
+  return c.job?.submitted_at_ms ?? 0
+}
+
+function lastStep(c: RunCardData): number {
+  return c.manifest?.history.last_train_step
+    ?? c.manifest?.history.step_max
+    ?? -1
+}
+
+// Default order: running first, then queued (pending/building), then
+// everything else; within each bucket by `activityTs` desc. Puts cont7k-ext
+// at the top after it last logged today (even though created May 11), AND a
+// fresh `tomat train` fire at the very top while it's still queueing.
+function orderRuns(cards: RunCardData[], mode: SortMode = 'active'): RunCardData[] {
+  if (mode === 'updated') {
+    return [...cards].sort((a, b) => activityTs(b) - activityTs(a))
   }
-  // Sort buckets: running first, then queued, then everything else; within a
-  // bucket by most-recent activity.
+  if (mode === 'created') {
+    return [...cards].sort((a, b) => createdTs(b) - createdTs(a))
+  }
+  if (mode === 'name') {
+    return [...cards].sort((a, b) => a.id.localeCompare(b.id))
+  }
+  if (mode === 'step') {
+    return [...cards].sort((a, b) => lastStep(b) - lastStep(a))
+  }
+  // 'active' (default): bucket + activity-desc.
   const rank = (c: RunCardData): number =>
     isRunning(c) ? 0 : isQueued(c) ? 1 : 2
   return [...cards].sort((a, b) => {
@@ -362,10 +396,15 @@ function RunsIndex() {
     return out
   }, [iris, modal, visibleSet, evalByRun])
 
+  // URL-persisted card sort mode (`?sort=`). Default 'active' = the existing
+  // bucket-by-state + activity-desc behavior; others let the user re-key on
+  // pure last-updated, created, name, or current step.
+  const [sortMode, setSortMode] = useUrlState('sort', enumParam<SortMode>('active', SORT_MODES))
+
   // Drop v2 (P14) runs — obsolete tokenizer, and a few are mislabeled
   // `train-full-v3-…` (trained on v2 data) which is pure confusion on the board.
   const ordered = cards
-    ? orderRuns([...cards, ...pendingCards].filter((c) => !isV2Run(c)))
+    ? orderRuns([...cards, ...pendingCards].filter((c) => !isV2Run(c)), sortMode)
     : null
   const runningCount = ordered?.filter(isRunning).length ?? 0
   const queuedCount = ordered?.filter(isQueued).length ?? 0
@@ -635,6 +674,29 @@ function RunsIndex() {
       {err && <p style={{ color: 'crimson' }}>error: {err}</p>}
       {!ordered && !err && <p>loading…</p>}
       {ordered && ordered.length === 0 && <p>(none synced yet)</p>}
+      {ordered && ordered.length > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.6rem', fontSize: '0.75rem' }}>
+          <span style={{ color: '#888' }}>sort:</span>
+          {SORT_MODES.map((m) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => setSortMode(m)}
+              style={{
+                fontSize: '0.75rem',
+                padding: '0.15rem 0.5rem',
+                borderRadius: 4,
+                border: `1px solid ${sortMode === m ? '#4a8aff' : '#444'}`,
+                background: sortMode === m ? 'rgba(74,138,255,0.15)' : 'transparent',
+                color: 'inherit',
+                cursor: 'pointer',
+              }}
+            >
+              {m === 'active' ? 'active+updated' : m === 'updated' ? 'updated' : m}
+            </button>
+          ))}
+        </div>
+      )}
       {timelineSeries.length > 0 && (
         <div style={{ marginBottom: '1.2rem' }}>
           <RunsTimelinePlot
