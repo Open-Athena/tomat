@@ -966,6 +966,18 @@ export function RunHeaderRich({
                 }} />
               </div>
             )}
+            {/* Epoch counter — first-class measure of training progress, sits
+                directly below the step counter so it's visible at a glance
+                regardless of which x-axis the WallclockPlot is showing.
+                Hidden when the data label / batch size needed for the
+                computation isn't in the manifest. */}
+            {nEpochs != null && (
+              <Tooltip content="fractional passes over the training set, computed from total_tokens / (epoch_sequences × train_seq_len)">
+                <div style={{ marginTop: 3, fontSize: '0.78rem' }}>
+                  epoch <b>{nEpochs.toFixed(2)}</b>
+                </div>
+              </Tooltip>
+            )}
           </div>
         )}
         {/* Sparkline: step vs wallclock over last 6h. Flat = preempt/restart. */}
@@ -1003,12 +1015,6 @@ export function RunHeaderRich({
           {typeof mfu === 'number' && <> · MFU {mfu.toFixed(1)}%</>}
           {typeof mtNmae === 'number' && <> · MT {mtNmae.toFixed(2)}%</>}
           {typeof mvNmae === 'number' && <> · MV {mvNmae.toFixed(2)}%</>}
-          {nEpochs != null && <>
-            {' · '}
-            <Tooltip content="fractional passes over the training set, computed from total_tokens / (epoch_sequences × train_seq_len)">
-              <span>ep {nEpochs.toFixed(2)}</span>
-            </Tooltip>
-          </>}
           {nFlops != null && <> · {formatFlops(nFlops)} FLOP</>}
         </div>
         {/* % training chip — sum(train-active windows ∩ attempt windows) /
