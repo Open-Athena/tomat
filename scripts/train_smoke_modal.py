@@ -427,6 +427,7 @@ def _train_bakeoff_impl(
     maskgit_prior: str = "absorbing",
     maskgit_loss_type: str = "ce",
     wandb_project: str | None = None,
+    steps_per_eval: int | None = None,  # None = disable mid-training eval (old default)
 ) -> dict:
     """200M-or-other preset training body for the bakeoff probe.
 
@@ -691,10 +692,14 @@ def _train_bakeoff_impl(
         compute_dtype=compute_jdtype,
         output_dtype=jnp.float32,
     )
+    # `steps_per_eval=None` keeps the historical behavior (eval only at the
+    # final step). Pass an explicit value to surface VL mid-training — cheap
+    # for MG-CE on the val cache (one bidi forward per eval period).
+    spe = steps_per_eval if steps_per_eval is not None else max(steps, 1)
     trainer = TrainerConfig(
         id=run_id, seed=seed,
         num_train_steps=steps, train_batch_size=batch_size,
-        steps_per_eval=max(steps, 1),  # disable mid-training eval
+        steps_per_eval=spe,
         tracker=trackers, checkpointer=checkpointer,
         mp=mp_policy,
     )
@@ -805,6 +810,7 @@ def train_bakeoff_h200x8(
     maskgit_prior: str = "absorbing",
     maskgit_loss_type: str = "ce",
     wandb_project: str | None = None,
+    steps_per_eval: int | None = None,
 ) -> dict:
     """8× H200 bakeoff probe; same SM as H100, 1.4× HBM bandwidth."""
     return _train_bakeoff_impl(
@@ -818,6 +824,7 @@ def train_bakeoff_h200x8(
         maskgit_prior=maskgit_prior,
         maskgit_loss_type=maskgit_loss_type,
         wandb_project=wandb_project,
+        steps_per_eval=steps_per_eval,
     )
 
 
