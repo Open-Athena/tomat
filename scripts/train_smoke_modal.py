@@ -146,6 +146,7 @@ def _train_smoke_impl(
         PrebuiltLmDatasetFormat,
         UrlDatasetSourceConfig,
     )
+    from levanter.data.text.datasets import BlockShuffleConfig
     from datetime import timedelta
     from levanter.checkpoint import CheckpointerConfig
     from levanter.layers.rotary import Llama3RotaryEmbeddingsConfig
@@ -428,6 +429,13 @@ def _train_bakeoff_impl(
     maskgit_loss_type: str = "ce",
     wandb_project: str | None = None,
     steps_per_eval: int | None = None,  # None = disable mid-training eval (old default)
+    # Shuffle params: mirror the TPU trainer's env-var convention
+    # (`marin/train_tomat_tpu.py:651-664`). Defaults match TPU. Set
+    # `window_blocks=0` to fully disable BlockShuffle (Levanter then uses its
+    # built-in default, which is what produced the 1024-step sawtooth — see
+    # spec 44). Pass any of these as Modal call args to override per-spawn.
+    shuffle_io_block_size: int = 32,
+    shuffle_window_blocks: int = 1024,
 ) -> dict:
     """200M-or-other preset training body for the bakeoff probe.
 
@@ -461,6 +469,7 @@ def _train_bakeoff_impl(
         PrebuiltLmDatasetFormat,
         UrlDatasetSourceConfig,
     )
+    from levanter.data.text.datasets import BlockShuffleConfig
     from datetime import timedelta
     from levanter.checkpoint import CheckpointerConfig
     from levanter.layers.rotary import Llama3RotaryEmbeddingsConfig
@@ -542,12 +551,28 @@ def _train_bakeoff_impl(
     component = DatasetComponent(
         source=source, cache_dir=cache_dir, format=prebuilt_fmt,
     )
+    # See `train_bakeoff_h200x8` signature for the shuffle param semantics.
+    # `window_blocks=0` → disable BlockShuffle (use Levanter's noisy default).
+    if shuffle_window_blocks > 0:
+        shuffle_cfg: BlockShuffleConfig | bool = BlockShuffleConfig(
+            io_block_size=shuffle_io_block_size,
+            window_blocks=shuffle_window_blocks,
+        )
+        err(f"[bakeoff] shuffle: BlockShuffle(io_block_size={shuffle_io_block_size}, "
+            f"window_blocks={shuffle_window_blocks}) — window covers "
+            f"{shuffle_io_block_size * shuffle_window_blocks} seqs "
+            f"= {(shuffle_io_block_size * shuffle_window_blocks) // batch_size} steps "
+            f"at BS={batch_size}")
+    else:
+        shuffle_cfg = False
+        err(f"[bakeoff] shuffle: OFF (window_blocks=0)")
     data = LmDataConfig(
         tokenizer="passthrough",
         vocab_size=vocab_size,
         cache_dir=cache_dir,
         components={"tomat": component},
         block_cross_document_attention=False,
+        shuffle=shuffle_cfg,
     )
 
     preset = MODEL_PRESETS[model_preset]
@@ -615,6 +640,8 @@ def _train_bakeoff_impl(
                 cache_dir=cache_dir,
                 components={"tomat": component},
                 block_cross_document_attention=False,
+                # Re-use the shuffle_cfg computed for the main `data` above.
+                shuffle=shuffle_cfg,
             )
         else:
             # Mirror train_tomat_tpu.py density-loss setup.
@@ -811,6 +838,8 @@ def train_bakeoff_h200x8(
     maskgit_loss_type: str = "ce",
     wandb_project: str | None = None,
     steps_per_eval: int | None = None,
+    shuffle_io_block_size: int = 32,
+    shuffle_window_blocks: int = 1024,
 ) -> dict:
     """8× H200 bakeoff probe; same SM as H100, 1.4× HBM bandwidth."""
     return _train_bakeoff_impl(
@@ -825,6 +854,8 @@ def train_bakeoff_h200x8(
         maskgit_loss_type=maskgit_loss_type,
         wandb_project=wandb_project,
         steps_per_eval=steps_per_eval,
+        shuffle_io_block_size=shuffle_io_block_size,
+        shuffle_window_blocks=shuffle_window_blocks,
     )
 
 
