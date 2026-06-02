@@ -2335,6 +2335,377 @@ def evals_sync(substr: str | None, bucket: str, dry_run: bool, prefix: str):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# tomat evals backfill — reconstruct eval records from historical GCS results.
+# See specs/43-run-eval-relation.md §"Backfill" + §"Data model".
+# ──────────────────────────────────────────────────────────────────────
+
+# Set names whose results land directly under `eval/results/<dir>/<set>/`
+# (teacher mode) or `eval/results/<dir>/<set>-<mode>/` (free, maskgit, ...).
+# We scan for both flavors per known set.
+_BACKFILL_SETS = ("val_200", "train_200")
+_BACKFILL_MODES = ("teacher", "free", "maskgit")
+
+
+def _backfill_record_key(step: int, set_: str, mode: str, task_idx: int | None) -> str:
+    """Build the record's key — used both for the R2 filename and the
+    index.json entry. Spec 43 §"Where the record lives":
+    `<step>-<set>-<mode>(-task<i>)`."""
+    suffix = f"-task{task_idx}" if task_idx is not None else ""
+    return f"{step}-{set_}-{mode}{suffix}"
+
+
+def _backfill_result_summary(d: dict) -> dict:
+    """Copy out the scalar(s) the dashboard renders. The full per-step JSON
+    stays on GCS at `gcs_result_path`."""
+    return {
+        "n_mats":      d.get("n_mats"),
+        "nmae_mean":   d.get("nmae_mean"),
+        "nmae_median": d.get("nmae_median"),
+        "nmae_p99":    d.get("nmae_p99"),
+        "nemd_mean":   d.get("nemd_mean"),
+        "nemd_median": d.get("nemd_median"),
+        "nemd_p99":    d.get("nemd_p99"),
+    }
+
+
+def _backfill_parse_step_filename(fname: str) -> tuple[int, int | None] | None:
+    """`step-<N>.json` → (N, None); `step-<N>-task<I>.json` → (N, I).
+    Returns None on a non-matching name."""
+    if not (fname.startswith("step-") and fname.endswith(".json")):
+        return None
+    stem = fname[len("step-"):-len(".json")]
+    task: int | None = None
+    if "-task" in stem:
+        stem, task_s = stem.split("-task", 1)
+        try:
+            task = int(task_s)
+        except ValueError:
+            return None
+    try:
+        return int(stem), task
+    except ValueError:
+        return None
+
+
+def _backfill_discover_dirs(fs, results_base: str, dashboard_run_id: str) -> list[tuple[str, str, str]]:
+    """Find every `<set>(-<mode>)` subdir for a given dashboard run id.
+    Returns [(gcs_subdir, set, mode), ...]. The dashboard run id IS the
+    `eval/results/` leaf dir name for both Modal-trained (`...-bs128-seed42`)
+    and iris-trained (`<run_label>`) runs — see spec 43 §"Backfill" + the
+    `--ckpt-leaf` flag in `tomat evals fire`.
+
+    Reads the directory listing once; iterates all (set, mode) flavors
+    against it. Missing subdirs are silently skipped — runs vary in which
+    mat-sets / modes they've been evaluated against.
+    """
+    run_base = f"{results_base}/{dashboard_run_id}"
+    if not fs.exists(run_base):
+        return []
+    try:
+        children = {p.rsplit("/", 1)[-1] for p in fs.ls(run_base) if fs.isdir(p)}
+    except Exception as e:
+        err(f"[evals backfill] WARN: ls {run_base} failed: {e}")
+        return []
+    out: list[tuple[str, str, str]] = []
+    for s in _BACKFILL_SETS:
+        # Teacher mode → bare `<set>/` subdir.
+        if s in children:
+            out.append((f"{run_base}/{s}", s, "teacher"))
+        # Other modes → `<set>-<mode>/` subdirs.
+        for m in _BACKFILL_MODES:
+            if m == "teacher":
+                continue
+            sub = f"{s}-{m}"
+            if sub in children:
+                out.append((f"{run_base}/{sub}", s, m))
+    return out
+
+
+@evals.command("backfill")
+@click.option("-b", "--bucket", default=R2_BUCKET, help="R2 bucket")
+@click.option("-p", "--prefix", default=R2_RUNS_PREFIX, help="R2 key prefix (run id appended)")
+@click.option("-g", "--gcs-bucket", default=GCS_BUCKET, help="GCS bucket holding eval results")
+@click.option("-f", "--force", is_flag=True, help="rewrite records even if newer-or-equal mtime exists on R2 (default: skip)")
+@click.option("-n", "--dry-run", is_flag=True, help="report what would be written; skip R2 uploads")
+@click.argument("run_label")
+def evals_backfill(
+    run_label: str,
+    bucket: str,
+    prefix: str,
+    gcs_bucket: str,
+    force: bool,
+    dry_run: bool,
+):
+    """Reconstruct eval records for historical eval results (spec 43, Phase A).
+
+    For RUN_LABEL (= the dashboard run id, which equals the wandb run name
+    AND the leaf dir under `gs://<bucket>/eval/results/`), discover every
+    `<set>(-<mode>)/step-*.json` result file, fabricate one record per
+    `(step, set, mode, task)` combination with `state="succeeded"` and
+    `result` populated from the JSON's scalars, and upload:
+
+      - `s3://<bucket>/<prefix>/<run>/evals/<key>.json` (one per record)
+      - `s3://<bucket>/<prefix>/<run>/evals/index.json` (pointer list)
+
+    Idempotent: by default, skip records whose R2 mtime is ≥ the GCS object
+    mtime (which is set when the result JSON last landed). Pass --force to
+    rewrite all records unconditionally — useful when the record schema
+    changes.
+
+    `job_ref` is null on backfill records (the backend handle is lost —
+    we can't reconstruct iris job names or Modal call-ids from result JSONs).
+    """
+    import fsspec
+    from datetime import datetime, timezone
+
+    fs = fsspec.filesystem("gcs")
+    # Strip the `gs://` scheme + tomat sub-prefix to match the existing
+    # `evals sync` style (`fsspec` accepts both, but consistency helps).
+    gcs_bucket_path = gcs_bucket.replace("gs://", "")
+    results_base = f"{gcs_bucket_path}/eval/results"
+
+    subdirs = _backfill_discover_dirs(fs, results_base, run_label)
+    if not subdirs:
+        err(f"[evals backfill] no eval-result subdirs found for {run_label!r} "
+            f"under gs://{results_base}/{run_label}/")
+        err("                  (this is fine for runs with no evals fired yet)")
+        # Still write an empty index so the CFW returns [] vs 404.
+        index: list[dict] = []
+        _backfill_upload_index(bucket, prefix, run_label, index, dry_run=dry_run)
+        return
+
+    # Pre-list existing R2 records so we can apply the idempotency check
+    # without an aws-head-object per record. Records that don't yet exist
+    # on R2 get written unconditionally.
+    existing = _backfill_list_r2_records(bucket, prefix, run_label)
+
+    records_by_key: dict[str, dict] = {}
+    n_written = n_skipped = n_failed = 0
+
+    for subdir, set_, mode in subdirs:
+        try:
+            entries = fs.ls(subdir, detail=True)
+        except Exception as e:
+            err(f"[evals backfill] WARN: ls {subdir} failed: {e}")
+            continue
+        # Collect (path, mtime, step, task) tuples.
+        for entry in entries:
+            path = entry["name"] if isinstance(entry, dict) else entry
+            if not path.endswith(".json"):
+                continue
+            fname = path.rsplit("/", 1)[-1]
+            parsed = _backfill_parse_step_filename(fname)
+            if parsed is None:
+                continue
+            step, task_idx = parsed
+            key = _backfill_record_key(step, set_, mode, task_idx)
+            gcs_path = f"gs://{path}" if not path.startswith("gs://") else path
+            # Pull GCS mtime for the staleness check + the record's
+            # fired_at/result_seen_at synth. fsspec's `ls(detail=True)`
+            # returns dicts with an `updated` key on GCS; fall back to a
+            # `stat` call if missing.
+            mtime_iso: str | None = None
+            mtime_epoch: float | None = None
+            if isinstance(entry, dict):
+                upd = entry.get("updated") or entry.get("mtime")
+                if isinstance(upd, str):
+                    mtime_iso = upd
+                    try:
+                        mtime_epoch = datetime.fromisoformat(
+                            upd.replace("Z", "+00:00")
+                        ).timestamp()
+                    except Exception:
+                        pass
+                elif isinstance(upd, (int, float)):
+                    mtime_epoch = float(upd)
+                    mtime_iso = datetime.fromtimestamp(
+                        mtime_epoch, tz=timezone.utc,
+                    ).isoformat(timespec="seconds")
+            if mtime_iso is None:
+                try:
+                    st = fs.stat(path)
+                    upd = st.get("updated") or st.get("mtime")
+                    if isinstance(upd, str):
+                        mtime_iso = upd
+                        try:
+                            mtime_epoch = datetime.fromisoformat(
+                                upd.replace("Z", "+00:00")
+                            ).timestamp()
+                        except Exception:
+                            pass
+                    elif isinstance(upd, (int, float)):
+                        mtime_epoch = float(upd)
+                        mtime_iso = datetime.fromtimestamp(
+                            mtime_epoch, tz=timezone.utc,
+                        ).isoformat(timespec="seconds")
+                except Exception:
+                    pass
+
+            # Idempotency: skip if R2 record exists AND its mtime ≥ GCS mtime.
+            ex_mtime = existing.get(f"{key}.json")
+            if not force and ex_mtime is not None and mtime_epoch is not None and ex_mtime >= mtime_epoch:
+                n_skipped += 1
+                # Still surface the record in the index — we just won't
+                # re-upload its body. Pull the existing one to grab the
+                # state for the index entry.
+                idx_entry = {
+                    "key": key,
+                    "fired_at": mtime_iso or "1970-01-01T00:00:00Z",
+                    "state": "succeeded",
+                }
+                records_by_key[key] = idx_entry
+                continue
+
+            # Read + parse the result JSON to extract the result scalars.
+            try:
+                with fs.open(path, "r") as f:
+                    raw = json.load(f)
+            except Exception as e:
+                err(f"[evals backfill] WARN: read {path} failed: {e}")
+                n_failed += 1
+                continue
+
+            # Sanity-check the mode/set match — guards against renamed
+            # eval scripts dumping into the wrong subdir.
+            if raw.get("mode") and raw["mode"] != mode:
+                err(f"[evals backfill] WARN: {path} reports mode={raw['mode']!r}, "
+                    f"expected {mode!r} (path-derived); using path-derived value")
+            if raw.get("mat_set") and raw["mat_set"] != set_:
+                err(f"[evals backfill] WARN: {path} reports mat_set={raw['mat_set']!r}, "
+                    f"expected {set_!r} (path-derived)")
+
+            ckpt = raw.get("checkpoint") or ""
+            # `gs://<bucket>/<tomat_prefix>/results/<run_label>/checkpoints/<leaf>/step-N`
+            ckpt_leaf: str | None = None
+            m = re.search(r"/results/([^/]+)/checkpoints/([^/]+)/step-\d+/?$", ckpt)
+            if m:
+                rl = m.group(1)
+                leaf = m.group(2)
+                if leaf != rl:
+                    ckpt_leaf = leaf
+
+            fired_at = mtime_iso or datetime.now(timezone.utc).isoformat(timespec="seconds")
+            record = {
+                "schema_version": 1,
+                "run_label":  run_label,
+                "ckpt_leaf":  ckpt_leaf,
+                "step":       step,
+                "set":        set_,
+                "mode":       mode,
+                "task_idx":   task_idx,
+                "n_tasks":    1,                       # backfill doesn't know fanout cardinality
+                "n_mats":     raw.get("n_mats"),
+                "eval_label": raw.get("label"),
+                "model_preset": raw.get("model"),
+                "mg_k_steps": None,
+                "free_batch": None,
+                "eval_batch": None,
+                "decoder":    None,
+
+                "backend":  None,   # backend handle is lost
+                "job_ref":  None,
+
+                "fired_at":         fired_at,
+                "state":            "succeeded",
+                "state_synced_at":  fired_at,
+                "started_at":       None,
+                "finished_at":      fired_at,
+                "exit_code":        0,
+                "error_msg":        None,
+
+                "gcs_result_path":  gcs_path,
+                "result":           _backfill_result_summary(raw),
+                "result_seen_at":   fired_at,
+            }
+            data = json.dumps(record, separators=(",", ":")).encode()
+            r2_key = f"{prefix}/{run_label}/evals/{key}.json"
+            if dry_run:
+                err(f"[evals backfill] {run_label}: would upload {r2_key} "
+                    f"({len(data)} B)")
+            else:
+                _r2_put_bytes(bucket, r2_key, data, "application/json")
+            n_written += 1
+            records_by_key[key] = {
+                "key":      key,
+                "fired_at": fired_at,
+                "state":    "succeeded",
+            }
+
+    # Sort the index by (step, set, mode, task) per spec — cheap-stable.
+    def _index_sort_key(e: dict) -> tuple:
+        parts = e["key"].split("-")
+        # Defensive: keys we wrote are always `step-set-mode[-taskI]`.
+        try:
+            step = int(parts[0])
+        except ValueError:
+            step = 0
+        return (step, e["key"])
+
+    index = sorted(records_by_key.values(), key=_index_sort_key)
+    _backfill_upload_index(bucket, prefix, run_label, index, dry_run=dry_run)
+
+    err(f"[evals backfill] {run_label}: wrote {n_written} record(s), "
+        f"skipped {n_skipped}, failed {n_failed}; index has {len(index)} entries")
+
+
+def _backfill_list_r2_records(bucket: str, prefix: str, run_label: str) -> dict[str, float]:
+    """List `evals/*.json` under one run on R2, return `{filename: mtime_epoch}`.
+    Used for idempotency in `evals backfill`."""
+    r = subprocess.run(
+        ["aws", "--profile", "cfo", "--endpoint-url", R2_ENDPOINT,
+         "s3api", "list-objects-v2",
+         "--bucket", bucket,
+         "--prefix", f"{prefix}/{run_label}/evals/",
+         "--query", "Contents[].[Key,LastModified]",
+         "--output", "text"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if r.returncode != 0:
+        err(f"[evals backfill] WARN: list existing R2 records failed: "
+            f"rc={r.returncode} stderr={r.stderr[-200:]}")
+        return {}
+    out: dict[str, float] = {}
+    from datetime import datetime
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if not line or line == "None":
+            continue
+        # `Contents[].[Key,LastModified]` `--output text` emits TAB-separated.
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        key, lastmod = parts[0], parts[1]
+        fname = key.rsplit("/", 1)[-1]
+        if fname == "index.json":
+            continue
+        try:
+            mtime = datetime.fromisoformat(lastmod.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+        out[fname] = mtime
+    return out
+
+
+def _backfill_upload_index(
+    bucket: str,
+    prefix: str,
+    run_label: str,
+    index: list[dict],
+    dry_run: bool,
+):
+    """Write `evals/index.json` for one run."""
+    key = f"{prefix}/{run_label}/evals/index.json"
+    data = json.dumps(index, separators=(",", ":")).encode()
+    if dry_run:
+        err(f"[evals backfill] {run_label}: would upload index "
+            f"({len(index)} entries, {len(data)} B) → s3://{bucket}/{key}")
+        return
+    _r2_put_bytes(bucket, key, data, "application/json")
+    err(f"[evals backfill] {run_label}: index ({len(index)} entries) "
+        f"→ {R2_ENDPOINT}/{bucket}/{key}")
+
+
+# ──────────────────────────────────────────────────────────────────────
 # tomat preempts
 # ──────────────────────────────────────────────────────────────────────
 
