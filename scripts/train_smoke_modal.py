@@ -429,12 +429,15 @@ def _train_bakeoff_impl(
     maskgit_loss_type: str = "ce",
     wandb_project: str | None = None,
     steps_per_eval: int | None = None,  # None = disable mid-training eval (old default)
-    # Shuffle params: mirror the TPU trainer's env-var convention
-    # (`marin/train_tomat_tpu.py:651-664`). Defaults match TPU. Set
-    # `window_blocks=0` to fully disable BlockShuffle (Levanter then uses its
-    # built-in default, which is what produced the 1024-step sawtooth — see
-    # spec 44). Pass any of these as Modal call args to override per-spawn.
-    shuffle_io_block_size: int = 32,
+    # Shuffle params. TPU reads these from `meta.patches_per_material` (default
+    # 64 for train-full-v3) + the `TOMAT_SHUFFLE_*` env vars (see
+    # `marin/train_tomat_tpu.py:651-664`); the Modal side takes them as kwargs.
+    # The right `io_block_size` is `patches_per_material` so one io_block =
+    # exactly one material's-worth of consecutive patches, and intra-window
+    # BlockShuffle interleaves materials rather than slicing them.
+    # `window_blocks=0` disables BlockShuffle (Levanter then uses its built-in
+    # default — the source of the 1024-step sawtooth; see spec 44).
+    shuffle_io_block_size: int = 64,
     shuffle_window_blocks: int = 1024,
 ) -> dict:
     """200M-or-other preset training body for the bakeoff probe.
@@ -838,7 +841,7 @@ def train_bakeoff_h200x8(
     maskgit_loss_type: str = "ce",
     wandb_project: str | None = None,
     steps_per_eval: int | None = None,
-    shuffle_io_block_size: int = 32,
+    shuffle_io_block_size: int = 64,
     shuffle_window_blocks: int = 1024,
 ) -> dict:
     """8× H200 bakeoff probe; same SM as H100, 1.4× HBM bandwidth."""
