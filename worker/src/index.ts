@@ -2,11 +2,13 @@
  * tomat-runs-api — CFW backing tomat.oa.dev/runs.
  *
  * Endpoints (all read-only, public for now):
- *   GET  /api/runs-snapshot.json         — aggregated: runs index + all manifests + iris state + modal state, in one shot
+ *   GET  /api/runs-snapshot.json         — aggregated: runs index + all manifests + iris state + modal state + evals indexes, in one shot
  *   GET  /api/runs                       — list of synced run ids
  *   GET  /api/runs/:id/manifest.json     — per-run metadata (config, summary, history range)
  *   GET  /api/runs/:id/raw.parquet       — full history parquet
  *   GET  /api/runs/:id/eval.json         — per-step mat-NMAE/NEMD series (both mat-sets)
+ *   GET  /api/runs/:id/evals             — eval-records index (spec 43): [{key, fired_at, state}]
+ *   GET  /api/runs/:id/evals/:key        — one eval record (spec 43, Phase A)
  *   GET  /api/iris-state.json            — iris snapshot (synced by tomat iris sync)
  *   GET  /api/iris-attempts/:label.json  — per-task per-attempt history (death events) for one training run
  *   GET  /api/voxel-corr/:label.json     — voxel-position corr-matrix sidecar (int8 scale, 1D curve, blob_format)
@@ -16,9 +18,10 @@
  *   GET  /api/files/get?path=…           — generic R2 get with Range support
  *   GET  /health
  *
- * Backed by R2 `openathena/tomat/runs/<id>/{raw.parquet,manifest.json,eval.json}`,
- * populated out-of-band by `tomat runs sync` + `tomat evals sync` (will become
- * an on-demand pull in a later phase — see specs/23-runs-dashboard.md).
+ * Backed by R2 `openathena/tomat/runs/<id>/{raw.parquet,manifest.json,eval.json,evals/*.json}`,
+ * populated out-of-band by `tomat runs sync` + `tomat evals sync` + `tomat evals backfill`
+ * (will become an on-demand pull in a later phase — see specs/23-runs-dashboard.md
+ * and specs/43-run-eval-relation.md).
  *
  * The `/api/files/*` endpoints expose the broader `tomat/` sub-tree of the
  * `openathena` bucket (runs/, eval/, codecs/, tokenized/, …) for the
@@ -149,6 +152,22 @@ async function listRuns(env: Env): Promise<string[]> {
 	return out.sort();
 }
 
+/** Eval-records index entry (spec 43 §"Where the record lives"). Each entry
+ *  is a pointer to a full record file under `runs/<run>/evals/<key>.json`. */
+interface EvalIndexEntry {
+	key: string;        // `<step>-<set>-<mode>` or `<step>-<set>-<mode>-task<i>`
+	fired_at: string;   // ISO-8601 (≈ GCS object mtime for backfill records)
+	state: string;      // pending | running | succeeded | failed | killed
+}
+
+/** What `runs[id]` carries in the aggregated snapshot. Loosely-typed because
+ *  the manifest is the existing `RunManifest` shape (defined in the site's
+ *  `api.ts`); we just need to splice in an optional `evals` field. */
+interface RunSnapshotEntry {
+	evals?: EvalIndexEntry[];
+	[key: string]: unknown;
+}
+
 /**
  * Aggregated snapshot endpoint — assembles the full runs-dashboard payload in
  * ONE response so the frontend doesn't have to fan out N per-run requests.
@@ -168,17 +187,19 @@ async function listRuns(env: Env): Promise<string[]> {
 async function buildRunsSnapshot(env: Env): Promise<{
 	synced_at: string;
 	count: number;
-	runs: Record<string, unknown | null>;
+	runs: Record<string, RunSnapshotEntry | null>;
 	iris: unknown | null;
 	modal: unknown | null;
 }> {
 	const runIds = await listRuns(env);
 
-	// Fan out manifest.json reads in parallel. ~50 small R2 GETs in parallel
-	// is well within the Worker's subrequest budget (50/req soft cap; 1000/req
-	// hard cap on paid plans) and finishes in roughly one R2 round-trip.
+	// Fan out manifest.json + evals/index.json reads in parallel. ~50 small
+	// R2 GETs in parallel is well within the Worker's subrequest budget
+	// (50/req soft cap; 1000/req hard cap on paid plans) and finishes in
+	// roughly one R2 round-trip.
 	const manifestKeys = runIds.map((id) => `${env.R2_RUNS_PREFIX}/${id}/manifest.json`);
-	const [manifestResults, irisObj, modalObj] = await Promise.all([
+	const evalsIndexKeys = runIds.map((id) => `${env.R2_RUNS_PREFIX}/${id}/evals/index.json`);
+	const [manifestResults, evalsIndexResults, irisObj, modalObj] = await Promise.all([
 		Promise.all(
 			manifestKeys.map(async (k): Promise<unknown | null> => {
 				const obj = await env.R2.get(k);
@@ -190,13 +211,37 @@ async function buildRunsSnapshot(env: Env): Promise<{
 				}
 			}),
 		),
+		Promise.all(
+			evalsIndexKeys.map(async (k): Promise<EvalIndexEntry[] | null> => {
+				const obj = await env.R2.get(k);
+				if (!obj) return null;
+				try {
+					const parsed = await obj.json();
+					return Array.isArray(parsed) ? (parsed as EvalIndexEntry[]) : null;
+				} catch {
+					return null;
+				}
+			}),
+		),
 		env.R2.get('tomat/iris-state.json'),
 		env.R2.get('tomat/modal-state.json'),
 	]);
 
-	const runs: Record<string, unknown | null> = {};
+	const runs: Record<string, RunSnapshotEntry | null> = {};
 	for (let i = 0; i < runIds.length; i++) {
-		runs[runIds[i]] = manifestResults[i];
+		const manifest = manifestResults[i];
+		const evals = evalsIndexResults[i];
+		if (manifest === null && evals === null) {
+			runs[runIds[i]] = null;
+		} else {
+			// Common case: manifest exists, evals may or may not.
+			// Edge case: evals exist but manifest doesn't (we just backfilled
+			// before runs-sync caught up) — still surface so the dashboard's
+			// "have we got any data for this run" check doesn't drop it.
+			const entry: RunSnapshotEntry = (manifest as RunSnapshotEntry) ?? {};
+			if (evals && evals.length > 0) entry.evals = evals;
+			runs[runIds[i]] = entry;
+		}
 	}
 
 	let iris: unknown | null = null;
@@ -519,6 +564,33 @@ export default {
 			const [, runId, file] = runFileMatch;
 			const key = `${env.R2_RUNS_PREFIX}/${runId}/${file}`;
 			return serveR2Object(req, env, key);
+		}
+
+		// /api/runs/:id/evals — eval-records index (spec 43). Returns the
+		// `index.json` sidecar; the dashboard hot-cache snapshot already
+		// inlines this, but exposing it standalone lets the detail page
+		// re-fetch independently of the 30s snapshot edge-cache.
+		const evalsIndexMatch = path.match(/^\/api\/runs\/([^/]+)\/evals\/?$/);
+		if (evalsIndexMatch) {
+			const [, runId] = evalsIndexMatch;
+			const key = `${env.R2_RUNS_PREFIX}/${runId}/evals/index.json`;
+			// 404 → empty array (no records yet, not an error).
+			const obj = await env.R2.get(key);
+			if (!obj) return jsonResponse([], env);
+			return serveR2Object(req, env, key);
+		}
+
+		// /api/runs/:id/evals/:key — one eval record (spec 43). Key is
+		// `<step>-<set>-<mode>` optionally with `-task<i>`. Validate the key
+		// shape so we don't expose arbitrary R2-key traversal under
+		// `runs/<id>/evals/`.
+		const evalRecordMatch = path.match(/^\/api\/runs\/([^/]+)\/evals\/([A-Za-z0-9._-]+)$/);
+		if (evalRecordMatch) {
+			const [, runId, rawKey] = evalRecordMatch;
+			// Strip a trailing `.json` so both `key` and `key.json` work.
+			const key = rawKey.endsWith('.json') ? rawKey.slice(0, -5) : rawKey;
+			const r2Key = `${env.R2_RUNS_PREFIX}/${runId}/evals/${key}.json`;
+			return serveR2Object(req, env, r2Key);
 		}
 
 		if (path === '/api/files/list') {

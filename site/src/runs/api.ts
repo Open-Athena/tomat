@@ -76,13 +76,18 @@ export async function fetchManifest(runId: string): Promise<RunManifest> {
  * just one snapshot poll. Runs in the index without a synced manifest yet
  * show up as `runs[id] = null`; the dashboard drops them silently.
  *
+ * Per spec 43 (Phase A), each entry can also carry an `evals` index so the
+ * dashboard renders the eval matrix without an extra round-trip per run.
+ *
  * See `worker/src/index.ts:handleRunsSnapshot` and `specs/23-runs-dashboard.md`
  * (Phase B "On-demand caching" section) for the design.
  */
+export type RunsSnapshotEntry = RunManifest & { evals?: EvalIndexEntry[] }
+
 export interface RunsSnapshot {
   synced_at: string
   count: number
-  runs: Record<string, RunManifest | null>
+  runs: Record<string, RunsSnapshotEntry | null>
   iris: IrisState | null
   modal: ModalState | null
 }
@@ -136,6 +141,87 @@ export async function fetchEval(runId: string): Promise<RunEval | null> {
   const r = await fetch(`${API_BASE}/api/runs/${encodeURIComponent(runId)}/eval.json`)
   if (r.status === 404) return null
   if (!r.ok) throw new Error(`fetchEval(${runId}) ${r.status}`)
+  return r.json()
+}
+
+// ── eval-records (spec 43, Phase A) ────────────────────────────────────────
+// One record per (step, set, mode, task) eval-child of a training run. The
+// CFW serves them from R2 sidecars (`tomat/runs/<id>/evals/<key>.json`,
+// plus an `index.json` pointer list). Phase A is read-only + backfill;
+// `tomat evals fire`/`sync` start writing live in Phase B/C.
+
+/** Pointer into a run's eval-records folder. Sorted by (step, set, mode, task). */
+export interface EvalIndexEntry {
+  key: string         // `<step>-<set>-<mode>` or `<step>-<set>-<mode>-task<i>`
+  fired_at: string    // ISO-8601 (≈ GCS object mtime for backfill records)
+  state: EvalRecordState
+}
+
+export type EvalRecordState = 'pending' | 'running' | 'succeeded' | 'failed' | 'killed'
+
+/** Full record. Schema lifted directly from spec 43 §"Data model"; fields
+ *  unknown to the dashboard (e.g. `job_ref`) pass through untouched. */
+export interface EvalRecord {
+  run_label: string
+  ckpt_leaf: string | null
+  step: number
+  set: string                 // 'val_200' | 'train_200' | ...
+  mode: string                // 'teacher' | 'free' | 'maskgit'
+  task_idx?: number | null
+  n_tasks: number
+  n_mats: number | null
+  eval_label: string | null
+  model_preset: string | null
+  mg_k_steps?: number | null
+  free_batch?: number | null
+  eval_batch?: number | null
+  decoder?: string | null
+
+  backend: 'iris' | 'modal' | null
+  job_ref: Record<string, unknown> | null
+
+  fired_at: string
+  state: EvalRecordState
+  state_synced_at: string | null
+  started_at: string | null
+  finished_at: string | null
+  exit_code: number | null
+  error_msg: string | null
+
+  /** Bucket + path explicit per spec ([[cross-region-eval-egress]] —
+   *  results may live in a mirror bucket distinct from the ckpt bucket). */
+  gcs_result_path: string
+  result: EvalRecordResult | null
+  result_seen_at: string | null
+}
+
+/** The scalar(s) we copy out of the per-step result JSON for display.
+ *  Kept narrow to keep records small; the full JSON is at `gcs_result_path`. */
+export interface EvalRecordResult {
+  n_mats: number | null
+  nmae_mean: number | null
+  nmae_median: number | null
+  nmae_p99: number | null
+  nemd_mean: number | null
+  nemd_median: number | null
+  nemd_p99: number | null
+}
+
+/** Fetch the eval-records index for one run. Empty array on 404 (no
+ *  records yet — backfill hasn't been run, no evals fired). */
+export async function fetchEvalsIndex(runId: string): Promise<EvalIndexEntry[]> {
+  const r = await fetch(`${API_BASE}/api/runs/${encodeURIComponent(runId)}/evals`)
+  if (r.status === 404) return []
+  if (!r.ok) throw new Error(`fetchEvalsIndex(${runId}) ${r.status}`)
+  return r.json()
+}
+
+/** Fetch one eval record by key. Null on 404 (record never landed / was
+ *  cleared). */
+export async function fetchEvalRecord(runId: string, key: string): Promise<EvalRecord | null> {
+  const r = await fetch(`${API_BASE}/api/runs/${encodeURIComponent(runId)}/evals/${encodeURIComponent(key)}`)
+  if (r.status === 404) return null
+  if (!r.ok) throw new Error(`fetchEvalRecord(${runId}, ${key}) ${r.status}`)
   return r.json()
 }
 

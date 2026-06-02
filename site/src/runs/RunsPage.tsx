@@ -2,11 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { enumParam, useUrlState } from 'use-prms'
 import { Tooltip } from '../Tooltip'
-import { evalJobsByRun, evalPhase, fetchEval, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchRunsSnapshot, irisJobIdForRun, modalAppForRun, parquetUrl } from './api'
+import { evalJobsByRun, evalPhase, fetchEval, fetchEvalsIndex, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchRunsSnapshot, irisJobIdForRun, modalAppForRun, parquetUrl } from './api'
 import type { EvalJob, EvalPoint } from './api'
 import { fetchRunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
 import { RecentEvents } from './RecentEvents'
+import { EvalsPanel } from './EvalsPanel'
 import { RunsTimelinePlot, colorForIndex, useNameFilter, useTagFilters, useAncestorsToggle, compileMultiTermFilter, runHaystack, shortLabel } from './RunsTimelinePlot'
 import { runPassesTagFilters, tagsFor } from './tags'
 import { ancestorsOf, lineageFor } from './lineage'
@@ -950,6 +951,16 @@ function RunDetail({ runId }: { runId: string }) {
     refetchInterval: (q) => errBackoff(q) ?? REFETCH_MS.history.active,
     retry: 1,
   })
+  // Eval-records index (spec 43): per-(step, set, mode[, task]) lifecycle
+  // records. Drives the EvalsPanel matrix view between WallclockPlot and
+  // RecentEvents. Phase A is read-only + backfill; Phase B/C wire live
+  // pending/running states from `tomat evals fire`/`sync`.
+  const evalsIndexQ = useQuery({
+    queryKey: ['evals-index', runId],
+    queryFn: () => fetchEvalsIndex(runId),
+    refetchInterval: (q) => errBackoff(q) ?? REFETCH_MS.history.active,
+    retry: 1,
+  })
   const manifest = manifestQ.data ?? null
   const history = historyQ.data ?? null
   const evalJobs = useMemo(
@@ -1038,6 +1049,10 @@ function RunDetail({ runId }: { runId: string }) {
           attempts={attemptsQ.data ?? null}
         />
       )}
+      <EvalsPanel
+        runId={runId}
+        evalsIndex={evalsIndexQ.data ?? null}
+      />
       <RecentEvents
         attempts={attemptsQ.data ?? null}
         modalApp={modalAppForRun(modalQ.data ?? null, runId)}
