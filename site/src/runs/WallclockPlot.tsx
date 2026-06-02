@@ -13,7 +13,9 @@
 // 200 mats: p25–p75 (IQR) and a fainter p1–p99. NMAE is green, NEMD teal; MV
 // solid, MT dashed. Eval points are keyed by checkpoint step; on the
 // time/elapsed axes they're placed at the wallclock of that step, recovered
-// from the parquet's (timestamp, global_step) rows.
+// from the parquet's (timestamp, global_step) rows. Non-teacher-mode bands
+// (maskgit, free) come from `val/train_200-<mode>` set keys and render with
+// the same visual style as teacher (legend disambiguates via `MV/maskgit`).
 //
 // Lifecycle events render as vertical lines via `shapes` (yref='paper') so
 // they span both panels.
@@ -697,9 +699,18 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   }
   const evalTraces = useMemo(() => {
     const out: Record<string, unknown>[] = []
-    for (const [setKey, mvmt, dash] of [
-      ['val_200', 'MV', 'solid'], ['train_200', 'MT', 'dash'],
-    ] as [string, string, 'solid' | 'dash'][]) {
+    // val/train_200 are the teacher-mode bare keys (cont33k-era eval.json);
+    // val/train_200-<mode> are non-teacher modes (maskgit, free) — same shape,
+    // same line style for now (spec 25 follow-up: color-code per mode).
+    const setKeys = Object.keys(evalSeries?.sets ?? {})
+    const labelFor = (setKey: string): [string, 'solid' | 'dash'] => {
+      const [base, mode] = setKey.split('-', 2) as [string, string | undefined]
+      const mvmt = base === 'val_200' ? 'MV' : 'MT'
+      const dash = base === 'val_200' ? 'solid' : 'dash'
+      return [mode ? `${mvmt}/${mode}` : mvmt, dash]
+    }
+    for (const setKey of setKeys) {
+      const [mvmt, dash] = labelFor(setKey)
       for (const metric of ['nmae', 'nemd'] as const) {
         out.push(...evalBandGroup(setKey, mvmt, dash, metric))
       }

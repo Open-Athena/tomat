@@ -2270,12 +2270,16 @@ def evals_sync(substr: str | None, bucket: str, dry_run: bool, prefix: str):
                  "nemd_mean", "nemd_median", "nemd_p99")
     for run in run_dirs:
         sets: dict[str, list[dict]] = {}
-        for mat_set in ("val_200", "train_200"):
-            base = f"{results_base}/{run}/{mat_set}"
-            if not fs.exists(base):
-                continue
+        # Discover every `<set>(-<mode>)/` subdir (teacher, free, maskgit, ...)
+        # — shares `_backfill_discover_dirs` so sync + backfill stay in lockstep
+        # on the on-GCS layout. Teacher-mode subdirs map back to the bare
+        # `<set>` key (back-compat with cont33k-era eval.json's); other modes
+        # land under `<set>-<mode>` (the dashboard's WallclockPlot iterates
+        # both flavors).
+        for subdir, mat_set, mode in _backfill_discover_dirs(fs, results_base, run):
+            sets_key = mat_set if mode == "teacher" else f"{mat_set}-{mode}"
             paths = [
-                p for p in fs.ls(base)
+                p for p in fs.ls(subdir)
                 if (n := p.rsplit("/", 1)[-1]).startswith("step-")
                 and n.endswith(".json")
             ]
@@ -2314,7 +2318,7 @@ def evals_sync(substr: str | None, bucket: str, dry_run: bool, prefix: str):
                         row[f"{metric}_{key}"] = float(np.percentile(vals, pct))
                 rows.append(row)
             if rows:
-                sets[mat_set] = sorted(rows, key=lambda r: r["step"])
+                sets[sets_key] = sorted(rows, key=lambda r: r["step"])
         if not sets:
             err(f"[evals sync] {run}: no eval JSONs, skipping")
             continue
