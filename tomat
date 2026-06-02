@@ -26,7 +26,8 @@ in the tomat training project. Subcommands:
   tomat wb type <name>               introspect a GraphQL type
   tomat wb gql <query> [-v K=V]      raw GraphQL execution
 
-  tomat cost                         MSRP-equivalent table for project
+  tomat cost compute <run> [--all]   write per-run MSRP estimates to R2
+  tomat cost summary                 MSRP-equivalent table for project
 
 Conventions:
   RUN_LABEL    wandb display name == iris job name == GCS results dir
@@ -4219,10 +4220,22 @@ def analyze_voxel_corr_blob(
             print(f"{k:>8d}  |  {curve[k]:>8.4f}  |  {note}")
 
 
-@cli.command("cost")
+@cli.group("cost")
+def cost_grp():
+    """MSRP-equivalent compute estimates ("retail value", NOT actual billing).
+
+    Subcommands:
+      tomat cost compute <run_label>   write `runs/<label>/cost.json` to R2
+      tomat cost compute --all         backfill every synced run
+      tomat cost summary               legacy: print preempt/on-demand rates
+                                       for matching iris parent jobs
+    """
+
+
+@cost_grp.command("summary")
 @click.option("-p", "--prefix", default="/ryan", help="iris job prefix to inspect")
 @click.option("-f", "--filter", "filter_re", default="tomat|train-full|train-cont", help="regex on job name")
-def cost(prefix: str, filter_re: str):
+def cost_summary(prefix: str, filter_re: str):
     """Estimate MSRP-equivalent compute spend across matching iris jobs.
 
     Sums chip-hours (TPU × duration) across visible parent jobs and prints
@@ -4261,6 +4274,284 @@ def cost(prefix: str, filter_re: str):
     print()
     print("(For per-job chip-hour totals, run `tomat iris summary <jid>` and")
     print(" multiply chips × wall-clock manually. Auto-summing TBD.)")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# tomat cost compute  (spec 46)
+# ──────────────────────────────────────────────────────────────────────
+
+def _r2_get_json(bucket: str, key: str, timeout: int = 60) -> dict | list | None:
+    """Fetch `s3://<bucket>/<key>` from R2 → parsed JSON, or None on 404."""
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        path = f.name
+    try:
+        r = subprocess.run(
+            ["aws", "--profile", "cfo", "--endpoint-url", R2_ENDPOINT,
+             "s3", "cp", f"s3://{bucket}/{key}", path],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if r.returncode != 0:
+            # NoSuchKey / 404 is common (cost.json doesn't exist yet for fresh
+            # runs); only warn on truly unexpected failures.
+            stderr = r.stderr or ""
+            if "NoSuchKey" in stderr or "Not Found" in stderr or "404" in stderr:
+                return None
+            err(f"[r2 get] aws s3 cp s3://{bucket}/{key} failed: "
+                f"rc={r.returncode} stderr={stderr[-300:]}")
+            return None
+        try:
+            return json.loads(Path(path).read_text())
+        except json.JSONDecodeError as e:
+            err(f"[r2 get] {key}: JSON decode failed: {e}")
+            return None
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
+def _r2_list_synced_runs(bucket: str, prefix: str) -> list[str]:
+    """Return the sorted list of run labels under `s3://<bucket>/<prefix>/`."""
+    r = subprocess.run(
+        ["aws", "--profile", "cfo", "--endpoint-url", R2_ENDPOINT,
+         "s3api", "list-objects-v2",
+         "--bucket", bucket,
+         "--prefix", f"{prefix}/",
+         "--delimiter", "/",
+         "--query", "CommonPrefixes[].Prefix",
+         "--output", "text"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if r.returncode != 0:
+        err(f"[r2 list] failed: rc={r.returncode} stderr={r.stderr[-300:]}")
+        return []
+    labels: list[str] = []
+    # `--output text` returns space-/tab-separated tokens like
+    # `tomat/runs/foo/\ttomat/runs/bar/`.
+    for tok in (r.stdout or "").replace("\t", "\n").split("\n"):
+        tok = tok.strip()
+        if not tok or tok == "None":
+            continue
+        # Strip the prefix + trailing slash.
+        if tok.startswith(f"{prefix}/") and tok.endswith("/"):
+            label = tok[len(prefix) + 1 : -1]
+            if label:
+                labels.append(label)
+    return sorted(labels)
+
+
+def _compute_one_cost(
+    run_label: str,
+    *,
+    bucket: str,
+    runs_prefix: str,
+    attempts_prefix: str,
+    iris_state: dict | None,
+    dry_run: bool,
+) -> dict | None:
+    """Compute + (optionally) upload one run's cost.json. Returns the record.
+
+    Skips runs we can't make a TPU MSRP estimate for (no recognisable TPU
+    suffix AND no iris job AND not a Modal run). Modal runs get a placeholder
+    `Modal MSRP TBD` segment so the dashboard chip renders an honest "pending".
+    """
+    from tomat.cost import (
+        build_cost_record,
+        compute_tpu_segments,
+        compute_tpu_segments_from_job_window,
+        CostSegment,
+        detect_allocation_class,
+        parse_tpu_hardware,
+        parse_tpu_hardware_from_attempts,
+        TpuVariant,
+    )
+    from datetime import datetime, timezone
+
+    now_ms = int(time.time() * 1000)
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    notes: list[str] = []
+
+    # Attempts sidecar (TPU runs only). 404 is fine — we'll fall back to
+    # iris-state for the full window.
+    attempts = _r2_get_json(bucket, f"{attempts_prefix}/{run_label}.json")
+    # Iris job (parent) entry from the snapshot.
+    job: dict | None = None
+    if iris_state is not None:
+        job = iris_state.get("jobs", {}).get(f"/{IRIS_USER}/{run_label}")
+
+    # Try to parse TPU hardware from the label. Modal runs (h100x8, h200x8,
+    # b200x8) won't match — they get the Phase-B placeholder.
+    is_modal_run = ("-modal-" in run_label
+                    or re.search(r"-(?:h100|h200|b200|a100|l40s)x\d+\b", run_label, re.I) is not None)
+    parsed = parse_tpu_hardware(run_label)
+    # Fallback for run labels without an hw suffix (e.g. `train-mg-tz-11`):
+    # sniff the slice out of the attempts sidecar's worker hostnames.
+    if parsed is None and not is_modal_run:
+        parsed = parse_tpu_hardware_from_attempts(attempts)
+        if parsed is not None:
+            notes.append(
+                f"hardware inferred from attempts sidecar worker hostname: "
+                f"{parsed[0]}-{parsed[1]}"
+            )
+
+    segments: list[CostSegment] = []
+    is_complete = False
+
+    if parsed is None and is_modal_run:
+        # Phase B placeholder: surface "Modal MSRP TBD" so the dashboard
+        # doesn't claim $0. Wallclock + GPU spec stay null until Phase B
+        # wires Modal's billing API.
+        notes.append("Modal MSRP not yet implemented (Phase B)")
+        segments.append(CostSegment(
+            kind="modal",
+            label="Modal MSRP TBD",
+            wallclock_sec=0.0,
+            rate_per_hr_usd=None,
+            msrp_usd=None,
+            source="phase-b-pending",
+        ))
+        # Modal runs: is_complete reflects only whether the function call
+        # finished. We can't tell from cost-input alone; leave False so the
+        # tooltip won't say "final".
+    elif parsed is not None:
+        family, num_chips = parsed
+        alloc = detect_allocation_class(attempts)
+        variant = TpuVariant(
+            variant=family,
+            num_chips=num_chips,
+            allocation_class=alloc,
+        )
+        if variant.rate_usd_per_chip_hr is None:
+            notes.append(f"no published rate for TPU variant={family}")
+        elif attempts is not None:
+            segments.extend(
+                compute_tpu_segments(attempts, variant, now_ms=now_ms)
+            )
+            is_complete = attempts.get("finished_at_ms") is not None
+            if not segments:
+                notes.append("no billable attempt windows in sidecar")
+            # iris's `gather_bug_report` only preserves the most-recent attempt
+            # per task — prior failed/preempted cycles are dropped. When the
+            # job's failure+preempt counters exceed what we see in the
+            # sidecar, the MSRP estimate UNDERCOUNTS those earlier cycles.
+            n_attempts_seen = len({
+                a.get("attempt_id") for t in attempts.get("tasks", [])
+                for a in t.get("attempts", []) if a.get("attempt_id") is not None
+            })
+            f = (attempts.get("job_failure_count") or 0)
+            p = (attempts.get("job_preemption_count") or 0)
+            historical_cycles = f + p
+            if historical_cycles > n_attempts_seen:
+                notes.append(
+                    f"undercount: {historical_cycles} historical "
+                    f"failure/preempt cycles vs {n_attempts_seen} attempt(s) "
+                    f"in sidecar (iris bug-report drops prior attempts)"
+                )
+        elif job is not None:
+            segments.extend(
+                compute_tpu_segments_from_job_window(job, variant, now_ms=now_ms)
+            )
+            notes.append("no attempts sidecar; charged full iris-state window")
+            is_complete = job.get("finished_at_ms") is not None
+        else:
+            notes.append("no attempts sidecar AND no iris-state job entry; "
+                         "MSRP estimate unavailable for this TPU run")
+    else:
+        notes.append(f"unrecognised hardware for run {run_label!r} — "
+                     f"no TPU suffix found; not a Modal run by name")
+
+    record = build_cost_record(
+        segments,
+        is_complete=is_complete,
+        computed_at_iso=now_iso,
+        notes=notes,
+    )
+    key = f"{runs_prefix}/{run_label}/cost.json"
+    data = json.dumps(record, separators=(",", ":")).encode("utf-8")
+    if dry_run:
+        err(f"[cost compute] dry-run: {run_label} → ${record['msrp_usd']:.2f} "
+            f"({len(record['breakdown'])} segments, {len(data)} B) "
+            f"→ s3://{bucket}/{key}")
+    else:
+        _r2_put_bytes(bucket, key, data, "application/json")
+        err(f"[cost compute] {run_label}: ${record['msrp_usd']:.2f} "
+            f"({len(record['breakdown'])} segments) "
+            f"→ {R2_ENDPOINT}/{bucket}/{key}")
+    return record
+
+
+@cost_grp.command("compute")
+@click.option("-b", "--bucket", default=R2_BUCKET, help="R2 bucket")
+@click.option("-p", "--prefix", default=R2_RUNS_PREFIX,
+              help="R2 key prefix for runs/<label>/cost.json")
+@click.option("--attempts-prefix", default="tomat/iris-attempts",
+              help="R2 prefix for attempts sidecars")
+@click.option("-a", "--all", "all_runs", is_flag=True,
+              help="iterate every synced run instead of one LABEL")
+@click.option("-n", "--dry-run", is_flag=True,
+              help="compute + print, but skip the R2 upload")
+@click.argument("run_label", required=False)
+def cost_compute(
+    run_label: str | None,
+    bucket: str,
+    prefix: str,
+    attempts_prefix: str,
+    all_runs: bool,
+    dry_run: bool,
+):
+    """Write `runs/<label>/cost.json` with the run's MSRP estimate.
+
+    For an iris (TPU) run: walks the attempts sidecar, multiplying each
+    task-attempt's wallclock × num_chips × rate. Falls back to the parent
+    iris-state window (with a note) for older runs without a sidecar.
+
+    For a Modal run: emits a placeholder `Modal MSRP TBD` segment so the
+    dashboard chip renders an honest "pending" rather than $0 (Phase B).
+
+    Idempotent: re-runs overwrite the sidecar with the freshest estimate.
+    --all backfills every synced run; useful one-shot after a pricing
+    table change.
+    """
+    if all_runs and run_label:
+        raise click.UsageError("pass either RUN_LABEL or --all, not both")
+    if not all_runs and not run_label:
+        raise click.UsageError("provide RUN_LABEL or --all")
+
+    # Iris-state is shared across all the runs we visit; fetch once.
+    iris_state = _r2_get_json(bucket, "tomat/iris-state.json")
+    if iris_state is None:
+        err("[cost compute] WARN: iris-state.json not found on R2; "
+            "fallback (job-window) estimates won't be available")
+
+    if all_runs:
+        labels = _r2_list_synced_runs(bucket, prefix)
+        err(f"[cost compute] --all: {len(labels)} synced runs under "
+            f"s3://{bucket}/{prefix}/")
+        n_ok = n_skip = 0
+        for label in labels:
+            try:
+                _compute_one_cost(
+                    label,
+                    bucket=bucket,
+                    runs_prefix=prefix,
+                    attempts_prefix=attempts_prefix,
+                    iris_state=iris_state,
+                    dry_run=dry_run,
+                )
+                n_ok += 1
+            except Exception as e:
+                err(f"[cost compute] {label}: FAILED ({type(e).__name__}: {e})")
+                n_skip += 1
+        err(f"[cost compute] --all done: {n_ok} ok, {n_skip} failed")
+    else:
+        assert run_label
+        _compute_one_cost(
+            run_label,
+            bucket=bucket,
+            runs_prefix=prefix,
+            attempts_prefix=attempts_prefix,
+            iris_state=iris_state,
+            dry_run=dry_run,
+        )
 
 
 @cli.group("marin")
