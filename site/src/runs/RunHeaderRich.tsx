@@ -1100,10 +1100,18 @@ export function RunHeaderRich({
           })()}
           {data.job && (() => {
             // iris dashboard URL pattern: `https://iris.oa.dev/#/job/%2Fryan%2F<id>`
-            // (per iris-dashboard-share-pattern memory).
-            const irisUrl = `https://iris.oa.dev/#/job/${encodeURIComponent(data.job.job_id)}`
+            // (per iris-dashboard-share-pattern memory). The iris job-id is
+            // the dict key in iris-state.json (`/ryan/<run-label>`); the
+            // `IrisJob` object itself has no `job_id` field — earlier code
+            // read `data.job.job_id` and got `undefined` here, so all iris
+            // links rendered as `/#/job/undefined`. Reconstruct from `data.id`
+            // (the run label) plus the standard `/ryan/` prefix that the
+            // server-side `tomat iris sync` uses (matches
+            // `trainingRunIdFromIrisJob` in RunsPage.tsx).
+            const irisJobId = `/ryan/${data.id}`
+            const irisUrl = `https://iris.oa.dev/#/job/${encodeURIComponent(irisJobId)}`
             return (
-              <Tooltip content={`open iris job (${data.job.job_id})`}>
+              <Tooltip content={`open iris job (${irisJobId})`}>
                 <a href={irisUrl} target="_blank" rel="noreferrer"
                   style={{ fontSize: '0.75rem', color: '#888',
                     display: 'inline-flex', alignItems: 'center', gap: 2 }}>
