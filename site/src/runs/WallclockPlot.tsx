@@ -422,6 +422,51 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     return { mean, std }
   }
 
+  // Gap detection in wallclock / elapsed modes: when a run is paused
+  // (e.g. a Modal-side respawn between two real data points without an
+  // intervening `lifecycle/trainer_started`), the parquet rows that bookend
+  // the pause would otherwise be connected by a solid line indistinguishable
+  // from a normal training step — especially misleading once rolling
+  // smoothing is on. Detect "gaps" as consecutive-x deltas ≥ `GAP_THRESHOLD`
+  // × the segment's median delta, split the main line at those points (insert
+  // `null` y to break it), and emit a separate dotted bridge trace (same
+  // color/legendgroup/opacity, `showlegend: false`) covering only the gap
+  // span. Step-mode is exempt: restart-segment splitting already breaks at
+  // step regressions and intra-segment step deltas are unit-1 monotone.
+  const GAP_THRESHOLD = 10
+  // Numeric distance between consecutive xs. `NaN` if either is null/mixed.
+  // For date-typed `wallclock` xs (ISO strings) → ms; for `elapsed` xs
+  // (hours, numbers) → hours. Units are irrelevant for the median-based
+  // threshold — only the ratio matters.
+  function xDelta(prev: string | number, curr: string | number): number {
+    if (typeof prev === 'number' && typeof curr === 'number') return curr - prev
+    if (typeof prev === 'string' && typeof curr === 'string') {
+      return new Date(curr).getTime() - new Date(prev).getTime()
+    }
+    return NaN
+  }
+  // Indices `i` such that `xs[i-1] → xs[i]` is a gap (delta ≥ threshold ×
+  // median). Empty in step-mode (caller short-circuits) and for short series.
+  function findGapEndIndices(xs: (string | number)[]): number[] {
+    if (xMode === 'step' || xs.length < 3) return []
+    const deltas: number[] = []
+    for (let i = 1; i < xs.length; i++) {
+      const d = xDelta(xs[i - 1], xs[i])
+      if (Number.isFinite(d) && d > 0) deltas.push(d)
+    }
+    if (deltas.length === 0) return []
+    const sorted = [...deltas].sort((a, b) => a - b)
+    const median = sorted[Math.floor(sorted.length / 2)]
+    if (!(median > 0)) return []
+    const cutoff = median * GAP_THRESHOLD
+    const out: number[] = []
+    for (let i = 1; i < xs.length; i++) {
+      const d = xDelta(xs[i - 1], xs[i])
+      if (Number.isFinite(d) && d > cutoff) out.push(i)
+    }
+    return out
+  }
+
   // Smooth a parquet-derived Series in place + (optionally) build paired
   // ±σ band traces. Bands inherit the line's `name` (so the closest-trace
   // matching logic upstream remains correct) and a shared `legendgroup` so
@@ -460,29 +505,89 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       // instead of three identical "TL (train/loss)" rows.
       const segName = N > 1 && !isLatest ? `${name} #${segIdx + 1}/${N}` : name
       const { mean: ySmoothed, std: yStd } = smoothedMeanStd(s.ys, smooth)
+      const segGsteps = customGsteps(s)
+      // Gap-break the main-line arrays so plotly doesn't connect across pauses.
+      // We insert one extra `null` y entry between the gap-start and gap-end
+      // indices (plotly drops the null point but breaks the line on either
+      // side). The bridge trace gets only the (start, end, null) triples for
+      // each gap so consecutive bridges render as discrete dotted spans
+      // rather than fusing into one polyline.
+      const gapEnds = findGapEndIndices(s.xs)
+      const gapSet = new Set(gapEnds)
+      const bridgeX: (string | number | null)[] = []
+      const bridgeY: (number | null)[] = []
+      let lineX: (string | number)[] = s.xs
+      let lineY: (number | null)[] = ySmoothed
+      let lineG: (number | string | null)[] = segGsteps
+      let lineYStd: (number | null)[] | null = yStd
+      if (gapEnds.length > 0) {
+        const newX: (string | number)[] = []
+        const newY: (number | null)[] = []
+        const newG: (number | string | null)[] = []
+        const newYStd: (number | null)[] | null = yStd ? [] : null
+        for (let i = 0; i < s.xs.length; i++) {
+          if (gapSet.has(i)) {
+            // Insert a null-y break-marker BEFORE the post-gap point. Reuse
+            // the gap-start x as the marker's x — plotly drops the null
+            // anyway; its x value never renders.
+            newX.push(s.xs[i - 1])
+            newY.push(null)
+            newG.push(null)
+            newYStd?.push(null)
+            // Bridge: (start, end, null) so consecutive bridges don't fuse.
+            bridgeX.push(s.xs[i - 1], s.xs[i], null)
+            bridgeY.push(ySmoothed[i - 1], ySmoothed[i], null)
+          }
+          newX.push(s.xs[i])
+          newY.push(ySmoothed[i])
+          newG.push(segGsteps[i])
+          newYStd?.push(yStd ? yStd[i] : null)
+        }
+        lineX = newX; lineY = newY; lineG = newG; lineYStd = newYStd
+      }
       const lineTrace: SmoothedTrace = {
-        x: s.xs, y: ySmoothed, name: segName,
+        x: lineX, y: lineY, name: segName,
         type: 'scatter', mode: 'lines',
         line: { color, width: lineWidth },
         opacity,
         yaxis: 'y2',
         legendgroup: lg,
         showlegend: isLatest,
-        customdata: customGsteps(s),
+        customdata: lineG,
         hovertemplate: `${segName} %{y:.3f}<br>gstep %{customdata}<extra></extra>`,
       }
+      // Dotted bridge connecting each gap's endpoints. Same color/opacity/
+      // legendgroup as the main line so a legend-toggle hides them with the
+      // rest of the segment; `showlegend: false` so it doesn't add its own
+      // LI. We use `hoverinfo: 'none'` (NOT 'skip') intentionally: the
+      // `applyBandFade` callback above force-sets opacity on all
+      // `showlegend:false + hoverinfo:'skip'` traces (the eval / ±σ band
+      // edges) to either 1 or 0.3, which would flatten the older-segment
+      // opacity ramp on our bridges. `'none'` lets the configured opacity
+      // pass through while still suppressing the bridge's tooltip.
+      const bridgeTrace: SmoothedTrace | null = bridgeX.length > 0 ? {
+        x: bridgeX, y: bridgeY, name: segName,
+        type: 'scatter', mode: 'lines',
+        line: { color, width: lineWidth, dash: 'dot' },
+        opacity,
+        yaxis: 'y2',
+        legendgroup: lg,
+        showlegend: false,
+        hoverinfo: 'none',
+      } : null
       // Only show ±σ bands on the latest segment — drawing 28 overlapping
       // bands would just be noise, and the older trajectories already smear
       // visually via opacity.
-      if (!bandsOn || !yStd || !isLatest) {
+      if (!bandsOn || !lineYStd || !isLatest) {
         out.push(lineTrace)
+        if (bridgeTrace) out.push(bridgeTrace)
         return
       }
       const yLower: (number | null)[] = []
       const yUpper: (number | null)[] = []
-      for (let i = 0; i < ySmoothed.length; i++) {
-        const m = ySmoothed[i]
-        const sd = yStd[i]
+      for (let i = 0; i < lineY.length; i++) {
+        const m = lineY[i]
+        const sd = lineYStd[i]
         if (m == null || sd == null) { yLower.push(null); yUpper.push(null); continue }
         // y2 is log-scaled — keep band edges strictly positive so plotly doesn't
         // drop them (`log(<=0) = NaN`). 1e-6 is well below any real loss value.
@@ -490,7 +595,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         yUpper.push(m + sd)
       }
       const edge = (y: (number | null)[], fillKey: string | null): SmoothedTrace => ({
-        x: s.xs, y, name: segName,
+        x: lineX, y, name: segName,
         type: 'scatter', mode: 'lines',
         line: { width: 0, color: 'rgba(0,0,0,0)' },
         yaxis: 'y2', legendgroup: lg,
@@ -501,6 +606,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       const rgb = hexToRgbTuple(color)
       const fillcolor = `rgba(${rgb}, 0.18)`
       out.push(edge(yLower, null), edge(yUpper, fillcolor), lineTrace)
+      if (bridgeTrace) out.push(bridgeTrace)
     })
     return out
   }
