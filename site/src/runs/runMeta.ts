@@ -19,29 +19,48 @@ export const LOOKBACK_SEC = LOOKBACK_HOURS * 3600
  * Step = `global_step` (Levanter's actual training step), not `_step` (wandb's
  * log-call counter) — the latter inflates 5–10× per row and isn't what users
  * mean when they ask "how many steps in the last hour?"
+ *
+ * Restricts to the latest monotonic-increasing segment so crash-loop runs
+ * (whose parquets can contain interleaved rows from multiple attempts that
+ * `tomat runs sync`'s last-reset-only trim doesn't fully clean up) don't show
+ * a negative rate. Walks ts-desc from the latest row, accepting only rows
+ * whose `global_step` is ≤ the running minimum — anything higher came from a
+ * pre-restart attempt and is excluded.
  */
 export function stepsInWindow(history: RunHistory, windowSec: number): number | null {
   const tsCol = history.timestamps
   const gsCol = history.cols.get('global_step') ?? []
-  let latestTs: number | null = null
-  let latestStep: number | null = null
+  // Collect (ts, gs) for rows where both are set, sort ts-asc.
+  const pts: { t: number; s: number }[] = []
   for (let i = 0; i < history.rowCount; i++) {
     const t = tsCol[i], s = gsCol[i]
     if (t == null || s == null) continue
-    if (latestTs == null || t > latestTs) { latestTs = t; latestStep = s }
+    pts.push({ t, s })
   }
-  if (latestTs == null || latestStep == null) return null
-  const cutoff = latestTs - windowSec
-  // Earliest step at-or-before the cutoff (so we measure exact window).
-  let baseStep: number | null = null
-  let baseTs: number | null = null
-  for (let i = 0; i < history.rowCount; i++) {
-    const t = tsCol[i], s = gsCol[i]
-    if (t == null || s == null) continue
-    if (t <= cutoff && (baseTs == null || t > baseTs)) { baseTs = t; baseStep = s }
+  if (pts.length === 0) return null
+  pts.sort((a, b) => a.t - b.t)
+  const latest = pts[pts.length - 1]
+  // Walk ts-desc; keep rows whose gs ≤ running min. The running min starts at
+  // latest.s and only decreases as we walk back, so any row with a higher gs
+  // belongs to a pre-restart attempt (and gets dropped).
+  let minStep = latest.s
+  const seg: { t: number; s: number }[] = [latest]
+  for (let i = pts.length - 2; i >= 0; i--) {
+    const p = pts[i]
+    if (p.s <= minStep) { seg.push(p); minStep = p.s }
   }
-  if (baseStep == null) return null
-  return latestStep - baseStep
+  if (seg.length < 2) return null
+  // seg is ts-desc; the earliest accepted row is at the end.
+  const cutoff = latest.t - windowSec
+  // Latest row at-or-before the cutoff within the segment (= base for window).
+  // If the segment doesn't extend back to the cutoff, fall back to the
+  // earliest row in the segment — return whatever fits, rather than null.
+  let base = seg[seg.length - 1]
+  for (let i = 0; i < seg.length; i++) {
+    const p = seg[i]
+    if (p.t <= cutoff) { base = p; break }
+  }
+  return latest.s - base.s
 }
 
 /** Filter history to last N seconds + downsample (max ~120 points for sparkline). */
