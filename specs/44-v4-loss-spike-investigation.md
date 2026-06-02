@@ -158,3 +158,95 @@ Alternative hypotheses considered + rejected:
   `tmp/v4_spike_periodicity.py`, `tmp/v4_spike_visualize.py`,
   `tmp/v4_extra_checks.py` (gitignored).
 - Raw parquet: `tmp/tomat-v4.parquet` (gitignored).
+
+## Update: v4-cont-2 sawtooth (2026-06-02)
+
+After cont-2 fired (steps 20001-34890 as of 2026-06-02 18:12 UTC), the
+TL trace showed a pronounced sawtooth concentrated in the last third
+of the run. Re-running the analysis on the full parquet (34,889 rows)
+revealed the period missed by spec 44's original spike-detection (it
+looked for impulse periodicity; the actual pattern is a slow within-
+window decay + boundary jump).
+
+### Measured period
+
+- **Period: exactly 1024 steps** = `io_block_size × window_blocks /
+  batch_size = 256 × 512 / 128 = 1024` (no jitter; full integer).
+- ACF at lag 1024 (on smoothed-then-long-detrended TL):
+  - pre-cont-2 (steps 5000-19999): **0.46**
+  - v4-cont-2 (steps 20001-34890): **0.81** (3.3× stronger lock-in)
+- Wallclock period: 1024 × 3.146 s/step ≈ **3222 s ≈ 53.7 min** in
+  cont-2 (≈3252 s = 54.2 min in pre-cont-2; ~1% faster post-resume).
+- Intra-window phase shape (residual after subtracting per-window
+  mean, 14 windows in cont-2):
+  - bin 0 (steps 0-31 within window): residual **+0.27**
+  - bin 31 (steps 992-1023 within window): residual **−0.13**
+  - **monotonic decrease** across the entire window (32 phase bins,
+    no mid-window oscillation).
+- Per-window swing `(first_loss - last_loss)`:
+  - pre-cont-2: median **0.17** (sign mixed: 9 positive, 5 mixed)
+  - v4-cont-2: median **0.48**, **14/14 windows positive** —
+    every window's loss falls 0.2-0.8 nats from start to end.
+
+### Cause (confidence: high)
+
+The 1024-step period maps **exactly** to Levanter's
+`BlockShuffleConfig` window: `train_smoke_modal.py` builds
+`LmDataConfig` without an explicit `shuffle=` arg, picking up the
+default `BlockShuffleConfig(io_block_size=256, window_blocks=512)`
+(visible in the manifest's `data.shuffle` field). Examples are well-
+shuffled within each 131,072-sequence window, but adjacent windows
+hold physically adjacent regions of the source parquet shards (one
+contiguous draw of ~4,000 materials × 32 patches/mat). The model
+"learns" each window's material distribution over 1024 steps, then
+at the boundary jumps to a fresh window of materials → loss spikes
+up.
+
+The effect is **3× stronger in cont-2** because cont-2 is ~entirely
+in epoch 2:
+
+- Dataset has ~2.48M sequences (per memory tomat-arch-key-facts) →
+  one epoch ≈ 2.48M / 128 = **19,378 steps**.
+- First epoch ends ~step 19378. v4-cont-2 (steps 20001+) is the
+  start of epoch 2: every window is data the model last saw
+  ~19k steps ago, long enough to partially forget → bigger upward
+  jump at each window boundary.
+- Falling mean loss also makes the fixed window-boundary jump a
+  larger fraction of per-step loss, increasing visual prominence.
+
+The user's hypothesis ("transition between materials' patches") is
+**not** the mechanism. M=32 patches/mat × BS=128 means 4 mats are
+consumed per step, and even the larger `io_block_size=256` block
+holds 8 materials. Material-transition cadence is sub-step, not
+1024 steps. The 1024-step cadence is the inter-window-boundary
+distance.
+
+### Recommended fix
+
+Match the TPU trainer's shuffle config — tighter `io_block_size`,
+bigger window, which both reduces window-boundary heterogeneity and
+mixes more materials per window:
+
+```python
+# scripts/train_smoke_modal.py, in train_bakeoff_h200x8 (and the
+# density variant) — pass shuffle to LmDataConfig:
+from levanter.data.text.datasets import BlockShuffleConfig
+data = LmDataConfig(
+    ...,
+    shuffle=BlockShuffleConfig(io_block_size=32, window_blocks=8192),  # ≈ TPU defaults
+)
+```
+
+`io_block_size=32` = one material's patches per block (cache-
+friendly sequential reads); `window_blocks=8192` puts all of one
+parquet shard worth of materials in a single window. This shifts
+the sawtooth period to ~2048 steps (32 × 8192 / 128) and makes
+window-boundary jumps far smaller because each window already
+covers a much larger slice of the dataset. Alternatively bumping
+`window_blocks` alone (256 × 8192 = 2,097,152 sequences ≈ 0.85 of
+the dataset) would essentially eliminate the boundary.
+
+Will not change asymptotic loss; will visibly smooth the trace and
+remove the within-window forgetting-then-relearning waste. Lands in
+the same scripts/train_smoke_modal.py file flagged in spec 44's
+original Recommendation #2.
