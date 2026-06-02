@@ -651,13 +651,15 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     const pts = evalSeries?.sets[setKey] ?? []
     const xs: (string | number)[] = []
     const ys: (number | null)[] = []
-    const steps: number[] = []
+    const customdata: [number, number | string][] = []
     for (const pt of pts) {
       const x = xOfStep(pt.step)
       if (x === null) continue
       const rec = pt as unknown as Record<string, number | null>
       const v = rec[`${metric}_median`]
-      xs.push(x); steps.push(pt.step)
+      const nMats = (pt as unknown as { n_mats?: number }).n_mats
+      xs.push(x)
+      customdata.push([pt.step, nMats ?? '?'])
       ys.push(typeof v === 'number' ? v * 100 : null)  // fraction → %
     }
     const color = COLORS[metric]
@@ -683,8 +685,8 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       // toggles the individual trace, not the whole legendgroup).
       legendgroup: 'mtmv',
       legendgrouptitle: { text: 'MT/MV (mat-NMAE / mat-NEMD %)' },
-      customdata: steps,
-      hovertemplate: `${name} %{y:.2f}%%<br>step %{customdata}<extra></extra>`,
+      customdata,
+      hovertemplate: `${name} %{y:.2f}%%<br>step %{customdata[0]} · n_mats %{customdata[1]}<extra></extra>`,
     }
   }
   const evalTraces = useMemo(() => {
@@ -969,6 +971,12 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
             type: xMode === 'time' ? 'date' : 'linear',
             ...(xMode === 'time' ? { tickformat: '%-m/%-d %H:%M' } : {}),
             gridcolor, zerolinecolor, linecolor: gridcolor,
+            // Anchor to the bottom-most y-axis so tick labels render BELOW
+            // the bottom panel (MT/MV when present, TL/VL when not), instead
+            // of below the topmost panel (the step counter) which is plotly's
+            // default for a shared xaxis. Without this, the bottom panel has
+            // no visible x reference.
+            anchor: showEvalPanel ? 'y3' : 'y2',
             // Restore user-picked range across re-renders triggered by
             // smoothing / bands toggles. `null` → omit → plotly autoranges.
             ...(userXRange ? { range: userXRange, autorange: false } : {}),
@@ -994,8 +1002,11 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
             fixedrange: true,
           },
           yaxis3: {
-            title: { text: 'mat-NMAE / NEMD % (log)' },
-            type: logType,
+            // Linear scale: MT/MV values are typically 100-600% (< 6× range),
+            // not orders of magnitude — log here compresses the range without
+            // adding information.
+            title: { text: 'mat-NMAE / NEMD %' },
+            type: 'linear',
             domain: evalDomain ?? [0.0, 0.01],
             gridcolor, zerolinecolor, linecolor: gridcolor,
             visible: showEvalPanel,
