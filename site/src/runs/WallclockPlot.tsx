@@ -662,17 +662,26 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     }
     const color = COLORS[metric]
     const name = `${mvmt} ${metric.toUpperCase()}`
-    // Smooth the median (in practice MT/MV has ~handfuls of points so smoothing
-    // is usually a no-op, but keep the `smooth` knob applied for consistency
-    // with TL/VL).
-    const ySmoothed = smoothedMeanStd(ys, smooth).mean
+    // Do NOT apply the `smooth` knob to MT/MV — these are sparse eval-point
+    // traces (one point per checkpoint, typically 5-30 timepoints spaced by
+    // 1-5k steps), not the per-step training-row sequences smoothing was
+    // designed for. With `rolling:50` over 5 points each output collapses to
+    // the mean of all neighbors → the whole trace renders as a flat line at
+    // the average y-value (which is the bug a comment here originally
+    // mis-described as "usually a no-op"). Window smoothing in row-space
+    // makes no sense for sparse eval data; if a user wants to denoise across
+    // adjacent ckpts, that's a separate "moving median per N checkpoints"
+    // feature.
     return {
-      x: xs, y: ySmoothed, name,
+      x: xs, y: ys, name,
       type: 'scatter' as const, mode: 'lines+markers' as const,
       line: { color, width: 1.6, dash },
       marker: { color, size: 6 },
       yaxis: 'y3',
-      legendgroup: `mtmv-${mvmt}-${metric}`,
+      // Single shared legendgroup so the "MT/MV …" group title only renders
+      // once; per-trace click-to-toggle still works (plotly's default click
+      // toggles the individual trace, not the whole legendgroup).
+      legendgroup: 'mtmv',
       legendgrouptitle: { text: 'MT/MV (mat-NMAE / mat-NEMD %)' },
       customdata: steps,
       hovertemplate: `${name} %{y:.2f}%%<br>step %{customdata}<extra></extra>`,
