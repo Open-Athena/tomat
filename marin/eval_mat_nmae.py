@@ -33,6 +33,13 @@ Env vars:
                             a coverage cap (default 32). Free-running is ~P^3
                             sequential forwards/patch; cap cost via the mat
                             count (TOMAT_EVAL_N_MATS), not this.
+    TOMAT_EVAL_RUN_LABEL    override the dir under `<BUCKET>/eval/results/`.
+                            Default: parts[-4] of TOMAT_CHECKPOINT (the parent
+                            of the `checkpoints/` dir under Levanter's layout).
+                            Use when checkpoint's parent-dir name ≠ desired
+                            results dir — e.g. Modal-trained runs whose ckpts
+                            live at `results/<RL>/checkpoints/<leaf>/step-N`
+                            but whose eval JSONs should land under `<leaf>/`.
 """
 
 from __future__ import annotations
@@ -1050,9 +1057,11 @@ def main():
         # Compute the output path once. Levanter writes
         # <base>/<run_id>/step-N and `tomat evals fire` sets base =
         # <BUCKET>/results/<RL>/checkpoints → parts[-4]=run_label, -1=step.
+        # TOMAT_EVAL_RUN_LABEL overrides the dir for Modal-trained runs
+        # whose ckpt layout has RL ≠ leaf and we want results under <leaf>/.
         _ckpt_parts = checkpoint_path.rstrip("/").split("/")
         _ckpt_tail = _ckpt_parts[-1]
-        _run_label = _ckpt_parts[-4]
+        _run_label = os.environ.get("TOMAT_EVAL_RUN_LABEL", "").strip() or _ckpt_parts[-4]
         _mode_suffix = {"free": "-free", "maskgit": "-maskgit"}.get(eval_mode, "")
         _ms = (eval_mat_set or "default") + _mode_suffix
         _out_suffix = os.environ.get("TOMAT_EVAL_OUTPUT_SUFFIX", "")

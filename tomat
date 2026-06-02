@@ -1810,6 +1810,104 @@ def modal_sync(bucket: str, key: str, dry_run: bool, fc_ids: tuple[str, ...]):
 # ──────────────────────────────────────────────────────────────────────
 
 
+EVAL_MODAL_SCRIPT = PROJECT_ROOT / "scripts" / "eval_modal.py"
+
+
+def _load_eval_modal_module():
+    """Dynamically import `scripts/eval_modal.py` (the directory isn't a
+    package). Returns the loaded module so callers can grab `app` and the
+    function symbols.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("tomat_eval_modal", EVAL_MODAL_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load {EVAL_MODAL_SCRIPT}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _evals_fire_modal(
+    *,
+    step_list: list[int],
+    set_list: list[str],
+    num_tasks: int,
+    per_task: int,
+    run_label: str,
+    leaf: str,
+    eval_bucket: str,
+    eval_label: str,
+    model: str,
+    decoder: str,
+    eval_batch: int,
+    mode: str,
+    mg_k_steps: int,
+    debug_dump_mat: str,
+) -> int:
+    """Modal-backend eval fire: spawn one 8×H200 call per (step, set, task).
+
+    Uses an ephemeral detached app — spawned calls survive after this Python
+    process exits, and the result JSONs land at the same GCS path the iris
+    path writes to (eval/results/<leaf>/<set>{-mode}/step-N{-task<i>}.json),
+    courtesy of TOMAT_EVAL_RUN_LABEL=<leaf>.
+    """
+    import modal as _modal
+    mod = _load_eval_modal_module()
+    app = mod.app
+    eval_fn = mod.eval_checkpoint_h200x8
+
+    # Modal-trained ckpts have RL ≠ leaf — eval_mat_nmae.py would otherwise
+    # compute parts[-4] = RL and write under eval/results/<RL>/, but we want
+    # eval/results/<leaf>/ (matches the existing maskgit step-9969 layout).
+    run_label_override = leaf if leaf != run_label else None
+
+    fired = 0
+    call_ids: list[tuple[int, str, int, str]] = []
+    # Detached: the modal app keeps running after this process exits, so
+    # all spawned calls survive a Ctrl-C / SSH drop. This matches the
+    # train_smoke_modal `--detach` semantics.
+    with _modal.enable_output():
+        with app.run(detach=True):
+            for step in step_list:
+                for s in set_list:
+                    ckpt = f"{eval_bucket}/results/{run_label}/checkpoints/{leaf}/step-{step}"
+                    for task_i in range(num_tasks):
+                        task_skip = task_i * per_task
+                        task_n_mats = per_task
+                        out_suffix = f"-task{task_i}" if num_tasks > 1 else ""
+                        try:
+                            call = eval_fn.spawn(
+                                checkpoint=ckpt,
+                                mat_set=s,
+                                label=eval_label,
+                                lmq_path=LMQ_PATH,
+                                model=model,
+                                n_mats=task_n_mats,
+                                decoder=decoder,
+                                batch=eval_batch,
+                                debug_dump_mat=debug_dump_mat,
+                                run_label=run_label_override,
+                                mode=mode,
+                                mg_k_steps=mg_k_steps,
+                                eval_skip=task_skip,
+                                output_suffix=out_suffix,
+                            )
+                        except Exception as e:
+                            err(f"[FAIL spawn step={step} set={s} task={task_i}] {e}")
+                            continue
+                        call_ids.append((step, s, task_i, call.object_id))
+                        print(f"[fired modal step={step} set={s} task={task_i} "
+                              f"call_id={call.object_id}]")
+                        fired += 1
+    # Summary block — easier to grep for later.
+    if call_ids:
+        print("\n[modal call IDs]")
+        for step, s, task_i, cid in call_ids:
+            print(f"  step={step:<6} set={s:<10} task={task_i}  {cid}")
+        print("  watch with: modal call-logs <call_id>  (or `modal app logs tomat-eval`)")
+    return fired
+
+
 @cli.group()
 def evals():
     """Mat-NMAE eval firing + harvesting."""
@@ -1834,6 +1932,7 @@ def evals():
 @click.option("--bucket", "bucket_override", default=None, help=f"GCS bucket where the run's ckpts live (default: {GCS_BUCKET}). Use when the run was trained with --bucket override (e.g. v5p in us-east5 → gs://marin-us-east5/tomat).")
 @click.option("--mirror-to", "mirror_to", default=None, help="Before firing, mirror the resolved ckpt(s) to this bucket via `tomat ckpt mirror` and run eval against the mirror. Prevents cross-region egress when eval TPU region differs from ckpt bucket. See [[cross-region-eval-egress]].")
 @click.option("--ckpt-leaf", "ckpt_leaf", default=None, help="Override the leaf dir under `<bucket>/results/<run_label>/checkpoints/` (default: run_label). Use for Modal training runs whose ckpt path is `results/<results_label>/checkpoints/<results_label>-bs<bs>-seed<seed>/step-*` — pass `--ckpt-leaf <results_label>-bs<bs>-seed<seed>`.")
+@click.option("--backend", default="iris", type=click.Choice(["iris", "modal"]), help="Submission backend. `iris` (default): submit one iris/TPU job per (step, set, task). `modal`: spawn each combo as an 8×H200 Modal `eval_checkpoint_h200x8` call. The modal path sidesteps marin-iris's 14-day client-freshness gate + marin-*-latest wheel rotation (see memories `iris-build-date-empty-bug`, `marin-dev-wheel-rotation`). Result JSONs land at the same GCS path either way (eval/results/<ckpt_leaf or run_label>/<set>/step-N.json); modal forces `<ckpt_leaf>` via TOMAT_EVAL_RUN_LABEL so RL ≠ leaf runs (Modal-trained) get the leaf-based output dir.")
 @click.option("-P", "--dump-predictions", "dump_predictions", is_flag=True, help="Sets TOMAT_EVAL_DUMP_PREDICTIONS=1. Each completed mat dumps a (n_patches, P^3) pred/true .npz sibling to the result JSON, for the voxel-position corr-matrix diagnostic (spec 41).")
 @click.argument("run_label")
 def evals_fire(
@@ -1856,6 +1955,7 @@ def evals_fire(
     bucket_override: str | None,
     mirror_to: str | None,
     ckpt_leaf: str | None,
+    backend: str,
     dump_predictions: bool,
 ):
     """Fire mat-NMAE eval jobs against a run's GCS checkpoints.
@@ -1867,7 +1967,14 @@ def evals_fire(
     results land in GCS `<set>-free/`. MaskGIT iterative-refinement
     (`--mode maskgit`) runs K bidirectional forwards per patch (confidence-
     sorted cosine schedule); results land in GCS `<set>-maskgit/`.
-    Use --dry-run to print iris commands without executing.
+
+    `--backend modal` routes each (step, set, task) to an 8×H200 Modal call
+    via `scripts/eval_modal.py::eval_checkpoint_h200x8` (sidesteps the iris
+    14-day client-freshness gate + marin-*-latest wheel rotation). The Modal
+    app runs detached, so the local process exits after spawning; Modal call
+    IDs are printed for later inspection.
+
+    Use --dry-run to print iris commands without executing (iris backend only).
     """
     # Resolve `-s` against actual GCS ckpts. Two recurring foot-guns this
     # avoids: (1) the Levanter `num_train_steps=N` → final ckpt named
@@ -1932,8 +2039,11 @@ def evals_fire(
         for s in set_list:
             (TMP_DIR / f"{run_label}-{s}-evals-fired.txt").write_text("")
 
+    # iris backend pushes WANDB to each TPU container via --env-vars; the
+    # modal path doesn't (eval_modal.py doesn't wire wandb either — keep this
+    # follow-up: bake wandb logging back into the modal entrypoint).
     wandb_key = os.environ.get("WANDB_API_KEY", "<WANDB_API_KEY>")
-    if not dry_run and wandb_key == "<WANDB_API_KEY>":
+    if backend == "iris" and not dry_run and wandb_key == "<WANDB_API_KEY>":
         err("WANDB_API_KEY not set in env")
         sys.exit(1)
 
@@ -1944,6 +2054,42 @@ def evals_fire(
     # union covers every mat; the last task may have a slightly smaller
     # slice (truncated by `n_mats` on the eval-script side).
     per_task = (n_mats + num_tasks - 1) // num_tasks
+
+    if backend == "modal":
+        if dry_run:
+            err("[evals fire] --dry-run not implemented for --backend modal; "
+                "printing the planned (step, set, task) combos and exiting")
+            for step in step_list:
+                for s in set_list:
+                    for task_i in range(num_tasks):
+                        print(f"  step={step} set={s} task={task_i}")
+            print(f"\n[planned {len(step_list)*len(set_list)*num_tasks} modal calls (dry-run)]")
+            return
+        fired_total = _evals_fire_modal(
+            step_list=step_list,
+            set_list=set_list,
+            num_tasks=num_tasks,
+            per_task=per_task,
+            run_label=run_label,
+            leaf=leaf,
+            eval_bucket=eval_bucket,
+            eval_label=eval_label,
+            model=model,
+            decoder=decoder,
+            eval_batch=eval_batch,
+            mode=mode,
+            mg_k_steps=mg_k_steps,
+            debug_dump_mat=debug_dump_mat,
+        )
+        print(f"\n[done firing {fired_total}/{len(step_list)*len(set_list)*num_tasks} modal jobs]")
+        # FIRED file seeding still useful so a downstream `tomat evals harvest`
+        # can find the runs once results land.
+        if mode == "teacher":
+            for s in set_list:
+                with open(TMP_DIR / f"{run_label}-{s}-evals-fired.txt", "a") as f:
+                    for step in step_list:
+                        f.write(f"{step}\n")
+        return
 
     fired_total = 0
     for step in step_list:
