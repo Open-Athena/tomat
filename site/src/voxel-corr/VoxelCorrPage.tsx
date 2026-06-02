@@ -224,9 +224,12 @@ function zoomViewport(vp: Viewport, factor: number, anchorCx: number, anchorCy: 
   const ay = vp.y0 + (anchorCy / CANVAS_DIM) * h
   let nw = w * factor
   let nh = h * factor
-  // Min 4 source pixels (so we never zoom past usefulness); max 2× full extent.
+  // Min 4 source pixels (so we never zoom past usefulness); max = N so the
+  // fully-zoomed-out viewport is exactly the matrix's [0,N]×[0,N] extent
+  // (no dark margin around the matrix). Previously was `2 * N` which let
+  // the user zoom out into empty space.
   const minW = 4
-  const maxW = 2 * N
+  const maxW = N
   nw = Math.max(minW, Math.min(maxW, nw))
   nh = Math.max(minW, Math.min(maxW, nh))
   const x0 = ax - (anchorCx / CANVAS_DIM) * nw
