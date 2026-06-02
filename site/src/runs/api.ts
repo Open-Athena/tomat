@@ -82,7 +82,13 @@ export async function fetchManifest(runId: string): Promise<RunManifest> {
  * See `worker/src/index.ts:handleRunsSnapshot` and `specs/23-runs-dashboard.md`
  * (Phase B "On-demand caching" section) for the design.
  */
-export type RunsSnapshotEntry = RunManifest & { evals?: EvalIndexEntry[] }
+export type RunsSnapshotEntry = RunManifest & {
+  evals?: EvalIndexEntry[]
+  /** Spec 46 Phase A: tiny per-run MSRP summary inlined into the snapshot
+   *  for the first-paint chip. Full breakdown lives in `cost.json` and
+   *  is fetched on-demand by the detail page (`fetchRunCost`). */
+  cost?: RunCostSummary
+}
 
 export interface RunsSnapshot {
   synced_at: string
@@ -222,6 +228,54 @@ export async function fetchEvalRecord(runId: string, key: string): Promise<EvalR
   const r = await fetch(`${API_BASE}/api/runs/${encodeURIComponent(runId)}/evals/${encodeURIComponent(key)}`)
   if (r.status === 404) return null
   if (!r.ok) throw new Error(`fetchEvalRecord(${runId}, ${key}) ${r.status}`)
+  return r.json()
+}
+
+// ── cost.json (spec 46 Phase A: TPU MSRP) ───────────────────────────────────
+// Estimated-MSRP equivalent retail value of one run's compute, written by
+// `tomat cost compute` and surfaced as the "$X MSRP" chip on the run-detail
+// page. Phase A models TPU iris runs (variant + chips + wallclock × rate);
+// Modal runs ship a `breakdown[i].kind === "modal"` placeholder with null
+// `msrp_usd` so the chip can render "Modal MSRP TBD" instead of $0.
+
+/** One contributor: a TPU attempt cycle or a Modal function call.
+ *  `msrp_usd` is null when the rate is unknown (Phase B Modal). */
+export interface RunCostBreakdownRow {
+  kind: 'tpu' | 'modal'
+  label: string                // "v6e-16 preemptible", "Modal MSRP TBD"
+  wallclock_sec: number
+  rate_per_hr_usd: number | null
+  msrp_usd: number | null
+  source: string
+  started_at_ms: number | null
+  finished_at_ms: number | null
+}
+
+export interface RunCost {
+  schema_version: number
+  pricing_table_version: string  // "2026-06-02" — snapshot date
+  computed_at: string             // ISO-8601 UTC
+  is_complete: boolean
+  msrp_usd: number
+  breakdown: RunCostBreakdownRow[]
+  notes: string[]
+}
+
+/** Tiny summary inlined into runs-snapshot for first-paint. The detail
+ *  page's tooltip lazy-fetches the full RunCost via `fetchRunCost`. */
+export interface RunCostSummary {
+  msrp_usd: number
+  is_complete: boolean
+  pricing_table_version: string
+  has_modal_pending: boolean
+}
+
+/** Fetch one run's full MSRP record. Null when the sidecar doesn't exist
+ *  yet (run hasn't been `tomat cost compute`-d). */
+export async function fetchRunCost(runId: string): Promise<RunCost | null> {
+  const r = await fetch(`${API_BASE}/api/runs/${encodeURIComponent(runId)}/cost.json`)
+  if (r.status === 404) return null
+  if (!r.ok) throw new Error(`fetchRunCost(${runId}) ${r.status}`)
   return r.json()
 }
 

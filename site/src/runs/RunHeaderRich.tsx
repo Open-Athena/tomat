@@ -14,8 +14,13 @@
 // jobs + color) and renders. No fetching, no react-query inside.
 
 import { useMemo } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { Tooltip } from '../Tooltip'
-import { evalPhase, isModalRun, type EvalJob, type IrisAttempts, type IrisJob, type ModalApp, type ModalFunctionCall, type RunManifest } from './api'
+import {
+  evalPhase, fetchRunCost, isModalRun,
+  type EvalJob, type IrisAttempts, type IrisJob, type ModalApp,
+  type ModalFunctionCall, type RunCost, type RunCostSummary, type RunManifest,
+} from './api'
 import { computeTrainingFraction, formatDurationShort } from './trainingFraction'
 import { lineageFor } from './lineage'
 import type { RunHistory } from './parquet'
@@ -83,6 +88,10 @@ export interface RunCardData {
    *  `ModalBadge` to replace the wandb-state fallback with real Modal
    *  state (cache-build / queued / running / failed). */
   modalApp?: ModalApp | null
+  /** Spec 46 Phase A: tiny MSRP summary inlined in `/api/runs-snapshot.json`.
+   *  Used by the "$X MSRP" chip on cards + detail-page header. Null when
+   *  the run hasn't been `tomat cost compute`-d yet. */
+  cost?: RunCostSummary | null
 }
 
 // ── status badges/dots ──────────────────────────────────────────────────────
@@ -749,6 +758,138 @@ function TagChips({ runId }: { runId: string }) {
   )
 }
 
+// ── MSRP chip (spec 46 Phase A) ─────────────────────────────────────────────
+// Renders "$X MSRP" + tooltip with the per-segment breakdown. Honest framing:
+// "Estimated MSRP" / "equivalent retail value — not actual billing", with the
+// pricing-table snapshot date. Do NOT change copy to "cost" / "spend" — see
+// spec 46's "Important framing" section + `feedback_no_funding_in_public_repo`
+// memory.
+
+function formatMsrp(n: number): string {
+  // Cents granularity at small values, whole dollars once we're past $10.
+  if (n < 10) return `$${n.toFixed(2)}`
+  if (n < 1000) return `$${Math.round(n)}`
+  return `$${(n / 1000).toFixed(1)}k`
+}
+
+function formatWallclockShort(sec: number): string {
+  if (sec < 60) return `${sec.toFixed(0)}s`
+  if (sec < 3600) return `${(sec / 60).toFixed(0)}m`
+  if (sec < 86400) return `${(sec / 3600).toFixed(1)}h`
+  return `${(sec / 86400).toFixed(2)}d`
+}
+
+function CostBreakdownTooltipBody({ cost, summary }: {
+  cost: RunCost | null
+  summary: RunCostSummary | null
+}) {
+  // Render copy that survives the spec's framing constraints. The summary
+  // bits (total + snapshot date) come first so the user has them even when
+  // the full breakdown is still fetching.
+  const total = cost?.msrp_usd ?? summary?.msrp_usd ?? null
+  const tableV = cost?.pricing_table_version ?? summary?.pricing_table_version ?? ''
+  const isComplete = cost?.is_complete ?? summary?.is_complete ?? false
+  return (
+    <div style={{ fontFamily: 'sans-serif', fontSize: '0.78rem', lineHeight: 1.45,
+                  maxWidth: 360 }}>
+      <div style={{ fontWeight: 600, marginBottom: 4 }}>Estimated MSRP</div>
+      <div style={{ borderTop: '1px solid #555', margin: '4px 0' }} />
+      {cost == null ? (
+        <div style={{ color: '#bbb', fontStyle: 'italic' }}>loading breakdown…</div>
+      ) : cost.breakdown.length === 0 ? (
+        <div style={{ color: '#bbb', fontStyle: 'italic' }}>
+          no billable segments — this run has no attempts sidecar nor
+          iris-state job data.
+        </div>
+      ) : (
+        <div style={{ fontFamily: 'monospace', fontSize: '0.72rem' }}>
+          {cost.breakdown.map((row, i) => {
+            if (row.kind === 'modal' && row.msrp_usd == null) {
+              return (
+                <div key={i} style={{ color: '#d4a017' }}>
+                  Modal MSRP TBD <span style={{ color: '#888' }}>(Phase B)</span>
+                </div>
+              )
+            }
+            const wallclock = formatWallclockShort(row.wallclock_sec)
+            const rate = row.rate_per_hr_usd != null
+              ? `$${row.rate_per_hr_usd.toFixed(2)}/hr` : '—'
+            const msrp = row.msrp_usd != null
+              ? `$${row.msrp_usd.toFixed(2)}` : '—'
+            return (
+              <div key={i}>
+                {row.label} · {wallclock} · {rate} → {msrp}
+                <div style={{ color: '#888', fontSize: '0.68rem', marginLeft: 12 }}>
+                  {row.source}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+      <div style={{ borderTop: '1px solid #555', margin: '4px 0' }} />
+      <div>
+        Total: <b>{total != null ? `$${total.toFixed(2)}` : '—'}</b>
+        {isComplete ? '' : ' (so far)'}
+      </div>
+      {tableV && (
+        <div style={{ color: '#888', marginTop: 3, fontSize: '0.72rem' }}>
+          Snapshot pricing {tableV} — equivalent retail value, not actual billing.
+        </div>
+      )}
+      {cost && cost.notes.length > 0 && (
+        <div style={{ color: '#b08800', marginTop: 4, fontSize: '0.7rem' }}>
+          {cost.notes.map((n, i) => <div key={i}>{n}</div>)}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function CostChip({ runId, summary, isModalOnly }: {
+  runId: string
+  summary: RunCostSummary | null
+  isModalOnly: boolean
+}) {
+  // Lazy-fetch the full breakdown on tooltip hover. Until the user hovers,
+  // we render only what's in the snapshot's summary (msrp_usd + snapshot
+  // date) so first-paint is one R2 round-trip lighter per run.
+  const costQ = useQuery({
+    queryKey: ['runCost', runId],
+    queryFn: () => fetchRunCost(runId),
+    enabled: false,  // gated; we call refetch() on mouse-enter below
+    staleTime: 60_000,
+  })
+  if (summary == null) {
+    // Modal-only runs with no sidecar yet: still render the chip slot so
+    // the user knows it's pending implementation, not free.
+    if (isModalOnly) {
+      return (
+        <Tooltip content="Modal MSRP not yet implemented (Phase B). The dashboard will surface a $X MSRP figure here once we wire Modal's billing API.">
+          <span style={{ color: '#888', fontFamily: 'monospace', fontStyle: 'italic' }}>
+            Modal MSRP TBD
+          </span>
+        </Tooltip>
+      )
+    }
+    return null
+  }
+  const label = summary.has_modal_pending && summary.msrp_usd === 0
+    ? 'Modal MSRP TBD'
+    : `${formatMsrp(summary.msrp_usd)} MSRP`
+  return (
+    <Tooltip content={
+      <CostBreakdownTooltipBody cost={costQ.data ?? null} summary={summary} />
+    }>
+      <span
+        onMouseEnter={() => { if (!costQ.data && !costQ.isFetching) costQ.refetch() }}
+        style={{ color: '#9aa6c2', fontFamily: 'monospace', cursor: 'help' }}>
+        {label}
+      </span>
+    </Tooltip>
+  )
+}
+
 // ── RunHeaderRich ───────────────────────────────────────────────────────────
 
 const navigate = (path: string) => {
@@ -1089,6 +1230,13 @@ export function RunHeaderRich({
           {typeof mfu === 'number' && <> · MFU {mfu.toFixed(1)}%</>}
           {typeof mtNmae === 'number' && <> · MT {mtNmae.toFixed(2)}%</>}
           {typeof mvNmae === 'number' && <> · MV {mvNmae.toFixed(2)}%</>}
+          {(data.cost != null || isModalRun(id)) && (
+            <> · <CostChip
+              runId={id}
+              summary={data.cost ?? null}
+              isModalOnly={data.cost == null && isModalRun(id)}
+            /></>
+          )}
           {nFlops != null && <> · {formatFlops(nFlops)} FLOP</>}
         </div>
         {/* % training chip — sum(train-active windows ∩ attempt windows) /

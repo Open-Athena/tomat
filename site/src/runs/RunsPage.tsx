@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { enumParam, useUrlState } from 'use-prms'
 import { Tooltip } from '../Tooltip'
-import { evalJobsByRun, evalPhase, fetchEval, fetchEvalsIndex, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchRunsSnapshot, irisJobIdForRun, modalAppForRun, parquetUrl } from './api'
+import { evalJobsByRun, evalPhase, fetchEval, fetchEvalsIndex, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchRunCost, fetchRunsSnapshot, irisJobIdForRun, modalAppForRun, parquetUrl } from './api'
 import type { EvalJob, EvalPoint } from './api'
 import { fetchRunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
@@ -386,6 +386,7 @@ function RunsIndex() {
           evalJobs: evalByRun.get(id) ?? [],
           color: colorForIndex(idx),
           err: null,
+          cost: manifest?.cost ?? null,
         }
       })
     : null
@@ -961,6 +962,15 @@ function RunDetail({ runId }: { runId: string }) {
     refetchInterval: (q) => errBackoff(q) ?? REFETCH_MS.history.active,
     retry: 1,
   })
+  // Spec 46 Phase A: run cost (MSRP). On the detail page we fetch the full
+  // breakdown directly (the tooltip needs it anyway); 404s land as null when
+  // the run hasn't been `tomat cost compute`-d.
+  const costQ = useQuery({
+    queryKey: ['cost', runId],
+    queryFn: () => fetchRunCost(runId),
+    refetchInterval: (q) => errBackoff(q) ?? REFETCH_MS.manifest,
+    retry: 1,
+  })
   const manifest = manifestQ.data ?? null
   const history = historyQ.data ?? null
   const evalJobs = useMemo(
@@ -1008,6 +1018,17 @@ function RunDetail({ runId }: { runId: string }) {
     color: '#888',
     err,
     attempts: attemptsQ.data ?? null,
+    // Synthesize a RunCostSummary from the full RunCost record so the chip
+    // can render without waiting on a second hover-fetch (the detail page
+    // already has the full breakdown via `costQ`).
+    cost: costQ.data
+      ? {
+          msrp_usd: costQ.data.msrp_usd,
+          is_complete: costQ.data.is_complete,
+          pricing_table_version: costQ.data.pricing_table_version,
+          has_modal_pending: costQ.data.breakdown.some((b) => b.kind === 'modal'),
+        }
+      : null,
   }
 
   return (
