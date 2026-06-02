@@ -2,13 +2,14 @@
  * tomat-runs-api — CFW backing tomat.oa.dev/runs.
  *
  * Endpoints (all read-only, public for now):
- *   GET  /api/runs-snapshot.json         — aggregated: runs index + all manifests + iris state + modal state + evals indexes, in one shot
+ *   GET  /api/runs-snapshot.json         — aggregated: runs index + all manifests + iris state + modal state + evals indexes + per-run cost.msrp_usd, in one shot
  *   GET  /api/runs                       — list of synced run ids
  *   GET  /api/runs/:id/manifest.json     — per-run metadata (config, summary, history range)
  *   GET  /api/runs/:id/raw.parquet       — full history parquet
  *   GET  /api/runs/:id/eval.json         — per-step mat-NMAE/NEMD series (both mat-sets)
  *   GET  /api/runs/:id/evals             — eval-records index (spec 43): [{key, fired_at, state}]
  *   GET  /api/runs/:id/evals/:key        — one eval record (spec 43, Phase A)
+ *   GET  /api/runs/:id/cost.json         — MSRP-equivalent compute estimate (spec 46, Phase A: TPU only)
  *   GET  /api/iris-state.json            — iris snapshot (synced by tomat iris sync)
  *   GET  /api/iris-attempts/:label.json  — per-task per-attempt history (death events) for one training run
  *   GET  /api/voxel-corr/:label.json     — voxel-position corr-matrix sidecar (int8 scale, 1D curve, blob_format)
@@ -160,11 +161,22 @@ interface EvalIndexEntry {
 	state: string;      // pending | running | succeeded | failed | killed
 }
 
+/** Tiny cost summary inlined into `runs[i]`. Full breakdown lives in
+ *  `runs/<id>/cost.json` (lazy-fetched by the run-detail page on hover).
+ *  Sized small so the snapshot doesn't bloat — first-paint chip only. */
+interface CostSummary {
+	msrp_usd: number;
+	is_complete: boolean;
+	pricing_table_version: string;
+	has_modal_pending: boolean;
+}
+
 /** What `runs[id]` carries in the aggregated snapshot. Loosely-typed because
  *  the manifest is the existing `RunManifest` shape (defined in the site's
- *  `api.ts`); we just need to splice in an optional `evals` field. */
+ *  `api.ts`); we just need to splice in optional `evals` + `cost` fields. */
 interface RunSnapshotEntry {
 	evals?: EvalIndexEntry[];
+	cost?: CostSummary;
 	[key: string]: unknown;
 }
 
@@ -199,7 +211,8 @@ async function buildRunsSnapshot(env: Env): Promise<{
 	// roughly one R2 round-trip.
 	const manifestKeys = runIds.map((id) => `${env.R2_RUNS_PREFIX}/${id}/manifest.json`);
 	const evalsIndexKeys = runIds.map((id) => `${env.R2_RUNS_PREFIX}/${id}/evals/index.json`);
-	const [manifestResults, evalsIndexResults, irisObj, modalObj] = await Promise.all([
+	const costKeys = runIds.map((id) => `${env.R2_RUNS_PREFIX}/${id}/cost.json`);
+	const [manifestResults, evalsIndexResults, costResults, irisObj, modalObj] = await Promise.all([
 		Promise.all(
 			manifestKeys.map(async (k): Promise<unknown | null> => {
 				const obj = await env.R2.get(k);
@@ -223,6 +236,33 @@ async function buildRunsSnapshot(env: Env): Promise<{
 				}
 			}),
 		),
+		Promise.all(
+			costKeys.map(async (k): Promise<CostSummary | null> => {
+				// Spec 46: inline only the tiny summary fields — full breakdown
+				// is lazy-fetched on the run-detail page's chip tooltip.
+				const obj = await env.R2.get(k);
+				if (!obj) return null;
+				try {
+					const parsed = await obj.json() as {
+						msrp_usd?: number;
+						is_complete?: boolean;
+						pricing_table_version?: string;
+						breakdown?: { kind?: string }[];
+					};
+					if (typeof parsed.msrp_usd !== 'number') return null;
+					const hasModalPending = Array.isArray(parsed.breakdown)
+						&& parsed.breakdown.some((b) => b?.kind === 'modal');
+					return {
+						msrp_usd: parsed.msrp_usd,
+						is_complete: !!parsed.is_complete,
+						pricing_table_version: String(parsed.pricing_table_version ?? ''),
+						has_modal_pending: hasModalPending,
+					};
+				} catch {
+					return null;
+				}
+			}),
+		),
 		env.R2.get('tomat/iris-state.json'),
 		env.R2.get('tomat/modal-state.json'),
 	]);
@@ -231,15 +271,17 @@ async function buildRunsSnapshot(env: Env): Promise<{
 	for (let i = 0; i < runIds.length; i++) {
 		const manifest = manifestResults[i];
 		const evals = evalsIndexResults[i];
-		if (manifest === null && evals === null) {
+		const cost = costResults[i];
+		if (manifest === null && evals === null && cost === null) {
 			runs[runIds[i]] = null;
 		} else {
-			// Common case: manifest exists, evals may or may not.
-			// Edge case: evals exist but manifest doesn't (we just backfilled
+			// Common case: manifest exists, evals + cost may or may not.
+			// Edge case: evals/cost exist but manifest doesn't (we just backfilled
 			// before runs-sync caught up) — still surface so the dashboard's
 			// "have we got any data for this run" check doesn't drop it.
 			const entry: RunSnapshotEntry = (manifest as RunSnapshotEntry) ?? {};
 			if (evals && evals.length > 0) entry.evals = evals;
+			if (cost) entry.cost = cost;
 			runs[runIds[i]] = entry;
 		}
 	}
@@ -559,7 +601,7 @@ export default {
 		}
 
 		// /api/runs/:id/<file>
-		const runFileMatch = path.match(/^\/api\/runs\/([^/]+)\/(raw\.parquet|manifest\.json|eval\.json)$/);
+		const runFileMatch = path.match(/^\/api\/runs\/([^/]+)\/(raw\.parquet|manifest\.json|eval\.json|cost\.json)$/);
 		if (runFileMatch) {
 			const [, runId, file] = runFileMatch;
 			const key = `${env.R2_RUNS_PREFIX}/${runId}/${file}`;
