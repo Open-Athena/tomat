@@ -70,6 +70,15 @@ def build_payload(rows_by_prefix: dict[str, list[dict]]) -> dict:
                 continue
             state_full = row.get("state", "")
             state = state_full.removeprefix("JOB_STATE_") if state_full else "UNKNOWN"
+            # `task_state_counts` is iris's per-state task histogram (keys are
+            # `task_state_friendly` strings: 'running', 'pending', 'building',
+            # 'completed', 'failed', 'killed', ...). Surface it raw — the
+            # dashboard uses it to disambiguate `RUNNING (1r/3p)` cascade-
+            # restart loops from genuine all-healthy RUNNING (spec 45). Drop
+            # zero entries to keep the payload tight; consumers treat missing
+            # keys as zero.
+            tsc_raw = row.get("task_state_counts") or {}
+            tsc = {k: int(v) for k, v in tsc_raw.items() if int(v) > 0}
             jobs[jid] = {
                 "state": state,
                 "state_code": 0,
@@ -81,6 +90,7 @@ def build_payload(rows_by_prefix: dict[str, list[dict]]) -> dict:
                 "started_at_ms": int((row.get("started_at") or {}).get("epoch_ms") or 0) or None,
                 "finished_at_ms": int((row.get("finished_at") or {}).get("epoch_ms") or 0) or None,
                 "num_tasks": int(row.get("task_count") or 0),
+                "task_state_counts": tsc,
             }
     return {
         "schema_version": 1,

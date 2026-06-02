@@ -1,24 +1,30 @@
-// Per-run plot — 2 stacked subplots over a shared x-axis. x-axis modes:
+// Per-run plot — up to 3 stacked subplots over a shared x-axis. x-axis modes:
 //   • wallclock — local time (the viewer's zone)
 //   • elapsed   — hours since the run's first log
 //   • step      — Levanter `global_step`
-// Panels:
-//   1. step (running max of global_step) — top, 28%. Hidden in step mode
+// Panels (top → bottom):
+//   1. step (running max of global_step) — ~17%. Hidden in step/epoch modes
 //      (it would degenerate to y = x).
-//   2. losses + mat-NMAE + mat-NEMD on a single log y-axis (bottom).
+//   2. TL + VL on a log y-axis — ~45% (the "tall, watch the loss decrease"
+//      panel).
+//   3. MT/MV (mat-NMAE + mat-NEMD on train_200 / val_200) on a separate log
+//      y-axis — ~35%. Hidden when the run has no eval.json yet (the plot
+//      falls back to the legacy 2-panel layout).
 //
-// Eval bands (MV = val_200, MT = train_200) come from the canonical per-step
+// Eval points (MV = val_200, MT = train_200) come from the canonical per-step
 // eval.json — NOT the parquet's collapsed harvested points. Per (set × metric)
-// the plot draws a median center line plus two shaded spread bands across the
-// 200 mats: p25–p75 (IQR) and a fainter p1–p99. NMAE is green, NEMD teal; MV
-// solid, MT dashed. Eval points are keyed by checkpoint step; on the
-// time/elapsed axes they're placed at the wallclock of that step, recovered
-// from the parquet's (timestamp, global_step) rows. Non-teacher-mode bands
-// (maskgit, free) come from `val/train_200-<mode>` set keys and render with
-// the same visual style as teacher (legend disambiguates via `MV/maskgit`).
+// the plot draws the per-step median as a connected line+markers trace; the
+// p25–p75 / p1–p99 spread bands were dropped (4-timepoint horizontal smears
+// were confusing rather than informative — see spec 25 follow-up). NMAE is
+// green, NEMD teal; MV solid, MT dashed. Eval points are keyed by checkpoint
+// step; on the time/elapsed axes they're placed at the wallclock of that
+// step, recovered from the parquet's (timestamp, global_step) rows.
+// Non-teacher-mode points (maskgit, free) come from `val/train_200-<mode>`
+// set keys and render with the same visual style (legend disambiguates via
+// `MV/maskgit`).
 //
 // Lifecycle events render as vertical lines via `shapes` (yref='paper') so
-// they span both panels.
+// they span all panels.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Plot, useTheme } from 'pltly/react'
@@ -76,10 +82,6 @@ const COLORS = {
   sigterm: '#bdbdbd',
   preempt: '#ba68c8',
 } as const
-
-/** Translucent fill for a metric's spread band. */
-const bandFill = (metric: 'nmae' | 'nemd', alpha: number): string =>
-  metric === 'nmae' ? `rgba(67,160,71,${alpha})` : `rgba(0,172,193,${alpha})`
 
 /** `#rrggbb` → `"R, G, B"` for use inside `rgba(…)` strings. Used by the
  *  smoothing ±σ bands to colour-match their parent line. */
@@ -577,6 +579,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         opacity,
         yaxis: 'y2',
         legendgroup: lg,
+        legendgrouptitle: { text: 'losses (log)' },
         showlegend: isLatest,
         customdata: lineG,
         hovertemplate: `${segName} %{y:.3f}<br>gstep %{customdata}<extra></extra>`,
@@ -636,66 +639,44 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     return out
   }
 
-  // ── eval bands from eval.json ──
-  // Per (set × metric): a median center line + a p25–p75 IQR band + a fainter
-  // p1–p99 band. Band edges are `showlegend:false`; the median carries the
-  // legend entry, and a shared `legendgroup` makes a legend-click toggle the
-  // whole group (median + both bands). `fill:'tonexty'` fills to the
-  // immediately-preceding trace, so the per-group order is
-  // [p1, p99, p25, p75, median].
-  const evalBandGroup = (
+  // ── eval points from eval.json ──
+  // Per (set × metric): per-step median rendered as a `lines+markers` trace
+  // on the dedicated MT/MV panel (yaxis: 'y3'). Markers are size 6 so the
+  // typically-handful (~4) of timepoints are clearly visible (was: median +
+  // p25–p75 + p1–p99 bands, dropped — see header comment).
+  const evalMedianTrace = (
     setKey: string, mvmt: string, dash: 'solid' | 'dash',
     metric: 'nmae' | 'nemd',
   ) => {
     const pts = evalSeries?.sets[setKey] ?? []
     const xs: (string | number)[] = []
+    const ys: (number | null)[] = []
     const steps: number[] = []
-    const pct: Record<string, (number | null)[]> = {
-      p1: [], p25: [], median: [], p75: [], p99: [],
-    }
     for (const pt of pts) {
       const x = xOfStep(pt.step)
       if (x === null) continue
       const rec = pt as unknown as Record<string, number | null>
+      const v = rec[`${metric}_median`]
       xs.push(x); steps.push(pt.step)
-      for (const k of ['p1', 'p25', 'median', 'p75', 'p99']) {
-        const v = rec[`${metric}_${k}`]
-        pct[k].push(typeof v === 'number' ? v * 100 : null)  // fraction → %
-      }
+      ys.push(typeof v === 'number' ? v * 100 : null)  // fraction → %
     }
     const color = COLORS[metric]
     const name = `${mvmt} ${metric.toUpperCase()}`
-    const lg = `${mvmt}-${metric}`
-    const edge = (key: string, fill: number | null) => ({
-      x: xs, y: pct[key], name,
-      type: 'scatter' as const, mode: 'lines' as const,
-      line: { width: 0, color },
-      ...(fill !== null
-        ? { fill: 'tonexty' as const, fillcolor: bandFill(metric, fill) }
-        : {}),
-      yaxis: 'y2', legendgroup: lg, showlegend: false,
-      hoverinfo: 'skip' as const,
-    })
-    // Smooth the median (the eval points themselves still carry the IQR /
-    // p1–p99 spread bands across the 200 mats, so the user's `bands=1` ±σ
-    // toggle is NOT applied here — adding rolling σ on top of inter-mat IQR
-    // would conflate two different sources of spread and confuse the reader).
-    const medianSmoothed = smoothedMeanStd(pct.median, smooth).mean
-    return [
-      edge('p1', null),     // lower edge of the p1–p99 band
-      edge('p99', 0.09),    // upper edge → fills down to p1
-      edge('p25', null),    // lower edge of the IQR band
-      edge('p75', 0.20),    // upper edge → fills down to p25
-      {                     // median — the legend-bearing center line
-        x: xs, y: medianSmoothed, name,
-        type: 'scatter' as const, mode: 'lines+markers' as const,
-        line: { color, width: 1.6, dash },
-        marker: { color, size: 3 },
-        yaxis: 'y2', legendgroup: lg,
-        customdata: steps,
-        hovertemplate: `${name} median %{y:.2f}%%<br>step %{customdata}<extra></extra>`,
-      },
-    ]
+    // Smooth the median (in practice MT/MV has ~handfuls of points so smoothing
+    // is usually a no-op, but keep the `smooth` knob applied for consistency
+    // with TL/VL).
+    const ySmoothed = smoothedMeanStd(ys, smooth).mean
+    return {
+      x: xs, y: ySmoothed, name,
+      type: 'scatter' as const, mode: 'lines+markers' as const,
+      line: { color, width: 1.6, dash },
+      marker: { color, size: 6 },
+      yaxis: 'y3',
+      legendgroup: `mtmv-${mvmt}-${metric}`,
+      legendgrouptitle: { text: 'MT/MV (mat-NMAE / mat-NEMD %)' },
+      customdata: steps,
+      hovertemplate: `${name} %{y:.2f}%%<br>step %{customdata}<extra></extra>`,
+    }
   }
   const evalTraces = useMemo(() => {
     const out: Record<string, unknown>[] = []
@@ -712,12 +693,23 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     for (const setKey of setKeys) {
       const [mvmt, dash] = labelFor(setKey)
       for (const metric of ['nmae', 'nemd'] as const) {
-        out.push(...evalBandGroup(setKey, mvmt, dash, metric))
+        out.push(evalMedianTrace(setKey, mvmt, dash, metric))
       }
     }
     return out
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [evalSeries, xMode, smooth])
+  // Whether to render the third (MT/MV) panel: true iff the run has at least
+  // one eval set with at least one point. Runs without eval.json (or with an
+  // empty sets dict) fall back to the legacy 2-panel layout.
+  const hasEvalData = useMemo(() => {
+    const sets = evalSeries?.sets
+    if (!sets) return false
+    for (const k of Object.keys(sets)) {
+      if ((sets[k]?.length ?? 0) > 0) return true
+    }
+    return false
+  }, [evalSeries])
 
   // Lifecycle event timestamps.
   const eventTimes = (key: string): number[] => {
@@ -825,7 +817,9 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   }
 
   // Legend-only invisible point so the event vlines show up in the legend
-  // (real lines are `shapes`, which don't legend-ify).
+  // (real lines are `shapes`, which don't legend-ify). All event LIs share
+  // the `events` legendgroup so they cluster together under the "events"
+  // header below the metric groups.
   const legendOnly = (name: string, color: string, dash: 'dash' | 'dot' | 'solid') => ({
     x: [null], y: [null],
     mode: 'lines' as const,
@@ -833,16 +827,38 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     line: { color, width: 1.5, dash },
     name,
     showlegend: true,
+    legendgroup: 'events',
+    legendgrouptitle: { text: 'events' },
     hoverinfo: 'skip' as const,
   })
 
   // The top-panel (running-max global_step) is degenerate in both `step` and
   // `epoch` modes (epoch is a pure rescaling of step → also y = x there).
   const showTopPanel = xMode !== 'step' && xMode !== 'epoch'
+  const showEvalPanel = hasEvalData
 
   const logType: 'log' = 'log'
-  const lossDomain: [number, number] = showTopPanel ? [0.0, 0.66] : [0.0, 1.0]
-  const stepDomain: [number, number] = [0.72, 1.0]
+  // Domains: stack panels top → bottom with small inter-panel gaps. Each of
+  // the 4 (showTopPanel × showEvalPanel) combinations gets its own layout so
+  // each panel uses the full available space.
+  const [stepDomain, lossDomain, evalDomain]: [
+    [number, number] | null, [number, number], [number, number] | null,
+  ] = (() => {
+    if (showTopPanel && showEvalPanel) {
+      // 3 panels: step ~17%, TL/VL ~45%, MT/MV ~35%, with ~1.5% gaps between.
+      return [[0.83, 1.0], [0.36, 0.815], [0.0, 0.345]]
+    }
+    if (showTopPanel && !showEvalPanel) {
+      // 2 panels: step ~28% (legacy), TL/VL ~70%.
+      return [[0.72, 1.0], [0.0, 0.685], null]
+    }
+    if (!showTopPanel && showEvalPanel) {
+      // 2 panels: TL/VL ~55%, MT/MV ~40%, no step.
+      return [null, [0.45, 1.0], [0.0, 0.42]]
+    }
+    // 1 panel: TL/VL only.
+    return [null, [0.0, 1.0], null]
+  })()
 
   const xTitle = xMode === 'time' ? TZ_LABEL
     : xMode === 'elapsed' ? 'elapsed (h)'
@@ -895,6 +911,8 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
             type: 'scatter' as const, mode: 'lines' as const,
             line: { color: COLORS.step, width: 2, shape: 'hv' as const },
             yaxis: 'y',
+            legendgroup: 'step',
+            legendgrouptitle: { text: 'progress' },
             hovertemplate: 'step %{y}<extra></extra>',
           }] : []),
           // 2. losses (shared log y2) — smoothing-aware. Bands (when on) share
@@ -902,8 +920,10 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
           //    their parent on hover.
           ...smoothedSeriesTraces(TL, 'TL (train/loss)', COLORS.TL, 1.2, 'TL'),
           ...smoothedSeriesTraces(VL, 'VL (eval/loss)', COLORS.VL, 1.4, 'VL'),
-          // 3. mat-NMAE + mat-NEMD (from eval.json)
-          ...evalTraces,
+          // 3. mat-NMAE + mat-NEMD (from eval.json) on yaxis: 'y3' — only when
+          //    the run has eval data; otherwise the panel + traces are omitted
+          //    and we fall back to the legacy 2-panel layout.
+          ...(showEvalPanel ? evalTraces : []),
           // Hide lifecycle LIs whose count is 0 — for a Modal run with no
           // iris-style restarts / preempts / sigterms, three permanently
           // greyed (0) rows just clutter the legend.
@@ -947,7 +967,9 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
           yaxis: {
             title: { text: 'step', font: { color: COLORS.step } },
             tickfont: { color: COLORS.step },
-            domain: stepDomain,
+            // When step panel is hidden, the domain is unused, but plotly
+            // requires SOMETHING valid here; pick a tiny offscreen slice.
+            domain: stepDomain ?? [0.99, 1.0],
             gridcolor, zerolinecolor, linecolor: gridcolor,
             visible: showTopPanel,
             // Lock y-zoom: click-drag should zoom x-only (constraint imposed
@@ -956,17 +978,32 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
             fixedrange: true,
           },
           yaxis2: {
-            title: { text: 'loss / NMAE·NEMD % (log)' },
+            title: { text: 'loss (log)' },
             type: logType,
             domain: lossDomain,
             gridcolor, zerolinecolor, linecolor: gridcolor,
             fixedrange: true,
           },
+          yaxis3: {
+            title: { text: 'mat-NMAE / NEMD % (log)' },
+            type: logType,
+            domain: evalDomain ?? [0.0, 0.01],
+            gridcolor, zerolinecolor, linecolor: gridcolor,
+            visible: showEvalPanel,
+            fixedrange: true,
+          },
           shapes: eventShapes,
-          margin: { t: 50, l: 70, r: 170, b: 50 },
+          margin: { t: 50, l: 70, r: 210, b: 50 },
           hovermode: 'x unified',
           hoverlabel: themedHoverlabel(isDark),
-          legend: { x: 1.02, y: 1, bgcolor: 'rgba(0,0,0,0)' },
+          // Single legend on the right with grouped headers per panel.
+          // `tracegroupgap` adds vertical breathing room between groups so
+          // the per-group `legendgrouptitle` rows visually separate the
+          // panels' entries (step / losses / MT·MV / events).
+          legend: {
+            x: 1.02, y: 1, bgcolor: 'rgba(0,0,0,0)',
+            tracegroupgap: 10,
+          },
         }}
       />
       </div>
