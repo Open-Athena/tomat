@@ -23,7 +23,8 @@ export function HomePage() {
         token stream — a sequence-model alternative to 3D-ResUNet
         approaches over voxel grids.{' '}
         <ExtLink href="https://github.com/Open-Athena/tomat">Open-Athena/tomat</ExtLink>{' '}
-        · <a href="#/runs">live runs dashboard</a>.
+        · <a href="#/runs">live runs dashboard</a>
+        {' '}· <a href="#/posts">posts</a>.
       </p>
 
       <h2>Current best</h2>

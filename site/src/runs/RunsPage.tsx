@@ -682,7 +682,14 @@ function RunsIndex() {
       // cursor during an auto-refresh — without this the fade could stick.
       onMouseLeave={() => highlight.setHoverTrace(null)}
     >
-      <h1>tomat runs</h1>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: '1rem' }}>
+        <h1 style={{ margin: 0 }}>tomat runs</h1>
+        <nav style={{ display: 'flex', gap: '0.75rem', fontSize: '0.9rem' }}>
+          <a href="#/posts">posts</a>
+          <a href="#/files">files</a>
+          <a href="#/deck">deck</a>
+        </nav>
+      </div>
       <p style={{ color: '#888', fontSize: '0.85rem' }}>
         {ordered && (
           <>

@@ -3,6 +3,7 @@ import { DeckPage } from './DeckPage'
 import { FilesPage } from './files/FilesPage'
 import { HomePage } from './HomePage'
 import { KbdShell } from './KbdSetup'
+import { PostsPage } from './posts/PostsPage'
 import { RunsPage } from './runs/RunsPage'
 import { VoxelCorrPage } from './voxel-corr/VoxelCorrPage'
 import { parseHash, useHash } from './useHash'
@@ -33,6 +34,8 @@ export function App() {
           <RunsPage parts={parts.slice(1)} />
         ) : route === 'files' ? (
           <FilesPage />
+        ) : route === 'posts' ? (
+          <PostsPage parts={parts.slice(1)} />
         ) : route === 'voxel-corr' ? (
           <VoxelCorrPage parts={parts.slice(1)} />
         ) : (
