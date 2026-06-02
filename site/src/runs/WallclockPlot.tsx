@@ -200,29 +200,29 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   // 30 s react-query poll.
   type AxisVal = number | string
   const [userXRange, setUserXRange] = useState<[AxisVal, AxisVal] | null>(null)
-  useEffect(() => {
-    const root = plotWrapperRef.current
-    if (!root) return
-    const plotDiv = root.querySelector('.js-plotly-plot') as (HTMLElement & {
-      on?: (evt: string, fn: (ev: Record<string, unknown>) => void) => void
-      removeListener?: (evt: string, fn: (ev: Record<string, unknown>) => void) => void
-    }) | null
-    if (!plotDiv?.on) return
-    const onRelayout = (ev: Record<string, unknown>) => {
-      if (ev['xaxis.autorange'] === true) {
-        setUserXRange(null)
-        return
-      }
-      const lo = ev['xaxis.range[0]']
-      const hi = ev['xaxis.range[1]']
-      const validLo = typeof lo === 'number' || typeof lo === 'string'
-      const validHi = typeof hi === 'number' || typeof hi === 'string'
-      if (validLo && validHi) {
-        setUserXRange([lo as AxisVal, hi as AxisVal])
-      }
+  // Capture box-zoom into local state via `<Plot onRelayout=…>` (not a
+  // post-mount DOM `plot.on('plotly_relayout', …)` listener). pltly's <Plot>
+  // attaches the prop INSIDE its own `bindEvents` — which runs AFTER
+  // `Plotly.react` creates the `.js-plotly-plot` element. A useEffect with
+  // `[]` deps that tries to grab `.js-plotly-plot` at mount races against
+  // <Plot>'s async first render: querySelector returns null, we bail, and
+  // the listener is silently never attached — so box-zoom never updates
+  // `userXRange`, and the next render (e.g. legend-hover triggering a
+  // layout rebuild via `eventShapes` colors) drops `xaxis.range` from the
+  // prop, letting plotly autorange. From the user's seat: hovering a
+  // legend item resets their zoom.
+  const onRelayout = useCallback((ev: Record<string, unknown>) => {
+    if (ev['xaxis.autorange'] === true) {
+      setUserXRange(null)
+      return
     }
-    plotDiv.on('plotly_relayout', onRelayout)
-    return () => plotDiv.removeListener?.('plotly_relayout', onRelayout)
+    const lo = ev['xaxis.range[0]']
+    const hi = ev['xaxis.range[1]']
+    const validLo = typeof lo === 'number' || typeof lo === 'string'
+    const validHi = typeof hi === 'number' || typeof hi === 'string'
+    if (validLo && validHi) {
+      setUserXRange([lo as AxisVal, hi as AxisVal])
+    }
   }, [])
   // x-mode changes are unit changes (step ↔ elapsed ↔ wallclock) — preserving
   // a numeric range across them would land you somewhere meaningless. Clear.
@@ -738,6 +738,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       <div ref={plotWrapperRef}>
       <Plot
         onActiveTraceChange={setActiveTraceName}
+        onRelayout={onRelayout as (ev: unknown) => void}
         data={[
           // 1. step (top panel) — only when not in step mode
           ...(showTopPanel ? [{
