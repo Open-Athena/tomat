@@ -861,9 +861,12 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
           ...smoothedSeriesTraces(VL, 'VL (eval/loss)', COLORS.VL, 1.4, 'VL'),
           // 3. mat-NMAE + mat-NEMD (from eval.json)
           ...evalTraces,
-          legendOnly(`trainer_started (${startTs.length})`, COLORS.start, 'dash'),
-          legendOnly(`sigterm (${sigtermTs.length})`, COLORS.sigterm, 'dot'),
-          legendOnly(`cluster preempt (${preemptTs.length})`, COLORS.preempt, 'solid'),
+          // Hide lifecycle LIs whose count is 0 — for a Modal run with no
+          // iris-style restarts / preempts / sigterms, three permanently
+          // greyed (0) rows just clutter the legend.
+          ...(startTs.length > 0 ? [legendOnly(`trainer_started (${startTs.length})`, COLORS.start, 'dash')] : []),
+          ...(sigtermTs.length > 0 ? [legendOnly(`sigterm (${sigtermTs.length})`, COLORS.sigterm, 'dot')] : []),
+          ...(preemptTs.length > 0 ? [legendOnly(`cluster preempt (${preemptTs.length})`, COLORS.preempt, 'solid')] : []),
           // Death-cause legend entries — one row per non-empty bucket. Hidden
           // when the sidecar hasn't loaded yet (`attempts == null`) so the
           // legend doesn't grow until the data's in.
