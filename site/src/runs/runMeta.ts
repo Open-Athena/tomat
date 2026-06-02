@@ -201,14 +201,35 @@ export const EPOCH_SEQUENCES: Record<string, number> = {
   'train-full-v3': 4954176,
 }
 
-/** Data label (tokenization) of a run — the `cache/<label>/` path segment. */
+/** Data label (tokenization) of a run.
+ *
+ *  Two layouts in production:
+ *   - iris/TPU: `cache_dir = ".../cache/<label>/"` — the canonical Levanter
+ *     cache path; label is the trailing segment.
+ *   - Modal: `cache_dir = "/vol/results/<run>/cache"` (the Modal-volume
+ *     output cache, NOT named for the data label) AND `train_urls` like
+ *     `/vol/tokenized/<label>/worker-*​/*.parquet` — label is in the
+ *     URL's `/tokenized/<label>/` segment.
+ *
+ *  Falls back from the canonical cache_dir parse to the train_urls parse so
+ *  Modal-trained runs still surface `nEpochs` + the `?x=epoch` axis. */
 export function dataLabelOf(manifest: RunManifest | null): string | null {
   const data = (manifest?.run.config as Record<string, unknown> | undefined)?.data
-  const cd = data && typeof data === 'object'
-    ? (data as { cache_dir?: unknown }).cache_dir : undefined
-  if (typeof cd !== 'string') return null
-  const m = cd.match(/\/cache\/([^/]+)\/?$/)
-  return m ? m[1] : null
+  if (!data || typeof data !== 'object') return null
+  const cd = (data as { cache_dir?: unknown }).cache_dir
+  if (typeof cd === 'string') {
+    const m = cd.match(/\/cache\/([^/]+)\/?$/)
+    if (m) return m[1]
+  }
+  // Modal fallback: `components.tomat.source.train_urls[0]` contains the
+  // pre-tokenization parquet path, which DOES embed the label.
+  const comps = (data as { components?: { tomat?: { source?: { train_urls?: unknown } } } }).components
+  const urls = comps?.tomat?.source?.train_urls
+  if (Array.isArray(urls) && urls.length > 0 && typeof urls[0] === 'string') {
+    const m = (urls[0] as string).match(/\/tokenized\/([^/]+)\//)
+    if (m) return m[1]
+  }
+  return null
 }
 
 /** Tokens trained on so far (`throughput/total_tokens` from the run summary). */
