@@ -1003,7 +1003,12 @@ export function RunHeaderRich({
           {typeof mfu === 'number' && <> · MFU {mfu.toFixed(1)}%</>}
           {typeof mtNmae === 'number' && <> · MT {mtNmae.toFixed(2)}%</>}
           {typeof mvNmae === 'number' && <> · MV {mvNmae.toFixed(2)}%</>}
-          {nEpochs != null && <> · {nEpochs.toFixed(2)} ep</>}
+          {nEpochs != null && <>
+            {' · '}
+            <Tooltip content="fractional passes over the training set, computed from total_tokens / (epoch_sequences × train_seq_len)">
+              <span>ep {nEpochs.toFixed(2)}</span>
+            </Tooltip>
+          </>}
           {nFlops != null && <> · {formatFlops(nFlops)} FLOP</>}
         </div>
         {/* % training chip — sum(train-active windows ∩ attempt windows) /

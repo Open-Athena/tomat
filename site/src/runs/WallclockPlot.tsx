@@ -24,9 +24,10 @@ import { rolling } from 'pltly/core'
 import { enumParam, useUrlState } from 'use-prms'
 import { themedHoverlabel } from '../theme'
 import type { RunHistory } from './parquet'
-import type { IrisAttempts, RunEval } from './api'
+import type { IrisAttempts, RunEval, RunManifest } from './api'
 import { classifyDeath, DEATH_COLORS, type DeathCause } from './deathEvents'
 import { SmoothingChips, useBandsToggle, useSmoothMode } from './RunsTimelinePlot'
+import { epochOfStep } from './runMeta'
 import { applySmoothing, type SmoothMode } from './smoothing'
 
 interface Props {
@@ -42,17 +43,26 @@ interface Props {
    *  + legend entries that augment (but don't replace) the existing
    *  trainer_started / sigterm / cluster_preempt overlays. */
   attempts?: IrisAttempts | null
+  /** Run manifest — used for the `epoch` x-axis mode (fractional epoch =
+   *  `step · train_batch_size / epoch_sequences`). When null or missing the
+   *  data needed (data label not in `EPOCH_SEQUENCES`, `train_batch_size`
+   *  missing), the `epoch` button is hidden. */
+  manifest?: RunManifest | null
 }
 
-type XMode = 'time' | 'elapsed' | 'step'
+type XMode = 'time' | 'elapsed' | 'step' | 'epoch'
 
-// URL-facing x-axis mode names (`?x=wallclock|elapsed|step`). The internal
-// XMode uses `'time'` for the wallclock axis; `wallclock` reads better in
-// shared links.
-type UrlXMode = 'wallclock' | 'elapsed' | 'step'
-const URL_X_MODES = ['wallclock', 'elapsed', 'step'] as const
-const X_TO_URL: Record<XMode, UrlXMode> = { time: 'wallclock', elapsed: 'elapsed', step: 'step' }
-const URL_TO_X: Record<UrlXMode, XMode> = { wallclock: 'time', elapsed: 'elapsed', step: 'step' }
+// URL-facing x-axis mode names (`?x=wallclock|elapsed|step|epoch`). The
+// internal XMode uses `'time'` for the wallclock axis; `wallclock` reads
+// better in shared links.
+type UrlXMode = 'wallclock' | 'elapsed' | 'step' | 'epoch'
+const URL_X_MODES = ['wallclock', 'elapsed', 'step', 'epoch'] as const
+const X_TO_URL: Record<XMode, UrlXMode> = {
+  time: 'wallclock', elapsed: 'elapsed', step: 'step', epoch: 'epoch',
+}
+const URL_TO_X: Record<UrlXMode, XMode> = {
+  wallclock: 'time', elapsed: 'elapsed', step: 'step', epoch: 'epoch',
+}
 
 const COLORS = {
   step: '#2196f3',
@@ -100,7 +110,7 @@ const TZ_LABEL: string = (() => {
   }
 })()
 
-export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step', attempts }: Props) {
+export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step', attempts, manifest = null }: Props) {
   const { isDark } = useTheme()
   // Wrapper around <Plot> so we can DOM-walk to the `.js-plotly-plot` element
   // and call `Plotly.restyle` on the band traces directly. Bands have
@@ -180,11 +190,17 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     return () => plotDiv.removeListener?.('plotly_afterplot', applyBandFade)
   }, [applyBandFade])
 
-  // `?x=wallclock|elapsed|step` — URL-persisted so deep-links carry the view
-  // choice. The run-detail page defaults to `'step'` (training progress is
-  // the obvious x for a single run); callers can override.
+  // `?x=wallclock|elapsed|step|epoch` — URL-persisted so deep-links carry
+  // the view choice. The run-detail page defaults to `'step'` (training
+  // progress is the obvious x for a single run); callers can override.
   const [urlXMode, setUrlXMode] = useUrlState('x', enumParam<UrlXMode>(defaultXMode, URL_X_MODES))
-  const xMode: XMode = URL_TO_X[urlXMode]
+  // Whether the `epoch` axis is available — requires `train_batch_size`
+  // from the run config + an `EPOCH_SEQUENCES` entry for the run's data
+  // label. Hides the button (and silently falls back to `step` if the URL
+  // asks for `?x=epoch` on a run whose manifest can't compute it).
+  const epochAvailable = epochOfStep(0, manifest) != null
+  const rawXMode: XMode = URL_TO_X[urlXMode]
+  const xMode: XMode = rawXMode === 'epoch' && !epochAvailable ? 'step' : rawXMode
   const setXMode = (m: XMode) => setUrlXMode(X_TO_URL[m])
 
   // User-set x-range captured from box-zoom (`plotly_relayout`). Persists
@@ -280,6 +296,12 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   /** x-coordinate for a wallclock ts, per the current x-mode. */
   function xOfTs(ts: number): string | number {
     if (xMode === 'step') return gstepAtTs(ts) ?? NaN
+    if (xMode === 'epoch') {
+      const s = gstepAtTs(ts)
+      if (s == null) return NaN
+      const ep = epochOfStep(s, manifest)
+      return ep ?? NaN
+    }
     if (xMode === 'elapsed') return (ts - t0) / 3600
     return toLocal(ts)
   }
@@ -287,6 +309,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   /** x-coordinate for an eval point at checkpoint `step`. */
   function xOfStep(step: number): string | number | null {
     if (xMode === 'step') return step
+    if (xMode === 'epoch') return epochOfStep(step, manifest)
     const ts = tsAtGstep(step)
     if (ts === null) return null
     return xMode === 'elapsed' ? (ts - t0) / 3600 : toLocal(ts)
@@ -802,20 +825,29 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     hoverinfo: 'skip' as const,
   })
 
-  const showTopPanel = xMode !== 'step'
+  // The top-panel (running-max global_step) is degenerate in both `step` and
+  // `epoch` modes (epoch is a pure rescaling of step → also y = x there).
+  const showTopPanel = xMode !== 'step' && xMode !== 'epoch'
 
   const logType: 'log' = 'log'
   const lossDomain: [number, number] = showTopPanel ? [0.0, 0.66] : [0.0, 1.0]
   const stepDomain: [number, number] = [0.72, 1.0]
 
   const xTitle = xMode === 'time' ? TZ_LABEL
-    : xMode === 'elapsed' ? 'elapsed (h)' : 'global_step'
+    : xMode === 'elapsed' ? 'elapsed (h)'
+    : xMode === 'epoch' ? 'epoch (fractional)'
+    : 'global_step'
 
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '0.4rem', marginBottom: '0.3rem' }}>
         <span style={{ fontSize: '0.75rem', color: '#888', alignSelf: 'center' }}>x-axis:</span>
-        {(['time', 'elapsed', 'step'] as XMode[]).map((m) => (
+        {(['time', 'elapsed', 'step', 'epoch'] as XMode[])
+          // Hide `epoch` when the manifest can't compute it (data label not
+          // in EPOCH_SEQUENCES, or `train_batch_size` missing) — a useless
+          // button would just confuse.
+          .filter((m) => m !== 'epoch' || epochAvailable)
+          .map((m) => (
           <button
             key={m}
             type="button"

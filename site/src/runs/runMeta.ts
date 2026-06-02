@@ -225,16 +225,54 @@ export function nFlopsOf(manifest: RunManifest | null): number | null {
   return 6 * n * tok
 }
 
+/** Training sequence length (`train_seq_len` from the run config). */
+export function seqLenOf(manifest: RunManifest | null): number | null {
+  const v = (manifest?.run.config as Record<string, unknown> | undefined)?.train_seq_len
+  return typeof v === 'number' && v > 0 ? v : null
+}
+
+/** Train batch size (`trainer.train_batch_size`). */
+export function batchSizeOf(manifest: RunManifest | null): number | null {
+  const t = (manifest?.run.config as Record<string, unknown> | undefined)?.trainer
+  if (t && typeof t === 'object' && 'train_batch_size' in t) {
+    const n = (t as { train_batch_size?: unknown }).train_batch_size
+    if (typeof n === 'number' && n > 0) return n
+  }
+  return null
+}
+
+/** Sequences per epoch for the run's data label, from `EPOCH_SEQUENCES`. */
+export function epochSequencesOf(manifest: RunManifest | null): number | null {
+  const label = dataLabelOf(manifest)
+  if (label == null) return null
+  return EPOCH_SEQUENCES[label] ?? null
+}
+
 /** Passes over the training set = tokens / (epoch_sequences · seq_len).
  *  Null when the data label's epoch size isn't in EPOCH_SEQUENCES. */
 export function nEpochsOf(manifest: RunManifest | null): number | null {
   const tok = totalTokensOf(manifest)
-  const label = dataLabelOf(manifest)
-  const seqLen = (manifest?.run.config as Record<string, unknown> | undefined)?.train_seq_len
-  if (tok == null || label == null || typeof seqLen !== 'number' || seqLen <= 0) return null
-  const epochSeqs = EPOCH_SEQUENCES[label]
-  if (!epochSeqs) return null
+  const seqLen = seqLenOf(manifest)
+  const epochSeqs = epochSequencesOf(manifest)
+  if (tok == null || seqLen == null || epochSeqs == null) return null
   return tok / (epochSeqs * seqLen)
+}
+
+/** Fractional epoch count at training `step`: `step · batch_size / epoch_seqs`.
+ *  Pure rescaling of `step` (same monotonicity / linearity, just a different
+ *  unit). Algebraically equivalent to `nEpochsOf` evaluated at `step` (the
+ *  chip on the run card / detail page) — using `train_batch_size` instead of
+ *  `total_tokens` so we can compute the epoch coordinate for ANY step, not
+ *  just the latest one in the summary.
+ *
+ *  Returns null when the manifest doesn't carry the data needed —
+ *  `train_batch_size` missing, data label unknown, or no `EPOCH_SEQUENCES`
+ *  entry for that label. */
+export function epochOfStep(step: number, manifest: RunManifest | null): number | null {
+  const bs = batchSizeOf(manifest)
+  const epochSeqs = epochSequencesOf(manifest)
+  if (bs == null || epochSeqs == null) return null
+  return (step * bs) / epochSeqs
 }
 
 /** FLOP count → "1.1e20". */

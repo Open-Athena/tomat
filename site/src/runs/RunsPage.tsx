@@ -1047,6 +1047,7 @@ function RunDetail({ runId }: { runId: string }) {
           evalSeries={evalQ.data ?? null}
           runId={runId}
           attempts={attemptsQ.data ?? null}
+          manifest={manifest}
         />
       )}
       <EvalsPanel
