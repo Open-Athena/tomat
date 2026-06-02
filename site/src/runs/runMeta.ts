@@ -199,6 +199,10 @@ export function numTrainStepsOf(manifest: RunManifest | null): number | null {
 // doesn't need a code change here.
 export const EPOCH_SEQUENCES: Record<string, number> = {
   'train-full-v3': 4954176,
+  // Globally pre-shuffled copy of `train-full-v3` (spec 50). Same row count,
+  // same shard structure; just permuted. Pick this up via `TOMAT_LABEL` to
+  // eliminate the 1024-step BlockShuffleConfig sawtooth (spec 44).
+  'train-full-v3-shuffled': 4954176,
 }
 
 /** Data label (tokenization) of a run.
