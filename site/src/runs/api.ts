@@ -274,11 +274,35 @@ export interface IrisAttempt {
   state: string
   exit_code: number
   error: string
+  /** Cleaned first line of `error` (stripped of iris's
+   *  `Exit code: N. stderr:` wrapper). Server-side convenience added in
+   *  schema v2 by `scripts/iris_attempts_dump.py`. Optional for back-compat
+   *  with v1 sidecars; dashboard falls back to client-side cleanup. */
+  error_first_line?: string | null
+  /** Bucket label for the failure mode — e.g. "JAX mesh ValueError (eval
+   *  boundary)", "OOM", "cascade (sibling died)". Same regex set as
+   *  `site/src/runs/errorClassification.ts`. Schema v2; dashboard falls
+   *  back to client-side classification. */
+  error_classification?: string | null
   is_worker_failure: boolean
   started_at: string
   started_at_ms: number | null
   finished_at: string
   finished_at_ms: number | null
+}
+
+/** Flat per-attempt-per-task summary record (schema v2). Sorted by
+ *  `trainer_started_ts_ms`. Mirrors `attempts_summary` in
+ *  `iris_attempts_dump.py`. */
+export interface IrisAttemptSummary {
+  task_id: string
+  attempt_id: number
+  trainer_started_ts_ms: number | null
+  ended_ts_ms: number | null
+  state: string
+  exit_code: number
+  error_first_line: string | null
+  error_classification: string | null
 }
 
 export interface IrisAttemptsTask {
@@ -309,6 +333,10 @@ export interface IrisAttempts {
   finished_at: string
   finished_at_ms: number | null
   tasks: IrisAttemptsTask[]
+  /** Schema v2: flat per-attempt summary records ordered by start time.
+   *  Optional for back-compat. The dashboard builds the same list
+   *  client-side from `tasks[*].attempts` when missing. */
+  attempts_summary?: IrisAttemptSummary[]
 }
 
 /** Fetch the per-task attempt history sidecar for one training label.

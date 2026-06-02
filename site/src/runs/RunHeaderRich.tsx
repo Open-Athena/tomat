@@ -192,15 +192,75 @@ function taskStateLine(job: IrisJob): string {
   return `tasks (${job.num_tasks}): ` + sorted.map(([k, v]) => `${v} ${k}`).join(', ')
 }
 
-export function IrisBadge({ job, incomplete }: { job: IrisJob; incomplete?: boolean }) {
+/** Detect "iris parent says RUNNING but every task is pending and we have
+ *  failures" — the crash-loop pathology where iris keeps bouncing the
+ *  gang because each attempt dies in <3 min. Symptoms: `state == RUNNING`,
+ *  `task_state_counts.pending == num_tasks` (zero running tasks),
+ *  `failures > 0`. The job-level state lies; per-task state and the
+ *  failure counter tell the truth.
+ *
+ *  Two data sources, in priority order:
+ *    1. `job.task_state_counts` — populated by recent `tomat iris sync`
+ *       passes (schema with that field). Fast path: one read.
+ *    2. `attempts.tasks[*].state` — populated by `iris attempts-dump`
+ *       sidecar (always present when the sidecar is present, regardless
+ *       of which iris-state.json schema is live).
+ *
+ *  When neither source is available (e.g. older runs without an attempts
+ *  sidecar AND an older iris-state schema), we conservatively return false
+ *  — better to underflag than to mislabel a healthy run.
+ *
+ *  See specs/45-dashboard-tz11-surfacing.md for the standing rule.
+ */
+export function isCrashLoop(job: IrisJob, attempts?: IrisAttempts | null): boolean {
+  if (job.state !== 'RUNNING') return false
+  if (job.failures <= 0) return false
+  const tsc = job.task_state_counts
+  if (tsc) {
+    const pending = tsc.pending ?? 0
+    const running = tsc.running ?? 0
+    if (running > 0) return false
+    if (pending + (tsc.building ?? 0) < job.num_tasks) return false
+    return true
+  }
+  // Fallback: derive per-task running/pending counts from the attempts
+  // sidecar. This makes the crash-loop badge work even when the iris-state
+  // snapshot was written by an older schema (no task_state_counts) — as
+  // long as the per-label attempts sidecar is fresh.
+  if (attempts) {
+    let running = 0
+    let pendingOrBuilding = 0
+    for (const t of attempts.tasks) {
+      if (t.state === 'running') running++
+      else if (t.state === 'pending' || t.state === 'building') pendingOrBuilding++
+    }
+    if (running > 0) return false
+    if (pendingOrBuilding < job.num_tasks) return false
+    return true
+  }
+  return false
+}
+
+export function IrisBadge({ job, attempts, incomplete }: {
+  job: IrisJob
+  attempts?: IrisAttempts | null
+  incomplete?: boolean
+}) {
   // `incomplete`: iris says SUCCEEDED but the run stopped well short of its
   // step target — almost always a preemption whose clean SIGTERM exit (0)
   // iris mis-buckets as success. Show it as its own burnt-orange state so the
   // card doesn't read as a healthy finish (iris won't re-enqueue it).
   const showIncomplete = incomplete && job.state === 'SUCCEEDED'
+  // Crash-loop: parent RUNNING but tasks all pending + failures > 0. The
+  // iris state field is lying; honor the contradiction by labeling the
+  // badge for what's actually happening (a restart cascade). Red/orange
+  // (not green) — distinct from a healthy RUNNING.
+  const crashLoop = !showIncomplete && isCrashLoop(job, attempts ?? null)
   const style = showIncomplete
     ? { bg: '#b4632a', fg: '#fff' }
-    : IRIS_STATE_STYLES[job.state] ?? { bg: '#888', fg: '#fff' }
+    : crashLoop
+      ? { bg: '#cb2431', fg: '#fff' }
+      : IRIS_STATE_STYLES[job.state] ?? { bg: '#888', fg: '#fff' }
   // Compact per-task-state histogram. Replaces the old `(p=N, f=M)`
   // preemption/failure counters — those still appear in the tooltip but
   // are noisy on the badge itself once a run has churned for hours.
@@ -211,12 +271,21 @@ export function IrisBadge({ job, incomplete }: { job: IrisJob; incomplete?: bool
     ? ''
     : (job.preempts > 0 || job.failures > 0
        ? ` (p=${job.preempts}, f=${job.failures})` : '')
-  const tail = stateTail || legacyTail
+  // Crash-loop: lead with failure count — that's the metric the human
+  // cares about ("how many failed restarts so far?"). Per-task histogram
+  // stays in the tooltip.
+  const crashLoopTail = ` (f=${job.failures})`
+  const tail = crashLoop ? crashLoopTail : (stateTail || legacyTail)
   const tooltipParts: string[] = []
   if (showIncomplete) {
     tooltipParts.push(
       `iris reported SUCCEEDED, but the run ended early — likely preempted `
       + `with a clean SIGTERM exit. iris will not re-enqueue it.`,
+    )
+  } else if (crashLoop) {
+    tooltipParts.push(
+      `iris parent is RUNNING but 0 of ${job.num_tasks} tasks have started; `
+      + `${job.failures} task-level failures so far — restart cascade.`,
     )
   } else if (job.error) {
     tooltipParts.push(job.error)
@@ -226,6 +295,11 @@ export function IrisBadge({ job, incomplete }: { job: IrisJob; incomplete?: bool
   const taskLine = taskStateLine(job)
   if (taskLine) tooltipParts.push(taskLine)
   tooltipParts.push(`preempts=${job.preempts} failures=${job.failures}`)
+  const label = showIncomplete
+    ? 'INCOMPLETE'
+    : crashLoop
+      ? 'CRASH-LOOP'
+      : job.state
   return (
     <Tooltip content={tooltipParts.join(' · ')}>
       <span
@@ -235,7 +309,7 @@ export function IrisBadge({ job, incomplete }: { job: IrisJob; incomplete?: bool
           fontSize: '0.75rem', fontFamily: 'monospace',
         }}
       >
-        {showIncomplete ? 'INCOMPLETE' : job.state}{tail}
+        {label}{tail}
       </span>
     </Tooltip>
   )
@@ -794,7 +868,7 @@ export function RunHeaderRich({
             incomplete={incomplete}
             lastLogTs={lastLogTs}
           />
-          {job && <IrisBadge job={job} incomplete={incomplete} />}
+          {job && <IrisBadge job={job} attempts={attempts} incomplete={incomplete} />}
           {!job && modalApp && <ModalBadge app={modalApp} />}
           {!job && !modalApp && manifest && (
             // No iris job AND no matched Modal app — fall back to wandb's

@@ -3,9 +3,18 @@
 // start/finish + death reason), wandb history (`lifecycle/trainer_started`,
 // `cluster/preemptions`), and Modal app state. No time-based heuristics —
 // only events that were actually reported by an upstream system.
+//
+// Per-attempt causation: each iris attempt is rendered as a single row
+// captioned with a `trainer_started #N` primary line and a "died Xm Ys
+// later · step S · <classification>" sub-line. This is the dashboard
+// fulfilling the standing rule in specs/45-dashboard-tz11-surfacing.md
+// — when the iris parent says RUNNING but tasks are pending and
+// failures > 0, the user needs to see WHY each restart died.
 
 import { useMemo } from 'react'
-import type { IrisAttempts, ModalApp } from './api'
+import type { IrisAttempt, IrisAttempts, ModalApp } from './api'
+import { classifyDeath } from './deathEvents'
+import { classifyErrorMessage, errorFirstLine } from './errorClassification'
 import type { RunHistory } from './parquet'
 
 interface Event {
@@ -13,6 +22,13 @@ interface Event {
   source: 'iris' | 'wandb' | 'modal'
   label: string
   detail?: string
+  /** Indented sub-line rendered below the main row — primary use is the
+   *  per-attempt "died Xm Ys later · step S · <classification>" line
+   *  attached to a trainer_started row. */
+  subline?: {
+    text: string
+    cls?: 'info' | 'warn' | 'error' | 'ok'
+  }
   cls?: 'info' | 'warn' | 'error' | 'ok'
 }
 
@@ -77,6 +93,136 @@ function formatTs(ms: number): string {
   })
 }
 
+/** "3m 41s" / "47s" / "2h 14m". */
+function formatDelta(ms: number): string {
+  const s = Math.round(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60), rem_s = s % 60
+  if (m < 60) return rem_s > 0 ? `${m}m ${rem_s}s` : `${m}m`
+  const h = Math.floor(m / 60), rem_m = m % 60
+  return rem_m > 0 ? `${h}h ${rem_m}m` : `${h}h`
+}
+
+/** A logical restart "cycle" — one `attempt_id` across one or more tasks. */
+interface AttemptCycle {
+  attempt_id: number
+  /** Earliest task-attempt start within the cycle. */
+  started_at_ms: number
+  /** Latest finish; null if any task hasn't finished yet (still running). */
+  finished_at_ms: number | null
+  /** Per-task entries that made up this cycle. Sorted by task_id. */
+  perTask: Array<{
+    task_id: string
+    attempt: IrisAttempt
+  }>
+}
+
+/** Group `IrisAttempt`s across tasks into per-attempt-id cycles. Iris
+ *  re-uses the same `attempt_id` across the gang's tasks for a coordinated
+ *  restart, so this groups them naturally. */
+function buildCycles(attempts: IrisAttempts): AttemptCycle[] {
+  const byId = new Map<number, AttemptCycle>()
+  for (const t of attempts.tasks) {
+    for (const a of t.attempts) {
+      if (a.started_at_ms == null) continue
+      let c = byId.get(a.attempt_id)
+      if (!c) {
+        c = {
+          attempt_id: a.attempt_id,
+          started_at_ms: a.started_at_ms,
+          finished_at_ms: null,
+          perTask: [],
+        }
+        byId.set(a.attempt_id, c)
+      } else if (a.started_at_ms < c.started_at_ms) {
+        c.started_at_ms = a.started_at_ms
+      }
+      c.perTask.push({ task_id: t.task_id, attempt: a })
+    }
+  }
+  // Finish-time rule: a gang restart cycle is considered DEAD as soon as
+  // ANY task in it finishes with a non-success state — iris bounces the
+  // siblings, but their per-attempt `finished_at` doesn't always get
+  // written before the bug-report snapshot, so the sibling records read
+  // as "still running" even though the cycle effectively ended. We pick
+  // the earliest finish as the cycle's death time (= when the trigger
+  // task fell over). If EVERY task finished (clean completion), we use
+  // the latest finish (the gang's final stop time).
+  for (const c of byId.values()) {
+    const finished = c.perTask
+      .map((e) => e.attempt.finished_at_ms)
+      .filter((ms): ms is number => ms != null)
+    if (finished.length === 0) {
+      c.finished_at_ms = null  // every task still running → cycle alive
+    } else if (finished.length === c.perTask.length) {
+      c.finished_at_ms = Math.max(...finished)  // clean finish across all tasks
+    } else {
+      // Some task died, others are listed as still-pending. Iris has
+      // started bouncing the gang; mark the cycle dead at the trigger's
+      // finish time.
+      c.finished_at_ms = Math.min(...finished)
+    }
+  }
+  const out = [...byId.values()]
+  // Sort each cycle's perTask by task index so the picked-trigger task
+  // is deterministic for ties.
+  for (const c of out) {
+    c.perTask.sort((x, y) => x.task_id.localeCompare(y.task_id))
+  }
+  // Cycles in attempt-id order (== chronological for iris's monotonic
+  // counter).
+  out.sort((a, b) => a.attempt_id - b.attempt_id)
+  return out
+}
+
+/** Pick the per-task attempt that "caused" the cycle to die: skip cascade
+ *  victims (sibling-bounced) in favor of the actual trigger if any task
+ *  has a non-cascade error. The trigger is the task whose own `finished_at`
+ *  is set + carries a non-cascade error; the gang's other tasks are
+ *  usually marked `preempted` (cascade) without their own `finished_at`. */
+function pickTrigger(cycle: AttemptCycle): { task_id: string; attempt: IrisAttempt } {
+  // Prefer a task that actually finished + has a non-cascade error.
+  // That's iris's "this is the task that triggered the bounce" signal.
+  for (const e of cycle.perTask) {
+    if (e.attempt.finished_at_ms == null) continue
+    const cause = classifyDeath(e.attempt)
+    if (cause !== 'cascade' && (e.attempt.error || '').trim()) return e
+  }
+  // Next: any finished task (even if cause is cascade) — it's the one
+  // with an actual death timestamp.
+  for (const e of cycle.perTask) {
+    if (e.attempt.finished_at_ms != null) return e
+  }
+  // No finishes — fall back to any non-cascade.
+  for (const e of cycle.perTask) {
+    const cause = classifyDeath(e.attempt)
+    if (cause !== 'cascade') return e
+  }
+  return cycle.perTask[0]
+}
+
+/** Walk wandb history's `global_step` column and find the max step seen
+ *  inside the (`started_at_ms`, `finished_at_ms`) window. Used to caption
+ *  per-attempt sub-lines with the step at which the attempt died. */
+function maxStepBetween(history: RunHistory | null, startMs: number, endMs: number | null): number | null {
+  if (!history) return null
+  const end = endMs ?? Date.now()
+  const ts = history.timestamps
+  const gs = history.cols.get('global_step') ?? []
+  let max = -Infinity
+  for (let i = 0; i < history.rowCount; i++) {
+    const t = ts[i]
+    if (t == null) continue
+    const tms = t * 1000
+    if (tms < startMs || tms > end) continue
+    const v = gs[i]
+    if (v == null) continue
+    const n = Number(v)
+    if (n > max) max = n
+  }
+  return max === -Infinity ? null : max
+}
+
 export function RecentEvents({ attempts, modalApp, history }: {
   attempts: IrisAttempts | null
   modalApp: ModalApp | null
@@ -85,10 +231,84 @@ export function RecentEvents({ attempts, modalApp, history }: {
   const events = useMemo<Event[]>(() => {
     const out: Event[] = []
 
-    // iris attempts: each attempt contributes a "started" and (if finished)
-    // a "finished" event. The death reason is in `error`.
+    // Build per-attempt-cycle rows. Each cycle = one logical restart.
+    // We emit a single `trainer_started #N` row per cycle (collapsing
+    // the N per-task started events into one), with a sub-line describing
+    // the outcome.
+    const cycles = attempts ? buildCycles(attempts) : []
+    // Lookup wandb-history attempt termini windowed by cycle start/end
+    // — used to caption sub-lines with the step at which the attempt died.
+    for (const c of cycles) {
+      const trigger = pickTrigger(c)
+      const cause = classifyDeath(trigger.attempt)
+      // Prefer the server-classified fields (schema v2) when available;
+      // fall back to client-side regex for v1 sidecars + dev runs against
+      // a freshly-dumped attempt.
+      const classification = trigger.attempt.error_classification
+        ?? classifyErrorMessage(trigger.attempt.error)
+      const firstLine = trigger.attempt.error_first_line
+        ?? errorFirstLine(trigger.attempt.error)
+      const step = maxStepBetween(history, c.started_at_ms, c.finished_at_ms)
+      const taskCountSuffix = c.perTask.length > 1
+        ? ` · ${c.perTask.length} tasks`
+        : ''
+      const taskShort = trigger.task_id.split('/').pop() ?? trigger.task_id
+      let subline: Event['subline'] | undefined
+      let cls: Event['cls'] = 'ok'
+      if (c.finished_at_ms == null) {
+        // Cycle still in flight — caption with elapsed time.
+        const elapsed = Date.now() - c.started_at_ms
+        const stepBit = step != null ? ` · step ${step}` : ''
+        subline = {
+          text: `alive · started ${formatDelta(elapsed)} ago${stepBit}`,
+          cls: 'ok',
+        }
+        cls = 'ok'
+      } else {
+        const delta = c.finished_at_ms - c.started_at_ms
+        const stepBit = step != null ? ` · step ${step}` : ''
+        const isPreempt = cause === 'preempt'
+        const isCascade = cause === 'cascade'
+        // Outcome phrasing: preempt is a soft death (purple/warn), cascade
+        // and other failures read as error.
+        const verb = isPreempt
+          ? 'preempted'
+          : (trigger.attempt.state === 'succeeded' || trigger.attempt.state === 'completed')
+            ? 'completed'
+            : 'died'
+        const completed = verb === 'completed'
+        // Caption: prefer the classified label; fall back to the cleaned
+        // first line (already trimmed to ≤80 chars by the classifier).
+        let causeLine: string
+        if (completed) {
+          causeLine = 'succeeded'
+        } else if (isPreempt) {
+          causeLine = 'GCP preempt'
+        } else if (isCascade && !classification) {
+          causeLine = 'cascade (sibling died)'
+        } else {
+          causeLine = classification ?? firstLine ?? trigger.attempt.state
+        }
+        subline = {
+          text: `${verb} ${formatDelta(delta)} later${stepBit} · ${causeLine}`,
+          cls: completed ? 'ok' : isPreempt ? 'warn' : 'error',
+        }
+        cls = completed ? 'ok' : isPreempt ? 'warn' : 'error'
+      }
+      out.push({
+        ts_ms: c.started_at_ms,
+        source: 'iris',
+        label: `trainer_started #${c.attempt_id}`,
+        detail: `task ${taskShort}${taskCountSuffix}`,
+        subline,
+        cls,
+      })
+    }
+
+    // iris attempts: also emit the job-level lifecycle events (submitted,
+    // started, finished). Per-task finish rows are NOW collapsed into
+    // each cycle's sub-line above — no separate `task N failed` row.
     if (attempts) {
-      // job-level: submitted, started, finished
       if (attempts.submitted_at_ms) {
         out.push({
           ts_ms: attempts.submitted_at_ms, source: 'iris',
@@ -111,23 +331,6 @@ export function RecentEvents({ attempts, modalApp, history }: {
           cls: attempts.job_state === 'KILLED' || attempts.job_state === 'FAILED'
             ? 'error' : attempts.job_state === 'SUCCEEDED' ? 'ok' : 'info',
         })
-      }
-      // per-task attempts: only the finished ones (started gets too noisy)
-      for (const task of attempts.tasks) {
-        for (const a of task.attempts) {
-          if (a.finished_at_ms == null) continue
-          const taskN = task.task_id.split('/').pop()
-          const isCascade = (a.error || '').includes('Coscheduled sibling')
-          const isPreempt = a.state === 'preempted' && !a.is_worker_failure
-          const cls: Event['cls'] =
-            isPreempt ? 'warn' : isCascade ? 'warn' : a.state === 'failed' ? 'error' : 'info'
-          out.push({
-            ts_ms: a.finished_at_ms, source: 'iris',
-            label: `task ${taskN} ${a.state}${isCascade ? ' (cascade)' : ''}`,
-            detail: (a.error || '').slice(0, 80),
-            cls,
-          })
-        }
       }
     }
 
@@ -172,10 +375,17 @@ export function RecentEvents({ attempts, modalApp, history }: {
       }
     }
 
-    // wandb history: trainer_started, sigterm, cluster_preempt — the
-    // existing vlines on the plot already render these, but listing
-    // them in the events log gives times + cumulative counts.
+    // wandb history: trainer_started, sigterm, cluster_preempt.
+    //
+    // When the iris attempts sidecar is populated, we DROP the wandb
+    // `trainer_started` rows here — every started cycle is already
+    // surfaced above as an iris `trainer_started #N` row with a per-attempt
+    // sub-line, and emitting them twice would be confusing redundancy.
+    // The wandb-side row stays as a backstop for runs WITHOUT iris
+    // attempts data (e.g. Modal-hosted training, or a sidecar that hasn't
+    // synced yet).
     if (history) {
+      const hasIrisAttempts = !!attempts && cycles.length > 0
       const trainerStarts: number[] = []
       const sigterms: number[] = []
       const preempts: number[] = []
@@ -215,8 +425,10 @@ export function RecentEvents({ attempts, modalApp, history }: {
           label: `latest train step gs=${maxStep}`, cls: 'info',
         })
       }
-      for (const ts of trainerStarts) {
-        out.push({ ts_ms: ts, source: 'wandb', label: 'trainer_started', cls: 'info' })
+      if (!hasIrisAttempts) {
+        for (const ts of trainerStarts) {
+          out.push({ ts_ms: ts, source: 'wandb', label: 'trainer_started', cls: 'info' })
+        }
       }
       for (const ts of sigterms) {
         out.push({ ts_ms: ts, source: 'wandb', label: 'sigterm received', cls: 'warn' })
@@ -280,11 +492,38 @@ export function RecentEvents({ attempts, modalApp, history }: {
             <span style={{ color: '#888' }}>{formatTs(e.ts_ms)}</span>
             <span><SourceCell source={e.source} /></span>
             <span>
-              <span>{e.label}</span>
-              {e.detail && (
-                <span style={{ color: '#888', marginLeft: '0.6rem' }}>
-                  {e.detail}
-                </span>
+              <div>
+                <span>{e.label}</span>
+                {e.detail && (
+                  <span style={{ color: '#888', marginLeft: '0.6rem' }}>
+                    {e.detail}
+                  </span>
+                )}
+              </div>
+              {e.subline && (
+                <div style={{
+                  color: '#888',
+                  marginTop: '0.15rem',
+                  paddingLeft: '1.2rem',
+                  // Box-drawing prefix mirrors the user-requested format
+                  // (└── …). Rendered as a separate flex element so the
+                  // text wraps cleanly under it.
+                  position: 'relative',
+                }}>
+                  <span style={{
+                    position: 'absolute',
+                    left: 0,
+                    color: '#555',
+                  }}>└─</span>
+                  <span style={{
+                    color: e.subline.cls === 'error' ? '#ef9a9a'
+                      : e.subline.cls === 'warn' ? '#f3c172'
+                        : e.subline.cls === 'ok' ? '#9fdfa5'
+                          : '#aaa',
+                  }}>
+                    {e.subline.text}
+                  </span>
+                </div>
               )}
             </span>
           </div>
