@@ -111,6 +111,7 @@ def _setup_env_and_run(
     eval_batch: int,
     eval_skip: int,
     output_suffix: str,
+    dump_predictions: bool = False,
 ) -> dict:
     """Shared body: set env vars, call `eval_main()`, read back the summary."""
     import json
@@ -151,6 +152,8 @@ def _setup_env_and_run(
         env["TOMAT_EVAL_RUN_LABEL"] = run_label
     if output_suffix:
         env["TOMAT_EVAL_OUTPUT_SUFFIX"] = output_suffix
+    if dump_predictions:
+        env["TOMAT_EVAL_DUMP_PREDICTIONS"] = "1"
     os.environ.update(env)
     err(f"[eval-modal] mode={mode} mat_set={mat_set} ckpt={checkpoint} "
         f"run_label={run_label or '<auto>'}")
@@ -199,6 +202,7 @@ def eval_checkpoint(
     mg_k_steps: int = 12,
     eval_skip: int = 0,
     output_suffix: str = "",
+    dump_predictions: bool = False,
 ) -> dict:
     """Eval one checkpoint against one mat-set; return the summary dict."""
     return _setup_env_and_run(
@@ -207,6 +211,7 @@ def eval_checkpoint(
         debug_dump_mat=debug_dump_mat, run_label=run_label,
         mode=mode, mg_k_steps=mg_k_steps, eval_batch=batch,
         eval_skip=eval_skip, output_suffix=output_suffix,
+        dump_predictions=dump_predictions,
     )
 
 
@@ -231,6 +236,7 @@ def eval_checkpoint_h200x8(
     mg_k_steps: int = 12,
     eval_skip: int = 0,
     output_suffix: str = "",
+    dump_predictions: bool = False,
 ) -> dict:
     """H200×8 backend used by `tomat evals fire --backend modal`. Same body
     as `eval_checkpoint`, just bigger GPU pool — TF eval @ n_mats=200 on
@@ -242,6 +248,7 @@ def eval_checkpoint_h200x8(
         debug_dump_mat=debug_dump_mat, run_label=run_label,
         mode=mode, mg_k_steps=mg_k_steps, eval_batch=batch,
         eval_skip=eval_skip, output_suffix=output_suffix,
+        dump_predictions=dump_predictions,
     )
 
 

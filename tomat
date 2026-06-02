@@ -1844,6 +1844,7 @@ def _evals_fire_modal(
     mode: str,
     mg_k_steps: int,
     debug_dump_mat: str,
+    dump_predictions: bool = False,
 ) -> int:
     """Modal-backend eval fire: spawn one 8×H200 call per (step, set, task).
 
@@ -1892,6 +1893,7 @@ def _evals_fire_modal(
                                 mg_k_steps=mg_k_steps,
                                 eval_skip=task_skip,
                                 output_suffix=out_suffix,
+                                dump_predictions=dump_predictions,
                             )
                         except Exception as e:
                             err(f"[FAIL spawn step={step} set={s} task={task_i}] {e}")
@@ -2081,6 +2083,7 @@ def evals_fire(
             mode=mode,
             mg_k_steps=mg_k_steps,
             debug_dump_mat=debug_dump_mat,
+            dump_predictions=dump_predictions,
         )
         print(f"\n[done firing {fired_total}/{len(step_list)*len(set_list)*num_tasks} modal jobs]")
         # FIRED file seeding still useful so a downstream `tomat evals harvest`
