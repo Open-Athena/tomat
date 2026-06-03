@@ -18,7 +18,8 @@ Env-var knobs:
     TOMAT_RESULTS_LABEL   overrides W&B run id / checkpoint namespace
     TOMAT_MODEL           model size preset: "30M" (default) or "200M"
     TOMAT_VAL_SEQS        num validation sequences held out (default 0 = no val)
-    TOMAT_STEPS_PER_EVAL  eval cadence; default steps // 4 when val is on
+    TOMAT_STEPS_PER_EVAL  eval cadence; default steps // 4 when val is on.
+                          0 (or -1) disables the in-training eval callback.
     TOMAT_LR              peak learning rate (default 3e-4)
     TOMAT_LR_SCHEDULE     cosine (default) | constant | linear | inv_sqrt | …
                           Choose constant/linear for runs you might extend:
@@ -1085,8 +1086,14 @@ def main():
     # Eval cadence: if val is on, every steps // 4 by default (so 4 evals in a
     # 2000-step run — useful plot resolution). With no val, default keeps the
     # old behavior (one mid-run eval, effectively a no-op).
-    if steps_per_eval_env:
-        steps_per_eval = int(steps_per_eval_env)
+    if steps_per_eval_env is not None:
+        _spe = int(steps_per_eval_env)
+        # Sentinel: 0 or -1 disables the in-training eval callback. Levanter
+        # still registers it, but `step % steps_per_eval == 0` never fires
+        # because we set it to `steps + 1`. Use this to sidestep eval-mesh
+        # crashes (see specs/40, levanter BackgroundIterable + JAX mesh
+        # propagation bug) without ripping out the callback wiring.
+        steps_per_eval = steps + 1 if _spe <= 0 else _spe
     elif val_seqs > 0:
         steps_per_eval = max(steps // 4, 1)
     else:
