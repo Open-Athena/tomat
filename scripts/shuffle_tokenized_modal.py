@@ -13,26 +13,26 @@ count, same shards per worker, same rows per shard). The permutation is saved
 as a sidecar JSON so the (output_index → original_index) mapping is
 reproducible.
 
-Strategy (single high-memory container, output-driven, no full concat):
+Strategy (single high-memory container, streaming output, no global concat):
 
   1. List every input shard and its row count -> manifest.
   2. Build a deterministic permutation ``perm`` of length N (numpy RNG, seeded).
      ``perm[i]`` = global input-row index that ends up at global output-row i.
-  3. For each output shard, gather the rows it needs:
-       - Compute the input global indices it pulls from (= perm slice).
-       - Group them by input shard.
-       - For each input shard, read ONLY the requested rows (download once,
-         take, append).
-     This needs each input shard read once per output shard that pulls from it
-     (~2560 reads in worst case). To avoid 2560**2 GCS round-trips we cache
-     downloaded input tables in RAM until all of their consumers are done.
+  3. Read all input shards into RAM as a ``list[pa.Table]`` (one entry per
+     input shard). We do NOT ``pa.concat_tables`` them — an earlier version
+     concat'd and then ran ``Table.take(perm[start:end])`` against the
+     resulting 2560-chunk ChunkedArray, which OOM'd at exit-137 even when
+     serialized.
+  4. For each output shard, decode its perm slice to (input_shard, local_row)
+     pairs, bucket by input shard, do one small ``take()`` per touched
+     input shard (each producing <=1936 rows), ``concat_tables`` the small
+     partials, and re-permute once via ``take(inverse)`` to restore the
+     output order. Write locally, upload to eu-west4 + us-east5 in parallel.
 
-  4. Each output shard is small (~1936 rows ~= 25 MB compressed) -> write
-     locally, then upload in parallel to eu-west4 + us-east5.
-
-Memory budget: input tables held in RAM total ~55 GiB (compressed) ~= ~80 GiB
-in Arrow form (mostly int32 lists). We provision a 256 GiB container; the
-``--sample-rows`` smoke path needs <8 GiB.
+Memory budget: resident input tables ~ 162 GB (large_list<int32>,
+4.95M rows x 8192 = the dataset itself). Per-output-shard transient
+working set ~ 63 MB (the permuted shard). The 320 GiB container fits
+this comfortably; the ``--sample-rows`` smoke path needs <8 GiB.
 
 Idempotency: each output shard is skipped if the destination exists with the
 expected byte size > 0 (full row-count check needs a read; size check is the
@@ -358,78 +358,123 @@ def shuffle_all(
                     f"({time.time()-t0:.1f}s elapsed)")
     err(f"[shuffle] all input shards read in {time.time()-t0:.1f}s")
 
-    # Sanity: all shards share schema (drop redundant inspection).
+    # ------------------------------------------------------------------
+    # 5. Per-output-shard gather + write — STREAMING.
+    #
+    #    Earlier versions ran:
+    #
+    #      global_table = pa.concat_tables(tables, promote_options=...)
+    #      # then in a 64-way ThreadPool:
+    #      out_tbl = global_table.take(perm[start:end])
+    #
+    #    which OOM'd at exit-137: the concat'd ChunkedArray (2560 chunks of
+    #    large_list<int32>) + N parallel ``take()`` calls with random
+    #    indices pushed working set past Modal's 320 GiB cap. Even
+    #    serialized, ``take()`` on a 2560-chunk ChunkedArray with random
+    #    permutation indices has surprisingly large transient allocations
+    #    inside pyarrow.
+    #
+    #    Fix: don't concat. Keep ``tables`` as a list. For each output
+    #    shard, decode the global perm indices to (input_shard, local_row)
+    #    pairs, bucket by input shard, do ONE small ``take()`` per touched
+    #    input shard, then concat the small partials and reorder once.
+    #
+    #    Per-shard memory: O(rows_per_output_shard × 8192 × 4) ≈ 63 MB
+    #    transient. Bounded regardless of input size.
+    # ------------------------------------------------------------------
+    import gc
+    # Sanity: all shards share schema.
     schema = tables[0].schema
     for i, t in enumerate(tables[1:], 1):
         if t.schema != schema:
             err(f"[shuffle] WARN schema drift at shard {i}: {t.schema} vs {schema}")
 
-    # ------------------------------------------------------------------
-    # 5. Build a global table view via pa.concat_tables — promote_options
-    #    keeps int32 list columns aligned. This materializes a single
-    #    table reference; the underlying buffers are shared with the
-    #    per-shard tables (zero-copy in Arrow).
-    # ------------------------------------------------------------------
-    err("[shuffle] concatenating input tables (zero-copy)...")
-    t0 = time.time()
-    global_table = pa.concat_tables(tables, promote_options="default")
-    del tables  # let GC reclaim per-shard refs (concat keeps buffers alive)
-    err(f"[shuffle] concat: {time.time()-t0:.1f}s "
-        f"(num_rows={global_table.num_rows}, num_chunks={global_table.column(0).num_chunks})")
-    assert global_table.num_rows == eff_input_rows, (global_table.num_rows, eff_input_rows)
-
-    # ------------------------------------------------------------------
-    # 6. Per-output-shard: gather rows via Table.take, write parquet bytes,
-    #    upload to all buckets. Done in parallel via a thread pool — Arrow
-    #    releases the GIL for take(), and uploads are I/O-bound.
-    # ------------------------------------------------------------------
     err(f"[shuffle] writing {len(outputs)} output shards to {len(buckets)} bucket(s)...")
+    err("[shuffle] (per-shard lazy gather; take+encode serial; uploads parallel)")
+    err(f"[shuffle] resident input tables: {len(tables)}; {eff_input_rows} rows total")
     t0 = time.time()
+
+    input_offsets_arr = np.asarray(input_offsets, dtype=np.int64)
 
     def _out_path(bucket: str, worker: int, shard: int) -> str:
         return f"{bucket}/tokenized/{out_label}/worker-{worker:02d}/shard-{shard:05d}.parquet"
 
-    def _process_one(o: dict) -> dict:
-        start, end = o["global_start"], o["global_end"]
-        take_idx = output_to_input_global[start:end]
-        # pa.Table.take accepts int64 Arrow Array.
-        idx_arr = pa.array(take_idx, type=pa.int64())
-        out_tbl = global_table.take(idx_arr)
-        # Write to in-memory bytes — output shards are ~25 MB each so this is fine.
-        buf = pa.BufferOutputStream()
-        # Match input parquet conventions: zstd compression (input uses ZSTD per
-        # pqm), 64-row groups (input has row_group=64). Keeping row-group size
-        # the same makes BlockShuffleConfig's io_block_size math match upstream.
-        pq.write_table(
-            out_tbl,
-            buf,
-            compression="zstd",
-            row_group_size=64,
-        )
-        data = buf.getvalue().to_pybytes()
-        sz = len(data)
-        if dry_run:
-            return dict(worker=o["worker"], shard=o["shard"], rows=o["rows"],
-                        bytes=sz, uploaded=[])
-        uploaded = []
-        for bucket in buckets:
-            gpath = _out_path(bucket, o["worker"], o["shard"])
-            with fs.open(gpath[5:], "wb") as f:
-                f.write(data)
-            uploaded.append(gpath)
-        return dict(worker=o["worker"], shard=o["shard"], rows=o["rows"],
-                    bytes=sz, uploaded=uploaded)
+    def _upload(bucket: str, worker: int, shard: int, data: bytes) -> str:
+        gpath = _out_path(bucket, worker, shard)
+        with fs.open(gpath[5:], "wb") as f:
+            f.write(data)
+        return gpath
 
-    # Use a smaller pool than I/O threads — write() is mostly upload (I/O) but
-    # take() peaks transient RAM. n_io_threads is fine.
     results = []
-    with ThreadPoolExecutor(max_workers=n_io_threads) as ex:
-        for i, res in enumerate(ex.map(_process_one, outputs)):
-            results.append(res)
+    upload_pool = ThreadPoolExecutor(max_workers=max(2, len(buckets)))
+    try:
+        for i, o in enumerate(outputs):
+            start, end = o["global_start"], o["global_end"]
+            global_idx = output_to_input_global[start:end]  # length N (~1936)
+
+            # Decode global -> (shard_idx, local_idx) via searchsorted.
+            # ``input_offsets`` is sorted ascending; side='right' - 1 gives
+            # the shard whose [offset, offset+rows) interval contains the idx.
+            shard_idx = np.searchsorted(input_offsets_arr, global_idx, side="right") - 1
+            local_idx = global_idx - input_offsets_arr[shard_idx]
+
+            # Bucket by shard. We need to remember each row's output position
+            # so we can reassemble in the requested order at the end.
+            # Use a stable groupby via argsort: pieces sorted by shard_idx.
+            order = np.argsort(shard_idx, kind="stable")
+            sorted_shard = shard_idx[order]
+            sorted_local = local_idx[order]
+            # boundaries[i] = first index in sorted_shard whose value > i
+            # We just iterate via run-length.
+            boundaries = np.flatnonzero(np.diff(sorted_shard) != 0) + 1
+            starts = np.concatenate([[0], boundaries])
+            ends = np.concatenate([boundaries, [len(sorted_shard)]])
+
+            sub_tables = []
+            for s_, e_ in zip(starts, ends):
+                sid = int(sorted_shard[s_])
+                locs = sorted_local[s_:e_]
+                sub = tables[sid].take(pa.array(locs, type=pa.int64()))
+                sub_tables.append(sub)
+
+            concat_sub = pa.concat_tables(sub_tables, promote_options="default")
+            del sub_tables
+
+            # ``concat_sub`` rows are in ``order``-permuted form; we want
+            # them in original output order. Inverse permutation:
+            inverse = np.empty(len(order), dtype=np.int64)
+            inverse[order] = np.arange(len(order), dtype=np.int64)
+            out_tbl = concat_sub.take(pa.array(inverse, type=pa.int64()))
+            del concat_sub, order, sorted_shard, sorted_local, inverse
+            del shard_idx, local_idx, global_idx
+
+            buf = pa.BufferOutputStream()
+            pq.write_table(
+                out_tbl,
+                buf,
+                compression="zstd",
+                row_group_size=64,
+            )
+            del out_tbl
+            data = buf.getvalue().to_pybytes()
+            del buf
+            sz = len(data)
+            if dry_run:
+                uploaded = []
+            else:
+                futs = [upload_pool.submit(_upload, b, o["worker"], o["shard"], data)
+                        for b in buckets]
+                uploaded = [f.result() for f in futs]
+            del data
+            results.append(dict(worker=o["worker"], shard=o["shard"], rows=o["rows"],
+                                bytes=sz, uploaded=uploaded))
             if (i + 1) % 50 == 0:
+                gc.collect()
                 done_bytes = sum(r["bytes"] for r in results)
                 err(f"[shuffle]   wrote {i+1}/{len(outputs)} shards, "
                     f"{done_bytes/1e9:.2f} GB out, {time.time()-t0:.1f}s elapsed")
+    finally:
+        upload_pool.shutdown(wait=True)
     total_out_bytes = sum(r["bytes"] for r in results)
     err(f"[shuffle] wrote {len(results)} output shards "
         f"({total_out_bytes/1e9:.2f} GB) in {time.time()-t0:.1f}s")
