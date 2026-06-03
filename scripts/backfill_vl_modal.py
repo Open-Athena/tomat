@@ -237,10 +237,10 @@ def backfill_one(
     # `num_validation_sequences={"tomat": val_seqs}` + default
     # `shuffle_before_trainval_split=True` carves the last `val_seqs`
     # sequences (after a PRNGKey(0) feistel shuffle) into the val slice.
-    # We have to point cache_dir at a writable local path the eval
-    # process can build the cache in — Levanter rebuilds when the
-    # content-hash changes, so each (parquet, vocab) gets its own dir.
-    cache_dir = "/root/vl-backfill-cache"
+    # Persist the levanter cache on the Modal Volume so spawns past the
+    # first share the (~hour-long) build cost. Per-parquet-label
+    # subdir so different vocabs get separate caches.
+    cache_dir = f"{MOUNT}/vl-backfill-cache/{parquet_label}"
     source = UrlDatasetSourceConfig(train_urls=[parquet_glob])
     prebuilt_fmt = PrebuiltLmDatasetFormat(input_ids_key="input_ids")
     component = DatasetComponent(
@@ -344,6 +344,16 @@ def backfill_one(
     with fsspec.open(dst, "w") as f:
         json.dump(out, f, indent=2)
     err(f"[vl-backfill] wrote {dst}")
+
+    # Commit the volume so the (~hour-long) levanter cache build under
+    # `{MOUNT}/vl-backfill-cache/{parquet_label}/` is visible to the next
+    # spawn — without this each step pays the full build cost again
+    # (~$25/h H200x8). Idempotent if cache already exists.
+    try:
+        train_volume.commit()
+        err(f"[vl-backfill] volume committed (cache persisted for next spawn)")
+    except Exception as e:
+        err(f"[vl-backfill] WARN: volume.commit() failed: {type(e).__name__}: {e}")
     return out
 
 
