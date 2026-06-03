@@ -988,6 +988,90 @@ def main():
             logits_arr = logits.array.astype(jnp.float32)  # (B, Pos, V)
             return logits_arr[..., DENS_LO:DENS_HI]       # (B, Pos, n_bins)
 
+        # NB: `n_to_fill_now` is a plain Python int → hax.named_jit's own
+        # static/dynamic partitioning (via `is_array`) classifies it as
+        # static automatically. No `static_argnames` needed (and the
+        # underlying jax.jit wrapper doesn't expose the user-facing arg
+        # name anyway — passing static_argnames raises ValueError, since
+        # the wrapper signature is `(dynamic_donated, dynamic_reserved, static)`).
+        @hax.named_jit(axis_resources=compute_mapping)
+        def maskgit_iter_jit(tok_ha, still_masked_jax, dens_positions_jax,
+                             n_to_fill_now):
+            """One K-iter MaskGIT step, fully on-device.
+
+            Replaces the host-side Python loop (forward → np.asarray full
+            (B, pad_to, n_bins) logits → softmax → per-example argsort →
+            scatter updated tokens back to GPU each iter). The old path
+            shipped ~17 GB of logits across PCIe per iter; here logits
+            stay on-device and only the int32 token + bool mask updates
+            persist.
+
+            tok_ha:            (Batch, Pos) NamedArray int32 — current tokens
+            still_masked_jax:  (B, P3)      bool  — which dens positions are MASK_ID
+            dens_positions_jax: (P3,)       int32 — indices into pad_to of density slots
+            n_to_fill_now:     static int   — positions to fill this iter
+
+            Returns (tok_ha', still_masked_jax').
+
+            Vectorization note: all examples share the same n_to_fill_now
+            because they start each iter with identical `n_already_filled`
+            (the cosine schedule is deterministic). The original
+            `for b in range(B): np.argsort(...)[:n_to_fill_now]` loop was
+            doing the same operation B times with no actual per-example
+            divergence — collapsed here to a single `lax.top_k`.
+            """
+            # Forward — inline the maskgit_forward body so the named_jit
+            # trace produces ONE fused HLO graph (nested hax.named_jits
+            # work but add wrapping; flat is simpler).
+            act = model.activations(tok_ha, key=None, attn_mask=_mg_bidir_mask)
+            head = model.get_lm_head()
+            logits = hax.dot(act, head, axis=model.Embed)
+            logits_arr = logits.array.astype(jnp.float32)  # (B, Pos, V)
+            dl_full = logits_arr[..., DENS_LO:DENS_HI]     # (B, Pos, n_bins)
+            dl_dens = dl_full[:, dens_positions_jax, :]    # (B, P3, n_bins)
+            probs = jax.nn.softmax(dl_dens, axis=-1)
+            confidence = probs.max(axis=-1)                # (B, P3)
+            picked_bin = probs.argmax(axis=-1).astype(jnp.int32)  # (B, P3)
+
+            # Pick top-`n_to_fill_now` confident positions among still-masked
+            # only. Setting filled positions to -inf guarantees top_k picks
+            # masked entries.
+            neg_inf = jnp.array(-jnp.inf, dtype=confidence.dtype)
+            confidence_masked = jnp.where(still_masked_jax, confidence, neg_inf)
+            # (B, n_to_fill_now)
+            _, top_idx = jax.lax.top_k(confidence_masked, n_to_fill_now)
+
+            # Build the "fill this iter" boolean mask. One-hot the top
+            # indices into a (B, P3) bool grid via scatter.
+            B_local = still_masked_jax.shape[0]
+            fill_mask = jnp.zeros_like(still_masked_jax)
+            batch_idx = jnp.broadcast_to(
+                jnp.arange(B_local, dtype=jnp.int32)[:, None],
+                (B_local, n_to_fill_now),
+            )
+            fill_mask = fill_mask.at[batch_idx, top_idx].set(True)
+            # Sanity: only count masked positions that actually had finite
+            # confidence (i.e. were still masked) — if n_to_fill_now overshoots
+            # the remaining count (shouldn't happen with the cosine schedule
+            # since sum-of-deltas = P3), drop the overshoot.
+            fill_mask = fill_mask & still_masked_jax
+
+            # Scatter picked_bin → tokens at dens_positions for fill_mask
+            # entries. Use jnp.where over (B, P3) then write back at
+            # dens_positions via .at[].set().
+            tokens_jax = tok_ha.array
+            current_at_dens = tokens_jax[:, dens_positions_jax]  # (B, P3)
+            new_at_dens = jnp.where(
+                fill_mask,
+                density_offset + picked_bin,
+                current_at_dens,
+            )
+            tokens_new = tokens_jax.at[:, dens_positions_jax].set(new_at_dens)
+            tok_ha_new = hax.named(tokens_new, tok_ha.axes)
+
+            still_masked_new = still_masked_jax & ~fill_mask
+            return tok_ha_new, still_masked_new
+
         # Pick mp-IDs: either from the pinned JSON snapshot (preferred for
         # apples-to-apples curves across runs), or from the parquets directly.
         if eval_mat_set:
@@ -1627,41 +1711,89 @@ def main():
                     # shape (B, P3); bool.
                     still_masked = np.ones((B, P3), dtype=bool)
 
-                    for k in range(mg_k_steps):
+                    # Fast path: keep tokens + logits on-device across all K
+                    # iters via `maskgit_iter_jit`. Old host-loop path stays
+                    # available behind TOMAT_EVAL_MG_LEGACY=1 for A/B and
+                    # fallback if anything goes sideways.
+                    use_legacy_mg_loop = bool(int(
+                        os.environ.get("TOMAT_EVAL_MG_LEGACY", "0")
+                    ))
+
+                    if not use_legacy_mg_loop:
+                        # Precompute per-iter cumulative + delta targets from
+                        # the cosine schedule. Identical math to the legacy
+                        # path, just hoisted out of the loop.
+                        n_fill_target_cum = [
+                            min(P3, math.ceil(
+                                (1.0 - math.cos((k + 1) / mg_k_steps * math.pi / 2.0))
+                                * P3
+                            ))
+                            for k in range(mg_k_steps)
+                        ]
+                        n_to_fill_deltas = [n_fill_target_cum[0]] + [
+                            n_fill_target_cum[k] - n_fill_target_cum[k - 1]
+                            for k in range(1, mg_k_steps)
+                        ]
+                        # Move tokens + state to device once; only return at
+                        # end. dens_positions is a (P3,) constant; we pass it
+                        # as a jax array so it doesn't get re-staged each call.
                         Pos = hax.Axis("position", pad_to)
                         tok_ha = hax.named(jnp.asarray(tokens), (Batch, Pos))
-                        # (B, pad_to, n_bins) density logits
-                        dl_full = np.asarray(maskgit_forward(tok_ha))
-                        # Extract at density positions: (B, P3, n_bins)
-                        dl_dens = dl_full[:, dens_positions, :]
+                        still_masked_dev = jnp.asarray(still_masked)
+                        dens_positions_dev = jnp.asarray(
+                            dens_positions, dtype=jnp.int32,
+                        )
 
-                        # Softmax → confidence = max prob at each position.
-                        probs = jax.nn.softmax(jnp.asarray(dl_dens), axis=-1)
-                        probs_np = np.asarray(probs)  # (B, P3, n_bins)
-                        confidence = probs_np.max(axis=-1)   # (B, P3)
-                        picked_bin = probs_np.argmax(axis=-1) # (B, P3)
-
-                        # Cosine schedule: how many positions to have filled
-                        # after step k+1 (1-indexed).
-                        frac_fill = 1.0 - math.cos((k + 1) / mg_k_steps * math.pi / 2.0)
-                        n_fill_target = math.ceil(frac_fill * P3)
-                        n_fill_target = min(n_fill_target, P3)
-
-                        for b in range(B):
-                            masked_pos_idx = np.where(still_masked[b])[0]
-                            n_already_filled = P3 - len(masked_pos_idx)
-                            n_to_fill_now = max(0, n_fill_target - n_already_filled)
-                            n_to_fill_now = min(n_to_fill_now, len(masked_pos_idx))
-                            if n_to_fill_now == 0:
+                        for k in range(mg_k_steps):
+                            n_to_fill_now_k = int(n_to_fill_deltas[k])
+                            if n_to_fill_now_k == 0:
                                 continue
-                            # Pick the most-confident among still-masked.
-                            conf_masked = confidence[b, masked_pos_idx]
-                            top_k = np.argsort(-conf_masked)[:n_to_fill_now]
-                            to_fill = masked_pos_idx[top_k]
-                            tokens[b, dens_positions[to_fill]] = (
-                                density_offset + picked_bin[b, to_fill]
+                            tok_ha, still_masked_dev = maskgit_iter_jit(
+                                tok_ha, still_masked_dev, dens_positions_dev,
+                                n_to_fill_now_k,
                             )
-                            still_masked[b, to_fill] = False
+
+                        # Pull final state back to host (small: int32 tokens +
+                        # bool mask) — replaces the per-iter ~17 GB logits
+                        # transfer that dominated the old path.
+                        tokens = np.asarray(tok_ha.array)
+                        still_masked = np.asarray(still_masked_dev)
+                    else:
+                        for k in range(mg_k_steps):
+                            Pos = hax.Axis("position", pad_to)
+                            tok_ha = hax.named(jnp.asarray(tokens), (Batch, Pos))
+                            # (B, pad_to, n_bins) density logits
+                            dl_full = np.asarray(maskgit_forward(tok_ha))
+                            # Extract at density positions: (B, P3, n_bins)
+                            dl_dens = dl_full[:, dens_positions, :]
+
+                            # Softmax → confidence = max prob at each position.
+                            probs = jax.nn.softmax(jnp.asarray(dl_dens), axis=-1)
+                            probs_np = np.asarray(probs)  # (B, P3, n_bins)
+                            confidence = probs_np.max(axis=-1)   # (B, P3)
+                            picked_bin = probs_np.argmax(axis=-1) # (B, P3)
+
+                            # Cosine schedule: how many positions to have filled
+                            # after step k+1 (1-indexed).
+                            frac_fill = 1.0 - math.cos((k + 1) / mg_k_steps * math.pi / 2.0)
+                            n_fill_target = math.ceil(frac_fill * P3)
+                            n_fill_target = min(n_fill_target, P3)
+
+                            for b in range(B):
+                                masked_pos_idx = np.where(still_masked[b])[0]
+                                n_already_filled = P3 - len(masked_pos_idx)
+                                n_to_fill_now = max(0, n_fill_target - n_already_filled)
+                                n_to_fill_now = min(n_to_fill_now, len(masked_pos_idx))
+                                if n_to_fill_now == 0:
+                                    continue
+                                # Pick the most-confident among still-masked.
+                                conf_masked = confidence[b, masked_pos_idx]
+                                top_k = np.argsort(-conf_masked)[:n_to_fill_now]
+                                to_fill = masked_pos_idx[top_k]
+                                tokens[b, dens_positions[to_fill]] = (
+                                    density_offset + picked_bin[b, to_fill]
+                                )
+                                still_masked[b, to_fill] = False
 
                     # Force-fill any remaining MASK positions (last-step safety).
                     for b in range(B):
