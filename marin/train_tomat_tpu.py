@@ -477,6 +477,71 @@ def main():
     val_seqs = int(os.environ.get("TOMAT_VAL_SEQS", "0"))
     steps_per_eval_env = os.environ.get("TOMAT_STEPS_PER_EVAL")
 
+    # Zone-aware TOMAT_BUCKET override. iris parks slices in whatever zone has
+    # capacity, but the fire-script pins `TOMAT_BUCKET` to one region — so a
+    # worker that lands in (e.g.) europe-west4 with `TOMAT_BUCKET` pinned to
+    # us-east5 writes every canonical checkpoint cross-region (Levanter's
+    # `keep_every` fires every 1000 steps at ~2.5 GB → bulk egress).
+    #
+    # Strategy: detect worker region; if the region-local mirror has
+    # checkpoints for this run, use it (resume + local writes). If the
+    # env-pinned bucket has checkpoints but the local one doesn't, KEEP
+    # env-pinned (preserve resume — accept one cross-region write per ckpt
+    # for THIS run; next fresh run will be zone-local). For fresh runs (no
+    # ckpts anywhere) always pick zone-local. Set `TOMAT_PIN_BUCKET=1` to
+    # short-circuit and force the env-pinned bucket regardless.
+    # See `_pick_cache_bucket` (reads) and `marin_temp_bucket` (temp ckpts)
+    # — same pattern, applied here to the canonical results path.
+    global BUCKET
+    _env_bucket = BUCKET
+    if os.environ.get("TOMAT_PIN_BUCKET") == "1":
+        print(f"[tomat-tpu] bucket: {BUCKET} (TOMAT_PIN_BUCKET=1)", flush=True)
+    else:
+        _worker_region = _detect_gce_region()
+        _zone_local = _REGION_TO_CACHE_BUCKET.get(_worker_region) if _worker_region else None
+        if not _zone_local:
+            print(f"[tomat-tpu] bucket: {BUCKET} "
+                  f"(no zone-local mirror for region={_worker_region}; "
+                  f"using env-pinned)", flush=True)
+        elif _zone_local == _env_bucket:
+            print(f"[tomat-tpu] bucket: {BUCKET} "
+                  f"(already zone-local, worker_region={_worker_region})",
+                  flush=True)
+        else:
+            # Decide override vs preserve based on checkpoint availability.
+            import fsspec as _fsspec
+            _ck_suffix = f"results/{results_label_env}/checkpoints/" if results_label_env else None
+
+            def _has_ckpts(_bucket: str) -> bool:
+                if not _ck_suffix:
+                    return False
+                _path = f"{_bucket}/{_ck_suffix}"
+                try:
+                    fs, _ = _fsspec.core.url_to_fs(_path)
+                    return fs.exists(_path.removeprefix("gs://"))
+                except Exception as e:
+                    print(f"[tomat-tpu] WARN: ckpt-exists check failed for "
+                          f"{_path}: {e}", flush=True)
+                    return False
+
+            _local_has = _has_ckpts(_zone_local)
+            _env_has = _has_ckpts(_env_bucket)
+            if _local_has or not _env_has:
+                # Local has ckpts (clean resume) OR neither has them (fresh).
+                print(f"[tomat-tpu] bucket: {_zone_local} "
+                      f"(zone-local override; env was {_env_bucket}, "
+                      f"worker_region={_worker_region}, "
+                      f"local_has_ckpts={_local_has}, env_has_ckpts={_env_has})",
+                      flush=True)
+                BUCKET = _zone_local
+            else:
+                # env has ckpts, local doesn't → keep env to preserve resume.
+                print(f"[tomat-tpu] bucket: {BUCKET} "
+                      f"(env-pinned preserved for resume; "
+                      f"worker_region={_worker_region}, "
+                      f"zone-local mirror={_zone_local} has no ckpts)",
+                      flush=True)
+
     parquet_glob = f"{BUCKET}/tokenized/{label}/worker-*/*.parquet"
     meta_url = f"{BUCKET}/tokenized/{label}/worker-00/meta.json"
     import fsspec
