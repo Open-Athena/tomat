@@ -69,6 +69,28 @@ image = (
         "'jax[cuda12]' 'pyarrow>=15' fsspec gcsfs "
         "zarr 'pymatgen<2025' boto3",
     )
+    # `add_local_python_source("marin")` is necessary but not
+    # sufficient: marin-haliax/levanter transitively install
+    # marin-core (`lib/marin/src/marin/`), which lands at
+    # `/root/marin/` (Modal places non-installed-package mounts under
+    # `/root/`) and resolves to the OA marin contents
+    # (`marin.__file__ → /root/marin/__init__.py` with only
+    # `__init__.py` + `utils.py` + cluster/core/datakit/... subdirs).
+    # Our tomat-local `qwen3_density.py` + `eval_mat_nmae.py` (never
+    # upstreamed) are silently dropped, so `from marin.qwen3_density
+    # import ...` reports ModuleNotFoundError. Force-copy the
+    # tomat-local files into `/root/marin/` so they live alongside the
+    # OA modules. `copy=True` so they become part of the image layer.
+    .add_local_file(
+        "marin/qwen3_density.py",
+        "/root/marin/qwen3_density.py",
+        copy=True,
+    )
+    .add_local_file(
+        "marin/eval_mat_nmae.py",
+        "/root/marin/eval_mat_nmae.py",
+        copy=True,
+    )
     .add_local_python_source("tomat")
     .add_local_python_source("marin")
 )
@@ -339,36 +361,35 @@ def main(
     `steps`: comma-separated list, e.g. `10000,20000`. Empty → every
     1k from 1000 to 40000.
 
-    Run as a plain Python script (NOT `modal run`) so we can use the
-    `with app.run(detach=True):` pattern from `_evals_fire_modal` in
-    `tomat`. `modal run`'s `@app.local_entrypoint` produces an
-    ephemeral app that gets stopped on entrypoint exit and kills the
-    queued inputs; `app.run(detach=True)` keeps them alive.
+    Run as a plain Python script (NOT `modal run`). Deploys the app
+    once (so the spawned function calls survive the local process
+    exit), then `.spawn()`s one call per step. Same pattern as
+    `tmp/spawn_mg_v4_cont_*.py` — deploy + spawn keeps queued inputs
+    alive without holding the local process open.
     """
-    import modal as _modal
-
     if steps:
         step_list = [int(s.strip()) for s in steps.split(",") if s.strip()]
     else:
         step_list = _default_steps()
     err(f"[vl-backfill] firing {len(step_list)} step(s): {step_list[:5]}"
         f"{'…' if len(step_list) > 5 else ''}")
+    err(f"[vl-backfill] deploying app {app.name!r}...")
+    app.deploy()
+    err(f"[vl-backfill] deployed; spawning {len(step_list)} call(s)...")
     calls: dict[int, str] = {}
-    with _modal.enable_output():
-        with app.run(detach=True):
-            for st in step_list:
-                call = backfill_one.spawn(
-                    run_label=run_label,
-                    ckpt_leaf=ckpt_leaf,
-                    step=st,
-                    parquet_label=parquet_label,
-                    model_preset=model_preset,
-                    val_seqs=val_seqs,
-                    eval_batch=eval_batch,
-                )
-                err(f"[vl-backfill spawned] step={st} call_id={call.object_id}")
-                calls[st] = call.object_id
-    err(f"[vl-backfill] all {len(calls)} call(s) spawned (detached). "
+    for st in step_list:
+        call = backfill_one.spawn(
+            run_label=run_label,
+            ckpt_leaf=ckpt_leaf,
+            step=st,
+            parquet_label=parquet_label,
+            model_preset=model_preset,
+            val_seqs=val_seqs,
+            eval_batch=eval_batch,
+        )
+        err(f"[vl-backfill spawned] step={st} call_id={call.object_id}")
+        calls[st] = call.object_id
+    err(f"[vl-backfill] all {len(calls)} call(s) spawned. "
         f"`modal app logs tomat-vl-backfill` to watch.")
     print("\n[modal call IDs]")
     for st, cid in sorted(calls.items()):
