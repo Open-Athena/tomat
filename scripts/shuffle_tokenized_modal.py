@@ -218,14 +218,14 @@ def assign_output_layout(
 
 @app.function(
     cpu=16,
-    memory=524_288,  # 512 GiB — Arrow concat of all ~5M rows (~150 GiB int32
-                      # list buffers) plus take() peak transient. Smoke at 100k
-                      # rows confirmed ~3 GB working set; linear extrapolation
-                      # to full label is ~150 GiB, so 512 GiB leaves headroom.
+    memory=327_680,  # 320 GiB — Modal's per-function max is 344_064 MiB ≈ 336
+                      # GiB. Smoke at 100k rows confirmed ~3 GB working set;
+                      # linear extrapolation to full label is ~150 GiB, so
+                      # 320 GiB leaves ~2× headroom and stays under the cap.
     timeout=14_400,  # 4h cap; expected wallclock 1-2h.
     secrets=[gcp_secret],
-    ephemeral_disk=524_288,  # 512 GiB scratch (Modal's floor for explicit
-                              # ephemeral disk; unused in the all-in-RAM path).
+    # No explicit ephemeral_disk — the all-in-RAM path doesn't use scratch,
+    # and the default disk size is enough for the parquet temp buffers.
 )
 def shuffle_all(
     label: str,

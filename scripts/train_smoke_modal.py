@@ -439,6 +439,12 @@ def _train_bakeoff_impl(
     # default — the source of the 1024-step sawtooth; see spec 44).
     shuffle_io_block_size: int = 64,
     shuffle_window_blocks: int = 1024,
+    # Carve out `val_seqs` sequences from train for validation (spec 47). 0
+    # disables — matches the historical behavior. Set to e.g. 256 to make
+    # `steps_per_eval` actually log `eval/loss` (otherwise Levanter sees an
+    # empty tagged-eval-set and never installs the eval callback). Mirrors
+    # the TPU recipe's `TOMAT_VAL_SEQS` env var (train_tomat_tpu.py:690).
+    val_seqs: int = 0,
 ) -> dict:
     """200M-or-other preset training body for the bakeoff probe.
 
@@ -569,6 +575,11 @@ def _train_bakeoff_impl(
     else:
         shuffle_cfg = False
         err(f"[bakeoff] shuffle: OFF (window_blocks=0)")
+    # Carve out a validation split from train when val_seqs > 0 (spec 47).
+    # Mirrors the TPU recipe's `num_validation_sequences={"tomat": val_seqs}`
+    # at `marin/train_tomat_tpu.py:690`. Without this the eval-callback is
+    # never installed, so `steps_per_eval` silently does nothing.
+    num_validation_sequences = {"tomat": val_seqs} if val_seqs > 0 else None
     data = LmDataConfig(
         tokenizer="passthrough",
         vocab_size=vocab_size,
@@ -576,6 +587,7 @@ def _train_bakeoff_impl(
         components={"tomat": component},
         block_cross_document_attention=False,
         shuffle=shuffle_cfg,
+        num_validation_sequences=num_validation_sequences,
     )
 
     preset = MODEL_PRESETS[model_preset]
@@ -645,6 +657,8 @@ def _train_bakeoff_impl(
                 block_cross_document_attention=False,
                 # Re-use the shuffle_cfg computed for the main `data` above.
                 shuffle=shuffle_cfg,
+                # Re-use the val carve-out as well (spec 47).
+                num_validation_sequences=num_validation_sequences,
             )
         else:
             # Mirror train_tomat_tpu.py density-loss setup.
@@ -843,6 +857,7 @@ def train_bakeoff_h200x8(
     steps_per_eval: int | None = None,
     shuffle_io_block_size: int = 64,
     shuffle_window_blocks: int = 1024,
+    val_seqs: int = 0,
 ) -> dict:
     """8× H200 bakeoff probe; same SM as H100, 1.4× HBM bandwidth."""
     return _train_bakeoff_impl(
@@ -859,6 +874,7 @@ def train_bakeoff_h200x8(
         steps_per_eval=steps_per_eval,
         shuffle_io_block_size=shuffle_io_block_size,
         shuffle_window_blocks=shuffle_window_blocks,
+        val_seqs=val_seqs,
     )
 
 
