@@ -335,7 +335,19 @@ def shuffle_all(
             raise RuntimeError(
                 f"row-count mismatch on {s['path']}: expected {s['rows']}, got {tbl.num_rows}"
             )
-        return tbl
+        # Re-cast list<int32> → large_list<int32>. The original schema uses
+        # int32 list offsets, which overflow when concat_tables sums offsets
+        # across all 4.95M rows × 8192 ints ≈ 40 B ints (> int32-max). large_list
+        # uses int64 offsets so `take()` after concat doesn't blow up.
+        new_fields = []
+        for f_ in tbl.schema:
+            if pa.types.is_list(f_.type):
+                value_type = f_.type.value_type
+                new_fields.append(pa.field(f_.name, pa.large_list(value_type)))
+            else:
+                new_fields.append(f_)
+        new_schema = pa.schema(new_fields)
+        return tbl.cast(new_schema)
 
     tables: list[pa.Table] = [None] * len(eff_inputs)  # type: ignore
     with ThreadPoolExecutor(max_workers=n_io_threads) as ex:
