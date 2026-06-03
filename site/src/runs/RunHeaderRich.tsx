@@ -108,17 +108,6 @@ const WANDB_STATE_BG: Record<string, string> = {
   killed: '#6a737d',
 }
 
-/** wandb marks a run as `state='finished'` even when training crashed at init
- *  (Levanter's atexit calls `wandb.finish()` regardless of exit code). Detect
- *  the empty-history case so the badge shows CRASHED rather than FINISHED.
- *  Returns the effective state to render.
- */
-function effectiveWandbState(manifest: RunManifest): string {
-  const s = manifest.run.state
-  if (s === 'finished' && manifest.history.rows === 0) return 'crashed'
-  return s
-}
-
 const IRIS_STATE_STYLES: Record<string, { bg: string; fg: string }> = {
   RUNNING:       { bg: '#22863a', fg: '#fff' },
   PENDING:       { bg: '#d4a017', fg: '#fff' },
@@ -1022,34 +1011,25 @@ export function RunHeaderRich({
           />
           {job && <IrisBadge job={job} attempts={attempts} incomplete={incomplete} />}
           {!job && modalApp && <ModalBadge app={modalApp} />}
-          {/* No iris job AND no matched Modal app — fall back to wandb's
-              run state. The status dots mark the source; a "running" run
-              gone stale (no logs in >10min) shows greyed as STALE rather
-              than green. `state='finished'` with no history rows is a
-              crashed-at-init run (Levanter's atexit calls wandb.finish()
-              regardless) — reclassify to 'crashed'. */}
-          {!job && !modalApp && manifest && (() => {
-            const effState = effectiveWandbState(manifest)
-            const reclassified = effState !== manifest.run.state
-            const tip = wandbStale
+          {!job && !modalApp && manifest && (
+            // No iris job AND no matched Modal app — fall back to wandb's
+            // run state. The status dots mark the source; a "running" run
+            // gone stale (no logs in >10min) shows greyed as STALE rather
+            // than green.
+            <Tooltip content={wandbStale
               ? `wandb says running, but last logged ${secsAgo(lastLogTs!)} — likely dead`
-              : reclassified
-                ? `wandb state: ${manifest.run.state} but no metrics logged (history.rows=0) — reclassified as ${effState}`
-                : `wandb state (no iris job, no modal app): ${manifest.run.state}`
-            return (
-              <Tooltip content={tip}>
-                <span
-                  style={{
-                    backgroundColor: wandbStale
-                      ? '#6a737d' : (WANDB_STATE_BG[effState] ?? '#555'),
-                    color: '#fff', padding: '1px 6px', borderRadius: 3,
-                    fontSize: '0.75rem', fontFamily: 'monospace',
-                  }}>
-                  {wandbStale ? 'STALE' : effState.toUpperCase()}
-                </span>
-              </Tooltip>
-            )
-          })()}
+              : `wandb state (no iris job, no modal app): ${manifest.run.state}`}>
+              <span
+                style={{
+                  backgroundColor: wandbStale
+                    ? '#6a737d' : (WANDB_STATE_BG[manifest.run.state] ?? '#555'),
+                  color: '#fff', padding: '1px 6px', borderRadius: 3,
+                  fontSize: '0.75rem', fontFamily: 'monospace',
+                }}>
+                {wandbStale ? 'STALE' : manifest.run.state.toUpperCase()}
+              </span>
+            </Tooltip>
+          )}
           {linkRunName ? (
             <a
               href={`#/runs/${id}`}
