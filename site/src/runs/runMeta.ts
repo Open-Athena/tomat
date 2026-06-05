@@ -310,7 +310,7 @@ export function formatFlops(f: number): string {
  *  (`tomat-…-P14` = v2 patch tokenizer, `…-P19` = v3). The run *name* is not
  *  reliable — some `train-full-v3-…` runs trained on v2 data (project P14). */
 export function tokenizerGen(manifest: RunManifest | null): 'v2' | 'v3' | null {
-  const p = manifest?.run.project ?? ''
+  const p = manifest?.run?.project ?? ''
   if (/P14/.test(p)) return 'v2'
   if (/P19/.test(p)) return 'v3'
   return null
