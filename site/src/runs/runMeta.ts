@@ -184,7 +184,7 @@ export function formatStepCount(n: number): string {
 
 /** Authoritative step target: `trainer.num_train_steps` from the run config. */
 export function numTrainStepsOf(manifest: RunManifest | null): number | null {
-  const v = (manifest?.run.config as Record<string, unknown> | undefined)?.trainer
+  const v = (manifest?.run?.config as Record<string, unknown> | undefined)?.trainer
   if (v && typeof v === 'object' && 'num_train_steps' in v) {
     const n = (v as { num_train_steps?: unknown }).num_train_steps
     if (typeof n === 'number' && n > 0) return n
@@ -218,7 +218,7 @@ export const EPOCH_SEQUENCES: Record<string, number> = {
  *  Falls back from the canonical cache_dir parse to the train_urls parse so
  *  Modal-trained runs still surface `nEpochs` + the `?x=epoch` axis. */
 export function dataLabelOf(manifest: RunManifest | null): string | null {
-  const data = (manifest?.run.config as Record<string, unknown> | undefined)?.data
+  const data = (manifest?.run?.config as Record<string, unknown> | undefined)?.data
   if (!data || typeof data !== 'object') return null
   const cd = (data as { cache_dir?: unknown }).cache_dir
   if (typeof cd === 'string') {
@@ -238,13 +238,13 @@ export function dataLabelOf(manifest: RunManifest | null): string | null {
 
 /** Tokens trained on so far (`throughput/total_tokens` from the run summary). */
 export function totalTokensOf(manifest: RunManifest | null): number | null {
-  const t = manifest?.summary['throughput/total_tokens']
+  const t = manifest?.summary?.['throughput/total_tokens']
   return typeof t === 'number' && t > 0 ? t : null
 }
 
 /** Forward+backward FLOPs — the standard 6·N·D estimate (N params, D tokens). */
 export function nFlopsOf(manifest: RunManifest | null): number | null {
-  const n = manifest?.summary['parameter_count']
+  const n = manifest?.summary?.['parameter_count']
   const tok = totalTokensOf(manifest)
   if (typeof n !== 'number' || tok == null) return null
   return 6 * n * tok
@@ -252,13 +252,13 @@ export function nFlopsOf(manifest: RunManifest | null): number | null {
 
 /** Training sequence length (`train_seq_len` from the run config). */
 export function seqLenOf(manifest: RunManifest | null): number | null {
-  const v = (manifest?.run.config as Record<string, unknown> | undefined)?.train_seq_len
+  const v = (manifest?.run?.config as Record<string, unknown> | undefined)?.train_seq_len
   return typeof v === 'number' && v > 0 ? v : null
 }
 
 /** Train batch size (`trainer.train_batch_size`). */
 export function batchSizeOf(manifest: RunManifest | null): number | null {
-  const t = (manifest?.run.config as Record<string, unknown> | undefined)?.trainer
+  const t = (manifest?.run?.config as Record<string, unknown> | undefined)?.trainer
   if (t && typeof t === 'object' && 'train_batch_size' in t) {
     const n = (t as { train_batch_size?: unknown }).train_batch_size
     if (typeof n === 'number' && n > 0) return n

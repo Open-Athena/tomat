@@ -174,7 +174,7 @@ function hardwareTokens(runId: string, job: IrisJob | null): string[] {
  *  an absent counter. `lifecycle/trainer_starts` is incremented on every
  *  `trainer.train()` entry in `train_tomat_tpu.py`. */
 function lineageTokens(manifest: RunManifest | null): string[] {
-  const v = manifest?.summary['lifecycle/trainer_starts']
+  const v = manifest?.summary?.['lifecycle/trainer_starts']
   const starts = typeof v === 'number' ? v : 0
   return starts > 1 ? ['resume'] : ['scratch']
 }
@@ -195,7 +195,7 @@ export function runHaystack(
 
   // Dates. created + last-activity (if history available). Often the same
   // day, in which case the haystack just has the date twice — harmless.
-  const createdYmd = yymmddIso(manifest?.run.created_at)
+  const createdYmd = yymmddIso(manifest?.run?.created_at)
   if (createdYmd) tokens.push(createdYmd)
   const lastSec = lastActivitySec(history)
   if (lastSec != null) tokens.push(yymmdd(lastSec))
@@ -217,7 +217,7 @@ export function runHaystack(
 function runIdFromShort(shortLabel: string, manifest: RunManifest | null): string {
   // Manifest has the canonical name; fall back to the short label so the
   // function still works pre-manifest-load.
-  return manifest?.run.name ?? shortLabel
+  return manifest?.run?.name ?? shortLabel
 }
 
 // ── EXAMPLES — manual spec of expected behaviour ───────────────────────────

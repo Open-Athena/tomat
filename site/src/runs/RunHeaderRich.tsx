@@ -581,8 +581,8 @@ function StatusDots({ job, modalApp, manifest, incomplete, lastLogTs }: {
             : <Dot hollow title="iris: no job (e.g. a Modal run)" />)}
       {manifest
         ? <Dot
-            color={wandbDotColor(manifest.run.state, logAgeSec)}
-            title={`wandb: ${manifest.run.state} · ${loggedStr}`}
+            color={wandbDotColor(manifest.run?.state, logAgeSec)}
+            title={`wandb: ${manifest.run?.state} · ${loggedStr}`}
           />
         : <Dot hollow title="wandb: no data yet" />}
     </span>
@@ -924,13 +924,13 @@ export function RunHeaderRich({
   // wandb's run state can sit at "running" long after a Modal job has died
   // (it never flushed a terminal state). Treat a "running" run that hasn't
   // logged in >10min as stale — so the badge greys instead of reading green.
-  const lastLogTs = manifest?.history.ts_max ?? null
-  const wandbStale = manifest?.run.state === 'running'
+  const lastLogTs = manifest?.history?.ts_max ?? null
+  const wandbStale = manifest?.run?.state === 'running'
     && lastLogTs != null && (Date.now() / 1000 - lastLogTs) >= 600
 
   const meta = parseRunName(id)
   const hwColor = meta.hardwareKind ? HW_COLORS[meta.hardwareKind] : '#888'
-  const wbUrl = manifest?.run.url
+  const wbUrl = manifest?.run?.url
   // Prefer `trainer.num_train_steps` from the manifest config (authoritative,
   // reflects most-recent resume target) over the run-name parse (which freezes
   // the *original* target — e.g. cont7k-ext was named …-8k but is now resumed
@@ -953,7 +953,7 @@ export function RunHeaderRich({
   //      progress for runs whose training has stalled or hasn't started.
   // Both (1) and (2) are 0-indexed (Levanter convention) so we display +1.
   const ltsRaw = manifest?.history?.last_train_step
-  const gsRaw = manifest?.summary['global_step']
+  const gsRaw = manifest?.summary?.['global_step']
   const lastGlobalStep =
     typeof ltsRaw === 'number' ? ltsRaw
     : typeof gsRaw === 'number' ? gsRaw
@@ -965,13 +965,13 @@ export function RunHeaderRich({
   const progressPct = stepsDone != null && targetSteps != null
     ? Math.min(100, (stepsDone / targetSteps) * 100)
     : null
-  const trainLoss = manifest?.summary['train/loss']
-  const evalLoss = manifest?.summary['eval/loss']
-  const mfu = manifest?.summary['throughput/mfu']
+  const trainLoss = manifest?.summary?.['train/loss']
+  const evalLoss = manifest?.summary?.['eval/loss']
+  const mfu = manifest?.summary?.['throughput/mfu']
   // MT/MV — latest mat-NMAE on the {train,val}_200 mat snapshots. Stored already
   // as a percentage (cont7k-ext logs 1.73 = 1.73%), so display as-is — no ×100.
-  const mtNmae = manifest?.summary['eval/mat_nmae/train_200/mean']
-  const mvNmae = manifest?.summary['eval/mat_nmae/val_200/mean']
+  const mtNmae = manifest?.summary?.['eval/mat_nmae/train_200/mean']
+  const mvNmae = manifest?.summary?.['eval/mat_nmae/val_200/mean']
   const nEpochs = nEpochsOf(manifest)
   const nFlops = nFlopsOf(manifest)
 
@@ -1020,15 +1020,15 @@ export function RunHeaderRich({
             // than green.
             <Tooltip content={wandbStale
               ? `wandb says running, but last logged ${secsAgo(lastLogTs!)} — likely dead`
-              : `wandb state (no iris job, no modal app): ${manifest.run.state}`}>
+              : `wandb state (no iris job, no modal app): ${manifest.run?.state}`}>
               <span
                 style={{
                   backgroundColor: wandbStale
-                    ? '#6a737d' : (WANDB_STATE_BG[manifest.run.state] ?? '#555'),
+                    ? '#6a737d' : (WANDB_STATE_BG[manifest.run?.state] ?? '#555'),
                   color: '#fff', padding: '1px 6px', borderRadius: 3,
                   fontSize: '0.75rem', fontFamily: 'monospace',
                 }}>
-                {wandbStale ? 'STALE' : manifest.run.state.toUpperCase()}
+                {wandbStale ? 'STALE' : manifest.run?.state.toUpperCase()}
               </span>
             </Tooltip>
           )}
@@ -1151,7 +1151,7 @@ export function RunHeaderRich({
         <div style={{ marginTop: '0.3rem', fontSize: '0.75rem', color: '#888' }}>
           {manifest && (
             <>
-              created {timeAgo(manifest.run.created_at)}
+              created {timeAgo(manifest.run?.created_at)}
               {manifest.history.ts_max != null && (
                 <>
                   {' · '}
@@ -1164,8 +1164,8 @@ export function RunHeaderRich({
                 </>
               )}
               {' · '}synced {timeAgo(manifest.synced_at)}
-              {manifest.run.entity && manifest.run.project && (
-                <> · {manifest.run.entity}/{manifest.run.project}</>
+              {manifest.run?.entity && manifest.run?.project && (
+                <> · {manifest.run?.entity}/{manifest.run?.project}</>
               )}
             </>
           )}
@@ -1290,7 +1290,7 @@ export function isIncomplete(c: RunCardData): boolean {
   if (c.job?.state !== 'SUCCEEDED') return false
   // `global_step` is 0-indexed (a finished N-step run ends at N-1), so steps
   // completed = global_step + 1; "incomplete" = that falls short of target.
-  const gs = c.manifest?.summary['global_step']
+  const gs = c.manifest?.summary?.['global_step']
   const lastGlobalStep = typeof gs === 'number' ? gs : null
   const target = numTrainStepsOf(c.manifest)
   return lastGlobalStep != null && target != null && lastGlobalStep + 1 < target

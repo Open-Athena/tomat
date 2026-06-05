@@ -175,7 +175,7 @@ function RunCard({ data, activeRunId, pinnedRunId, parentWandbUrl, parentColor, 
 const RUNNING_RECENCY_MS = 10 * 60 * 1000
 function isRunning(c: RunCardData): boolean {
   if (c.job?.state === 'RUNNING') return true
-  if (!c.job && c.manifest?.run.state === 'running') {
+  if (!c.job && c.manifest?.run?.state === 'running') {
     const tsMax = c.manifest?.history?.ts_max
     if (typeof tsMax === 'number'
         && Date.now() - tsMax * 1000 < RUNNING_RECENCY_MS) {
@@ -219,9 +219,9 @@ const SORT_MODES = ['active', 'updated', 'created', 'name', 'step'] as const
 type SortMode = (typeof SORT_MODES)[number]
 
 function activityTs(c: RunCardData): number {
-  const tsMax = c.manifest?.history.ts_max
+  const tsMax = c.manifest?.history?.ts_max
   if (typeof tsMax === 'number') return tsMax * 1000
-  const ca = c.manifest?.run.created_at
+  const ca = c.manifest?.run?.created_at
   if (ca) return Date.parse(ca)
   // Manifest-less pending/building card: sort by iris submission time so
   // the most recent fire is at the top of the queued bucket.
@@ -229,14 +229,14 @@ function activityTs(c: RunCardData): number {
 }
 
 function createdTs(c: RunCardData): number {
-  const ca = c.manifest?.run.created_at
+  const ca = c.manifest?.run?.created_at
   if (ca) return Date.parse(ca)
   return c.job?.submitted_at_ms ?? 0
 }
 
 function lastStep(c: RunCardData): number {
-  return c.manifest?.history.last_train_step
-    ?? c.manifest?.history.step_max
+  return c.manifest?.history?.last_train_step
+    ?? c.manifest?.history?.step_max
     ?? -1
 }
 
@@ -317,7 +317,14 @@ function RunsIndex() {
     const data = snapshotQ.data
     if (!data) return []
     return Object.keys(data.runs)
-      .filter((id) => !EXCLUDED_RUNS.has(id) && data.runs[id] != null)
+      .filter((id) => {
+        if (EXCLUDED_RUNS.has(id)) return false
+        const entry = data.runs[id]
+        // Drop null entries AND malformed-manifest entries (missing run /
+        // history / summary). Worker-side cost-only sidecars sometimes ship
+        // without a manifest; those have no cards to render.
+        return entry != null && entry.run != null && entry.history != null && entry.summary != null
+      })
       .sort()
   }, [snapshotQ.data])
 
@@ -757,7 +764,7 @@ function RunsIndex() {
         const parentCard = lin && cards
           ? cards.find((rc) => rc.id === lin.parent)
           : null
-        const parentWandbUrl = parentCard?.manifest?.run.url ?? null
+        const parentWandbUrl = parentCard?.manifest?.run?.url ?? null
         // Parent's trace color — when the parent is in `cards` (so the plot
         // assigned it a stable color), surface that on the ParentChip swatch.
         const parentColor = parentCard?.color ?? null
