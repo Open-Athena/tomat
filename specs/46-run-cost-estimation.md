@@ -151,23 +151,38 @@ contribution desc.
 
 ## Phases
 
-**Phase A — TPU first**: write the `tomat cost compute` CLI for iris
-jobs only. Sidecar + CFW endpoint + dashboard chip + tooltip. Modal
-returns null `msrp_usd` for now. Backfill all synced runs once.
+**Phase A — TPU first** (done): `tomat cost compute` CLI for iris
+jobs. Sidecar + CFW endpoint + dashboard chip + tooltip. Modal returned
+a `Modal MSRP TBD` placeholder.
 
-**Phase B — Modal**: add the Modal billing API path. Fire one-off
-backfills on the existing modal-h200x8 runs. Verify against the
-Modal dashboard's own usage page.
+**Phase B — Modal + auto-population** (done): Modal MSRP is derived
+from wandb-tracked wallclock (`history.ts_max - ts_min`) × published
+per-GPU-hour rates, with a flat 5% CPU/memory adder. The same wandb
+fallback covers TPU runs whose attempts sidecar undercounts vs
+`job_failure_count + job_preemption_count` (iris's bug-report drops
+prior attempts). Both `tomat runs sync` (laptop) and
+`scripts/runs-sync.py` (cron VM) auto-populate `cost.json` after every
+manifest write — no manual `tomat cost compute` step required.
 
-**Phase C — cron hook**: wire the per-minute cost refresh into
-`scripts/cron_iris_sync_modal.py`.
+Trade-off vs spec's original Phase B (Modal billing API): the wandb
+ts-span path requires zero Modal-API plumbing, charges all sessions
+of the same wandb run id (so it handles cascade restarts correctly),
+and matches empirical billing within ~1% for our H200×8 runs (the
+flat adder is essentially a noise margin). The original "query
+Modal's billing API" approach remains an option if higher-accuracy
+attribution is ever needed; current impl is good enough for the
+public-facing chip.
 
-**Phase D — refinements**: per-region pricing, CPU/memory adders,
-chips per run-card (`/runs` list view).
+**Phase C — cron hook** (folded into Phase B): the per-manifest write
+in the cron's `runs-sync.py` calls `_compute_and_upload_cost`
+inline. The separate `cron_iris_sync_modal.py` does NOT need a
+parallel hook — it only syncs iris-state, not per-run state.
 
-Phase A alone gives most of the user value (TPU runs have been the
-expensive ones day-to-day). Phase B is the highest-priority
-follow-up.
+**Phase D — refinements**: per-region pricing, distinguishing
+preemptible vs reserved TPU at finer granularity (current wandb-span
+fallback always uses preemptible), chips per run-card on the `/runs`
+list view (already lands wherever `RunHeaderRich` is rendered, so
+shipped with Phase B).
 
 ## Open questions
 

@@ -247,11 +247,15 @@ async function buildRunsSnapshot(env: Env): Promise<{
 						msrp_usd?: number;
 						is_complete?: boolean;
 						pricing_table_version?: string;
-						breakdown?: { kind?: string }[];
+						breakdown?: { kind?: string; msrp_usd?: number | null }[];
 					};
 					if (typeof parsed.msrp_usd !== 'number') return null;
+					// `has_modal_pending` should mean "there is a Modal segment we
+					// HAVEN'T priced yet" — i.e. a placeholder with null msrp_usd.
+					// Modal segments with a real msrp_usd (Phase B) are no longer
+					// "pending"; the chip should show `$X MSRP`, not "Modal MSRP TBD".
 					const hasModalPending = Array.isArray(parsed.breakdown)
-						&& parsed.breakdown.some((b) => b?.kind === 'modal');
+						&& parsed.breakdown.some((b) => b?.kind === 'modal' && b?.msrp_usd == null);
 					return {
 						msrp_usd: parsed.msrp_usd,
 						is_complete: !!parsed.is_complete,

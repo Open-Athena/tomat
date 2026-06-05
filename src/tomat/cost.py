@@ -34,6 +34,145 @@ TPU_RATES_USD_PER_CHIP_HR: dict[str, dict[str, float]] = {
 }
 
 
+# Modal per-GPU-hour rates (USD), snapshot 2026-06-02 from
+# https://modal.com/pricing. Keys are the lowercase tokens we look for in
+# the run-name suffix (`h200x8` etc.). CPU + memory contributions are
+# folded into a flat MODAL_CPU_MEM_ADDER (~5% per spec 46) rather than
+# tracked precisely — for our GPU-heavy workloads the GPU dominates.
+# Empirical sanity check: H200×8 Modal billing rows for `tomat-train-smoke`
+# (see `tmp/modal-billing-today.csv`) land ~$36.73/hr, which matches
+# 8 × $4.56 × 1.005 = $36.66/hr to within rounding noise.
+MODAL_GPU_RATES_USD_PER_HR: dict[str, float] = {
+    "h100": 3.95,
+    "h200": 4.56,
+    "b200": 6.25,
+    "a100": 2.78,
+    "l40s": 1.95,
+}
+
+# Flat adder for CPU + memory contributions on top of the GPU rate. Spec 46
+# §"Modal pricing" calls 5% — empirically the billed totals for our H200×8
+# runs sit within ~1% of GPU-only × 1.005, so this is essentially a noise
+# margin rather than a real correction. Kept named so a future review can
+# bump it if/when we add CPU-heavier modal apps to this same cost path.
+MODAL_CPU_MEM_ADDER = 1.005
+
+
+# Run-name suffix: any of `-h200x8`, `-h100x8`, `-b200x8`, `-a100x8`,
+# `-l40sx8`, optionally adjacent to a dash/word boundary. `(?P<gpu>...)` →
+# GPU family ("h200"); `(?P<n>\d+)` → GPU count. Matches both the bare
+# `train-mg-modal-h200x8-…` convention and the rare double-suffix form.
+_MODAL_GPU_RE = re.compile(
+    r"-(?P<gpu>h100|h200|b200|a100|l40s)x(?P<n>\d+)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class ModalGpu:
+    """Parsed Modal GPU spec from a run name's `-h200x8` etc. suffix."""
+    gpu: str          # 'h100', 'h200', 'b200', 'a100', 'l40s' (lowercase)
+    num_gpus: int
+
+    @property
+    def rate_usd_per_hr(self) -> float | None:
+        """Total rate for the slice: num_gpus × per-GPU rate × CPU/mem adder.
+
+        None when the GPU type isn't in our pricing table (e.g. someone
+        added an `-mi300x8` run before updating the table).
+        """
+        per_gpu = MODAL_GPU_RATES_USD_PER_HR.get(self.gpu)
+        if per_gpu is None:
+            return None
+        return per_gpu * self.num_gpus * MODAL_CPU_MEM_ADDER
+
+    def label(self) -> str:
+        """Human-readable: `H200×8`. Used in the tooltip."""
+        return f"{self.gpu.upper()}×{self.num_gpus}"
+
+
+def parse_modal_gpu(label: str) -> ModalGpu | None:
+    """Extract (gpu, num_gpus) from a Modal run's `-h200x8` etc. suffix.
+
+    Returns None when no Modal GPU suffix is in the label. Use alongside
+    `is_modal_run`-style name detection in the caller.
+    """
+    m = _MODAL_GPU_RE.search(label)
+    if not m:
+        return None
+    return ModalGpu(gpu=m.group("gpu").lower(), num_gpus=int(m.group("n")))
+
+
+def compute_modal_segment_from_manifest(
+    run_label: str,
+    manifest: dict | None,
+    *,
+    now_ms: int | None = None,
+) -> CostSegment | None:
+    """One CostSegment per Modal run, from the wandb manifest's tracked
+    wallclock.
+
+    `history.ts_max - history.ts_min` is the span of the run's logged
+    rows across ALL sessions (Modal-fn restarts re-attach to the same
+    wandb run id, so this number aggregates correctly across cascade
+    restarts). Falls back to `_runtime` (single-session, undercount on
+    restart) when ts_max/ts_min aren't both populated.
+
+    Returns None when:
+      - We can't parse the GPU type from `run_label` (not actually a
+        Modal-styled run, or an unknown family).
+      - The manifest has no usable wallclock signal yet (fresh run, no
+        history rows).
+    """
+    gpu = parse_modal_gpu(run_label)
+    if gpu is None:
+        return None
+    rate_per_hr = gpu.rate_usd_per_hr
+    if rate_per_hr is None:
+        return None
+    if manifest is None:
+        return None
+    # Prefer the parquet-derived ts range — survives Modal restarts.
+    hist = manifest.get("history") or {}
+    ts_min = hist.get("ts_min")
+    ts_max = hist.get("ts_max")
+    wallclock_sec: float | None = None
+    started_at_ms: int | None = None
+    finished_at_ms: int | None = None
+    if isinstance(ts_min, (int, float)) and isinstance(ts_max, (int, float)) and ts_max > ts_min:
+        wallclock_sec = float(ts_max - ts_min)
+        started_at_ms = int(ts_min * 1000)
+        finished_at_ms = int(ts_max * 1000)
+    else:
+        # Single-session fallback. `_runtime` is wandb's seconds-since-
+        # session-start; only present in the run summary.
+        summary = manifest.get("summary") or {}
+        rt = summary.get("_runtime")
+        if isinstance(rt, (int, float)) and rt > 0:
+            wallclock_sec = float(rt)
+            ts = summary.get("_timestamp")
+            if isinstance(ts, (int, float)):
+                finished_at_ms = int(ts * 1000)
+                started_at_ms = int((ts - rt) * 1000)
+    if wallclock_sec is None or wallclock_sec < 1.0:
+        return None
+    msrp = (wallclock_sec / 3600.0) * rate_per_hr
+    # The source string surfaces in the tooltip; pick the data-source we used.
+    src = ("wandb history ts span"
+           if (isinstance(ts_min, (int, float)) and isinstance(ts_max, (int, float)))
+           else "wandb summary._runtime")
+    return CostSegment(
+        kind="modal",
+        label=gpu.label(),
+        wallclock_sec=wallclock_sec,
+        rate_per_hr_usd=rate_per_hr,
+        msrp_usd=msrp,
+        source=src,
+        started_at_ms=started_at_ms,
+        finished_at_ms=finished_at_ms,
+    )
+
+
 # Iris worker hostnames embed both the variant (`v5p`, `v6e`) and the
 # allocation class (`preemptible`, `reserved`, `serving`) — see
 # `iris-pool-naming` memory. Example:
@@ -316,6 +455,53 @@ def compute_tpu_segments_from_job_window(
         started_at_ms=start_ms,
         finished_at_ms=end_ms,
     )]
+
+
+def compute_tpu_segment_from_manifest(
+    variant: TpuVariant,
+    manifest: dict | None,
+) -> CostSegment | None:
+    """Fallback TPU wallclock derived from wandb's `history.ts_max - ts_min`.
+
+    Used when:
+      - The attempts sidecar undercounts (iris-bug-report drops prior
+        cycles) AND the iris-state job-window is shorter than wandb's
+        tracked range (current iris-job entry covers only the most
+        recent fire).
+      - The attempts sidecar is missing AND the iris-state job-window
+        would similarly undercount.
+
+    Same caveat as the Modal path: this assumes the wandb-logged time
+    span ≈ the slice's billable time. A run that paused logging during
+    a long preempt cycle will undercount, but in practice Levanter logs
+    continuously while training and the wandb sessions re-attach
+    transparently across iris restarts, so the span is a tight upper
+    bound on the run's per-iris-attempt cost.
+    """
+    if manifest is None:
+        return None
+    rate = variant.rate_usd_per_chip_hr
+    if rate is None:
+        return None
+    hist = manifest.get("history") or {}
+    ts_min = hist.get("ts_min")
+    ts_max = hist.get("ts_max")
+    if not (isinstance(ts_min, (int, float)) and isinstance(ts_max, (int, float))):
+        return None
+    wallclock_sec = float(ts_max - ts_min)
+    if wallclock_sec < 1.0:
+        return None
+    msrp = (wallclock_sec / 3600.0) * variant.num_chips * rate
+    return CostSegment(
+        kind="tpu",
+        label=variant.label(),
+        wallclock_sec=wallclock_sec,
+        rate_per_hr_usd=rate * variant.num_chips,
+        msrp_usd=msrp,
+        source="wandb history ts span (covers all iris re-fires)",
+        started_at_ms=int(ts_min * 1000),
+        finished_at_ms=int(ts_max * 1000),
+    )
 
 
 def build_cost_record(

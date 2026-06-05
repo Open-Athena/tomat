@@ -1103,6 +1103,26 @@ def runs_sync(substr: str, bucket: str, prefix: str, project: str | None, dry_ru
     err(f"[sync] uploaded to s3://{bucket}/{prefix}/{r.name}/{{raw.parquet,manifest.json}}")
     print(f"{R2_ENDPOINT}/{bucket}/{parquet_key}")
 
+    # Auto-populate cost.json (spec 46) — the dashboard's `$X MSRP` chip
+    # reads this. Cheap to compute (one R2 GET for iris-state, optional
+    # attempts sidecar GET for TPU runs; Modal runs reuse the manifest
+    # we just built). Failures here must NOT abort runs sync — cost is
+    # secondary to the parquet + manifest write.
+    try:
+        iris_state = _r2_get_json(bucket, "tomat/iris-state.json")
+        _compute_one_cost(
+            r.name,
+            bucket=bucket,
+            runs_prefix=prefix,
+            attempts_prefix="tomat/iris-attempts",
+            iris_state=iris_state,
+            dry_run=False,
+            manifest=manifest,
+        )
+    except Exception as e:
+        err(f"[sync] WARN: cost compute failed for {r.name}: "
+            f"{type(e).__name__}: {e}")
+
 
 @runs.command("wallclock-plot")
 @click.argument("substr")
@@ -1570,18 +1590,23 @@ def iris_ls(filter_re: str | None, state: str | None, show_all: bool):
 
 @iris_grp.command("kill")
 @click.argument("substr")
+@click.option("-p", "--pending", is_flag=True, help="kill pending jobs (default: running only)")
 @click.option("-y", "--yes", is_flag=True, help="skip confirmation prompt")
-def iris_kill(substr: str, yes: bool):
-    """Kill iris jobs whose name matches SUBSTR (running ones only)."""
-    matches = []
-    for line in iris_list_lines(state="running"):
-        jid = line.split()[0]
-        if jid.count("/") > 2:
-            continue
-        if substr in jid:
-            matches.append(jid)
+def iris_kill(substr: str, pending: bool, yes: bool):
+    """Kill iris jobs whose name matches SUBSTR (running by default; -p adds pending)."""
+    states = ["running"] + (["pending"] if pending else [])
+    matches: list[str] = []
+    seen: set[str] = set()
+    for s in states:
+        for line in iris_list_lines(state=s):
+            jid = line.split()[0]
+            if jid.count("/") > 2:
+                continue
+            if substr in jid and jid not in seen:
+                matches.append(jid)
+                seen.add(jid)
     if not matches:
-        err(f"no running parent jobs match {substr!r}")
+        err(f"no {'/'.join(states)} parent jobs match {substr!r}")
         sys.exit(1)
     err(f"will kill {len(matches)} jobs:")
     for j in matches:
@@ -4425,15 +4450,19 @@ def _compute_one_cost(
     attempts_prefix: str,
     iris_state: dict | None,
     dry_run: bool,
+    manifest: dict | None = None,
 ) -> dict | None:
     """Compute + (optionally) upload one run's cost.json. Returns the record.
 
     Skips runs we can't make a TPU MSRP estimate for (no recognisable TPU
-    suffix AND no iris job AND not a Modal run). Modal runs get a placeholder
-    `Modal MSRP TBD` segment so the dashboard chip renders an honest "pending".
+    suffix AND no iris job AND not a Modal run). For Modal runs, we read
+    the manifest (passed in or freshly fetched) to derive wallclock from
+    wandb's tracked history span — Phase B of spec 46.
     """
     from tomat.cost import (
         build_cost_record,
+        compute_modal_segment_from_manifest,
+        compute_tpu_segment_from_manifest,
         compute_tpu_segments,
         compute_tpu_segments_from_job_window,
         CostSegment,
@@ -4455,6 +4484,11 @@ def _compute_one_cost(
     job: dict | None = None
     if iris_state is not None:
         job = iris_state.get("jobs", {}).get(f"/{IRIS_USER}/{run_label}")
+    # Manifest — lazily fetched. Required for Modal runs (we read
+    # `history.ts_min/max` for wallclock). Caller may pass it in to avoid
+    # a redundant R2 round-trip when we just wrote it (see `runs_sync`).
+    if manifest is None:
+        manifest = _r2_get_json(bucket, f"{runs_prefix}/{run_label}/manifest.json")
 
     # Try to parse TPU hardware from the label. Modal runs (h100x8, h200x8,
     # b200x8) won't match — they get the Phase-B placeholder.
@@ -4475,21 +4509,40 @@ def _compute_one_cost(
     is_complete = False
 
     if parsed is None and is_modal_run:
-        # Phase B placeholder: surface "Modal MSRP TBD" so the dashboard
-        # doesn't claim $0. Wallclock + GPU spec stay null until Phase B
-        # wires Modal's billing API.
-        notes.append("Modal MSRP not yet implemented (Phase B)")
-        segments.append(CostSegment(
-            kind="modal",
-            label="Modal MSRP TBD",
-            wallclock_sec=0.0,
-            rate_per_hr_usd=None,
-            msrp_usd=None,
-            source="phase-b-pending",
-        ))
-        # Modal runs: is_complete reflects only whether the function call
-        # finished. We can't tell from cost-input alone; leave False so the
-        # tooltip won't say "final".
+        # Phase B: derive Modal wallclock from the wandb manifest. The
+        # parquet `history.ts_max - ts_min` span survives Modal-fn restarts
+        # (same wandb run id across re-attaches) so it correctly aggregates
+        # multi-session runs like `v4-epochwin`. Falls back to `_runtime`
+        # when ts_min/ts_max aren't both populated (very fresh run).
+        modal_seg = compute_modal_segment_from_manifest(
+            run_label, manifest, now_ms=now_ms,
+        )
+        if modal_seg is not None:
+            segments.append(modal_seg)
+        else:
+            # No usable wallclock signal yet (no manifest, no history rows).
+            # Emit the "TBD" placeholder so the dashboard chip still
+            # renders honestly rather than silently dropping to $0.
+            notes.append("Modal MSRP: no usable wallclock signal yet "
+                         "(manifest missing or no history rows)")
+            segments.append(CostSegment(
+                kind="modal",
+                label="Modal MSRP TBD",
+                wallclock_sec=0.0,
+                rate_per_hr_usd=None,
+                msrp_usd=None,
+                source="awaiting-first-history-row",
+            ))
+        # is_complete: a Modal run is "done" when wandb reports a terminal
+        # state (finished / crashed / failed / killed). Cheap signal from
+        # the manifest we just read.
+        if manifest is not None:
+            wb_state = (manifest.get("run") or {}).get("state")
+            is_complete = wb_state in {"finished", "crashed", "failed", "killed"}
+        notes.append(
+            "Modal MSRP is an estimate from wandb-tracked wallclock × "
+            "published per-GPU-hour rates (snapshot pricing); see spec 46."
+        )
     elif parsed is not None:
         family, num_chips = parsed
         alloc = detect_allocation_class(attempts)
@@ -4501,16 +4554,12 @@ def _compute_one_cost(
         if variant.rate_usd_per_chip_hr is None:
             notes.append(f"no published rate for TPU variant={family}")
         elif attempts is not None:
-            segments.extend(
-                compute_tpu_segments(attempts, variant, now_ms=now_ms)
-            )
+            attempt_segs = compute_tpu_segments(attempts, variant, now_ms=now_ms)
             is_complete = attempts.get("finished_at_ms") is not None
-            if not segments:
-                notes.append("no billable attempt windows in sidecar")
             # iris's `gather_bug_report` only preserves the most-recent attempt
             # per task — prior failed/preempted cycles are dropped. When the
             # job's failure+preempt counters exceed what we see in the
-            # sidecar, the MSRP estimate UNDERCOUNTS those earlier cycles.
+            # sidecar, the per-attempt walk UNDERCOUNTS prior cycles.
             n_attempts_seen = len({
                 a.get("attempt_id") for t in attempts.get("tasks", [])
                 for a in t.get("attempts", []) if a.get("attempt_id") is not None
@@ -4518,21 +4567,83 @@ def _compute_one_cost(
             f = (attempts.get("job_failure_count") or 0)
             p = (attempts.get("job_preemption_count") or 0)
             historical_cycles = f + p
-            if historical_cycles > n_attempts_seen:
+            undercounted = historical_cycles > n_attempts_seen
+            # When the sidecar undercounts, try progressively wider sources
+            # to surface a realistic chip number:
+            #   1. iris-state job window: full submitted→finished wallclock
+            #      for the CURRENT iris-job entry.
+            #   2. wandb history ts span: covers ALL iris re-fires (the
+            #      same wandb run id survives iris label re-submission).
+            # Pick the LONGEST wallclock among the candidates that produced
+            # a segment. Without this, runs with dropped historical cycles
+            # report ~$1 instead of their real cost.
+            chosen_seg: CostSegment | None = None
+            chosen_source: str | None = None
+            if undercounted:
+                candidates: list[tuple[CostSegment, str]] = []
+                if job is not None:
+                    js = compute_tpu_segments_from_job_window(
+                        job, variant, now_ms=now_ms,
+                    )
+                    if js:
+                        candidates.append((js[0], "iris-state job window"))
+                ms = compute_tpu_segment_from_manifest(variant, manifest)
+                if ms is not None:
+                    candidates.append((ms, "wandb history ts span (all re-fires)"))
+                if candidates:
+                    chosen_seg, chosen_source = max(
+                        candidates, key=lambda x: x[0].wallclock_sec,
+                    )
+            if chosen_seg is not None:
+                segments.append(chosen_seg)
                 notes.append(
-                    f"undercount: {historical_cycles} historical "
+                    f"used {chosen_source}: {historical_cycles} historical "
                     f"failure/preempt cycles vs {n_attempts_seen} attempt(s) "
-                    f"in sidecar (iris bug-report drops prior attempts)"
+                    f"in sidecar — the sidecar's per-attempt detail would "
+                    f"undercount."
                 )
+            else:
+                segments.extend(attempt_segs)
+                if not segments:
+                    notes.append("no billable attempt windows in sidecar")
+                elif undercounted:
+                    notes.append(
+                        f"undercount: {historical_cycles} historical "
+                        f"failure/preempt cycles vs {n_attempts_seen} "
+                        f"attempt(s) in sidecar (iris bug-report drops prior)"
+                    )
         elif job is not None:
-            segments.extend(
-                compute_tpu_segments_from_job_window(job, variant, now_ms=now_ms)
+            # No attempts sidecar. Take the LONGER of the iris-state
+            # job-window (current iris-job entry) and the wandb-tracked
+            # history span (covers all iris re-fires) — same logic as the
+            # undercounted-attempts branch.
+            js = compute_tpu_segments_from_job_window(
+                job, variant, now_ms=now_ms,
             )
-            notes.append("no attempts sidecar; charged full iris-state window")
+            ms = compute_tpu_segment_from_manifest(variant, manifest)
+            candidates: list[tuple[CostSegment, str]] = []
+            if js:
+                candidates.append((js[0], "iris-state job window"))
+            if ms is not None:
+                candidates.append((ms, "wandb history ts span (all re-fires)"))
+            if candidates:
+                seg, src = max(candidates, key=lambda x: x[0].wallclock_sec)
+                segments.append(seg)
+                notes.append(f"no attempts sidecar; used {src}")
             is_complete = job.get("finished_at_ms") is not None
         else:
-            notes.append("no attempts sidecar AND no iris-state job entry; "
-                         "MSRP estimate unavailable for this TPU run")
+            # No attempts sidecar AND no iris-state entry. Last fallback:
+            # the wandb manifest's tracked history span. Honest about the
+            # source in the tooltip.
+            ms = compute_tpu_segment_from_manifest(variant, manifest)
+            if ms is not None:
+                segments.append(ms)
+                notes.append("no attempts sidecar, no iris-state job entry; "
+                             "used wandb history ts span")
+            else:
+                notes.append("no attempts sidecar AND no iris-state job entry "
+                             "AND no wandb history span; MSRP estimate "
+                             "unavailable for this TPU run")
     else:
         notes.append(f"unrecognised hardware for run {run_label!r} — "
                      f"no TPU suffix found; not a Modal run by name")

@@ -846,10 +846,13 @@ function CostBreakdownTooltipBody({ cost, summary }: {
   )
 }
 
-function CostChip({ runId, summary, isModalOnly }: {
+function CostChip({ runId, summary }: {
   runId: string
   summary: RunCostSummary | null
-  isModalOnly: boolean
+  /** Caller-side: was this a Modal run? Kept for future re-use even
+   *  though Phase B no longer special-cases Modal-only on the chip side
+   *  (real msrp_usd now lands on every sync). */
+  isModalOnly?: boolean
 }) {
   // Lazy-fetch the full breakdown on tooltip hover. Until the user hovers,
   // we render only what's in the snapshot's summary (msrp_usd + snapshot
@@ -861,19 +864,18 @@ function CostChip({ runId, summary, isModalOnly }: {
     staleTime: 60_000,
   })
   if (summary == null) {
-    // Modal-only runs with no sidecar yet: still render the chip slot so
-    // the user knows it's pending implementation, not free.
-    if (isModalOnly) {
-      return (
-        <Tooltip content="Modal MSRP not yet implemented (Phase B). The dashboard will surface a $X MSRP figure here once we wire Modal's billing API.">
-          <span style={{ color: '#888', fontFamily: 'monospace', fontStyle: 'italic' }}>
-            Modal MSRP TBD
-          </span>
-        </Tooltip>
-      )
-    }
+    // No sidecar yet — hide the chip rather than render an alarming
+    // placeholder. The `runs sync` flow auto-populates cost.json on
+    // every sync (spec 46 Phase A/B), so the gap is briefly the time
+    // between run creation and the next sync. `isModalOnly` is no
+    // longer special-cased — Modal cost is now computed too.
     return null
   }
+  // Phase B writes real Modal msrp_usd values via wandb-tracked wallclock,
+  // so a non-null summary with msrp_usd > 0 always renders as $X MSRP.
+  // `has_modal_pending` only fires now when a Modal segment ships with
+  // null msrp_usd (the "no usable wallclock signal yet" placeholder),
+  // which we keep separate from the `$X MSRP` chip's happy path.
   const label = summary.has_modal_pending && summary.msrp_usd === 0
     ? 'Modal MSRP TBD'
     : `${formatMsrp(summary.msrp_usd)} MSRP`
@@ -1238,11 +1240,15 @@ export function RunHeaderRich({
           {typeof mfu === 'number' && <> · MFU {mfu.toFixed(1)}%</>}
           {typeof mtNmae === 'number' && <> · MT {mtNmae.toFixed(2)}%</>}
           {typeof mvNmae === 'number' && <> · MV {mvNmae.toFixed(2)}%</>}
-          {(data.cost != null || isModalRun(id)) && (
+          {data.cost != null && (
+            // Spec 46 Phase A/B: chip renders only when a cost.json sidecar
+            // has been computed (via `tomat runs sync` or `tomat cost
+            // compute`). Modal runs without a sidecar yet hide silently
+            // rather than show "TBD" — they'll appear on the next sync.
             <> · <CostChip
               runId={id}
-              summary={data.cost ?? null}
-              isModalOnly={data.cost == null && isModalRun(id)}
+              summary={data.cost}
+              isModalOnly={isModalRun(id)}
             /></>
           )}
           {nFlops != null && <> · {formatFlops(nFlops)} FLOP</>}

@@ -25,6 +25,7 @@ import datetime
 import io
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -58,6 +59,28 @@ WANDB_PROJECTS = [
 # and R2 PUT cost. Heartbeat-fresh runs that aren't state=running are
 # rare (just-crashed before the state-flush) but worth catching.
 ACTIVE_HEARTBEAT_WINDOW_SEC = 60 * 60  # 1 hour
+
+# Spec 46 (Phase A/B): per-run MSRP estimates land at
+# `runs/<label>/cost.json`. We mirror the per-GPU/per-TPU rate tables from
+# `src/tomat/cost.py` here so the cron VM doesn't need the `tomat` package
+# installed — `runs-sync.py` is a standalone deploy.
+COST_PRICING_TABLE_VERSION = "2026-06-02"
+COST_SCHEMA_VERSION = 1
+TPU_RATES_USD_PER_CHIP_HR = {
+    "v5p": {"on-demand": 4.20, "preemptible": 1.68},
+    "v6e": {"on-demand": 2.70, "preemptible": 1.08},
+}
+MODAL_GPU_RATES_USD_PER_HR = {
+    "h100": 3.95, "h200": 4.56, "b200": 6.25, "a100": 2.78, "l40s": 1.95,
+}
+MODAL_CPU_MEM_ADDER = 1.005
+_MODAL_GPU_RE = re.compile(
+    r"-(?P<gpu>h100|h200|b200|a100|l40s)x(?P<n>\d+)\b", re.IGNORECASE,
+)
+_TPU_VARIANT_RE = re.compile(
+    r"(?<![a-z0-9])(v5p|v6e|tpu)(\d+)(?![a-z0-9])", re.IGNORECASE,
+)
+
 
 # Schema mirrors `tomat:76-92`. Bump version on incompatible changes.
 RUN_PARQUET_SCHEMA_VERSION = 1
@@ -319,6 +342,13 @@ def sync_one_run(s3, run_name: str, copies: list) -> tuple[str, int, int]:
             Body=json.dumps(manifest, indent=2).encode(),
             ContentType="application/json", CacheControl="public, max-age=60",
         )
+        # Refresh cost.json too so the chip keeps ticking on in-flight runs
+        # — wallclock keeps growing even when no new history rows landed.
+        try:
+            _compute_and_upload_cost(s3, run_name, manifest)
+        except Exception as e:
+            err(f"  [{run_name}] cost compute failed (non-fatal): "
+                f"{type(e).__name__}: {e}")
         return ("nochange", prev_history.get("rows", 0), 0)
 
     if since_step is None:
@@ -359,7 +389,167 @@ def sync_one_run(s3, run_name: str, copies: list) -> tuple[str, int, int]:
         Body=json.dumps(manifest, indent=2).encode(),
         ContentType="application/json", CacheControl="public, max-age=60",
     )
+    # Spec 46: keep cost.json fresh on the same cadence as manifest. Cheap
+    # (Modal: no extra R2 read; TPU: one iris-state.json fetch — but we
+    # accept the cost since the chip on /runs reads from runs-snapshot,
+    # which itself reads cost.json). Failure here MUST not block the
+    # manifest write — cost is secondary.
+    try:
+        _compute_and_upload_cost(s3, run_name, manifest)
+    except Exception as e:
+        err(f"  [{run_name}] cost compute failed (non-fatal): "
+            f"{type(e).__name__}: {e}")
     return ("ok", table.num_rows, len(parquet_bytes))
+
+
+# ── cost.json (spec 46) — Modal + TPU MSRP from manifest ─────────────────
+
+
+def _parse_modal_gpu(label):
+    """Return (gpu_lc, num_gpus) parsed from a run's `-h200x8` suffix, or None."""
+    m = _MODAL_GPU_RE.search(label)
+    if not m:
+        return None
+    return (m.group("gpu").lower(), int(m.group("n")))
+
+
+def _parse_tpu_variant(label):
+    """Return (family_lc, num_chips) from a TPU run-name suffix, or None.
+
+    Matches `v5p16`, `v6e32`, `tpu16` (shorthand → v6e).
+    """
+    m = _TPU_VARIANT_RE.search(label)
+    if not m:
+        return None
+    family = m.group(1).lower()
+    chips = int(m.group(2))
+    if family == "tpu":
+        family = "v6e"
+    return (family, chips)
+
+
+def _modal_segment_from_manifest(label, manifest):
+    """Modal cost segment from `history.ts_max - ts_min`. None when:
+       - label has no Modal GPU suffix
+       - GPU family not in our rate table
+       - manifest has no usable wallclock signal
+    """
+    parsed = _parse_modal_gpu(label)
+    if parsed is None:
+        return None
+    gpu, n = parsed
+    per_gpu = MODAL_GPU_RATES_USD_PER_HR.get(gpu)
+    if per_gpu is None:
+        return None
+    rate = per_gpu * n * MODAL_CPU_MEM_ADDER
+    hist = (manifest or {}).get("history") or {}
+    ts_min, ts_max = hist.get("ts_min"), hist.get("ts_max")
+    src = "wandb history ts span"
+    wallclock_sec = None
+    started_at_ms = finished_at_ms = None
+    if (isinstance(ts_min, (int, float)) and isinstance(ts_max, (int, float))
+            and ts_max > ts_min):
+        wallclock_sec = float(ts_max - ts_min)
+        started_at_ms = int(ts_min * 1000)
+        finished_at_ms = int(ts_max * 1000)
+    else:
+        summary = (manifest or {}).get("summary") or {}
+        rt = summary.get("_runtime")
+        if isinstance(rt, (int, float)) and rt > 0:
+            wallclock_sec = float(rt)
+            ts = summary.get("_timestamp")
+            if isinstance(ts, (int, float)):
+                finished_at_ms = int(ts * 1000)
+                started_at_ms = int((ts - rt) * 1000)
+            src = "wandb summary._runtime"
+    if wallclock_sec is None or wallclock_sec < 1.0:
+        return None
+    msrp = (wallclock_sec / 3600.0) * rate
+    return {
+        "kind": "modal", "label": f"{gpu.upper()}×{n}",
+        "wallclock_sec": round(wallclock_sec, 3),
+        "rate_per_hr_usd": rate,
+        "msrp_usd": round(msrp, 4),
+        "source": src,
+        "started_at_ms": started_at_ms, "finished_at_ms": finished_at_ms,
+    }
+
+
+def _tpu_segment_from_manifest(label, manifest):
+    """TPU cost segment using wandb-tracked wallclock × the *preemptible* rate.
+
+    The cron has no iris-state visibility (that's iris-sync.py's job, and
+    the two scripts only share R2). Assuming preemptible is the safe
+    direction: it UNDERESTIMATES vs on-demand for reserved/serving slices,
+    which is the right direction for a public MSRP chip — matches
+    `tomat.cost.detect_allocation_class`'s default.
+    """
+    parsed = _parse_tpu_variant(label)
+    if parsed is None:
+        return None
+    family, chips = parsed
+    rates = TPU_RATES_USD_PER_CHIP_HR.get(family)
+    if rates is None:
+        return None
+    rate = rates["preemptible"]
+    hist = (manifest or {}).get("history") or {}
+    ts_min, ts_max = hist.get("ts_min"), hist.get("ts_max")
+    if not (isinstance(ts_min, (int, float)) and isinstance(ts_max, (int, float))
+            and ts_max > ts_min):
+        return None
+    wallclock_sec = float(ts_max - ts_min)
+    if wallclock_sec < 1.0:
+        return None
+    msrp = (wallclock_sec / 3600.0) * chips * rate
+    return {
+        "kind": "tpu",
+        "label": f"{family}-{chips} preemptible",
+        "wallclock_sec": round(wallclock_sec, 3),
+        "rate_per_hr_usd": rate * chips,
+        "msrp_usd": round(msrp, 4),
+        "source": "wandb history ts span (covers all iris re-fires)",
+        "started_at_ms": int(ts_min * 1000),
+        "finished_at_ms": int(ts_max * 1000),
+    }
+
+
+def _compute_and_upload_cost(s3, run_name, manifest):
+    """Write `runs/<run_name>/cost.json` (spec 46 Phase A/B).
+
+    We try Modal first (the suffix `-h200x8` etc. dominates), then TPU
+    (`v5p16` / `v6e16` / `tpu16` suffixes). Runs with no recognisable
+    hardware suffix get a placeholder record so the dashboard chip can
+    still render — though it'll hide when `msrp_usd === 0`.
+    """
+    seg = _modal_segment_from_manifest(run_name, manifest)
+    notes = []
+    if seg is None:
+        seg = _tpu_segment_from_manifest(run_name, manifest)
+    else:
+        notes.append(
+            "Modal MSRP is an estimate from wandb-tracked wallclock × "
+            "published per-GPU-hour rates (snapshot pricing); see spec 46."
+        )
+    breakdown = [seg] if seg is not None else []
+    total = round(sum(b.get("msrp_usd") or 0.0 for b in breakdown), 2)
+    state = (manifest.get("run") or {}).get("state")
+    is_complete = state in {"finished", "crashed", "failed", "killed"}
+    record = {
+        "schema_version": COST_SCHEMA_VERSION,
+        "pricing_table_version": COST_PRICING_TABLE_VERSION,
+        "computed_at": datetime.datetime.now(datetime.timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "is_complete": is_complete,
+        "msrp_usd": total,
+        "breakdown": breakdown,
+        "notes": notes,
+    }
+    key = f"{R2_PREFIX}/{run_name}/cost.json"
+    s3.put_object(
+        Bucket=R2_BUCKET, Key=key,
+        Body=json.dumps(record, separators=(",", ":")).encode("utf-8"),
+        ContentType="application/json", CacheControl="public, max-age=60",
+    )
 
 
 def main():
