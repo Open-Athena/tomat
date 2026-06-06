@@ -764,76 +764,104 @@ def _vl_backfill_rows(
     ckpt_leaf: str,
     bucket: str = GCS_BUCKET,
 ) -> list[dict]:
-    """List `gs://<bucket>/eval/vl-backfill/<ckpt_leaf>/step-*.json` and emit
-    per-step history-style rows that `runs_sync` can splice into the wandb
-    history before parquet build.
+    """List per-step VL JSONs and emit history-style rows that `runs_sync`
+    can splice into the wandb history before parquet build.
 
-    Each row mirrors what `wandb.log({"eval/loss": ..., "global_step": ...})`
-    would have logged at training time, with `_timestamp` synthesized from
-    the JSON's `mtime` (so the row sorts after every wandb history row whose
-    `_timestamp` is older, and before any later row — both fine, since
-    `runs_sync` re-sorts by `_step` at the end anyway).
+    Two source dirs, queried in this order (later wins on per-step overlap):
+      1. `gs://<bucket>/eval/vl-backfill/<ckpt_leaf>/step-*.json` — older
+         backfill from `scripts/backfill_vl_modal.py` and the first
+         `preamble_vl_modal.py` baseline pass, both of which sampled
+         patches from the TAIL of `train-full-v3`. Not real VL (training
+         materials), but kept as a fallback for runs without a held-out
+         pass.
+      2. `gs://<bucket>/eval/vl/<ckpt_leaf>/step-*.json` — newer
+         held-out VL from `preamble_vl_modal.py --label val-full-v3`
+         (the default since 2026-06-05). This is the real generalization
+         signal. Overrides (1) on overlapping steps.
 
-    See `scripts/backfill_vl_modal.py` for the producer side. Skips silently
-    (returns `[]`) when no JSONs exist — runs without backfill artifacts
-    pass through unchanged.
+    Each emitted row mirrors what `wandb.log({"eval/loss": ...,
+    "global_step": ...})` would have logged at training time, with
+    `_timestamp` synthesized from the JSON's `mtime` (so the row sorts
+    after every wandb history row whose `_timestamp` is older, and before
+    any later row — both fine, since `runs_sync` re-sorts by `_step` at
+    the end anyway).
+
+    Skips silently (returns `[]`) when no JSONs exist — runs without VL
+    artifacts pass through unchanged.
     """
     import json
-    import fsspec
-    base = f"{bucket}/eval/vl-backfill/{ckpt_leaf}"
-    try:
-        fs, _ = fsspec.core.url_to_fs(base)
-        # `ls` raises FileNotFoundError on missing dirs in gcsfs.
-        if not fs.exists(base):
-            return []
-        paths = [p for p in fs.ls(base) if p.endswith(".json")]
-    except (FileNotFoundError, ValueError) as e:
-        err(f"[sync] vl-backfill: ls {base} failed: "
-            f"{type(e).__name__}: {e}")
-        return []
-    if not paths:
-        return []
     import re as _re
-    out: list[dict] = []
-    for p in sorted(paths):
+    import fsspec
+
+    def _read_dir(base: str, kind: str) -> dict[int, dict]:
+        """Return step→row dict for one source dir. Empty on missing dir."""
         try:
-            with fs.open(p, "r") as f:
-                d = json.load(f)
-            # Two known JSON shapes:
-            #   (a) `backfill_vl_modal.py`: {"step": N, "eval_loss": x, ...}
-            #   (b) `preamble_vl_modal.py` (baseline mode):
-            #       {"results": {"baseline": {"mean": x, ...}}, ...}
-            #       — step parsed from filename `.../step-<N>.json`.
-            if "step" in d and "eval_loss" in d:
-                step, ev = int(d["step"]), float(d["eval_loss"])
-            else:
-                # parse step from filename
-                m = _re.search(r"step-(\d+)\.json$", p)
-                if not m:
-                    raise KeyError(f"can't extract step from {p}")
-                step = int(m.group(1))
-                # find the baseline mean
-                ev = float(d["results"]["baseline"]["mean"])
-        except (KeyError, ValueError, json.JSONDecodeError) as e:
-            err(f"[sync] vl-backfill: skip {p}: {type(e).__name__}: {e}")
-            continue
-        try:
-            info = fs.info(p)
-            mtime = float(info.get("mtime") or info.get("updated") or 0)
-        except Exception:
-            mtime = 0.0
-        # Match the shape of a wandb history row: include `global_step` so
-        # `_trim_to_latest_trajectory` treats this as a training-step row
-        # (don't trip the reset detector — set monotonically increasing
-        # `_step` proxies too).
-        out.append({
-            "_step": step,
-            "_timestamp": mtime,
-            "global_step": step,
-            "eval/loss": ev,
-        })
-    err(f"[sync] vl-backfill: merged {len(out)} step(s) from {base}/")
-    return out
+            fs, _ = fsspec.core.url_to_fs(base)
+            if not fs.exists(base):
+                return {}
+            paths = [p for p in fs.ls(base) if p.endswith(".json")]
+        except (FileNotFoundError, ValueError) as e:
+            err(f"[sync] {kind}: ls {base} failed: "
+                f"{type(e).__name__}: {e}")
+            return {}
+        rows: dict[int, dict] = {}
+        for p in sorted(paths):
+            try:
+                with fs.open(p, "r") as f:
+                    d = json.load(f)
+                # Two known JSON shapes:
+                #   (a) `backfill_vl_modal.py`: {"step": N, "eval_loss": x, ...}
+                #   (b) `preamble_vl_modal.py` (baseline mode):
+                #       {"results": {"baseline": {"mean": x, ...}}, ...}
+                #       — step parsed from filename `.../step-<N>.json`.
+                if "step" in d and "eval_loss" in d:
+                    step, ev = int(d["step"]), float(d["eval_loss"])
+                else:
+                    m = _re.search(r"step-(\d+)\.json$", p)
+                    if not m:
+                        raise KeyError(f"can't extract step from {p}")
+                    step = int(m.group(1))
+                    ev = float(d["results"]["baseline"]["mean"])
+            except (KeyError, ValueError, json.JSONDecodeError) as e:
+                err(f"[sync] {kind}: skip {p}: {type(e).__name__}: {e}")
+                continue
+            try:
+                info = fs.info(p)
+                # gcsfs returns `mtime` as a `datetime` and `updated` as an
+                # ISO string — both need parsing. Try datetime → isoformat
+                # parse → 0.0 in that order.
+                mt = info.get("mtime") or info.get("updated")
+                if hasattr(mt, "timestamp"):
+                    mtime = float(mt.timestamp())
+                elif isinstance(mt, str):
+                    from datetime import datetime as _dt
+                    # Handle trailing 'Z' (Zulu) — fromisoformat needs +00:00.
+                    s = mt[:-1] + "+00:00" if mt.endswith("Z") else mt
+                    mtime = float(_dt.fromisoformat(s).timestamp())
+                else:
+                    mtime = float(mt) if mt else 0.0
+            except Exception as e:
+                err(f"[sync] {kind}: mtime-parse failed for {p}: "
+                    f"{type(e).__name__}: {e}")
+                mtime = 0.0
+            rows[step] = {
+                "_step": step,
+                "_timestamp": mtime,
+                "global_step": step,
+                "eval/loss": ev,
+            }
+        return rows
+
+    old = _read_dir(f"{bucket}/eval/vl-backfill/{ckpt_leaf}", "vl-backfill")
+    new = _read_dir(f"{bucket}/eval/vl/{ckpt_leaf}", "vl")
+    # `new` wins on overlap — held-out val supersedes train-tail.
+    merged = {**old, **new}
+    if not merged:
+        return []
+    err(f"[sync] vl: merged {len(merged)} step(s) "
+        f"(vl={len(new)}, vl-backfill={len(old)}, "
+        f"overrides={len(set(old) & set(new))})")
+    return [merged[s] for s in sorted(merged)]
 
 
 def _run_parquet_arrow_schema():
@@ -1010,24 +1038,30 @@ def runs_sync(substr: str, bucket: str, prefix: str, project: str | None, dry_ru
             if any(k for k in projected if not k.startswith("_")):
                 rows.append(projected)
         err(f"  [sync] {r.project}: +{len(rows) - before} rows")
-    # Splice in `eval/loss` from any VL backfill produced by
-    # `scripts/backfill_vl_modal.py` — pre-spec-47 runs (e.g. v4) didn't
-    # carve out a val split and thus never logged `eval/loss`. The Modal
-    # backfill computes the same metric retroactively against the same
-    # 256-seq val split v4-cont-3 uses. Sort+trim downstream order this
-    # alongside the wandb history rows.
+    # Sort + trim the wandb rows FIRST, then splice in VL backfill rows.
+    # The trim is for `--force` re-fire artifacts (wandb has two interleaved
+    # global_step trajectories for the same run id; keep only the latest).
+    # VL backfill rows have wallclock timestamps that postdate the entire
+    # training run, but their `global_step` field is mid-training — if we
+    # mix them in BEFORE trim, the reset detector mistakes the apparent
+    # global_step decrease (wandb tail's max global_step → VL row's
+    # mid-training global_step) for an abandoned trajectory and drops
+    # either the VL rows (when mtime sort puts them first) or all the
+    # wandb rows (when mtime sort puts them last). Splice AFTER trim.
+    rows.sort(key=lambda d: (d.get("_timestamp") or 0, d.get("_step") or 0))
+    rows = _trim_to_latest_trajectory(rows)
+    # Splice in `eval/loss` from any VL backfill: prefer real held-out
+    # `eval/vl/<ckpt_leaf>/step-*.json` (from `preamble_vl_modal.py
+    # --label val-full-v3`, default since 2026-06-05), fall back to the
+    # older `eval/vl-backfill/` JSONs (which sampled the TAIL of
+    # `train-full-v3` — directional but optimistically biased). Pre-spec-47
+    # runs (e.g. v4) didn't carve out a val split during training so they
+    # never logged `eval/loss` natively.
     vl_rows = _vl_backfill_rows(run_name)
     if vl_rows:
         rows.extend(vl_rows)
-    # Order merged rows by _timestamp so plots-over-time read naturally.
-    rows.sort(key=lambda d: (d.get("_timestamp") or 0, d.get("_step") or 0))
-    # Drop rows from abandoned trajectories. `--force` re-fires (or other
-    # restart-from-step-0 events) leave wandb with TWO interleaved histories
-    # for the same run id: the original ascending global_step trajectory,
-    # then a fresh one starting back from 0. The dashboard plots are
-    # unreadable with both overlaid. Detect the LAST `global_step` decrease
-    # in time-order and keep only rows from there onward.
-    rows = _trim_to_latest_trajectory(rows)
+        # Re-sort by _timestamp so plot consumers can iterate chronologically.
+        rows.sort(key=lambda d: (d.get("_timestamp") or 0, d.get("_step") or 0))
     err(f"[sync] pulled {len(rows)} merged history rows")
     r = primary  # downstream code reads `r.name`, `r.url`, etc.
 

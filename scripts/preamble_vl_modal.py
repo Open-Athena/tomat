@@ -51,7 +51,7 @@ DEFAULT_CKPT = (
     f"{BUCKET}/results/train-mg-modal-h200x8-tz-v4-epochwin/checkpoints/"
     "train-mg-modal-h200x8-tz-v4-epochwin-bs128-seed42/step-62000"
 )
-DEFAULT_LABEL = "train-full-v3"
+DEFAULT_LABEL = "val-full-v3"  # held-out val mats; see memory `datasets-val-test-train`
 VOL_NAME = "tomat-rho-gga-train"
 
 # Pin same as scripts/eval_modal.py — same marin SHA → same Levanter / Qwen3
@@ -108,16 +108,21 @@ def _materialize_gcp_sa() -> None:
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/gcp-sa.json"
 
 
-def _load_patches(label: str, n_patches: int, skip: int = 0):
-    """Read the tail `n_patches` sequences (after `skip`) from `train-full-v3`
-    parquets, deterministic order.
+def _load_patches(label: str, n_patches: int, skip: int = 0, *, head: bool = True):
+    """Read `n_patches` sequences (after `skip`) from a tokenized parquet set,
+    deterministic order.
 
     Layout: `{BUCKET}/tokenized/{label}/worker-NN/shard-XXX.parquet`, each
     row has an `input_ids` column with int32 lists (pad_to elements).
-    Reverse-sorting the (worker, shard, row) tuple gives a stable "tail" slice
-    that's both data-deterministic and unlikely to overlap with anything the
-    model already saw biased toward (the corpus is shuffled at training time;
-    here we just need *some* repeatable carve).
+
+    - `head=True` (default): walk shards in forward sorted order. Stable +
+      well-defined "first N" patches. Right default for `val-full-v3` where
+      every patch is held-out and direction is meaningless.
+    - `head=False`: walk shards in reverse sorted order ("tail slice"). Was
+      the only behavior pre-2026-06-05; used when reading `train-full-v3` to
+      bias away from the most-likely-trained-on prefix (corpus is shuffled
+      at training time so this is mostly cosmetic, but kept for back-compat
+      and for the preamble-ablation use case where contamination is fine).
 
     Returns: int32 ndarray of shape (n_patches, pad_to).
     """
@@ -130,16 +135,17 @@ def _load_patches(label: str, n_patches: int, skip: int = 0):
     shards = sorted(fs.glob(f"{base.replace('gs://', '')}/worker-*/shard-*.parquet"))
     if not shards:
         raise FileNotFoundError(f"No shards under {base}")
-    # Tail slice — walk shards in reverse order, collecting rows until we have
+    # Walk shards in chosen direction, collecting rows until we have
     # `skip + n_patches`. Each shard is ~hundreds of MB; pulling 2-3 is enough.
+    walk = shards if head else list(reversed(shards))
     rows: list[np.ndarray] = []
     needed = skip + n_patches
-    for shard in reversed(shards):
+    for shard in walk:
         with fsspec.open(f"gs://{shard}", "rb") as f:
             tbl = pq.read_table(f, columns=["input_ids"])
         col = tbl["input_ids"]
-        # Walk rows from the end of this shard backwards.
-        for i in range(len(col) - 1, -1, -1):
+        row_range = range(len(col)) if head else range(len(col) - 1, -1, -1)
+        for i in row_range:
             arr = np.asarray(col[i].as_py(), dtype=np.int32)
             rows.append(arr)
             if len(rows) >= needed:
@@ -148,7 +154,6 @@ def _load_patches(label: str, n_patches: int, skip: int = 0):
             break
     if len(rows) < needed:
         raise RuntimeError(f"Only {len(rows)} rows found; needed {needed}")
-    # Reverse so the very last shard's last row is index 0 — stable order.
     rows = rows[skip:skip + n_patches]
     return np.stack(rows, axis=0)  # (n_patches, pad_to)
 
@@ -332,11 +337,13 @@ def run_preamble_vl_h100x8(
     modes: list[str],
     seed: int,
     output_path: str,
+    head: bool = True,
 ) -> dict:
     return _run_preamble_vl(
         checkpoint=checkpoint, label=label, lmq_path=lmq_path,
         model_preset=model_preset, n_patches=n_patches, skip=skip,
         batch=batch, modes=modes, seed=seed, output_path=output_path,
+        head=head,
     )
 
 
@@ -358,11 +365,13 @@ def run_preamble_vl_h200x8(
     modes: list[str],
     seed: int,
     output_path: str,
+    head: bool = True,
 ) -> dict:
     return _run_preamble_vl(
         checkpoint=checkpoint, label=label, lmq_path=lmq_path,
         model_preset=model_preset, n_patches=n_patches, skip=skip,
         batch=batch, modes=modes, seed=seed, output_path=output_path,
+        head=head,
     )
 
 
@@ -378,6 +387,7 @@ def _run_preamble_vl(
     modes: list[str],
     seed: int,
     output_path: str,
+    head: bool = True,
 ) -> dict:
     """Shared body: load ckpt, load patches, run each mode, persist JSON."""
     import json
@@ -436,7 +446,7 @@ def _run_preamble_vl(
 
     # ---- Pull patches ----
     t0 = time.time()
-    patches = _load_patches(label, n_patches, skip=skip)
+    patches = _load_patches(label, n_patches, skip=skip, head=head)
     err(f"[preamble-vl] loaded {patches.shape[0]} patches in {time.time()-t0:.1f}s "
         f"({patches.shape[1]} tok each)")
     preamble_lens = _find_preamble_lengths(patches)
@@ -518,6 +528,7 @@ def _run_preamble_vl(
     summary = dict(
         checkpoint=checkpoint,
         label=label,
+        head=bool(head),
         n_patches=n_patches,
         skip=skip,
         seed=seed,
@@ -531,12 +542,31 @@ def _run_preamble_vl(
     return summary
 
 
-def _default_output_path(checkpoint: str) -> str:
-    """Pull `<run_label>/step-N` tail out of the checkpoint path."""
+def _default_output_path(checkpoint: str, label: str) -> str:
+    """Derive the JSON output path from the checkpoint path + source label.
+
+    Ckpt layout: `.../results/<parent>/checkpoints/<run_leaf>/step-N`.
+      - `parent`   = `parts[-4]`  (e.g. `train-mg-modal-h200x8-tz-v4`)
+      - `run_leaf` = `parts[-2]`  (e.g. `train-mg-modal-h200x8-tz-v4-bs128-seed42`)
+      - `step`     = `parts[-1]`  (e.g. `step-40000`)
+
+    Routing:
+      - `val-full-v3` (held-out, real VL): write to
+        `eval/vl/<run_leaf>/<step>.json`. `<run_leaf>` MUST match the
+        wandb run name so `tomat runs sync`'s splice (which looks up
+        `eval/vl/<wandb_run_name>/step-*.json`) finds it.
+      - other labels (preamble-ablation use case on `train-full-v3`):
+        keep the original `eval/preamble-test/<parent>-<step>.json`
+        path (flat, no per-leaf subdir — the ablation operates at the
+        run-family level, not the seed level).
+    """
     parts = checkpoint.rstrip("/").split("/")
-    rl = parts[-4]
+    parent = parts[-4]
+    run_leaf = parts[-2]
     step = parts[-1]
-    return f"{BUCKET}/eval/preamble-test/{rl}-{step}.json"
+    if label == "val-full-v3":
+        return f"{BUCKET}/eval/vl/{run_leaf}/{step}.json"
+    return f"{BUCKET}/eval/preamble-test/{parent}-{step}.json"
 
 
 @app.local_entrypoint()
@@ -548,26 +578,40 @@ def main(
     n_patches: int = 256,
     skip: int = 0,
     batch: int = 8,
-    modes: str = "baseline,shuffle,random",
+    modes: str = "baseline",
     seed: int = 42,
     output_path: str = "",
     gpu_pool: str = "h100x8",  # "h100x8" or "h200x8"
+    head: bool = True,
 ):
     """Run preamble-VL ablation on `checkpoint`.
 
+    Defaults: `label=val-full-v3` (held-out val patches; see memory
+    `datasets-val-test-train`) + `modes=baseline` — i.e. by default this
+    computes a real VL number with no perturbation. For the preamble
+    ablation use case, pass `--label train-full-v3 --modes
+    baseline,shuffle,random --head False` (tail-walk train data, all 3
+    perturbations).
+
     `modes`: comma-separated subset of {baseline, shuffle, random}.
     `gpu_pool`: h100x8 (cheaper) or h200x8 (faster).
-    `output_path`: where to write the JSON summary (default: derived).
+    `output_path`: where to write the JSON summary (default: derived from
+        `label` — `eval/vl/<rl>/step-N.json` for val-full-v3,
+        `eval/preamble-test/<rl>-step-N.json` otherwise).
+    `head`: True = walk shards forward (first-N patches; right for val);
+        False = walk reverse (tail slice; original behavior, used for
+        preamble ablation on train-full-v3).
     """
-    out = output_path or _default_output_path(checkpoint)
+    out = output_path or _default_output_path(checkpoint, label)
     mode_list = [m.strip() for m in modes.split(",") if m.strip()]
     fn = run_preamble_vl_h200x8 if gpu_pool == "h200x8" else run_preamble_vl_h100x8
     print(f"[preamble-vl] firing {gpu_pool}: ckpt={checkpoint} n={n_patches} "
-          f"modes={mode_list} → {out}")
+          f"label={label} head={head} modes={mode_list} → {out}")
     call = fn.spawn(
         checkpoint=checkpoint, label=label, lmq_path=lmq_path,
         model_preset=model_preset, n_patches=n_patches, skip=skip,
         batch=batch, modes=mode_list, seed=seed, output_path=out,
+        head=head,
     )
     print(f"[preamble-vl] call_id={call.object_id}")
     summary = call.get()
