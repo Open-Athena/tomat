@@ -273,21 +273,27 @@ async function buildRunsSnapshot(env: Env): Promise<{
 
 	const runs: Record<string, RunSnapshotEntry | null> = {};
 	for (let i = 0; i < runIds.length; i++) {
-		const manifest = manifestResults[i];
+		const manifest = manifestResults[i] as RunSnapshotEntry | null;
 		const evals = evalsIndexResults[i];
 		const cost = costResults[i];
-		if (manifest === null && evals === null && cost === null) {
+		// Drop entries whose manifest is missing the load-bearing trio
+		// (`run`, `history`, `summary`). About 10 stale entries in R2 (older v2
+		// P14 runs + a few partials) have only `cost.json` populated; without
+		// the manifest fields the dashboard can't render them and every consumer
+		// that reaches into sub-objects crashes. Emit `null` so the FE's
+		// existing null-filter drops them cleanly.
+		const manifestValid = manifest
+			&& manifest.run != null
+			&& manifest.history != null
+			&& manifest.summary != null;
+		if (!manifestValid) {
 			runs[runIds[i]] = null;
-		} else {
-			// Common case: manifest exists, evals + cost may or may not.
-			// Edge case: evals/cost exist but manifest doesn't (we just backfilled
-			// before runs-sync caught up) — still surface so the dashboard's
-			// "have we got any data for this run" check doesn't drop it.
-			const entry: RunSnapshotEntry = (manifest as RunSnapshotEntry) ?? {};
-			if (evals && evals.length > 0) entry.evals = evals;
-			if (cost) entry.cost = cost;
-			runs[runIds[i]] = entry;
+			continue;
 		}
+		const entry: RunSnapshotEntry = manifest;
+		if (evals && evals.length > 0) entry.evals = evals;
+		if (cost) entry.cost = cost;
+		runs[runIds[i]] = entry;
 	}
 
 	let iris: unknown | null = null;
