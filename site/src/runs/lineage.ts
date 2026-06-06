@@ -73,6 +73,16 @@ export const RUN_LINEAGE: Record<string, RunLineage> = {
     parent: 'train-mg-4-cos-ce',
     parent_step: 9999,
   },
+
+  // v4-epochwin resumed v4 at step-40000 (Modal H200×8 MaskGIT). v4 ran 0 →
+  // 40000; v4-epochwin picked up at 40001 and is targeting 90000. Internally
+  // the epochwin label was actually two consecutive wandb runs (smoke
+  // 40k-42k + cont 42k-90k) but they collapse into one results_label /
+  // checkpoint stream, so the dashboard sees a single child card.
+  'train-mg-modal-h200x8-tz-v4-epochwin-bs128-seed42': {
+    parent: 'train-mg-modal-h200x8-tz-v4-bs128-seed42',
+    parent_step: 40000,
+  },
 }
 
 /** Lineage entry for `runName`, or `null` if it has no recorded parent. */

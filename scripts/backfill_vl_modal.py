@@ -128,6 +128,14 @@ def backfill_one(
     val_seqs: int = 256,
     eval_batch: int = 64,
     seq_len: int = 8192,
+    # Optional override of the levanter cache dir on the volume. When None,
+    # falls back to a vl-backfill-private cache that the script builds itself
+    # (slow first run). For runs whose training cache survives on the volume,
+    # pass the training cache dir (e.g.
+    # `/vol/results/<run_label>/cache`) to skip the rebuild — Levanter's val
+    # carve-out is a derived view of the same cache, so reusing it gives
+    # bit-identical val sequences without re-tokenizing.
+    cache_dir_override: str | None = None,
 ) -> dict:
     """Eval ONE ckpt's training-time `eval/loss` against val_seqs held-out
     sequences from train-full-v3 and write a per-step JSON to GCS.
@@ -240,7 +248,11 @@ def backfill_one(
     # Persist the levanter cache on the Modal Volume so spawns past the
     # first share the (~hour-long) build cost. Per-parquet-label
     # subdir so different vocabs get separate caches.
-    cache_dir = f"{MOUNT}/vl-backfill-cache/{parquet_label}"
+    # NOTE: when `cache_dir_override` is provided, point at the *training
+    # cache* of the source run (e.g. `.../<rl>/cache`) so we skip a
+    # ~$25-an-hour rebuild. Levanter's `num_validation_sequences` carves
+    # the val split on read from the same cache.
+    cache_dir = cache_dir_override or f"{MOUNT}/vl-backfill-cache/{parquet_label}"
     source = UrlDatasetSourceConfig(train_urls=[parquet_glob])
     prebuilt_fmt = PrebuiltLmDatasetFormat(input_ids_key="input_ids")
     component = DatasetComponent(
@@ -325,7 +337,15 @@ def backfill_one(
         )
         err(f"[vl-backfill] evaluator built; running evaluate()")
         t0 = time.time()
-        result = evaluator.evaluate(model)
+        # Wrap in BOTH `set_mesh` and `axis_mapping` so the dataloader's
+        # `jax.jit`-ed `stack_tree` (it doesn't take an explicit axis_mapping)
+        # and haliax's named-jit fns alike see the same GPU mesh +
+        # compute-mapping that `accum_for_batch` expects. Without these two
+        # layers the inner jit traces with a CPU context and the eval blows
+        # up with "incompatible devices … GPU vs CPU".
+        with hax.partitioning.set_mesh(trainer_cfg.device_mesh):
+            with hax.axis_mapping(compute_mapping):
+                result = evaluator.evaluate(model)
         elapsed = time.time() - t0
         err(f"[vl-backfill] eval done: micro_avg_loss={result.micro_avg_loss:.4f} "
             f"(elapsed {elapsed:.1f}s)")
@@ -365,6 +385,7 @@ def main(
     model_preset: str = "200M",
     val_seqs: int = 256,
     eval_batch: int = 64,
+    cache_dir_override: str | None = None,
 ):
     """Fan out one H200×8 call per step.
 
@@ -396,6 +417,7 @@ def main(
             model_preset=model_preset,
             val_seqs=val_seqs,
             eval_batch=eval_batch,
+            cache_dir_override=cache_dir_override,
         )
         err(f"[vl-backfill spawned] step={st} call_id={call.object_id}")
         calls[st] = call.object_id
@@ -421,8 +443,12 @@ if __name__ == "__main__":
     @click.option("-m", "--model-preset", default="200M")
     @click.option("-v", "--val-seqs", default=256, type=int)
     @click.option("-b", "--eval-batch", default=64, type=int)
+    @click.option("-c", "--cache-dir", default=None,
+                  help="Override levanter cache dir (e.g. "
+                       "`/vol/results/<rl>/cache`) — reuse a training cache "
+                       "instead of building a fresh one.")
     def _cli(steps, run_label, ckpt_leaf, parquet_label, model_preset,
-             val_seqs, eval_batch):
+             val_seqs, eval_batch, cache_dir):
         main(
             steps=steps,
             run_label=run_label,
@@ -431,5 +457,6 @@ if __name__ == "__main__":
             model_preset=model_preset,
             val_seqs=val_seqs,
             eval_batch=eval_batch,
+            cache_dir_override=cache_dir,
         )
     _cli()

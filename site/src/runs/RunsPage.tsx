@@ -4,7 +4,7 @@ import { enumParam, useUrlState } from 'use-prms'
 import { Tooltip } from '../Tooltip'
 import { evalJobsByRun, evalPhase, fetchEval, fetchEvalsIndex, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchRunCost, fetchRunsSnapshot, irisJobIdForRun, modalAppForRun, parquetUrl } from './api'
 import type { EvalJob, EvalPoint } from './api'
-import { fetchRunHistory } from './parquet'
+import { concatHistories, fetchRunHistory, type RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
 import { RecentEvents } from './RecentEvents'
 import { EvalsPanel } from './EvalsPanel'
@@ -919,6 +919,71 @@ function EvalJobsTable({ jobs, evalByStep }: {
   )
 }
 
+// `?lineage=full|seg` — when the detail run has a recorded lineage parent
+// (see `./lineage.ts:RUN_LINEAGE`), `full` (the default) glues each
+// ancestor's history onto the front so the TL/VL/MFU plots render the
+// full lineage from step 0 instead of just the current segment.
+// `seg` shows only this run's segment (the old behaviour). Hidden
+// silently when the run has no recorded ancestors.
+const LINEAGE_MODES = ['full', 'seg'] as const
+type LineageMode = (typeof LINEAGE_MODES)[number]
+function useLineageMode(): readonly [LineageMode, (v: LineageMode) => void] {
+  const [m, set] = useUrlState('lineage', enumParam<LineageMode>('full', LINEAGE_MODES))
+  return [m, set] as const
+}
+
+/** Toggle the lineage-merge for the detail view (`?lineage=full|seg`).
+ *  Rendered only when the current run has recorded ancestors. */
+function LineageToggle({
+  mode, setMode, ancestors, ancestorHistoriesLoading,
+}: {
+  mode: LineageMode
+  setMode: (v: LineageMode) => void
+  ancestors: string[]
+  ancestorHistoriesLoading: boolean
+}) {
+  const tip = mode === 'full'
+    ? `Plot is glued to ${ancestors.length} ancestor segment${ancestors.length === 1 ? '' : 's'}: `
+      + ancestors.slice().reverse().join(' → ')
+      + ` → (this run). Click to show only this segment.`
+    : `Plot shows only this run's segment. Click to glue ${ancestors.length} `
+      + `ancestor segment${ancestors.length === 1 ? '' : 's'} on the left.`
+  const label = mode === 'full' ? '◀ lineage glued' : '◀ +lineage'
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 8,
+      margin: '0.4rem 0 0.2rem 0',
+    }}>
+      <Tooltip content={tip}>
+        <button
+          type="button"
+          onClick={() => setMode(mode === 'full' ? 'seg' : 'full')}
+          style={{
+            fontSize: '0.75rem',
+            fontFamily: 'monospace',
+            color: mode === 'full' ? '#cfe1ff' : '#9aa6c2',
+            background: mode === 'full'
+              ? 'rgba(80, 130, 220, 0.25)'
+              : 'rgba(120,140,200,0.10)',
+            border: `1px solid ${mode === 'full'
+              ? 'rgba(120, 170, 240, 0.65)'
+              : 'rgba(120,140,200,0.30)'}`,
+            borderRadius: 10,
+            padding: '2px 10px',
+            cursor: 'pointer',
+          }}>
+          {label}
+        </button>
+      </Tooltip>
+      {ancestorHistoriesLoading && mode === 'full' && (
+        <span style={{ fontSize: '0.7rem', color: '#888' }}>
+          loading ancestor history…
+        </span>
+      )}
+    </div>
+  )
+}
+
 function RunDetail({ runId }: { runId: string }) {
   // Same query keys as RunsIndex, so arriving from the index renders the
   // cached manifest/history instantly while a fresh fetch runs underneath.
@@ -937,6 +1002,25 @@ function RunDetail({ runId }: { runId: string }) {
     queryFn: () => fetchRunHistory(parquetUrl(runId)),
     refetchInterval: (q) => errBackoff(q) ?? REFETCH_MS.history.active,
     retry: 1,
+  })
+  // Lineage history glue: walk `RUN_LINEAGE` ancestors-of(`runId`) and fetch
+  // each parent's parquet in parallel. The default mode (`full`) concatenates
+  // them ancestor-first → child for the WallclockPlot below; `seg` shows only
+  // this run's own segment. When the run has no recorded ancestors, the toggle
+  // is hidden and we render this run's history directly (one query, no concat).
+  const [lineageMode, setLineageMode] = useLineageMode()
+  const ancestors = useMemo(() => ancestorsOf(runId), [runId])
+  // `useQueries` returns a stable array indexed by ancestor; ancestors-first
+  // (parent, grandparent, …) so concat below reverses to chronological order.
+  const ancestorHistoryQs = useQueries({
+    queries: ancestors.map((aid) => ({
+      queryKey: ['history', aid],
+      queryFn: () => fetchRunHistory(parquetUrl(aid)),
+      // Ancestors are by-definition finished segments; their parquet doesn't
+      // change. Idle cadence keeps polling cheap (single 2 MB fetch).
+      refetchInterval: REFETCH_MS.history.idle,
+      retry: 1,
+    })),
   })
   const irisQ = useQuery({
     queryKey: ['iris'], queryFn: fetchIrisState, refetchInterval: REFETCH_MS.iris,
@@ -986,7 +1070,29 @@ function RunDetail({ runId }: { runId: string }) {
     retry: 1,
   })
   const manifest = manifestQ.data ?? null
-  const history = historyQ.data ?? null
+  const ownHistory = historyQ.data ?? null
+  // Lineage-aware concatenated history: ancestor-first → … → this run.
+  // Available when every ancestor history has loaded (`every(d != null)`).
+  // While ancestor fetches are still in flight, fall back to the own history
+  // so the plot doesn't blink empty waiting for a 2 MB parquet to arrive.
+  const lineageHistory = useMemo<RunHistory | null>(() => {
+    if (lineageMode === 'seg') return ownHistory
+    if (ancestors.length === 0) return ownHistory
+    if (!ownHistory) return null
+    const ancestorHistories: RunHistory[] = []
+    for (const q of ancestorHistoryQs) {
+      const h = q.data
+      if (!h) return ownHistory  // hold off on glue until every ancestor lands
+      ancestorHistories.push(h)
+    }
+    // `ancestors[0]` is the immediate parent; the array is child→root. Reverse
+    // to root→…→parent so concat ends in chronological order, then append the
+    // current run's segment.
+    const ordered = [...ancestorHistories].reverse()
+    ordered.push(ownHistory)
+    return concatHistories(ordered)
+  }, [lineageMode, ownHistory, ancestors, ancestorHistoryQs])
+  const history = lineageHistory
   const evalJobs = useMemo(
     () => evalJobsByRun(irisQ.data ?? undefined).get(runId) ?? [],
     [irisQ.data, runId],
@@ -1074,6 +1180,14 @@ function RunDetail({ runId }: { runId: string }) {
       </div>
       {(evalJobs.length > 0 || evalByStep.size > 0) && (
         <EvalJobsTable jobs={evalJobs} evalByStep={evalByStep} />
+      )}
+      {ancestors.length > 0 && (
+        <LineageToggle
+          mode={lineageMode}
+          setMode={setLineageMode}
+          ancestors={ancestors}
+          ancestorHistoriesLoading={ancestorHistoryQs.some((q) => q.isLoading)}
+        />
       )}
       {!history && !err && <p>loading parquet…</p>}
       {history && (

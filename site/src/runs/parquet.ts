@@ -75,3 +75,48 @@ export async function fetchRunHistory(url: string): Promise<RunHistory> {
 
   return { rowCount: rows.length, timestamps, steps, cols }
 }
+
+/** Concatenate a list of `RunHistory`s end-to-end into one logical
+ *  history — used to render a child run together with its parent(s) on
+ *  the detail page (parent + child = full lineage on a single plot).
+ *
+ *  Caller passes the histories in ancestor-first order (oldest segment
+ *  first, then each child in turn). Output columns are the UNION of all
+ *  input columns (missing values per-row fill as `null`), and `rowCount`
+ *  is the total — so the consumer (WallclockPlot) sees one contiguous
+ *  history just as if it had been logged by a single run.
+ *
+ *  Two rows are not de-duplicated even if a parent's last `_step` ==
+ *  child's first; the child's first row typically sits at parent's last
+ *  step + 1 (Levanter increments before logging), so de-dup would be a
+ *  no-op in practice. */
+export function concatHistories(parts: RunHistory[]): RunHistory {
+  if (parts.length === 0) {
+    return { rowCount: 0, timestamps: [], steps: [], cols: new Map() }
+  }
+  if (parts.length === 1) return parts[0]
+  // Union of column keys across every part.
+  const allKeys = new Set<keyof RunHistoryRow>()
+  for (const p of parts) for (const k of p.cols.keys()) allKeys.add(k)
+  const cols = new Map<keyof RunHistoryRow, (number | null)[]>()
+  for (const k of allKeys) cols.set(k, [])
+  const timestamps: (number | null)[] = []
+  const steps: (number | null)[] = []
+  let rowCount = 0
+  for (const p of parts) {
+    rowCount += p.rowCount
+    timestamps.push(...p.timestamps)
+    steps.push(...p.steps)
+    for (const k of allKeys) {
+      const col = cols.get(k)!
+      const src = p.cols.get(k)
+      if (src) {
+        col.push(...src)
+      } else {
+        // Pad this part's slot with `null` so per-row indexing stays aligned.
+        for (let i = 0; i < p.rowCount; i++) col.push(null)
+      }
+    }
+  }
+  return { rowCount, timestamps, steps, cols }
+}
