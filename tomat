@@ -793,13 +793,27 @@ def _vl_backfill_rows(
         return []
     if not paths:
         return []
+    import re as _re
     out: list[dict] = []
     for p in sorted(paths):
         try:
             with fs.open(p, "r") as f:
                 d = json.load(f)
-            step = int(d["step"])
-            ev = float(d["eval_loss"])
+            # Two known JSON shapes:
+            #   (a) `backfill_vl_modal.py`: {"step": N, "eval_loss": x, ...}
+            #   (b) `preamble_vl_modal.py` (baseline mode):
+            #       {"results": {"baseline": {"mean": x, ...}}, ...}
+            #       — step parsed from filename `.../step-<N>.json`.
+            if "step" in d and "eval_loss" in d:
+                step, ev = int(d["step"]), float(d["eval_loss"])
+            else:
+                # parse step from filename
+                m = _re.search(r"step-(\d+)\.json$", p)
+                if not m:
+                    raise KeyError(f"can't extract step from {p}")
+                step = int(m.group(1))
+                # find the baseline mean
+                ev = float(d["results"]["baseline"]["mean"])
         except (KeyError, ValueError, json.JSONDecodeError) as e:
             err(f"[sync] vl-backfill: skip {p}: {type(e).__name__}: {e}")
             continue
