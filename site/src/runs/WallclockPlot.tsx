@@ -32,7 +32,7 @@ import { rolling } from 'pltly/core'
 import { enumParam, useUrlState } from 'use-prms'
 import { themedHoverlabel } from '../theme'
 import { Tooltip } from '../Tooltip'
-import type { RunHistory } from './parquet'
+import type { RunHistory, RunHistoryRow } from './parquet'
 import type { IrisAttempts, RunEval, RunManifest } from './api'
 import { classifyDeath, DEATH_COLORS, type DeathCause } from './deathEvents'
 import { SmoothingChips, useBandsToggle, useSmoothMode } from './RunsTimelinePlot'
@@ -370,7 +370,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
 
   // Returns one Series per restart segment. Empty segments are preserved at
   // their index so opacity / naming line up with `numSegments`.
-  function series(key: string): Series[] {
+  function series(key: keyof RunHistoryRow): Series[] {
     const col = cols.get(key) ?? []
     const out: Series[] = Array.from({ length: numSegments },
       () => ({ xs: [], ys: [], gsteps: [] }))
@@ -738,7 +738,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   }, [evalSeries])
 
   // Lifecycle event timestamps.
-  const eventTimes = (key: string): number[] => {
+  const eventTimes = (key: keyof RunHistoryRow): number[] => {
     const ts: number[] = []
     const col = cols.get(key) ?? []
     for (let i = 0; i < col.length; i++) {
