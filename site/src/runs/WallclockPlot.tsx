@@ -31,11 +31,13 @@ import { Plot, useTheme } from 'pltly/react'
 import { rolling } from 'pltly/core'
 import { enumParam, useUrlState } from 'use-prms'
 import { themedHoverlabel } from '../theme'
+import { Tooltip } from '../Tooltip'
 import type { RunHistory } from './parquet'
 import type { IrisAttempts, RunEval, RunManifest } from './api'
 import { classifyDeath, DEATH_COLORS, type DeathCause } from './deathEvents'
 import { SmoothingChips, useBandsToggle, useSmoothMode } from './RunsTimelinePlot'
 import { epochOfStep } from './runMeta'
+import { annotationsFor, type RunAnnotation } from './annotations'
 import { applySmoothing, type SmoothMode } from './smoothing'
 
 interface Props {
@@ -127,13 +129,18 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     data?: Array<Record<string, unknown>>
     _Plotly?: { restyle: (el: HTMLElement, attrs: Record<string, unknown>, indices?: number[]) => Promise<void> }
   }
-  // Fade bands by `legendgroup` whenever the active trace changes. We walk
-  // the Plotly trace list to find:
-  //   1. activeLG = legendgroup of the active (legend-visible) trace
-  //   2. bandIndices = indices of all `showlegend: false` traces
-  // Then `Plotly.restyle(plotDiv, { opacity: vals }, bandIndices)` flips each
-  // band to 1 if it shares the active legendgroup, 0.3 otherwise. When
-  // activeTraceName is null, all bands → 1.
+  // Fade bands by trace `name` whenever the active trace changes. Each band
+  // edge trace shares its parent line's `name` (e.g. `'TL (train/loss)'`), so
+  // matching by name brushes the band with its parent. We previously matched
+  // by `legendgroup`, but TL and VL now share `legendgroup: 'losses'` so
+  // their legend items sit flush (no flicker-inducing duplicate group-title
+  // row + gap between them), and group-based matching can no longer
+  // distinguish them.
+  //
+  // Walks the Plotly trace list to find all `showlegend: false` band-edge
+  // traces. `Plotly.restyle(plotDiv, { opacity: vals }, bandIndices)` flips
+  // each band to 1 if its name matches the active trace's name, 0.3 otherwise.
+  // When activeTraceName is null, all bands → 1.
   //
   // Idempotency check: every `Plotly.restyle` re-emits `plotly_afterplot`,
   // which we listen for to re-apply fade after Plotly.react resets defaults.
@@ -145,15 +152,6 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     const plotDiv = root.querySelector('.js-plotly-plot') as PlotlyDiv | null
     const P = plotDiv?._Plotly
     if (!plotDiv?.data || !P) return
-    let activeLG: string | null = null
-    if (activeTraceName) {
-      for (const t of plotDiv.data) {
-        if (t.name === activeTraceName && t.showlegend !== false) {
-          activeLG = (t.legendgroup as string | undefined) ?? null
-          break
-        }
-      }
-    }
     const indices: number[] = []
     const opacities: number[] = []
     let changed = false
@@ -168,7 +166,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       if (t.showlegend !== false) continue
       if (t.hoverinfo !== 'skip') continue
       indices.push(i)
-      const want = activeTraceName == null || (activeLG != null && (t.legendgroup as string | undefined) === activeLG) ? 1 : 0.3
+      const want = activeTraceName == null || t.name === activeTraceName ? 1 : 0.3
       opacities.push(want)
       const current = (t.opacity as number | undefined) ?? 1
       if (Math.abs(current - want) > 1e-9) changed = true
@@ -764,14 +762,19 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   const gridcolor = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'
   const zerolinecolor = isDark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.15)'
 
+  // Base color for hand-curated annotation vlines + the icon-stroke for the
+  // overlay icons. Declared here (not inline at the annotation block below)
+  // because `activeShapeColor` needs to reference it.
+  const ANNOTATION_COLOR = isDark ? 'rgba(190,190,210,0.6)' : 'rgba(80,80,100,0.55)'
+
   // Event vlines spanning both panels via paper-coord shapes.
   //
   // Shapes also fade on legend hover: if the user hovers a real trace (TL /
   // VL / etc.), all event vlines dim to alpha 0.18 so the trace stands out.
   // If the user hovers an event LI ("trainer_started", "sigterm", "cluster
-  // preempt", "death: preempt/cascade/failed"), shapes matching that event's
-  // color stay full opacity; the rest dim. With no hover, all shapes render
-  // at full opacity.
+  // preempt", "death: preempt/cascade/failed", "annotations"), shapes
+  // matching that event's color stay full opacity; the rest dim. With no
+  // hover, all shapes render at full opacity.
   type Shape = {
     type: 'line'
     xref: 'x'
@@ -793,6 +796,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     if (activeName.startsWith('death: preempt')) return DEATH_COLORS.preempt
     if (activeName.startsWith('death: cascade')) return DEATH_COLORS.cascade
     if (activeName.startsWith('death: failed')) return DEATH_COLORS.failed
+    if (activeName.startsWith('annotations')) return ANNOTATION_COLOR
     return ''  // hovered a non-event trace → fade everything
   }
   const activeColor = activeShapeColor(activeTraceName)
@@ -818,6 +822,36 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   addShapes(startTs, COLORS.start, 'dash')
   addShapes(sigtermTs, COLORS.sigterm, 'dot')
   addShapes(preemptTs, COLORS.preempt, 'solid')
+
+  // Hand-curated per-run annotations (LR / BS / data changes etc) from
+  // `annotations.ts`. Rendered as dashed vlines spanning all panels, with
+  // small info-icons floating just above the top of the plot — hover an
+  // icon to see the annotation's label + step in a floating tooltip.
+  // Toggle on/off via the "annotations" legend item (events group). Inline
+  // text labels were dropped because closely-spaced annotations collided.
+  const annotations = annotationsFor(runId)
+  // Per-annotation x in CURRENT-axis units (already resolved through
+  // `xOfStep`), used both to draw the vline shape and to compute the
+  // info-icon's pixel position in the HTML overlay below.
+  type AnnotationPos = { ann: RunAnnotation; x: string | number }
+  const annotationPositions: AnnotationPos[] = []
+  for (const ann of annotations) {
+    const x = xOfStep(ann.step)
+    if (x === null || (typeof x === 'number' && Number.isNaN(x))) continue
+    annotationPositions.push({ ann, x })
+  }
+  // Whether the "annotations" LI is toggled on. Drives both the dashed
+  // vlines and the HTML info-icons rendered as an overlay.
+  const [annotationsEnabled, setAnnotationsEnabled] = useState(true)
+  if (annotationsEnabled) {
+    for (const { ann, x } of annotationPositions) {
+      eventShapes.push({
+        type: 'line', xref: 'x', yref: 'paper',
+        x0: x, x1: x, y0: 0, y1: 1,
+        line: { color: shapeColor(ann.color ?? ANNOTATION_COLOR), width: 0.8, dash: 'dash' },
+      })
+    }
+  }
 
   // Death-cause vlines, sourced from the iris-attempts sidecar. These layer on
   // top of (do NOT replace) the trainer_started / sigterm / cluster_preempt
@@ -859,6 +893,151 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     legendgrouptitle: { text: 'events' },
     hoverinfo: 'skip' as const,
   })
+
+  // Annotation-LI name (the only one we need to intercept legend-clicks for).
+  // The trailing `(N)` mirrors the lifecycle LIs' count suffix and gives the
+  // user a quick "how many" signal in the legend itself.
+  const annotationsLegendName = `annotations (${annotationPositions.length})`
+  // Toggle visibility of annotation vlines + icons on legend-click.
+  //
+  // We attach a DOM listener directly to `.js-plotly-plot` (rather than the
+  // `onLegendClick` Plot prop) because pltly's internal pinned-legend / solo-
+  // trace machinery consumes `plotly_legendclick` and never delegates to the
+  // user prop when `onActiveTraceChange` is wired (which we DO need for the
+  // shape-fade behavior). Our listener fires alongside pltly's; the pin
+  // animation still runs on the LI, which is fine — clicking it again unpins
+  // AND re-toggles our state, the obvious mental model.
+  //
+  // Same gotcha as the box-zoom `onRelayout` thread upstream: a useEffect at
+  // mount time runs BEFORE pltly's async first render creates the
+  // `.js-plotly-plot` element. The `attachedRef` + `onAfterPlot`-driven
+  // recompute hook works around the race by attempting attachment every time
+  // the plot redraws, and bailing once successful.
+  const legendListenerRef = useRef<{ el: HTMLElement; fn: (ev: unknown) => void } | null>(null)
+  const ensureLegendListener = useCallback(() => {
+    const root = plotWrapperRef.current
+    if (!root) return
+    const plotDiv = root.querySelector('.js-plotly-plot') as (HTMLElement & {
+      on?: (evt: string, fn: (ev: unknown) => void) => void
+      removeListener?: (evt: string, fn: (ev: unknown) => void) => void
+    }) | null
+    if (!plotDiv?.on) return
+    if (legendListenerRef.current?.el === plotDiv) return
+    // Detach any prior (stale element) listener before re-attaching.
+    if (legendListenerRef.current) {
+      const { el, fn } = legendListenerRef.current
+      ;(el as unknown as { removeListener?: (evt: string, fn: (ev: unknown) => void) => void })
+        .removeListener?.('plotly_legendclick', fn)
+    }
+    const fn = (ev: unknown) => {
+      const e = ev as { curveNumber?: number; data?: Array<{ name?: string }> }
+      const idx = e.curveNumber
+      if (typeof idx === 'number' && e.data?.[idx]?.name === annotationsLegendName) {
+        setAnnotationsEnabled((v) => !v)
+      }
+    }
+    plotDiv.on('plotly_legendclick', fn)
+    legendListenerRef.current = { el: plotDiv, fn }
+  }, [annotationsLegendName])
+  useEffect(() => {
+    ensureLegendListener()
+    return () => {
+      if (legendListenerRef.current) {
+        const { el, fn } = legendListenerRef.current
+        ;(el as unknown as { removeListener?: (evt: string, fn: (ev: unknown) => void) => void })
+          .removeListener?.('plotly_legendclick', fn)
+        legendListenerRef.current = null
+      }
+    }
+  }, [ensureLegendListener])
+
+  // Pixel positions of the info-icons, recomputed on every Plotly redraw
+  // (axis rescale, zoom, x-mode swap…). Each entry has the icon's CSS
+  // (left, top) inside `plotWrapperRef` plus the annotation it represents.
+  type IconPos = { ann: RunAnnotation; left: number; top: number }
+  const [iconPositions, setIconPositions] = useState<IconPos[]>([])
+  // Annotation positions captured via ref so `recomputeIconPositions`
+  // (memoized) always reads the LATEST x-values — `annotationPositions`
+  // recomputes on every `xMode` swap (xOfStep returns different things),
+  // but the callback's dep list intentionally doesn't include it (otherwise
+  // we'd recreate the callback on every render).
+  const annotationPositionsRef = useRef(annotationPositions)
+  annotationPositionsRef.current = annotationPositions
+  const recomputeIconPositions = useCallback(() => {
+    // Piggyback the post-render callback to (re)attach the legend-click
+    // listener if it isn't already — fixes the mount-time race where the
+    // `.js-plotly-plot` element doesn't exist when the listener-registration
+    // useEffect first runs.
+    ensureLegendListener()
+    const root = plotWrapperRef.current
+    if (!root) return
+    const plotDiv = root.querySelector('.js-plotly-plot') as (HTMLElement & {
+      _fullLayout?: {
+        xaxis?: { d2p?: (v: number) => number; _offset?: number; r2c?: (v: string | number) => number }
+      }
+    }) | null
+    const xax = plotDiv?._fullLayout?.xaxis
+    if (!plotDiv || !xax?.d2p) {
+      setIconPositions((prev) => (prev.length === 0 ? prev : []))
+      return
+    }
+    const wrapperRect = root.getBoundingClientRect()
+    const plotRect = plotDiv.getBoundingClientRect()
+    // Anchor icons in the top margin between the plot title and the data
+    // area. `_fullLayout.margin.t` is the top-margin pixel height; the title
+    // sits at the top of that margin, so we shift to land just above the
+    // plot's drawing area (below the title row).
+    const yAxObj = (plotDiv as unknown as {
+      _fullLayout?: { margin?: { t?: number }; yaxis?: { _offset?: number } }
+    })._fullLayout
+    const yTopOffset = yAxObj?.yaxis?._offset ?? (yAxObj?.margin?.t ?? 50)
+    const topPx = plotRect.top - wrapperRect.top + Math.max(0, yTopOffset - 16)
+    const next: IconPos[] = []
+    for (const { ann, x } of annotationPositionsRef.current) {
+      // r2c handles both date strings (wallclock mode) and numbers; d2p then
+      // maps the canonical x-coordinate to a pixel offset within the axis.
+      const xc = typeof x === 'number' ? x : (xax.r2c ? xax.r2c(x) : NaN)
+      if (!Number.isFinite(xc)) continue
+      const xPx = xax.d2p(xc)
+      if (!Number.isFinite(xPx)) continue
+      const xOffset = xax._offset ?? 0
+      // `plotRect` is the `.js-plotly-plot` element; axis `_offset` is
+      // relative to that. Convert through wrapper-relative coords so the
+      // overlay (which lives inside the wrapper, not the plot div) lands
+      // on top of the right column.
+      const left = (plotRect.left - wrapperRect.left) + xOffset + xPx
+      next.push({ ann, left, top: topPx })
+    }
+    setIconPositions((prev) => {
+      if (prev.length === next.length
+          && prev.every((p, i) => p.left === next[i].left
+                              && p.top === next[i].top
+                              && p.ann.step === next[i].ann.step)) {
+        return prev
+      }
+      return next
+    })
+  // annotationPositionsRef provides the latest x-values per render; deps
+  // intentionally don't include it (it's a ref).
+  }, [ensureLegendListener])
+  // Recompute on window resize too (a wrapper width change moves icons
+  // horizontally without firing `plotly_afterplot`).
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const onResize = () => recomputeIconPositions()
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [recomputeIconPositions])
+  // Re-run when the set of annotation x-values changes (xMode swap, lineage
+  // glue re-resolving steps, etc). The ref captures the latest values; this
+  // effect is what schedules the actual recompute *after* the new x-values
+  // commit + Plotly.react finishes redrawing.
+  const annotationXKey = annotationPositions
+    .map((p) => `${p.ann.step}:${typeof p.x === 'number' ? p.x : p.x.toString()}`)
+    .join('|')
+  useEffect(() => {
+    recomputeIconPositions()
+  }, [annotationXKey, recomputeIconPositions])
 
   // The top-panel (running-max global_step) is degenerate in both `step` and
   // `epoch` modes (epoch is a pure rescaling of step → also y = x there).
@@ -928,10 +1107,11 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
           muted={isDark ? '#888' : '#666'}
         />
       </div>
-      <div ref={plotWrapperRef}>
+      <div ref={plotWrapperRef} style={{ position: 'relative' }}>
       <Plot
         onActiveTraceChange={setActiveTraceName}
         onRelayout={onRelayout as (ev: unknown) => void}
+        onAfterPlot={recomputeIconPositions}
         data={[
           // 1. step (top panel) — only when not in step mode
           ...(showTopPanel ? [{
@@ -946,8 +1126,14 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
           // 2. losses (shared log y2) — smoothing-aware. Bands (when on) share
           //    each line's `legendgroup` so `applyBandFade` desats them with
           //    their parent on hover.
-          ...smoothedSeriesTraces(TL, 'TL (train/loss)', COLORS.TL, 1.2, 'TL'),
-          ...smoothedSeriesTraces(VL, 'VL (eval/loss)', COLORS.VL, 1.4, 'VL'),
+          // TL/VL share the `'losses'` legendgroup so their LIs sit flush
+          // (a single shared "losses (log)" group title above; no inter-group
+          // gap between them) — sweeping the cursor from TL to VL no longer
+          // crosses a dead zone that thrashes the hover state. Per-trace fade
+          // continues to work because pltly fades by `trace.name` and our
+          // `applyBandFade` matches band edges to their parent by name.
+          ...smoothedSeriesTraces(TL, 'TL (train/loss)', COLORS.TL, 1.2, 'losses'),
+          ...smoothedSeriesTraces(VL, 'VL (eval/loss)', COLORS.VL, 1.4, 'losses'),
           // 3. mat-NMAE + mat-NEMD (from eval.json) on yaxis: 'y3' — only when
           //    the run has eval data; otherwise the panel + traces are omitted
           //    and we fall back to the legacy 2-panel layout.
@@ -967,6 +1153,10 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
               `death: ${c} (${deathBuckets[c].length})`,
               DEATH_COLORS[c], 'solid',
             )) : []),
+          // Annotation LI — only when the run has any annotations. Click
+          // toggles `annotationsEnabled`, which gates the vlines (above) +
+          // the HTML info-icon overlay (rendered below the Plot).
+          ...(annotationPositions.length > 0 ? [legendOnly(annotationsLegendName, ANNOTATION_COLOR, 'dash')] : []),
         ]}
         layout={{
           title: {
@@ -1050,6 +1240,58 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
           },
         }}
       />
+      {/* Annotation info-icon overlay. Pixel-positioned by
+          `recomputeIconPositions`; each icon wraps in a `<Tooltip>` that
+          shows the annotation's label + step on hover (floating-ui-driven,
+          escapes the plot container so it doesn't clip). */}
+      {annotationsEnabled && iconPositions.map(({ ann, left, top }, i) => (
+        <div
+          key={`${ann.step}-${i}`}
+          style={{
+            position: 'absolute',
+            left,
+            top,
+            transform: 'translateX(-50%)',
+            zIndex: 5,
+            pointerEvents: 'auto',
+          }}
+        >
+          <Tooltip
+            content={(
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>
+                  step {ann.step.toLocaleString()}
+                </div>
+                <div style={{ whiteSpace: 'pre-wrap' }}>{ann.label}</div>
+              </div>
+            )}
+          >
+            <span
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: 14,
+                height: 14,
+                borderRadius: '50%',
+                border: `1px solid ${ann.color ?? ANNOTATION_COLOR}`,
+                color: ann.color ?? ANNOTATION_COLOR,
+                background: isDark ? 'rgba(20,20,28,0.85)' : 'rgba(255,255,255,0.92)',
+                fontSize: 10,
+                fontFamily: 'serif',
+                fontStyle: 'italic',
+                fontWeight: 700,
+                lineHeight: 1,
+                cursor: 'help',
+                userSelect: 'none',
+              }}
+              aria-label={`annotation at step ${ann.step}`}
+            >
+              i
+            </span>
+          </Tooltip>
+        </div>
+      ))}
       </div>
     </div>
   )
