@@ -558,8 +558,18 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
   // its extent — short/small runs are invisible squished against the shared
   // axis. Pinning is driven by clicking a run card or legend item.
   const pinnedTrace = highlight?.pinnedTrace ?? null
+  // Local hover tracking, in addition to the shared `useTraceHighlight` (whose
+  // `activeTrace` collapses pin+hover into a single field — when pinned,
+  // `activeTrace === pinnedTrace`, so the hook alone can't tell us the user
+  // is hovering a DIFFERENT trace). Needed so that hovering a non-pinned
+  // legend item under a pin can ALSO surface that trace in the plot. Wired
+  // below in the legend item handlers and `handlePlotHover`/`handlePlotUnhover`.
+  const [hoverLabel, setHoverLabel] = useState<string | null>(null)
   const plotted = pinnedTrace
-    ? filteredRuns.filter((r) => r.label === pinnedTrace)
+    ? filteredRuns.filter((r) =>
+        r.label === pinnedTrace
+        || (hoverLabel != null && r.label === hoverLabel)
+      )
     : filteredRuns
 
   // Smoothing cache: keyed by (history identity, smoothKey, xMode, cutoff).
@@ -643,7 +653,15 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
       ? xNum.map((ms) => localDateStr(ms))
       : xNum
     const isActive = r.label === activeTrace
-    const faded = activeTrace != null && !isActive
+    // When pinned, `activeTrace === pinnedTrace`, but the user can still hover
+    // a different trace — surface that one as a "popped" sibling (full color,
+    // medium width) instead of fading it to grey. The pinned trace itself
+    // stays the most prominent (color + width 3).
+    const isHover = pinnedTrace != null
+      && hoverLabel != null
+      && r.label === hoverLabel
+      && r.label !== pinnedTrace
+    const faded = activeTrace != null && !isActive && !isHover
     const lineColor = faded ? '#666' : r.color
     const shape = (xMode === 'loss' ? 'linear' : 'hv') as 'linear' | 'hv'
 
@@ -784,6 +802,7 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
     }
     if (bestName !== closestTraceRef.current) {
       closestTraceRef.current = bestName
+      setHoverLabel(bestName)
       highlight?.setHoverTrace(bestName)
       onPlotHover?.(bestName)
     }
@@ -793,6 +812,7 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
     // between samples on the same trace. The hook's debounce (debounceMs in
     // useTraceHighlight) absorbs the brief gap when the next hover arrives.
     closestTraceRef.current = null
+    setHoverLabel(null)
     highlight?.setHoverTrace(null)
     onPlotHover?.(null)
   }
@@ -1117,22 +1137,34 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
             columnGap: 0, rowGap: 0,
             marginTop: 2, color: fg,
           }}>
-            {filteredRuns.map((r) => (
-              <LegendItem
-                key={r.id}
-                type="line"
-                color={r.color}
-                label={r.label}
-                active={highlight?.activeTrace === r.label}
-                faded={!!highlight?.activeTrace && highlight.activeTrace !== r.label}
-                pinned={highlight?.pinnedTrace === r.label}
-                {...(highlight ? highlight.handlers(r.label) : {})}
-                // Overrides LegendItem's default `0 0.4em` — pads vertically too
-                // (so vertically-adjacent rows are flush) and absorbs the
-                // ex-columnGap horizontally.
-                style={{ fontSize: '0.72rem', padding: '2px 7px' }}
-              />
-            ))}
+            {filteredRuns.map((r) => {
+              // Compose the shared `highlight.handlers` with a local hover
+              // tracker. The hook's handlers drive `activeTrace` (legend +
+              // plot fade); the local `setHoverLabel` is what lets the plot
+              // re-include this trace in `plotted` when something else is
+              // pinned. Without it, hovering a non-pinned legend item under
+              // a pin would only repaint the legend chip / card border — the
+              // plot itself would stay frozen on the pinned trace.
+              const base = highlight ? highlight.handlers(r.label) : null
+              return (
+                <LegendItem
+                  key={r.id}
+                  type="line"
+                  color={r.color}
+                  label={r.label}
+                  active={highlight?.activeTrace === r.label}
+                  faded={!!highlight?.activeTrace && highlight.activeTrace !== r.label}
+                  pinned={highlight?.pinnedTrace === r.label}
+                  onPointerEnter={(e) => { base?.onPointerEnter(e); setHoverLabel(r.label) }}
+                  onPointerLeave={(e) => { base?.onPointerLeave(e); setHoverLabel(null) }}
+                  onClick={base?.onClick}
+                  // Overrides LegendItem's default `0 0.4em` — pads vertically too
+                  // (so vertically-adjacent rows are flush) and absorbs the
+                  // ex-columnGap horizontally.
+                  style={{ fontSize: '0.72rem', padding: '2px 7px' }}
+                />
+              )
+            })}
           </div>
         )}
       </div>
