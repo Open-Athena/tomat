@@ -348,8 +348,16 @@ class MaskGITLossArgs:
     density_hi: int              # exclusive end of density vocab range
     mask_id: int                 # [MASK] token id = old vocab_size
     prior: str = "cosine"        # mask-ratio schedule: cosine|uniform|high|absorbing
-    weight: float = 1.0          # λ multiplier on the EMD density term
-    loss_type: str = "ce"        # "ce" or "ce_emd"
+    weight: float = 1.0          # λ multiplier on the EMD density term (ce_emd)
+    loss_type: str = "ce"        # "ce" | "ce_emd" | "emd" | "kl_gauss" | "crps"
+    # KL-Gaussian: stddev (in ρ-units) of the soft target distribution.
+    # Target Q(v) ∝ exp(-(ρ_v − ρ_true)² / 2σ²), normalized over the density
+    # range. σ→0 recovers vanilla CE; σ large gives EMD-like smoothness.
+    # See `posts/13-why-pure-emd-collapses.md` §5.1.
+    kl_sigma: float = 0.5
+
+
+_VALID_LOSS_TYPES = ("ce", "ce_emd", "emd", "kl_gauss", "crps")
 
 
 def build_maskgit_loss_args(
@@ -363,12 +371,15 @@ def build_maskgit_loss_args(
     prior: str = "cosine",
     weight: float = 1.0,
     loss_type: str = "ce",
+    kl_sigma: float = 0.5,
 ) -> MaskGITLossArgs:
     """Build `MaskGITLossArgs` from codec + config."""
-    if loss_type not in ("ce", "ce_emd", "emd"):
-        raise ValueError(f"loss_type must be 'ce'/'ce_emd'/'emd', got {loss_type!r}")
+    if loss_type not in _VALID_LOSS_TYPES:
+        raise ValueError(f"loss_type must be one of {_VALID_LOSS_TYPES}, got {loss_type!r}")
     if prior not in ("cosine", "uniform", "high", "absorbing"):
         raise ValueError(f"prior must be cosine/uniform/high/absorbing, got {prior!r}")
+    if loss_type == "kl_gauss" and not (kl_sigma > 0):
+        raise ValueError(f"kl_sigma must be > 0 for kl_gauss, got {kl_sigma!r}")
     decode_all_np = np.full(Vocab.size, float(penalty), dtype=np.float32)
     decode_all_np[density_offset : density_offset + n_density_bins] = codec_recon.astype(np.float32)
     decode_all = hax.named(decode_all_np, Vocab)
@@ -380,6 +391,7 @@ def build_maskgit_loss_args(
         prior=prior,
         weight=weight,
         loss_type=loss_type,
+        kl_sigma=kl_sigma,
     )
 
 
@@ -429,6 +441,45 @@ def maskgit_aware_loss(
         diff = decode_all_arr[None, None, :] - rho_true[..., None]  # (B, Pos, V)
         emd_per_pos = jnp.einsum("bpv,bpv->bp", probs, jnp.abs(diff))
         combined = jnp.where(is_density_target, emd_per_pos, 0.0)
+    elif args.loss_type in ("kl_gauss", "crps"):
+        # Soft-target losses at density positions; CE at non-density positions
+        # so the non-density preamble keeps the same gradient signal as the
+        # plain-CE baseline (clean LF-only ablation).
+        is_density_target = (targets_arr >= args.density_lo) & (targets_arr < args.density_hi)
+        log_probs = jax.nn.log_softmax(logits_arr, axis=-1)     # (B, Pos, V)
+        ce_per_pos = -jnp.take_along_axis(
+            log_probs, targets_arr[..., None], axis=-1,
+        ).squeeze(-1)                                           # (B, Pos)
+
+        rho_true = decode_all_arr[targets_arr]                  # (B, Pos)
+        V = decode_all_arr.shape[0]
+        dens_idx = jnp.arange(V)
+        density_bin_mask = (dens_idx >= args.density_lo) & (dens_idx < args.density_hi)  # (V,)
+
+        if args.loss_type == "kl_gauss":
+            # Q(v) ∝ exp(-(ρ_v - ρ_true)² / 2σ²) over density range only.
+            # Loss = -Σ_v Q(v) log P(v) (= KL(Q‖P) up to entropy(Q) const).
+            sigma = jnp.asarray(args.kl_sigma, dtype=jnp.float32)
+            log_q_unnorm = -((decode_all_arr[None, None, :] - rho_true[..., None]) ** 2) / (2.0 * sigma ** 2)
+            log_q_masked = jnp.where(density_bin_mask[None, None, :], log_q_unnorm, -jnp.inf)
+            log_q = jax.nn.log_softmax(log_q_masked, axis=-1)   # (B, Pos, V), normalized over density range
+            q = jnp.exp(log_q)
+            kl_ce_per_pos = -jnp.einsum("bpv,bpv->bp", q, log_probs)
+            combined = jnp.where(is_density_target, kl_ce_per_pos, ce_per_pos)
+        else:  # crps
+            # CRPS = ∫(F_P(x) − 1[x≥ρ_true])² dx, discretized over sorted
+            # density bins. LMQCodec.recon_points is sorted ascending (see
+            # src/tomat/float_codec.py boundaries). Integral from ρ_0 to ρ_{n-1};
+            # tails contribute 0 when ρ_true ∈ [ρ_0, ρ_{n-1}] (always true since
+            # the codec covers the full density range).
+            probs = jax.nn.softmax(logits_arr, axis=-1)         # (B, Pos, V)
+            p_dens = probs[..., args.density_lo : args.density_hi]   # (B, Pos, n_dens)
+            sorted_rho = decode_all_arr[args.density_lo : args.density_hi]  # (n_dens,)
+            gaps = jnp.diff(sorted_rho)                              # (n_dens - 1,)
+            f_p = jnp.cumsum(p_dens, axis=-1)[..., :-1]              # (B, Pos, n_dens - 1)
+            f_t = (sorted_rho[None, None, :-1] >= rho_true[..., None]).astype(jnp.float32)
+            crps_per_pos = jnp.einsum("bpv,v->bp", (f_p - f_t) ** 2, gaps)
+            combined = jnp.where(is_density_target, crps_per_pos, ce_per_pos)
     else:
         # CE at masked positions: no shift — target at t is original token at t.
         log_probs = jax.nn.log_softmax(logits_arr, axis=-1)     # (B, Pos, V)

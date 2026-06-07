@@ -586,14 +586,16 @@ def main():
     mg_mode = os.environ.get("TOMAT_MG_MODE", "0") == "1"
     mg_mask_prior = os.environ.get("TOMAT_MG_MASK_PRIOR", "cosine")
     mg_loss_type = os.environ.get("TOMAT_MG_LOSS_TYPE", "ce")
+    mg_kl_sigma = float(os.environ.get("TOMAT_MG_KL_SIGMA", "0.5"))
     if mg_mask_prior not in ("cosine", "uniform", "high", "absorbing"):
         raise ValueError(
             f"TOMAT_MG_MASK_PRIOR must be cosine/uniform/high/absorbing, "
             f"got {mg_mask_prior!r}"
         )
-    if mg_loss_type not in ("ce", "ce_emd", "emd"):
+    _valid_mg = ("ce", "ce_emd", "emd", "kl_gauss", "crps")
+    if mg_loss_type not in _valid_mg:
         raise ValueError(
-            f"TOMAT_MG_LOSS_TYPE must be ce/ce_emd/emd, got {mg_loss_type!r}"
+            f"TOMAT_MG_LOSS_TYPE must be one of {_valid_mg}, got {mg_loss_type!r}"
         )
 
     # Scheduled-sampling (FR-aware AR training) env vars — spec 31.
@@ -890,6 +892,7 @@ def main():
             prior=mg_mask_prior,
             weight=density_l1_weight,
             loss_type=mg_loss_type,
+            kl_sigma=mg_kl_sigma,
         )
         configure_maskgit_loss(mg_loss_args)
         print(f"[tomat-tpu] MaskGIT loss configured: penalty={penalty_val:.4f}")

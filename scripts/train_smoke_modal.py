@@ -427,6 +427,13 @@ def _train_bakeoff_impl(
     maskgit_mode: bool = False,
     maskgit_prior: str = "absorbing",
     maskgit_loss_type: str = "ce",
+    # KL-Gaussian σ in ρ-units (loss_type="kl_gauss"). See
+    # `posts/13-why-pure-emd-collapses.md` §5.1.
+    maskgit_kl_sigma: float = 0.5,
+    # λ multiplier on the EMD term in ce_emd. Was hard-coded to 1.0 in v4
+    # runs; exposed here for the LF ablation (§5.2 of post 13). Ignored for
+    # ce / kl_gauss / crps / emd-only.
+    maskgit_weight: float = 1.0,
     wandb_project: str | None = None,
     steps_per_eval: int | None = None,  # None = disable mid-training eval (old default)
     # Shuffle params. TPU reads these from `meta.patches_per_material` (default
@@ -530,10 +537,15 @@ def _train_bakeoff_impl(
                 f"maskgit_prior must be cosine/uniform/high/absorbing, got "
                 f"{maskgit_prior!r}"
             )
-        if maskgit_loss_type not in ("ce", "ce_emd", "emd"):
+        _valid_mg_lt = ("ce", "ce_emd", "emd", "kl_gauss", "crps")
+        if maskgit_loss_type not in _valid_mg_lt:
             raise ValueError(
-                f"maskgit_loss_type must be ce/ce_emd/emd, got "
+                f"maskgit_loss_type must be one of {_valid_mg_lt}, got "
                 f"{maskgit_loss_type!r}"
+            )
+        if maskgit_loss_type == "kl_gauss" and not (maskgit_kl_sigma > 0):
+            raise ValueError(
+                f"maskgit_kl_sigma must be > 0, got {maskgit_kl_sigma!r}"
             )
         if not lmq_path:
             raise ValueError(
@@ -554,6 +566,7 @@ def _train_bakeoff_impl(
         os.environ["TOMAT_MG_MODE"] = "1"
         os.environ["TOMAT_MG_MASK_PRIOR"] = maskgit_prior
         os.environ["TOMAT_MG_LOSS_TYPE"] = maskgit_loss_type
+        os.environ["TOMAT_MG_KL_SIGMA"] = str(maskgit_kl_sigma)
 
     # Install gcsfs at runtime (skipped in image build because adding it to the
     # image-level pip line busts the layer cache and re-resolves the marin-*
@@ -699,8 +712,9 @@ def _train_bakeoff_impl(
                 penalty=penalty,
                 mask_id=mask_id,
                 prior=maskgit_prior,
-                weight=1.0,
+                weight=maskgit_weight,
                 loss_type=maskgit_loss_type,
+                kl_sigma=maskgit_kl_sigma,
             )
             configure_maskgit_loss(mg_loss_args)
             err(f"[bakeoff] MaskGIT loss configured: penalty={penalty:.3f} "
@@ -771,6 +785,8 @@ def _train_bakeoff_impl(
             f"bs{batch_size}", f"seed{seed}"]
     if maskgit_mode:
         tags += ["maskgit", f"mg-prior-{maskgit_prior}", f"mg-loss-{maskgit_loss_type}"]
+        if maskgit_loss_type == "kl_gauss":
+            tags += [f"mg-kl-sigma-{maskgit_kl_sigma:g}"]
     trackers = (
         WandbConfig(
             entity="open-athena",  # corporate team; new tomat runs go here.
@@ -839,12 +855,26 @@ def train_bakeoff_h100x8(
     label: str,
     results_label: str,
     model_preset: str,
-    parquet_root: str,
+    parquet_root: str | list[str],
     gradient_checkpointing: bool = True,
     compute_dtype: str = "bfloat16",
     lmq_path: str | None = None,
     density_loss_type: str = "emd",
     density_only: bool = True,
+    maskgit_mode: bool = False,
+    maskgit_prior: str = "absorbing",
+    maskgit_loss_type: str = "ce",
+    maskgit_kl_sigma: float = 0.5,
+    wandb_project: str | None = None,
+    steps_per_eval: int | None = None,
+    shuffle_io_block_size: int = 64,
+    shuffle_window_blocks: int = 1024,
+    val_seqs: int = 0,
+    learning_rate: float = 3e-4,
+    lr_schedule: str = "cosine",
+    warmup: float = 0.05,
+    run_id: str | None = None,
+    cache_tarball_path: str | None = None,
 ) -> dict:
     """8× H100 SXM5 bakeoff probe; per-GPU BS = batch_size / 8."""
     return _train_bakeoff_impl(
@@ -854,6 +884,21 @@ def train_bakeoff_h100x8(
         lmq_path=lmq_path,
         density_loss_type=density_loss_type,
         density_only=density_only,
+        maskgit_mode=maskgit_mode,
+        maskgit_prior=maskgit_prior,
+        maskgit_loss_type=maskgit_loss_type,
+        maskgit_kl_sigma=maskgit_kl_sigma,
+        maskgit_weight=maskgit_weight,
+        wandb_project=wandb_project,
+        steps_per_eval=steps_per_eval,
+        shuffle_io_block_size=shuffle_io_block_size,
+        shuffle_window_blocks=shuffle_window_blocks,
+        val_seqs=val_seqs,
+        learning_rate=learning_rate,
+        lr_schedule=lr_schedule,
+        warmup=warmup,
+        run_id=run_id,
+        cache_tarball_path=cache_tarball_path,
     )
 
 
@@ -915,6 +960,13 @@ def train_bakeoff_h200x8(
     maskgit_mode: bool = False,
     maskgit_prior: str = "absorbing",
     maskgit_loss_type: str = "ce",
+    # KL-Gaussian σ in ρ-units (loss_type="kl_gauss"). See
+    # `posts/13-why-pure-emd-collapses.md` §5.1.
+    maskgit_kl_sigma: float = 0.5,
+    # λ multiplier on the EMD term in ce_emd. Was hard-coded to 1.0 in v4
+    # runs; exposed here for the LF ablation (§5.2 of post 13). Ignored for
+    # ce / kl_gauss / crps / emd-only.
+    maskgit_weight: float = 1.0,
     wandb_project: str | None = None,
     steps_per_eval: int | None = None,
     shuffle_io_block_size: int = 64,
@@ -937,6 +989,8 @@ def train_bakeoff_h200x8(
         maskgit_mode=maskgit_mode,
         maskgit_prior=maskgit_prior,
         maskgit_loss_type=maskgit_loss_type,
+        maskgit_kl_sigma=maskgit_kl_sigma,
+        maskgit_weight=maskgit_weight,
         wandb_project=wandb_project,
         steps_per_eval=steps_per_eval,
         shuffle_io_block_size=shuffle_io_block_size,
