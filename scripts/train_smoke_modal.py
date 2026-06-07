@@ -411,6 +411,81 @@ def main_8gpu(
 train_volume = modal.Volume.from_name(TRAIN_VOLUME_NAME)
 
 
+def record_pending_fire(
+    *,
+    fc_id: str,
+    hardware: str,
+    function_name: str,
+    results_label: str,
+    batch_size: int,
+    seed: int,
+    model_preset: str,
+    intended_steps: int,
+    wandb_project: str,
+    loss_type: str,
+    kl_sigma: float | None,
+    maskgit_prior: str,
+    tags: list[str],
+    app_name: str = "tomat-train-smoke",
+    run_id: str | None = None,
+) -> None:
+    """Push a `pending-fires.json` entry for a freshly-spawned training fire.
+
+    Mirrors the canonical `run_id` line in `_train_bakeoff_impl`
+    (`f"{results_label}-bs{batch_size}-seed{seed}"`). Run from the local
+    entrypoint AFTER `fn.spawn(...)` returns, so we have the real fc-id.
+
+    Best-effort: any failure here (missing `tomat` CLI, R2 auth gone, etc.)
+    just logs to stderr and continues — a missing placeholder card is at
+    worst 15-30 min of dashboard invisibility, never a training regression.
+
+    Opt out by setting `TOMAT_SKIP_PENDING_FIRE=1` (useful in tests / when
+    spawning to a non-R2-credentialed environment).
+    """
+    import os as _os
+    import subprocess as _sp
+    if _os.environ.get("TOMAT_SKIP_PENDING_FIRE") == "1":
+        err("[pending-fire] skipped via TOMAT_SKIP_PENDING_FIRE=1")
+        return
+    rid = run_id or f"{results_label}-bs{batch_size}-seed{seed}"
+    # Resolve the `tomat` CLI relative to this file (repo root sibling),
+    # so the script works both from inside the repo + when invoked from
+    # another cwd. `modal run` keeps cwd at the user's launch dir.
+    tomat_bin = str(Path(__file__).resolve().parent.parent / "tomat")
+    if not Path(tomat_bin).exists():
+        err(f"[pending-fire] WARN: tomat CLI not at {tomat_bin}; skipping")
+        return
+    cmd = [
+        tomat_bin, "modal", "pending-fire", "add",
+        "--app-name", app_name,
+        "--batch-size", str(batch_size),
+        "--fc-id", fc_id,
+        "--function-name", function_name,
+        "--hardware", hardware,
+        "--loss-type", loss_type,
+        "--model-preset", model_preset,
+        "--maskgit-prior", maskgit_prior,
+        "--results-label", results_label,
+        "--run-id", rid,
+        "--seed", str(seed),
+        "--intended-steps", str(intended_steps),
+        "--wandb-project", wandb_project,
+    ]
+    if kl_sigma is not None:
+        cmd += ["--kl-sigma", str(kl_sigma)]
+    for t in tags:
+        cmd += ["--tags", t]
+    try:
+        r = _sp.run(cmd, capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            err(f"[pending-fire] WARN: tomat pending-fire add rc={r.returncode}: "
+                f"{r.stderr[-500:]}")
+        else:
+            err(f"[pending-fire] recorded {rid} (fc={fc_id})")
+    except Exception as e:
+        err(f"[pending-fire] WARN: subprocess failed: {type(e).__name__}: {e}")
+
+
 def _train_bakeoff_impl(
     steps: int,
     batch_size: int,
@@ -1056,6 +1131,27 @@ def main_bakeoff_h200x8(
             wandb_project=wandb_project or None,
         )
         err(f"[modal] spawned call_id={call.object_id} — function runs independently of this process")
+        # Mirror the tag list `_train_bakeoff_impl` will set when wandb opens —
+        # the dashboard's placeholder card can render the same chips immediately.
+        tags = ["bakeoff", "modal", f"model{model_preset}",
+                f"bs{batch_size}", f"seed{seed}"]
+        if maskgit_mode:
+            tags += ["maskgit", f"mg-prior-{maskgit_prior}",
+                     f"mg-loss-{maskgit_loss_type}"]
+        record_pending_fire(
+            fc_id=call.object_id,
+            hardware="h200x8",
+            function_name="train_bakeoff_h200x8",
+            results_label=results_label,
+            batch_size=batch_size, seed=seed,
+            model_preset=model_preset,
+            intended_steps=steps,
+            wandb_project=wandb_project or "tomat-lmq-P19",
+            loss_type=maskgit_loss_type if maskgit_mode else density_loss_type,
+            kl_sigma=None,
+            maskgit_prior=maskgit_prior,
+            tags=tags,
+        )
     else:
         err(f"[modal] using blocking .remote() (TOMAT_MODAL_SPAWN=0); local process must stay alive")
         result = train_bakeoff_h200x8.remote(
