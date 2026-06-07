@@ -103,7 +103,7 @@ export function TrajectoryPlot({ url }: Props) {
         y: [best.value],
         name: `best ${r.label}`,
         showlegend: false,
-        mode: 'markers+text',
+        mode: 'text+markers',
         type: 'scatter',
         marker: { symbol: 'star', size: 16, color, line: { color: '#000', width: 0.7 } },
         text: [`step-${best.step}<br>${best.value.toFixed(2)}%`],
@@ -135,10 +135,13 @@ export function TrajectoryPlot({ url }: Props) {
     yaxis2: { title: { text: 'mat-NEMD mean (%)' }, gridcolor, zerolinecolor, layer: 'below traces' },
     shapes: [
       // Chinchilla-optimal + 1-epoch vertical lines on both panels.
-      ...(['y', 'y2'] as const).flatMap((yref) => [
-        { type: 'line' as const, x0: data.chinchilla_step, x1: data.chinchilla_step, yref, y0: 0, y1: 1, xref: yref === 'y' ? 'x' : 'x2', line: { color: '#888', width: 1, dash: 'dot' as const } },
-        { type: 'line' as const, x0: data.epoch_step,      x1: data.epoch_step,      yref, y0: 0, y1: 1, xref: yref === 'y' ? 'x' : 'x2', line: { color: '#888', width: 1, dash: 'dot' as const } },
-      ]),
+      ...(['y', 'y2'] as const).flatMap((yref) => {
+        const xref = yref === 'y' ? ('x' as const) : ('x2' as const)
+        return [
+          { type: 'line' as const, x0: data.chinchilla_step, x1: data.chinchilla_step, yref, y0: 0, y1: 1, xref, line: { color: '#888', width: 1, dash: 'dot' as const } },
+          { type: 'line' as const, x0: data.epoch_step,      x1: data.epoch_step,      yref, y0: 0, y1: 1, xref, line: { color: '#888', width: 1, dash: 'dot' as const } },
+        ]
+      }),
     ],
     annotations: [
       { x: data.chinchilla_step, y: 1.02, xref: 'x2', yref: 'paper', text: 'Chinchilla-opt', showarrow: false, font: { size: 10, color: '#888' }, xanchor: 'left' },
