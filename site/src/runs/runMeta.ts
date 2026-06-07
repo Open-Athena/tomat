@@ -300,11 +300,13 @@ export function epochOfStep(step: number, manifest: RunManifest | null): number 
   return (step * bs) / epochSeqs
 }
 
-/** FLOP count → "1.1e20". */
-export function formatFlops(f: number): string {
-  const exp = Math.floor(Math.log10(f))
-  return `${(f / 10 ** exp).toFixed(1)}e${exp}`
-}
+// `formatFlops` lives in `./flops.format` now; the URL-backed unit
+// preference (`?fopu=`) is in `./flops`. Re-export so callers can import
+// either path. The single-arg signature `formatFlops(n)` still works and
+// defaults to `EF` ("240 EF"); for the prior scientific-notation display
+// ("2.4e20"), pass `formatFlops(n, 'sci')` explicitly.
+export { formatFlops } from './flops.format'
+export type { FlopUnit } from './flops.format'
 
 /** Tokenizer generation, from the authoritative wandb project name
  *  (`tomat-…-P14` = v2 patch tokenizer, `…-P19` = v3). The run *name* is not

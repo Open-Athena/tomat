@@ -22,6 +22,7 @@ import {
   applySmoothing, bandsParam, DEFAULT_EMA_ALPHA, DEFAULT_ROLLING_WINDOW,
   smoothKey, smoothParam, type SmoothMode,
 } from './smoothing'
+import { FlopUnitChips, useFlopUnit } from './flops'
 // Re-export so RunsPage can `import { ... } from './RunsTimelinePlot'` —
 // keeps callers off the helper module's internal path.
 export { compileMultiTermFilter, runHaystack, FILTER_EXAMPLES } from './filter'
@@ -490,6 +491,10 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
   // closest-trace highlight fades them together.
   const [smooth, setSmooth] = useSmoothMode()
   const [bandsOn, setBandsOn] = useBandsToggle()
+  // FLOP-unit display preference (`?fopu=`). Drives `formatFlops` on this
+  // plot's hovertext + tooltips and — via the same URL state — every per-card
+  // pill in the list below.
+  const [flopUnit, setFlopUnit] = useFlopUnit()
 
   // Regex filter on run name. Persisted + cross-component-synced (RunsPage
   // reads the same hook to sort matching cards to top + fade non-matches).
@@ -1103,6 +1108,10 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
         <SmoothingChips
           mode={smooth} setMode={setSmooth}
           bandsOn={bandsOn} setBandsOn={setBandsOn}
+          isDark={isDark} fg={fg} muted={muted}
+        />
+        <FlopUnitChips
+          unit={flopUnit} setUnit={setFlopUnit}
           isDark={isDark} fg={fg} muted={muted}
         />
       </div>

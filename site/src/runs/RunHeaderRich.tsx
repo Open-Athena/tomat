@@ -25,7 +25,6 @@ import { computeTrainingFraction, formatDurationShort } from './trainingFraction
 import { lineageFor } from './lineage'
 import type { RunHistory } from './parquet'
 import {
-  formatFlops,
   formatStepCount,
   freshnessColor,
   HW_COLORS,
@@ -39,6 +38,7 @@ import {
   stepsInWindow,
   timeAgo,
 } from './runMeta'
+import { formatFlops, useFlopUnit } from './flops'
 import { tagsFor, type RunTag } from './tags'
 
 // ── small SVG sparkline (no plotly) ─────────────────────────────────────────
@@ -983,6 +983,9 @@ export function RunHeaderRich({
   const mvNmae = manifest?.summary?.['eval/mat_nmae/val_200/mean']
   const nEpochs = nEpochsOf(manifest)
   const nFlops = nFlopsOf(manifest)
+  // FLOP-unit preference (`?fopu=EF|PF|TF|sci`). Default EF. Same hook on
+  // every card so the chip group below the plot drives every per-card pill.
+  const [flopUnit] = useFlopUnit()
 
   const sparkPts = useMemo(() => history ? recentStepPoints(history) : [], [history])
   const lastTs = sparkPts.length > 0 ? sparkPts[sparkPts.length - 1].x : null
@@ -1263,7 +1266,12 @@ export function RunHeaderRich({
               isModalOnly={isModalRun(id)}
             /></>
           )}
-          {nFlops != null && <> · {formatFlops(nFlops)} FLOP</>}
+          {nFlops != null && (
+            <> · {flopUnit === 'sci'
+              ? <>{formatFlops(nFlops, 'sci')} FLOP</>
+              : formatFlops(nFlops, flopUnit)}
+            </>
+          )}
         </div>
         {/* % training chip — sum(train-active windows ∩ attempt windows) /
             (now or finished_at − submitted_at). Only renders when we have
