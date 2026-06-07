@@ -120,6 +120,36 @@ export function useAncestorsToggle(): readonly [boolean, (v: boolean) => void] {
   return [on, setOn] as const
 }
 
+/** `?xrange=lo,hi` — sticky x-axis zoom. Both endpoints come back from Plotly's
+ *  relayout event as either `number` (linear axes — step/elapsed/active) or a
+ *  `YYYY-MM-DD HH:MM:SS[.fff]` string (date axis — clock mode). Both encode
+ *  losslessly as `lo,hi` since neither format contains a literal comma; the
+ *  decoder routes any all-digits-with-optional-dot-and-sign back to `number`
+ *  and leaves date strings as-is. `null` (no user range) → param absent. */
+type XRangeVal = number | string
+const xRangeParam: Param<[XRangeVal, XRangeVal] | null> = {
+  encode: (v) => (v ? `${v[0]},${v[1]}` : undefined),
+  decode: (s) => {
+    if (s == null || s === '') return null
+    const comma = s.indexOf(',')
+    if (comma < 0) return null
+    const parseEnd = (raw: string): XRangeVal => {
+      // Numeric iff it matches a JS-number shape — date strings have `-`
+      // mid-string (e.g. `2026-05-26 …`) so leave them as-is and only
+      // narrow to `number` when the input parses cleanly.
+      if (/^-?\d+(\.\d+)?$/.test(raw)) return Number(raw)
+      return raw
+    }
+    return [parseEnd(s.slice(0, comma)), parseEnd(s.slice(comma + 1))]
+  },
+}
+
+/** Hook owning the `?xrange=lo,hi` URL state for the sticky x-axis zoom. */
+function useXRange(): readonly [[XRangeVal, XRangeVal] | null, (v: [XRangeVal, XRangeVal] | null) => void] {
+  const [v, set] = useUrlState('xrange', xRangeParam)
+  return [v, set] as const
+}
+
 /** Hook owning the `?smooth=…` smoothing mode. Default `raw`. */
 export function useSmoothMode(): readonly [SmoothMode, (v: SmoothMode) => void] {
   const [mode, setMode] = useUrlState('smooth', smoothParam)
@@ -688,11 +718,21 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
   const muted = isDark ? '#888' : '#666'
 
   // User-driven x-zoom selection. Sticky until the user double-clicks the plot
-  // (Plotly's auto-range gesture). Without this, every parent re-render
-  // recomputes the auto-ranged `xaxis` and overwrites Plotly's internal zoom.
-  // Reset when xMode changes (different x scale = different range units).
-  const [userXRange, setUserXRange] = useState<[number | string, number | string] | null>(null)
-  useEffect(() => { setUserXRange(null) }, [xMode])
+  // (Plotly's auto-range gesture) — and URL-persisted via `?xrange=lo,hi` so
+  // a deep-linked / reloaded session restores the same view. Without this,
+  // every parent re-render recomputes the auto-ranged `xaxis` and overwrites
+  // Plotly's internal zoom.
+  // Reset when xMode changes (different x scale = different range units), but
+  // skip the very first render so a fresh `?xrange=` from the URL survives.
+  // `xMode` is itself a localStorage-backed `useState` init, so `xMode` at
+  // mount IS the mode `?xrange` was zoomed under.
+  const [userXRange, setUserXRange] = useXRange()
+  const xModeOnMountRef = useRef(xMode)
+  useEffect(() => {
+    if (xMode === xModeOnMountRef.current) return
+    setUserXRange(null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [xMode])
 
   // Closest-trace-on-hover: with `hovermode: 'x unified'` Plotly hands us every
   // trace's value at the cursor's x; we pick the one whose y is closest to the
