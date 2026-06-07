@@ -1171,6 +1171,21 @@ def runs_sync(substr: str, bucket: str, prefix: str, project: str | None, dry_ru
         err(f"[sync] WARN: cost compute failed for {r.name}: "
             f"{type(e).__name__}: {e}")
 
+    # Drop this run from `pending-fires.json` now that its wandb manifest
+    # has landed on R2 — the dashboard's placeholder card has been
+    # superseded by the real manifest-derived card. Failures non-fatal.
+    try:
+        doc = _load_pending_fires(bucket)
+        fires = doc.get("fires", [])
+        kept = [f for f in fires if f.get("run_id") != r.name]
+        if len(kept) != len(fires):
+            doc["fires"] = kept
+            _save_pending_fires(doc, bucket=bucket)
+            err(f"[sync] pruned {r.name} from pending-fires.json")
+    except Exception as e:
+        err(f"[sync] WARN: pending-fires prune failed for {r.name}: "
+            f"{type(e).__name__}: {e}")
+
 
 @runs.command("wallclock-plot")
 @click.argument("substr")
@@ -1948,6 +1963,212 @@ def modal_sync(bucket: str, key: str, dry_run: bool, fc_ids: tuple[str, ...]):
     else:
         _r2_put_bytes(bucket, key, data, "application/json")
         print(f"[modal sync] {R2_ENDPOINT}/{bucket}/{key}")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# tomat modal pending-fire
+# ──────────────────────────────────────────────────────────────────────
+#
+# `pending-fires.json` is a tiny R2 sidecar listing Modal-spawned training
+# fires that the wandb-derived manifest doesn't know about yet. The /runs
+# dashboard merges it with the manifest-derived run list so a freshly-fired
+# Modal job shows up as a placeholder card immediately, well before the
+# container starts logging to wandb (~15-30 min later).
+#
+# Lifecycle:
+#   1. `tomat modal pending-fire add ...` (called by the spawn helper in
+#      `scripts/train_smoke_modal.py` right after `fn.spawn(...)`) →
+#      writes one entry to `pending-fires.json`.
+#   2. `tomat runs sync ...` syncs the wandb run → R2 manifest. After
+#      that, `tomat modal pending-fire gc` (called at the end of sync)
+#      prunes the corresponding `pending-fires.json` entry.
+#
+# The R2 read-modify-write is not locked across concurrent writes. We
+# accept the race window because spawn rate is < 1/sec in practice and a
+# missed entry just delays a placeholder card by one sync cycle.
+
+PENDING_FIRES_KEY = "tomat/pending-fires.json"
+_PENDING_FIRES_SCHEMA_VERSION = 1
+
+
+def _load_pending_fires(bucket: str = R2_BUCKET) -> dict:
+    """Fetch pending-fires.json from R2; return a fresh empty doc if absent."""
+    doc = _r2_get_json(bucket, PENDING_FIRES_KEY)
+    if not isinstance(doc, dict) or "fires" not in doc:
+        return {
+            "schema_version": _PENDING_FIRES_SCHEMA_VERSION,
+            "synced_at": datetime.datetime.now(datetime.timezone.utc)
+                .isoformat(timespec="seconds"),
+            "fires": [],
+        }
+    return doc
+
+
+def _save_pending_fires(doc: dict, bucket: str = R2_BUCKET, dry_run: bool = False) -> None:
+    """Stamp `synced_at` + push pending-fires.json back to R2."""
+    doc["schema_version"] = _PENDING_FIRES_SCHEMA_VERSION
+    doc["synced_at"] = datetime.datetime.now(datetime.timezone.utc)\
+        .isoformat(timespec="seconds")
+    data = json.dumps(doc, indent=1).encode("utf-8")
+    if dry_run:
+        print(data.decode())
+        return
+    _r2_put_bytes(bucket, PENDING_FIRES_KEY, data, "application/json")
+
+
+@modal_grp.group("pending-fire")
+def pending_fire_grp():
+    """Track Modal-spawned training fires before their wandb session opens.
+
+    `pending-fires.json` on R2 is read by the runs dashboard so a freshly-
+    spawned run renders as a placeholder card immediately, instead of
+    waiting ~15-30 min for the container to start logging to wandb.
+    """
+
+
+@pending_fire_grp.command("add")
+@click.option("-b", "--bucket", default=R2_BUCKET, help="R2 bucket")
+@click.option("-a", "--app-name", required=True, help="Modal app name (e.g. `tomat-train-smoke`)")
+@click.option("-B", "--batch-size", type=int, required=True, help="train batch size")
+@click.option("-f", "--fc-id", required=True, help="Modal function-call id (`fc-…`)")
+@click.option("-F", "--function-name", required=True, help="Modal function (e.g. `train_bakeoff_h200x8`)")
+@click.option("-H", "--hardware", required=True, help="hardware label (e.g. `h200x8`)")
+@click.option("-k", "--kl-sigma", type=float, default=None, help="MaskGIT kl_gauss sigma (if loss_type=kl_gauss)")
+@click.option("-L", "--loss-type", default="ce", help="loss type (`ce` / `emd` / `kl_gauss` / `crps` …)")
+@click.option("-m", "--model-preset", default="200M", help="model size preset")
+@click.option("-n", "--dry-run", is_flag=True, help="print the resulting JSON without uploading")
+@click.option("-P", "--maskgit-prior", default="absorbing", help="MaskGIT prior")
+@click.option("-r", "--results-label", required=True, help="results dir leaf (run_id minus `-bs<BS>-seed<S>`)")
+@click.option("-R", "--run-id", default=None, help="canonical run id (defaults to `<results_label>-bs<BS>-seed<seed>`)")
+@click.option("-s", "--seed", type=int, required=True, help="run seed")
+@click.option("-S", "--intended-steps", type=int, required=True, help="`num_train_steps` the spawn requested")
+@click.option("-t", "--tags", multiple=True, help="wandb tag (repeatable)")
+@click.option("-T", "--spawned-at-ms", type=int, default=None,
+              help="spawn epoch-ms (default: now)")
+@click.option("-W", "--wandb-project", required=True, help="wandb project (e.g. `tomat-lmq-P19`)")
+def pending_fire_add(
+    app_name: str,
+    batch_size: int,
+    bucket: str,
+    dry_run: bool,
+    fc_id: str,
+    function_name: str,
+    hardware: str,
+    intended_steps: int,
+    kl_sigma: float | None,
+    loss_type: str,
+    maskgit_prior: str,
+    model_preset: str,
+    results_label: str,
+    run_id: str | None,
+    seed: int,
+    spawned_at_ms: int | None,
+    tags: tuple[str, ...],
+    wandb_project: str,
+):
+    """Record one Modal-spawned training fire in `pending-fires.json`.
+
+    Called by the spawn wrapper in `scripts/train_smoke_modal.py` right
+    after `fn.spawn(...)` returns. Read-modify-write of the R2 sidecar;
+    if an entry with the same `run_id` already exists, this overwrites it
+    (e.g. a re-spawn of the same canonical name updates the fc_id).
+    """
+    rid = run_id or f"{results_label}-bs{batch_size}-seed{seed}"
+    if spawned_at_ms is None:
+        spawned_at_ms = int(time.time() * 1000)
+    entry = {
+        "run_id": rid,
+        "fc_id": fc_id,
+        "app_name": app_name,
+        "function_name": function_name,
+        "spawned_at_ms": spawned_at_ms,
+        "hardware": hardware,
+        "model_preset": model_preset,
+        "batch_size": batch_size,
+        "seed": seed,
+        "intended_steps": intended_steps,
+        "results_label": results_label,
+        "wandb_project": wandb_project,
+        "loss_type": loss_type,
+        "kl_sigma": kl_sigma,
+        "maskgit_prior": maskgit_prior,
+        "tags": list(tags),
+    }
+    doc = _load_pending_fires(bucket)
+    fires = [f for f in doc.get("fires", []) if f.get("run_id") != rid]
+    fires.append(entry)
+    fires.sort(key=lambda f: f.get("spawned_at_ms") or 0)
+    doc["fires"] = fires
+    print(f"[pending-fire add] {rid} (fc={fc_id}) → {len(fires)} total")
+    _save_pending_fires(doc, bucket=bucket, dry_run=dry_run)
+    if not dry_run:
+        print(f"[pending-fire add] {R2_ENDPOINT}/{bucket}/{PENDING_FIRES_KEY}")
+
+
+@pending_fire_grp.command("list")
+@click.option("-b", "--bucket", default=R2_BUCKET, help="R2 bucket")
+@click.option("--json", "as_json", is_flag=True, help="print raw JSON")
+def pending_fire_list(bucket: str, as_json: bool):
+    """List entries currently in `pending-fires.json`."""
+    doc = _load_pending_fires(bucket)
+    fires = doc.get("fires", [])
+    if as_json:
+        print(json.dumps(doc, indent=1))
+        return
+    print(f"synced_at: {doc.get('synced_at')}  n={len(fires)}")
+    for f in fires:
+        print(
+            f"  {f.get('run_id')}  fc={f.get('fc_id')}  "
+            f"hw={f.get('hardware')}  loss={f.get('loss_type')}  "
+            f"steps={f.get('intended_steps')}  "
+            f"spawned={f.get('spawned_at_ms')}"
+        )
+
+
+@pending_fire_grp.command("gc")
+@click.option("-b", "--bucket", default=R2_BUCKET, help="R2 bucket")
+@click.option("-p", "--prefix", default=R2_RUNS_PREFIX,
+              help="R2 key prefix (under which per-run manifests live)")
+@click.option("-n", "--dry-run", is_flag=True, help="report removals without uploading")
+@click.option("-A", "--max-age-hours", type=float, default=48.0,
+              help="also drop entries older than this many hours regardless of manifest "
+              "(catches `failed-before-wandb-init` fires that would never GC otherwise)")
+def pending_fire_gc(bucket: str, prefix: str, dry_run: bool, max_age_hours: float):
+    """Prune pending-fire entries whose wandb manifest now exists on R2.
+
+    Run after `tomat runs sync` so the dashboard stops double-rendering
+    a (placeholder, manifested) pair as soon as the wandb session has
+    been scraped.
+    """
+    doc = _load_pending_fires(bucket)
+    fires = doc.get("fires", [])
+    if not fires:
+        print("[pending-fire gc] empty — nothing to do")
+        return
+    manifested = set(_r2_list_synced_runs(bucket, prefix))
+    now_ms = int(time.time() * 1000)
+    max_age_ms = int(max_age_hours * 3600 * 1000)
+    kept: list[dict] = []
+    dropped: list[tuple[str, str]] = []  # (run_id, reason)
+    for f in fires:
+        rid = f.get("run_id", "")
+        spawned = f.get("spawned_at_ms") or 0
+        if rid in manifested:
+            dropped.append((rid, "manifested"))
+            continue
+        if spawned and now_ms - spawned > max_age_ms:
+            dropped.append((rid, f"older than {max_age_hours}h"))
+            continue
+        kept.append(f)
+    print(f"[pending-fire gc] kept={len(kept)} dropped={len(dropped)}")
+    for rid, reason in dropped:
+        print(f"  drop {rid} ({reason})")
+    if not dropped:
+        return
+    doc["fires"] = kept
+    _save_pending_fires(doc, bucket=bucket, dry_run=dry_run)
+    if not dry_run:
+        print(f"[pending-fire gc] {R2_ENDPOINT}/{bucket}/{PENDING_FIRES_KEY}")
 
 
 # ──────────────────────────────────────────────────────────────────────
