@@ -69,6 +69,12 @@ interface Props {
    *  applying the toggle to its card-list filter). */
   ancestorsOn?: boolean
   onAncestorsChange?: (next: boolean) => void
+  /** Fires whenever the user's loss-mode x-zoom (step range) changes. Only
+   *  populated when `xMode === 'loss'` (the only mode whose x-axis is
+   *  step-numbered); other modes fire `null` so the parent's step-range
+   *  filter clears. Passes `[lo, hi]` (rounded to step ints) on a finite
+   *  drag-zoom, `null` on autorange / non-loss modes / partial ranges. */
+  onStepRangeChange?: (range: [number, number] | null) => void
 }
 
 /** Local-TZ datetime string for a Plotly date axis. Plotly treats a string
@@ -345,7 +351,7 @@ export function SmoothingChips({
   const chipStyle = (on: boolean): CSSProperties => ({
     background: on ? (isDark ? '#2a2a2a' : '#e8e8e8') : 'transparent',
     border: `1px solid ${on ? (isDark ? '#444' : '#bbb') : 'transparent'}`,
-    borderRadius: 4, cursor: 'pointer', padding: '2px 8px',
+    borderRadius: 4, cursor: 'pointer', padding: '2px 5px',
     fontSize: '0.72rem', fontFamily: 'inherit',
     color: on ? fg : muted,
   })
@@ -370,7 +376,7 @@ export function SmoothingChips({
   }
 
   return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginLeft: 8 }}>
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, marginLeft: 4 }}>
       <span style={{ fontSize: '0.7rem', color: muted }}>smooth:</span>
       <Tooltip content="no smoothing (raw history)">
         <button onClick={() => setMode({ kind: 'raw' })} style={chipStyle(mode.kind === 'raw')}>
@@ -442,7 +448,7 @@ export function SmoothingChips({
   )
 }
 
-export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onPlotHover, tagFilters: tagFiltersExternal, onTagFiltersChange, ancestorsOn, onAncestorsChange }: Props) {
+export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onPlotHover, tagFilters: tagFiltersExternal, onTagFiltersChange, ancestorsOn, onAncestorsChange, onStepRangeChange }: Props) {
   const { isDark } = useTheme()
 
   // Legend collapse persists in localStorage — it's long, some users tuck it
@@ -751,6 +757,24 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
     setUserXRange(null)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [xMode])
+
+  // Tell the parent about the current step-range zoom (loss-mode only). Used to
+  // hide runs whose entire step trajectory is outside the visible window from
+  // both the legend and the card list. Fires `null` whenever we're NOT in a
+  // pure step-zoom state — non-loss modes, autorange, or a partial / non-numeric
+  // range (e.g. mid-drag with one endpoint still a date string from a stale
+  // mode). The plot itself remains unaffected; only the parent's filter cares.
+  useEffect(() => {
+    if (!onStepRangeChange) return
+    if (xMode !== 'loss' || userXRange == null) { onStepRangeChange(null); return }
+    const [a, b] = userXRange
+    if (typeof a !== 'number' || typeof b !== 'number'
+        || !Number.isFinite(a) || !Number.isFinite(b)) {
+      onStepRangeChange(null)
+      return
+    }
+    onStepRangeChange([Math.min(a, b), Math.max(a, b)])
+  }, [userXRange, xMode, onStepRangeChange])
 
   // Closest-trace-on-hover: with `hovermode: 'x unified'` Plotly hands us every
   // trace's value at the cursor's x; we pick the one whose y is closest to the
