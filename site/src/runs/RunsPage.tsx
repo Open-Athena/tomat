@@ -8,6 +8,7 @@ import { concatHistories, fetchRunHistory, type RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
 import { RecentEvents } from './RecentEvents'
 import { EvalsPanel } from './EvalsPanel'
+import { MEvalTable } from './MEvalTable'
 import { RunsTimelinePlot, colorForIndex, useNameFilter, useTagFilters, useAncestorsToggle, compileMultiTermFilter, runHaystack, shortLabel } from './RunsTimelinePlot'
 import { runPassesTagFilters, tagsFor } from './tags'
 import { ancestorsOf, lineageFor } from './lineage'
@@ -1400,6 +1401,12 @@ function RunDetail({ runId }: { runId: string }) {
           ancestorHistoriesLoading={ancestorHistoryQs.some((q) => q.isLoading)}
         />
       )}
+      {/* Per-step m-eval table — compact summary of the eval.json points
+          surfaced as `step | val_200 | train_200 | …-maskgit` with subtle
+          NMAE/NEMD colour-coding. Sits above the timeline so the most-
+          important quality numbers are immediately visible. Self-hides when
+          `eval.json` returned nothing. */}
+      <MEvalTable evalSeries={evalQ.data ?? null} />
       {!history && !err && <p>loading parquet…</p>}
       {history && (
         <WallclockPlot
