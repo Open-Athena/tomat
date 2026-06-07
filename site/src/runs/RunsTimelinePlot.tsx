@@ -321,7 +321,7 @@ export function SmoothingChips({
   const chipStyle = (on: boolean): CSSProperties => ({
     background: on ? (isDark ? '#2a2a2a' : '#e8e8e8') : 'transparent',
     border: `1px solid ${on ? (isDark ? '#444' : '#bbb') : 'transparent'}`,
-    borderRadius: 4, cursor: 'pointer', padding: '2px 8px',
+    borderRadius: 4, cursor: 'pointer', padding: '2px 5px',
     fontSize: '0.72rem', fontFamily: 'inherit',
     color: on ? fg : muted,
   })
@@ -346,7 +346,7 @@ export function SmoothingChips({
   }
 
   return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginLeft: 8 }}>
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, marginLeft: 4 }}>
       <span style={{ fontSize: '0.7rem', color: muted }}>smooth:</span>
       <Tooltip content="no smoothing (raw history)">
         <button onClick={() => setMode({ kind: 'raw' })} style={chipStyle(mode.kind === 'raw')}>
