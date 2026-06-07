@@ -340,8 +340,8 @@ export function SmoothingChips({
   }
 
   return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 2, marginLeft: 8 }}>
-      <span style={{ fontSize: '0.7rem', color: muted, marginRight: 2 }}>smooth:</span>
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginLeft: 8 }}>
+      <span style={{ fontSize: '0.7rem', color: muted }}>smooth:</span>
       <Tooltip content="no smoothing (raw history)">
         <button onClick={() => setMode({ kind: 'raw' })} style={chipStyle(mode.kind === 'raw')}>
           raw
@@ -403,7 +403,6 @@ export function SmoothingChips({
             ...chipStyle(bandsOn && mode.kind === 'rolling'),
             opacity: mode.kind === 'rolling' ? 1 : 0.4,
             cursor: mode.kind === 'rolling' ? 'pointer' : 'not-allowed',
-            marginLeft: 4,
           }}
         >
           ±σ
