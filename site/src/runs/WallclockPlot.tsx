@@ -38,6 +38,7 @@ import { SmoothingChips, useBandsToggle, useSmoothMode } from './RunsTimelinePlo
 import { epochOfStep } from './runMeta'
 import { annotationsFor, type RunAnnotation } from './annotations'
 import { computeSmoothedSeries } from './smoothing'
+import { FlopUnitChips, formatFlops, useFlopUnit } from './flops'
 
 interface Props {
   history: RunHistory
@@ -59,18 +60,18 @@ interface Props {
   manifest?: RunManifest | null
 }
 
-type XMode = 'time' | 'elapsed' | 'step' | 'epoch'
+type XMode = 'time' | 'elapsed' | 'step' | 'epoch' | 'flop'
 
-// URL-facing x-axis mode names (`?x=wallclock|elapsed|step|epoch`). The
+// URL-facing x-axis mode names (`?x=wallclock|elapsed|step|epoch|flop`). The
 // internal XMode uses `'time'` for the wallclock axis; `wallclock` reads
 // better in shared links.
-type UrlXMode = 'wallclock' | 'elapsed' | 'step' | 'epoch'
-const URL_X_MODES = ['wallclock', 'elapsed', 'step', 'epoch'] as const
+type UrlXMode = 'wallclock' | 'elapsed' | 'step' | 'epoch' | 'flop'
+const URL_X_MODES = ['wallclock', 'elapsed', 'step', 'epoch', 'flop'] as const
 const X_TO_URL: Record<XMode, UrlXMode> = {
-  time: 'wallclock', elapsed: 'elapsed', step: 'step', epoch: 'epoch',
+  time: 'wallclock', elapsed: 'elapsed', step: 'step', epoch: 'epoch', flop: 'flop',
 }
 const URL_TO_X: Record<UrlXMode, XMode> = {
-  wallclock: 'time', elapsed: 'elapsed', step: 'step', epoch: 'epoch',
+  wallclock: 'time', elapsed: 'elapsed', step: 'step', epoch: 'epoch', flop: 'flop',
 }
 
 const COLORS = {
@@ -200,8 +201,18 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   // label. Hides the button (and silently falls back to `step` if the URL
   // asks for `?x=epoch` on a run whose manifest can't compute it).
   const epochAvailable = epochOfStep(0, manifest) != null
+  // Whether the `flop` axis is available — requires `throughput/total_gflops`
+  // in the parquet (added 2026-06-07; older runs don't have it). Hide the
+  // button + fall back to `step` from a `?x=flop` URL when missing. Cheap to
+  // probe: the parquet reader skips absent columns, so the Map will not have
+  // the key at all (vs the `epoch` test which evaluates a formula).
+  const flopColAvailable = (history.cols.get('throughput/total_gflops')?.length ?? 0) > 0
   const rawXMode: XMode = URL_TO_X[urlXMode]
-  const xMode: XMode = rawXMode === 'epoch' && !epochAvailable ? 'step' : rawXMode
+  const xMode: XMode = (
+    rawXMode === 'epoch' && !epochAvailable ? 'step'
+    : rawXMode === 'flop' && !flopColAvailable ? 'step'
+    : rawXMode
+  )
   const setXMode = (m: XMode) => setUrlXMode(X_TO_URL[m])
 
   // User-set x-range captured from box-zoom (`plotly_relayout`). Persists
@@ -269,6 +280,24 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     return pairs
   }, [ordered, cols])
 
+  // (ts, flops) pairs from every row carrying `throughput/total_gflops`.
+  // The wandb column logs cumulative GFLOPs; we store raw FLOPs (×1e9) so
+  // `formatFlops(x, unit)` lands a value in the unit the user chose. Sorted by
+  // ts (matches `ordered`). Drives `flopAtTs` for the `flop` x-axis mode.
+  // Empty for parquets logged before the column was added to the schema —
+  // the `flop` button is hidden in that case.
+  const tsFlop = useMemo(() => {
+    const totalGflops = cols.get('throughput/total_gflops') ?? []
+    const pairs: { ts: number; flop: number }[] = []
+    for (const { ts, i } of ordered) {
+      const g = totalGflops[i]
+      if (g === null || g === undefined) continue
+      pairs.push({ ts: ts as number, flop: (g as number) * 1e9 })
+    }
+    return pairs
+  }, [ordered, cols])
+  const flopAvailable = tsFlop.length > 0
+
   /** gstep of the latest logged row at or before `ts`. */
   function gstepAtTs(ts: number): number | null {
     if (tsGstep.length === 0) return null
@@ -294,6 +323,21 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     return best < 0 ? tsGstep[tsGstep.length - 1].ts : tsGstep[best].ts
   }
 
+  /** Cumulative FLOPs at the latest logged row at or before `ts`. Returns NaN
+   *  if the parquet doesn't carry the column (older runs); callers should fall
+   *  back gracefully (the index plot just skips that point; per-run plot
+   *  renders NaN gaps). */
+  function flopAtTs(ts: number): number {
+    if (tsFlop.length === 0) return NaN
+    let lo = 0, hi = tsFlop.length - 1, best = -1
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      if (tsFlop[mid].ts <= ts) { best = mid; lo = mid + 1 }
+      else hi = mid - 1
+    }
+    return best < 0 ? NaN : tsFlop[best].flop
+  }
+
   /** x-coordinate for a wallclock ts, per the current x-mode. */
   function xOfTs(ts: number): string | number {
     if (xMode === 'step') return gstepAtTs(ts) ?? NaN
@@ -303,6 +347,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       const ep = epochOfStep(s, manifest)
       return ep ?? NaN
     }
+    if (xMode === 'flop') return flopAtTs(ts)
     if (xMode === 'elapsed') return (ts - t0) / 3600
     return toLocal(ts)
   }
@@ -311,6 +356,12 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   function xOfStep(step: number): string | number | null {
     if (xMode === 'step') return step
     if (xMode === 'epoch') return epochOfStep(step, manifest)
+    if (xMode === 'flop') {
+      const ts = tsAtGstep(step)
+      if (ts === null) return null
+      const f = flopAtTs(ts)
+      return Number.isFinite(f) ? f : null
+    }
     const ts = tsAtGstep(step)
     if (ts === null) return null
     return xMode === 'elapsed' ? (ts - t0) / 3600 : toLocal(ts)
@@ -427,6 +478,9 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   // `WallclockPlot.test.ts` for the contract.
   const [smooth, setSmooth] = useSmoothMode()
   const [bandsOn, setBandsOn] = useBandsToggle()
+  // FLOP-unit display preference (`?fopu=`). Drives the axis title + tooltip
+  // formatting whenever the user is in `?x=flop` mode.
+  const [flopUnit, setFlopUnit] = useFlopUnit()
 
   // Gap detection in wallclock / elapsed modes: when a run is paused
   // (e.g. a Modal-side respawn between two real data points without an
@@ -1032,17 +1086,20 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   const xTitle = xMode === 'time' ? TZ_LABEL
     : xMode === 'elapsed' ? 'elapsed (h)'
     : xMode === 'epoch' ? 'epoch (fractional)'
+    : xMode === 'flop' ? `FLOP (${flopUnit})`
     : 'global_step'
 
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '0.4rem', marginBottom: '0.3rem' }}>
         <span style={{ fontSize: '0.75rem', color: '#888', alignSelf: 'center' }}>x-axis:</span>
-        {(['time', 'elapsed', 'step', 'epoch'] as XMode[])
+        {(['time', 'elapsed', 'step', 'epoch', 'flop'] as XMode[])
           // Hide `epoch` when the manifest can't compute it (data label not
           // in EPOCH_SEQUENCES, or `train_batch_size` missing) — a useless
-          // button would just confuse.
+          // button would just confuse. Same for `flop` when the parquet
+          // doesn't carry `throughput/total_gflops` (added 2026-06-07).
           .filter((m) => m !== 'epoch' || epochAvailable)
+          .filter((m) => m !== 'flop' || flopColAvailable)
           .map((m) => (
           <button
             key={m}
@@ -1058,12 +1115,18 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
               cursor: 'pointer',
             }}
           >
-            {m === 'time' ? 'wallclock' : m}
+            {m === 'time' ? 'wallclock' : m === 'flop' ? 'FLOP' : m}
           </button>
         ))}
         <SmoothingChips
           mode={smooth} setMode={setSmooth}
           bandsOn={bandsOn} setBandsOn={setBandsOn}
+          isDark={isDark}
+          fg={isDark ? '#bbb' : '#444'}
+          muted={isDark ? '#888' : '#666'}
+        />
+        <FlopUnitChips
+          unit={flopUnit} setUnit={setFlopUnit}
           isDark={isDark}
           fg={isDark ? '#bbb' : '#444'}
           muted={isDark ? '#888' : '#666'}
@@ -1139,6 +1202,12 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
             title: { text: xTitle },
             type: xMode === 'time' ? 'date' : 'linear',
             ...(xMode === 'time' ? { tickformat: '%-m/%-d %H:%M' } : {}),
+            // FLOP mode: scientific notation for the axis ticks
+            // (`tickformat: '~e'` → 2e20, not "240 EF") so the axis itself
+            // stays compact. The unit-formatted display lives in the title +
+            // tooltip (`hovertemplate` below). FLOP values span 6+ OOM across
+            // runs so SI suffixes (`~s` → "240E") would be ambiguous.
+            ...(xMode === 'flop' ? { tickformat: '.2e' } : {}),
             gridcolor, zerolinecolor, linecolor: gridcolor,
             // Anchor to the bottom-most y-axis so tick labels render BELOW
             // the bottom panel (MT/MV when present, TL/VL when not), instead

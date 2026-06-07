@@ -89,6 +89,10 @@ RUN_PARQUET_KEYS = [
     "global_step",
     "train/loss", "eval/loss",
     "throughput/mfu", "throughput/tokens_per_second", "throughput/duration",
+    # Cumulative GFLOPs since training started — monotonic, drives the FLOP
+    # x-axis option in the dashboard. Added 2026-06-07; older parquets won't
+    # have it (older runs would need a forced full re-sync).
+    "throughput/total_gflops",
     "eval/mat_nmae/val_200/mean", "eval/mat_nmae/val_200/median", "eval/mat_nmae/val_200/p99",
     "eval/mat_nmae/train_200/mean", "eval/mat_nmae/train_200/median", "eval/mat_nmae/train_200/p99",
     "eval/mat_nemd/val_200/mean", "eval/mat_nemd/val_200/median", "eval/mat_nemd/val_200/p99",
@@ -128,6 +132,9 @@ def run_parquet_schema():
         ("throughput/mfu",                   pa.float32()),
         ("throughput/tokens_per_second",     pa.float32()),
         ("throughput/duration",              pa.float32()),
+        # Cumulative GFLOPs since training started — monotonic, drives the
+        # FLOP x-axis option in the dashboard. Added 2026-06-07.
+        ("throughput/total_gflops",          pa.float64()),
         ("eval/mat_nmae/val_200/mean",       pa.float32()),
         ("eval/mat_nmae/val_200/median",     pa.float32()),
         ("eval/mat_nmae/val_200/p99",        pa.float32()),

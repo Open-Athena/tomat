@@ -89,12 +89,13 @@ function localDateStr(ms: number): string {
     + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 
-type XMode = 'clock' | 'rel' | 'active' | 'loss'
+type XMode = 'clock' | 'rel' | 'active' | 'loss' | 'flop'
 const X_MODES: { id: XMode; label: string; help: string }[] = [
   { id: 'clock', label: 'clock', help: 'absolute wallclock — when each run was active' },
   { id: 'rel', label: 'elapsed', help: 'hours since each run’s own start — aligns runs at t=0' },
   { id: 'active', label: 'active', help: 'training time only — idle / preempt gaps (the flat segments) removed' },
   { id: 'loss', label: 'loss vs step', help: 'training-loss curves against step' },
+  { id: 'flop', label: 'flop', help: 'training step vs cumulative FLOPs — normalizes across BS / hardware' },
 ]
 const X_MODE_KEY = 'tomat:runs-xmode'
 const LEGEND_COLLAPSED_KEY = 'tomat:runs-legend-collapsed'
@@ -262,11 +263,14 @@ function quantile(sorted: number[], q: number): number {
 }
 
 /** One run's (x, y) series for the given x-axis mode.
- *  clock/rel: y = running-max `global_step` (flats = idle/preempt).
- *  loss:      y = `train/loss` vs `global_step`.
+ *  clock/rel:  y = running-max `global_step` (flats = idle/preempt).
+ *  loss:       y = `train/loss` vs `global_step`.
+ *  flop:       y = running-max `global_step` vs cumulative FLOPs
+ *              (`throughput/total_gflops * 1e9`). Skipped (empty result) for
+ *              runs whose parquet doesn't carry the column.
  *  `x` is ALWAYS numeric: ms-since-epoch for `clock`, hours for `rel`/`active`,
- *  step for `loss`. Date strings (when needed for the Plotly date axis) are
- *  built downstream from the ms values via `localDateStr`. */
+ *  step for `loss`, raw FLOPs for `flop`. Date strings (when needed for the
+ *  Plotly date axis) are built downstream from the ms values via `localDateStr`. */
 function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
   x: number[]; y: number[]
 } {
@@ -284,14 +288,18 @@ function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
     return { x: pts.map((p) => p.s), y: pts.map((p) => p.l) }
   }
 
-  // clock / rel / active: running max of global_step along ascending
+  // clock / rel / active / flop: running max of global_step along ascending
   // _timestamp. `active` accumulates only the intervals in which the step
   // advanced — idle / preempt stretches (the flat segments) collapse to zero,
-  // so the x-axis measures time the run was actually training.
+  // so the x-axis measures time the run was actually training. `flop` uses
+  // the parquet's cumulative `throughput/total_gflops` column instead of a
+  // wallclock function — when absent, the point is skipped (per the spec,
+  // older runs that don't carry the column gracefully drop from the plot).
   const ordered = timestamps
     .map((ts, i) => ({ ts, i }))
     .filter((r) => r.ts !== null && (cutoffSec == null || (r.ts as number) >= cutoffSec))
     .sort((a, b) => (a.ts as number) - (b.ts as number))
+  const totalGflops = mode === 'flop' ? cols.get('throughput/total_gflops') : null
   const t0 = ordered.length ? (ordered[0].ts as number) : 0
   const x: number[] = []
   const y: number[] = []
@@ -315,6 +323,13 @@ function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
     runningMax = Math.max(runningMax, s)
     if (mode === 'clock') x.push(tsec * 1000)        // ms since epoch
     else if (mode === 'rel') x.push((tsec - t0) / 3600)
+    else if (mode === 'flop') {
+      // Skip rows missing the column (older parquets, or pre-warm rows that
+      // log before the first throughput stats land).
+      const g = totalGflops?.[i]
+      if (g == null) continue
+      x.push((g as number) * 1e9)  // GFLOPs → FLOPs (so formatFlops scales right)
+    }
     else x.push(activeCum / 3600)
     y.push(runningMax)
     prevTs = tsec
@@ -900,8 +915,14 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
       type: 'linear' as const,
       title: {
         text: xMode === 'rel' ? 'elapsed (h)'
-          : xMode === 'active' ? 'active (h)' : 'step',
+          : xMode === 'active' ? 'active (h)'
+          : xMode === 'flop' ? `FLOP (${flopUnit})`
+          : 'step',
       },
+      // FLOP values span 6+ OOM across runs; use scientific notation on the
+      // axis ticks so the labels stay readable. The unit-formatted display is
+      // in the title.
+      ...(xMode === 'flop' ? { tickformat: '.2e' } : {}),
       gridcolor, zerolinecolor, linecolor: gridcolor,
     }
   const xaxis = userXRange

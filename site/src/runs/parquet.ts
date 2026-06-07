@@ -15,6 +15,11 @@ export type RunHistoryRow = {
   'throughput/mfu': number | null
   'throughput/tokens_per_second': number | null
   'throughput/duration': number | null
+  /** Cumulative GFLOPs since training started — monotonic, logged per step
+   *  by Levanter (`throughput/total_gflops`). Multiply by 1e9 for raw FLOPs.
+   *  Added 2026-06-07; older parquets won't have it (the column read just
+   *  yields an empty array for those runs). */
+  'throughput/total_gflops': number | null
   'eval/mat_nmae/val_200/mean': number | null
   'eval/mat_nmae/val_200/median': number | null
   'eval/mat_nmae/val_200/p99': number | null
