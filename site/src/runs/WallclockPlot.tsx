@@ -28,7 +28,6 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Plot, useTheme } from 'pltly/react'
-import { rolling } from 'pltly/core'
 import { enumParam, useUrlState } from 'use-prms'
 import { themedHoverlabel } from '../theme'
 import { Tooltip } from '../Tooltip'
@@ -38,7 +37,7 @@ import { classifyDeath, DEATH_COLORS, type DeathCause } from './deathEvents'
 import { SmoothingChips, useBandsToggle, useSmoothMode } from './RunsTimelinePlot'
 import { epochOfStep } from './runMeta'
 import { annotationsFor, type RunAnnotation } from './annotations'
-import { applySmoothing, type SmoothMode } from './smoothing'
+import { computeSmoothedSeries } from './smoothing'
 
 interface Props {
   history: RunHistory
@@ -411,60 +410,23 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   // Smoothing (shared URL state with the cross-run timeline). When raw the
   // TL/VL traces render unchanged; otherwise replace y, and optionally emit
   // ±σ fill bands in the same `legendgroup` so the existing legendgroup-fade
-  // machinery (above) brushes the bands with their parent line.
+  // machinery (above) brushes the bands with their parent line. `rolling`
+  // mode also returns a real within-window σ (Welford-equivalent); `ema` has
+  // no natural σ companion so its ±σ chip is disabled.
   //
-  // `rolling` mode goes through pltly's `rolling()` (Welford's O(n)) so the
-  // ±σ band is the real within-window stddev. `ema` keeps tomat's local
-  // implementation (pltly ships rolling but not EMA); since EMA has no natural
-  // σ companion, bands are unavailable in that mode (matching the chip rail's
-  // disabled-state).
+  // Window is SAMPLE-INDEX (`window` samples wide, ±window/2 around each i),
+  // NOT current-x-axis units. We tried x-axis units (`pltly.rolling`'s
+  // `getX/windowSize` API) to make `rolling:50` keep its meaning for sparse
+  // MT/MV — but that made `?x=wallclock&smooth=rolling:N` interpret N as
+  // ±N/2 ms, capturing only the point itself for typical 5-10 s training
+  // cadences, so rolling silently passed through. The fix is to keep
+  // N → sample-index everywhere (matches `RunsTimelinePlot.tsx`) and bypass
+  // smoothing entirely for sparse traces (see `evalMedianTrace`). Smoothing
+  // is computed once over the full series; plotly's `xaxis.range` then clips
+  // on display, so box-zoom is a pure display concern. See
+  // `WallclockPlot.test.ts` for the contract.
   const [smooth, setSmooth] = useSmoothMode()
   const [bandsOn, setBandsOn] = useBandsToggle()
-
-  /** Smoothed mean + (rolling-only) σ for the supplied (x, y) series. The
-   *  rolling window is in CURRENT X-AXIS UNITS — N=100 with `?x=step` means
-   *  "average over points whose step is within ±50 of this point's"; with
-   *  `?x=elapsed` (hours), ±50 hours; with `?x=wallclock`, ±50 ms (so window
-   *  values need to be scaled by the user for that mode — same convention as
-   *  pltly's `rolling()`). The point itself always contributes, so an isolated
-   *  point with no neighbors in the window passes through unchanged.
-   *
-   *  Earlier this used a sample-index window which collapsed sparse traces
-   *  (VL / eval points logged every 5-10k steps) to a near-flat line under
-   *  rolling:50 — rows N apart on the index axis can be megasteps apart on the
-   *  actual x. */
-  function smoothedMeanStd(
-    xs: (string | number)[], ys: (number | null)[], mode: SmoothMode,
-  ): { mean: (number | null)[]; std: (number | null)[] | null } {
-    if (mode.kind !== 'rolling') {
-      return { mean: applySmoothing(ys, mode), std: null }
-    }
-    // Convert xs to a numeric scalar for windowing. Date-typed xs (wallclock
-    // mode, ISO strings) → ms; numeric xs pass through. Non-finite values are
-    // marked NaN so pltly skips them — the smoothed output for those indices
-    // becomes NaN, which we normalize to null below (the raw value would be
-    // null/non-finite anyway in that case).
-    const xNum = xs.map((x) => {
-      if (typeof x === 'number') return x
-      const t = new Date(x).getTime()
-      return Number.isFinite(t) ? t : NaN
-    })
-    const idx = ys.map((_, i) => i)
-    const sm = rolling(idx, {
-      getX: (i) => xNum[i],
-      metrics: ['y'],
-      getValue: (i) => ys[i],
-      windowSize: mode.window,
-    })
-    const mean: (number | null)[] = []
-    const std: (number | null)[] = []
-    for (const pt of sm) {
-      const m = pt.smoothed.y
-      mean.push(Number.isNaN(m.mean) ? null : m.mean)
-      std.push(Number.isNaN(m.stddev) ? null : m.stddev)
-    }
-    return { mean, std }
-  }
 
   // Gap detection in wallclock / elapsed modes: when a run is paused
   // (e.g. a Modal-side respawn between two real data points without an
@@ -548,7 +510,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       // too so the x-unified tooltip shows distinct lines per segment
       // instead of three identical "TL (train/loss)" rows.
       const segName = N > 1 && !isLatest ? `${name} #${segIdx + 1}/${N}` : name
-      const { mean: ySmoothed, std: yStd } = smoothedMeanStd(s.xs, s.ys, smooth)
+      const { mean: ySmoothed, std: yStd } = computeSmoothedSeries(s.ys, smooth)
       const segGsteps = customGsteps(s)
       // Gap-break the main-line arrays so plotly doesn't connect across pauses.
       // We insert one extra `null` y entry between the gap-start and gap-end
@@ -681,16 +643,16 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     }
     const color = COLORS[metric]
     const name = `${mvmt} ${metric.toUpperCase()}`
-    // Apply the same x-units rolling/EMA smoothing the loss traces use. MT/MV
-    // are sparse (~5-30 timepoints, 1-10k steps apart): in x-units (`?x=step`)
-    // a window of e.g. ±50 steps trivially picks up no neighbors → passthrough,
-    // exactly the desired behaviour for sparse data. The earlier row-index
-    // window collapsed each output to the mean over all visible points
-    // (rolling:50 over 5 rows = flat line) — fixed once `smoothedMeanStd`
-    // walks neighbours in current-x-axis-units rather than index distance.
-    const { mean: ySmoothed } = smoothedMeanStd(xs, ys, smooth)
+    // Bypass smoothing for MT/MV — these are sparse eval-point traces (~5-30
+    // timepoints per run, 1-10k steps between them). Applying a sample-index
+    // rolling window of e.g. N=50 to a 5-point series collapses each output
+    // to the mean of all points → flat line; EMA across so few samples also
+    // doesn't carry useful information. The earlier x-units workaround that
+    // made `rolling:N` mean "N steps wide" silently broke wallclock-mode
+    // rolling for TL/VL, so we went back to sample-index everywhere and
+    // exempt sparse traces here instead.
     return {
-      x: xs, y: ySmoothed, name,
+      x: xs, y: ys, name,
       type: 'scatter' as const, mode: 'lines+markers' as const,
       line: { color, width: 1.6, dash },
       marker: { color, size: 6 },
@@ -724,7 +686,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     }
     return out
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [evalSeries, xMode, smooth])
+  }, [evalSeries, xMode])
   // Whether to render the third (MT/MV) panel: true iff the run has at least
   // one eval set with at least one point. Runs without eval.json (or with an
   // empty sets dict) fall back to the legacy 2-panel layout.
