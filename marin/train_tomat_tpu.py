@@ -592,7 +592,7 @@ def main():
             f"TOMAT_MG_MASK_PRIOR must be cosine/uniform/high/absorbing, "
             f"got {mg_mask_prior!r}"
         )
-    _valid_mg = ("ce", "ce_emd", "emd", "kl_gauss", "crps")
+    _valid_mg = ("ce", "ce_emd", "emd", "kl_gauss", "crps", "emd_atan")
     if mg_loss_type not in _valid_mg:
         raise ValueError(
             f"TOMAT_MG_LOSS_TYPE must be one of {_valid_mg}, got {mg_loss_type!r}"

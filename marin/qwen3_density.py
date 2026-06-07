@@ -357,7 +357,7 @@ class MaskGITLossArgs:
     kl_sigma: float = 0.5
 
 
-_VALID_LOSS_TYPES = ("ce", "ce_emd", "emd", "kl_gauss", "crps")
+_VALID_LOSS_TYPES = ("ce", "ce_emd", "emd", "kl_gauss", "crps", "emd_atan")
 
 
 def build_maskgit_loss_args(
@@ -441,6 +441,22 @@ def maskgit_aware_loss(
         diff = decode_all_arr[None, None, :] - rho_true[..., None]  # (B, Pos, V)
         emd_per_pos = jnp.einsum("bpv,bpv->bp", probs, jnp.abs(diff))
         combined = jnp.where(is_density_target, emd_per_pos, 0.0)
+    elif args.loss_type == "emd_atan":
+        # Pure EMD, but with atan-normalization instead of softmax.
+        # f(z) = (atan(z) + pi/2) / pi maps R → (0, 1) smoothly with
+        # POLYNOMIAL (1/(1+z²)) derivative decay vs softmax's exponential —
+        # ~7 orders of magnitude more gradient signal at concentrated P
+        # (post 13 §5.5). Mirrors the pure-EMD branch's structure (non-
+        # density-target positions get 0 loss) so this is an apples-to-
+        # apples "swap softmax for atan" test of the parameterization
+        # hypothesis, not a confound with where-CE-applies.
+        is_density_target = (targets_arr >= args.density_lo) & (targets_arr < args.density_hi)
+        f_z = (jnp.arctan(logits_arr) + jnp.pi / 2.0) / jnp.pi      # (B, Pos, V) ∈ (0, 1)
+        probs = f_z / jnp.sum(f_z, axis=-1, keepdims=True)          # (B, Pos, V)
+        rho_true = decode_all_arr[targets_arr]                       # (B, Pos)
+        diff = decode_all_arr[None, None, :] - rho_true[..., None]   # (B, Pos, V)
+        emd_atan_per_pos = jnp.einsum("bpv,bpv->bp", probs, jnp.abs(diff))
+        combined = jnp.where(is_density_target, emd_atan_per_pos, 0.0)
     elif args.loss_type in ("kl_gauss", "crps"):
         # Soft-target losses at density positions; CE at non-density positions
         # so the non-density preamble keeps the same gradient signal as the

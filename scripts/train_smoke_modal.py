@@ -612,7 +612,7 @@ def _train_bakeoff_impl(
                 f"maskgit_prior must be cosine/uniform/high/absorbing, got "
                 f"{maskgit_prior!r}"
             )
-        _valid_mg_lt = ("ce", "ce_emd", "emd", "kl_gauss", "crps")
+        _valid_mg_lt = ("ce", "ce_emd", "emd", "kl_gauss", "crps", "emd_atan")
         if maskgit_loss_type not in _valid_mg_lt:
             raise ValueError(
                 f"maskgit_loss_type must be one of {_valid_mg_lt}, got "
