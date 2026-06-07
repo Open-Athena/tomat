@@ -370,7 +370,7 @@ function modalInputTail(call: ModalFunctionCall): string {
   return parts.length > 0 ? ` (${parts.join('/')})` : ''
 }
 
-export function ModalBadge({ app }: { app: ModalApp }) {
+export function ModalBadge({ app, wandbStale = false }: { app: ModalApp; wandbStale?: boolean }) {
   // Surface the most-recent fc's input statuses on the badge tail.
   // We sort fc-ids descendingly (ULID-ish so this is created-time order)
   // and take the latest; the tooltip lists all of them.
@@ -405,7 +405,13 @@ export function ModalBadge({ app }: { app: ModalApp }) {
   let label: string
   let style: { bg: string; fg: string }
   let tail: string
-  if (isActuallyRunning) {
+  if (isActuallyRunning && wandbStale) {
+    // Modal container is alive but wandb hasn't logged in >10 min →
+    // cache build / JAX compile / ckpt load in progress, not training.
+    label = 'BUILDING'
+    style = { bg: '#b08800', fg: '#fff' }
+    tail = ` (${app.n_running_tasks}r)`
+  } else if (isActuallyRunning) {
     label = 'RUNNING'
     style = { bg: '#22863a', fg: '#fff' }
     tail = ` (${app.n_running_tasks}r)`
@@ -921,12 +927,15 @@ export function RunHeaderRich({
 }: RunHeaderRichProps) {
   const { id, manifest, job, history, evalJobs, err, attempts, modalApp } = data
   const incomplete = isIncomplete(data)
-  // wandb's run state can sit at "running" long after a Modal job has died
-  // (it never flushed a terminal state). Treat a "running" run that hasn't
-  // logged in >10min as stale — so the badge greys instead of reading green.
+  // "wandbStale" = wandb hasn't received a metric in a while. We do NOT
+  // require `run.state === 'running'` for this — per
+  // feedback_no_wandb_for_state, wandb's run state is unreliable (it
+  // stamps "crashed" on any client disconnect, including intentional
+  // kills). Just look at the last-log timestamp, treat anything older
+  // than 10 min as silent. Modal/iris signals are what drive RUNNING vs
+  // BUILDING vs UNKNOWN downstream.
   const lastLogTs = manifest?.history?.ts_max ?? null
-  const wandbStale = manifest?.run?.state === 'running'
-    && lastLogTs != null && (Date.now() / 1000 - lastLogTs) >= 600
+  const wandbStale = lastLogTs != null && (Date.now() / 1000 - lastLogTs) >= 600
 
   const meta = parseRunName(id)
   const hwColor = meta.hardwareKind ? HW_COLORS[meta.hardwareKind] : '#888'
@@ -1012,23 +1021,26 @@ export function RunHeaderRich({
             lastLogTs={lastLogTs}
           />
           {job && <IrisBadge job={job} attempts={attempts} incomplete={incomplete} />}
-          {!job && modalApp && <ModalBadge app={modalApp} />}
-          {!job && !modalApp && manifest && (
-            // No iris job AND no matched Modal app — fall back to wandb's
-            // run state. The status dots mark the source; a "running" run
-            // gone stale (no logs in >10min) shows greyed as STALE rather
-            // than green.
-            <Tooltip content={wandbStale
-              ? `wandb says running, but last logged ${secsAgo(lastLogTs!)} — likely dead`
-              : `wandb state (no iris job, no modal app): ${manifest.run?.state}`}>
+          {!job && modalApp && <ModalBadge app={modalApp} wandbStale={wandbStale} />}
+          {!job && !modalApp && (
+            // No iris job AND no matched Modal app → we have no ground-truth
+            // signal about the underlying job's state. Don't infer from
+            // wandb's `run.state` — wandb stamps "crashed" on any client
+            // disconnect (including intentional kills), so it's unreliable
+            // as a status source. Show UNKNOWN. (See memory:
+            // feedback_no_wandb_for_state.)
+            <Tooltip content={
+              manifest
+                ? `no iris job or modal app matched; wandb last state was "${manifest.run?.state}" but we don't infer state from wandb`
+                : 'no iris job, no modal app, no manifest — nothing to derive state from'
+            }>
               <span
                 style={{
-                  backgroundColor: wandbStale
-                    ? '#6a737d' : (WANDB_STATE_BG[manifest.run?.state] ?? '#555'),
+                  backgroundColor: '#6a737d',
                   color: '#fff', padding: '1px 6px', borderRadius: 3,
                   fontSize: '0.75rem', fontFamily: 'monospace',
                 }}>
-                {wandbStale ? 'STALE' : manifest.run?.state.toUpperCase()}
+                UNKNOWN
               </span>
             </Tooltip>
           )}

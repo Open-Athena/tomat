@@ -83,6 +83,15 @@ export const RUN_LINEAGE: Record<string, RunLineage> = {
     parent: 'train-mg-modal-h200x8-tz-v4-bs128-seed42',
     parent_step: 40000,
   },
+
+  // tz-11-bs256: BS=256 ablation forked from train-mg-tz-11 at step-20000
+  // (warm-start). The TPU script ties wandb run_id to results_label, so we
+  // get a fork at the wandb level; lineage glue here makes the dashboard
+  // show one continuous trajectory through the BS bump.
+  'train-mg-tz-11-bs256': {
+    parent: 'train-mg-tz-11',
+    parent_step: 20000,
+  },
 }
 
 /** Lineage entry for `runName`, or `null` if it has no recorded parent. */

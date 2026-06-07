@@ -423,18 +423,37 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   const [smooth, setSmooth] = useSmoothMode()
   const [bandsOn, setBandsOn] = useBandsToggle()
 
-  /** Smoothed mean + (rolling-only) σ for the supplied y-array. Sample-index
-   *  window — matches the legacy `?smooth=rolling:N` semantics where N counts
-   *  log rows, not x-units. */
+  /** Smoothed mean + (rolling-only) σ for the supplied (x, y) series. The
+   *  rolling window is in CURRENT X-AXIS UNITS — N=100 with `?x=step` means
+   *  "average over points whose step is within ±50 of this point's"; with
+   *  `?x=elapsed` (hours), ±50 hours; with `?x=wallclock`, ±50 ms (so window
+   *  values need to be scaled by the user for that mode — same convention as
+   *  pltly's `rolling()`). The point itself always contributes, so an isolated
+   *  point with no neighbors in the window passes through unchanged.
+   *
+   *  Earlier this used a sample-index window which collapsed sparse traces
+   *  (VL / eval points logged every 5-10k steps) to a near-flat line under
+   *  rolling:50 — rows N apart on the index axis can be megasteps apart on the
+   *  actual x. */
   function smoothedMeanStd(
-    ys: (number | null)[], mode: SmoothMode,
+    xs: (string | number)[], ys: (number | null)[], mode: SmoothMode,
   ): { mean: (number | null)[]; std: (number | null)[] | null } {
     if (mode.kind !== 'rolling') {
       return { mean: applySmoothing(ys, mode), std: null }
     }
+    // Convert xs to a numeric scalar for windowing. Date-typed xs (wallclock
+    // mode, ISO strings) → ms; numeric xs pass through. Non-finite values are
+    // marked NaN so pltly skips them — the smoothed output for those indices
+    // becomes NaN, which we normalize to null below (the raw value would be
+    // null/non-finite anyway in that case).
+    const xNum = xs.map((x) => {
+      if (typeof x === 'number') return x
+      const t = new Date(x).getTime()
+      return Number.isFinite(t) ? t : NaN
+    })
     const idx = ys.map((_, i) => i)
     const sm = rolling(idx, {
-      getX: (i) => i,
+      getX: (i) => xNum[i],
       metrics: ['y'],
       getValue: (i) => ys[i],
       windowSize: mode.window,
@@ -531,7 +550,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       // too so the x-unified tooltip shows distinct lines per segment
       // instead of three identical "TL (train/loss)" rows.
       const segName = N > 1 && !isLatest ? `${name} #${segIdx + 1}/${N}` : name
-      const { mean: ySmoothed, std: yStd } = smoothedMeanStd(s.ys, smooth)
+      const { mean: ySmoothed, std: yStd } = smoothedMeanStd(s.xs, s.ys, smooth)
       const segGsteps = customGsteps(s)
       // Gap-break the main-line arrays so plotly doesn't connect across pauses.
       // We insert one extra `null` y entry between the gap-start and gap-end
@@ -664,18 +683,16 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     }
     const color = COLORS[metric]
     const name = `${mvmt} ${metric.toUpperCase()}`
-    // Do NOT apply the `smooth` knob to MT/MV — these are sparse eval-point
-    // traces (one point per checkpoint, typically 5-30 timepoints spaced by
-    // 1-5k steps), not the per-step training-row sequences smoothing was
-    // designed for. With `rolling:50` over 5 points each output collapses to
-    // the mean of all neighbors → the whole trace renders as a flat line at
-    // the average y-value (which is the bug a comment here originally
-    // mis-described as "usually a no-op"). Window smoothing in row-space
-    // makes no sense for sparse eval data; if a user wants to denoise across
-    // adjacent ckpts, that's a separate "moving median per N checkpoints"
-    // feature.
+    // Apply the same x-units rolling/EMA smoothing the loss traces use. MT/MV
+    // are sparse (~5-30 timepoints, 1-10k steps apart): in x-units (`?x=step`)
+    // a window of e.g. ±50 steps trivially picks up no neighbors → passthrough,
+    // exactly the desired behaviour for sparse data. The earlier row-index
+    // window collapsed each output to the mean over all visible points
+    // (rolling:50 over 5 rows = flat line) — fixed once `smoothedMeanStd`
+    // walks neighbours in current-x-axis-units rather than index distance.
+    const { mean: ySmoothed } = smoothedMeanStd(xs, ys, smooth)
     return {
-      x: xs, y: ys, name,
+      x: xs, y: ySmoothed, name,
       type: 'scatter' as const, mode: 'lines+markers' as const,
       line: { color, width: 1.6, dash },
       marker: { color, size: 6 },
@@ -1015,7 +1032,14 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
           shapes: eventShapes,
           margin: { t: 50, l: 70, r: 210, b: 50 },
           hovermode: 'x unified',
-          hoverlabel: themedHoverlabel(isDark),
+          // Anchor the unified TT to a fixed paper-Y position so it doesn't
+          // chase the (noisy) trace values as the cursor scans horizontally.
+          // User reported jitter when TT was bouncing up/down with TL.
+          hoverlabel: { ...themedHoverlabel(isDark), align: 'left' },
+          // `hovermode: x unified` follows the cursor X but the box y-pos is
+          // computed to avoid the highest trace; using `hoverdistance: -1`
+          // disables nearest-point Y snapping → cursor-following Y.
+          hoverdistance: -1,
           // Single legend on the right with grouped headers per panel.
           // `tracegroupgap` adds vertical breathing room between groups so
           // the per-group `legendgrouptitle` rows visually separate the

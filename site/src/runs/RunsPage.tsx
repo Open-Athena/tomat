@@ -172,7 +172,12 @@ function RunCard({ data, activeRunId, pinnedRunId, parentWandbUrl, parentColor, 
 // first" floats them ahead of genuinely-active runs. 10 minutes is well
 // past the wandb heartbeat cadence (~30s for our trainers) so a still-alive
 // run will always be inside the window.
-const RUNNING_RECENCY_MS = 10 * 60 * 1000
+// Bumped 10 → 60 min: when a Modal job is in cache-build / JAX compile /
+// ckpt load, wandb stays silent for 30-60 min while the container is
+// alive. The shorter 10-min window incorrectly downgrades these runs
+// to UNKNOWN. See feedback_no_wandb_for_state — Modal/iris are the
+// ground truth, wandb's silence is just a logging artifact.
+const RUNNING_RECENCY_MS = 60 * 60 * 1000
 function isRunning(c: RunCardData): boolean {
   if (c.job?.state === 'RUNNING') return true
   if (!c.job && c.manifest?.run?.state === 'running') {
@@ -383,7 +388,16 @@ function RunsIndex() {
         const ts = manifest?.history?.ts_max
         const recent = typeof ts === 'number'
           && Date.now() - ts * 1000 < RUNNING_RECENCY_MS
-        const modalApp = candidate && recent ? candidate : null
+        // BUILDING-state allowance: even when wandb has been silent
+        // (cache build / JAX compile / ckpt load), keep the modalApp
+        // association if the run itself is recent enough that the
+        // deployed app is plausibly its current fc. This avoids the
+        // CRASHED/STALE misread per `feedback_no_wandb_for_state`.
+        const createdMs = manifest?.run?.created_at
+          ? Date.parse(manifest.run.created_at) : NaN
+        const runRecent = Number.isFinite(createdMs)
+          && Date.now() - createdMs < 24 * 3600 * 1000
+        const modalApp = candidate && (recent || runRecent) ? candidate : null
         return {
           id,
           manifest,
@@ -1128,11 +1142,16 @@ function RunDetail({ runId }: { runId: string }) {
   const detailTsMax = manifest?.history?.ts_max
   const detailModalRecent = typeof detailTsMax === 'number'
     && Date.now() - detailTsMax * 1000 < RUNNING_RECENCY_MS
+  // Same BUILDING-state allowance as the index view's card construction.
+  const detailCreatedMs = manifest?.run?.created_at
+    ? Date.parse(manifest.run.created_at) : NaN
+  const detailRunRecent = Number.isFinite(detailCreatedMs)
+    && Date.now() - detailCreatedMs < 24 * 3600 * 1000
   const headerData: RunCardData = {
     id: runId,
     manifest,
     job: irisQ.data?.jobs[irisJobIdForRun(runId)] ?? null,
-    modalApp: detailModalCandidate && detailModalRecent ? detailModalCandidate : null,
+    modalApp: detailModalCandidate && (detailModalRecent || detailRunRecent) ? detailModalCandidate : null,
     history,
     evalJobs,
     color: '#888',
