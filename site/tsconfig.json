@@ -12,5 +12,10 @@
     "jsx": "react-jsx",
     "noEmit": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  // Tests run via `node --test --experimental-strip-types …` and import
+  // node:test / node:assert. Excluding them from tsc means we don't need
+  // `@types/node` as a regular dev dep just to type-check tests; the test
+  // runner verifies the types implicitly by importing the same source.
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
 }
