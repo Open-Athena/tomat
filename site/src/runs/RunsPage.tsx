@@ -2,8 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { enumParam, useUrlState } from 'use-prms'
 import { Tooltip } from '../Tooltip'
-import { evalJobsByRun, evalPhase, fetchEval, fetchEvalsIndex, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchRunCost, fetchRunsSnapshot, irisJobIdForRun, modalAppForRun, parquetUrl } from './api'
-import type { EvalJob, EvalPoint } from './api'
+import { evalJobsByRun, fetchEval, fetchEvalsIndex, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchRunCost, fetchRunsSnapshot, irisJobIdForRun, modalAppForRun, parquetUrl } from './api'
+import type { EvalPoint } from './api'
 import { concatHistories, fetchRunHistory, type RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
 import { RecentEvents } from './RecentEvents'
@@ -854,85 +854,6 @@ function StickyActiveBanner({
   )
 }
 
-// ── run-detail: m-eval jobs table ───────────────────────────────────────────
-const EVAL_PHASE_COLOR: Record<string, string> = {
-  flight: DOT.amber, done: DOT.blue, failed: DOT.red,
-}
-
-/** iris-dashboard URL for a job id (`/ryan/<job>`) — the marin-eng share form. */
-function irisJobUrl(jobId: string): string {
-  return `https://iris.oa.dev/#/job/${encodeURIComponent(jobId)}`
-}
-
-// One row per checkpoint step, a cell per mat-set — each cell shows the eval
-// job's iris state (linked to its iris-dashboard page) and, once the result
-// JSON has synced, the per-step mat-NMAE / mat-NEMD. NMAE/NEMD come from the
-// canonical GCS eval results (`tomat evals sync` → R2 `eval.json`), NOT the
-// harvested wandb points (those collapse in runs-sync's parquet merge).
-function EvalJobsTable({ jobs, evalByStep }: {
-  jobs: EvalJob[]
-  evalByStep: Map<number, Record<string, EvalPoint>>
-}) {
-  const steps = [...new Set([
-    ...jobs.map((j) => j.step),
-    ...evalByStep.keys(),
-  ])].sort((a, b) => a - b)
-  const sets = ['val_200', 'train_200']
-  const cell: React.CSSProperties = {
-    padding: '3px 14px 3px 0', textAlign: 'left',
-  }
-  const pct = (v: number | null | undefined) =>
-    typeof v === 'number' ? `${(v * 100).toFixed(2)}%` : null
-  return (
-    <div style={{ marginBottom: '1.4rem' }}>
-      <h2 style={{ fontSize: '1rem', marginBottom: '0.3rem' }}>
-        m-evals ({steps.length} step{steps.length === 1 ? '' : 's'})
-      </h2>
-      <table style={{ borderCollapse: 'collapse', fontSize: '0.8rem',
-                      fontFamily: 'monospace' }}>
-        <thead>
-          <tr style={{ color: '#888' }}>
-            <th style={cell}>step</th>
-            {sets.map((s) => <th key={s} style={cell}>{s} — state · NMAE · NEMD</th>)}
-          </tr>
-        </thead>
-        <tbody>
-          {steps.map((step) => (
-            <tr key={step}>
-              <td style={cell}>{step.toLocaleString()}</td>
-              {sets.map((set) => {
-                const ej = jobs.find((j) => j.step === step && j.matSet === set)
-                const pt = evalByStep.get(step)?.[set]
-                if (!ej && !pt) return <td key={set} style={{ ...cell, color: '#555' }}>–</td>
-                const nmae = pct(pt?.nmae_mean)
-                const nemd = pct(pt?.nemd_mean)
-                return (
-                  <td key={set} style={cell}>
-                    {ej && (
-                      <a href={irisJobUrl(ej.jobId)} target="_blank" rel="noreferrer"
-                         style={{ color: EVAL_PHASE_COLOR[evalPhase(ej.job)] }}>
-                        {ej.job.state.toLowerCase()}
-                      </a>
-                    )}
-                    {(nmae || nemd) && (
-                      <span style={{ color: '#888' }}>
-                        {ej ? '  ' : ''}
-                        {nmae && `NMAE ${nmae}`}
-                        {nmae && nemd && ' · '}
-                        {nemd && `NEMD ${nemd}`}
-                      </span>
-                    )}
-                  </td>
-                )
-              })}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  )
-}
-
 // `?lineage=full|seg` — when the detail run has a recorded lineage parent
 // (see `./lineage.ts:RUN_LINEAGE`), `full` (the default) glues each
 // ancestor's history onto the front so the TL/VL/MFU plots render the
@@ -1197,9 +1118,6 @@ function RunDetail({ runId }: { runId: string }) {
       }}>
         <RunHeaderRich data={headerData} linkRunName={false} />
       </div>
-      {(evalJobs.length > 0 || evalByStep.size > 0) && (
-        <EvalJobsTable jobs={evalJobs} evalByStep={evalByStep} />
-      )}
       {ancestors.length > 0 && (
         <LineageToggle
           mode={lineageMode}
