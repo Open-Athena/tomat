@@ -15,6 +15,7 @@
  *   GET  /api/voxel-corr/:label.json     — voxel-position corr-matrix sidecar (int8 scale, 1D curve, blob_format)
  *   GET  /api/voxel-corr/:label.bin.gzip — gzipped int8 corr-matrix blob (upper-triangle)
  *   GET  /api/modal-state.json           — Modal app + function-call snapshot (synced by tomat modal sync)
+ *   GET  /api/pending-fires.json         — Modal-spawned training fires not yet wandb-manifested (synced by tomat modal pending-fire add)
  *   GET  /api/files/list?prefix=&cursor= — generic R2 list (under FILES_PREFIX allow-list)
  *   GET  /api/files/get?path=…           — generic R2 get with Range support
  *   GET  /health
@@ -202,6 +203,7 @@ async function buildRunsSnapshot(env: Env): Promise<{
 	runs: Record<string, RunSnapshotEntry | null>;
 	iris: unknown | null;
 	modal: unknown | null;
+	pending_fires: unknown | null;
 }> {
 	const runIds = await listRuns(env);
 
@@ -212,7 +214,7 @@ async function buildRunsSnapshot(env: Env): Promise<{
 	const manifestKeys = runIds.map((id) => `${env.R2_RUNS_PREFIX}/${id}/manifest.json`);
 	const evalsIndexKeys = runIds.map((id) => `${env.R2_RUNS_PREFIX}/${id}/evals/index.json`);
 	const costKeys = runIds.map((id) => `${env.R2_RUNS_PREFIX}/${id}/cost.json`);
-	const [manifestResults, evalsIndexResults, costResults, irisObj, modalObj] = await Promise.all([
+	const [manifestResults, evalsIndexResults, costResults, irisObj, modalObj, pendingFiresObj] = await Promise.all([
 		Promise.all(
 			manifestKeys.map(async (k): Promise<unknown | null> => {
 				const obj = await env.R2.get(k);
@@ -269,6 +271,7 @@ async function buildRunsSnapshot(env: Env): Promise<{
 		),
 		env.R2.get('tomat/iris-state.json'),
 		env.R2.get('tomat/modal-state.json'),
+		env.R2.get('tomat/pending-fires.json'),
 	]);
 
 	const runs: Record<string, RunSnapshotEntry | null> = {};
@@ -312,6 +315,14 @@ async function buildRunsSnapshot(env: Env): Promise<{
 			modal = null;
 		}
 	}
+	let pending_fires: unknown | null = null;
+	if (pendingFiresObj) {
+		try {
+			pending_fires = await pendingFiresObj.json();
+		} catch {
+			pending_fires = null;
+		}
+	}
 
 	return {
 		synced_at: new Date().toISOString(),
@@ -319,6 +330,7 @@ async function buildRunsSnapshot(env: Env): Promise<{
 		runs,
 		iris,
 		modal,
+		pending_fires,
 	};
 }
 
@@ -586,6 +598,14 @@ export default {
 			// badge on /runs (replaces the wandb-session-state fallback for
 			// runs whose iris job slot is empty).
 			return serveR2Object(req, env, 'tomat/modal-state.json');
+		}
+
+		if (path === '/api/pending-fires.json') {
+			// Modal-spawned training fires that wandb hasn't manifested yet.
+			// Written by `tomat modal pending-fire add` right after
+			// `fn.spawn(...)`, GC'd after the wandb manifest lands. Powers
+			// placeholder cards on /runs during the pre-wandb window.
+			return serveR2Object(req, env, 'tomat/pending-fires.json');
 		}
 
 		// /api/iris-attempts/<label>.json — per-task attempt history sidecar,
