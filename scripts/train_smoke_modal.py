@@ -418,7 +418,7 @@ def _train_bakeoff_impl(
     label: str,
     results_label: str,
     model_preset: str,
-    parquet_root: str,
+    parquet_root: str | list[str],
     gradient_checkpointing: bool = True,
     compute_dtype: str = "bfloat16",  # match TPU recipe; FP32 was the v1 trap
     lmq_path: str | None = None,  # gs://...codec.npz; enables EMD-density loss
@@ -445,6 +445,30 @@ def _train_bakeoff_impl(
     # empty tagged-eval-set and never installs the eval callback). Mirrors
     # the TPU recipe's `TOMAT_VAL_SEQS` env var (train_tomat_tpu.py:690).
     val_seqs: int = 0,
+    # Optimizer schedule. For from-scratch the cosine default decays from
+    # `learning_rate` to ~0 over `steps`. For *continuations* of an existing
+    # ckpt set `lr_schedule="constant"` + `warmup=0.0` + a small `learning_rate`
+    # (e.g. 3e-5) — otherwise resuming with a larger `num_train_steps`
+    # rewinds the cosine fraction and triggers a warm-restart LR spike
+    # (we saw step-42000 → step-42001 jump from ~3.8e-6 to ~2.9e-5 on
+    # `train-mg-modal-h200x8-tz-v4-epochwin`).
+    learning_rate: float = 3e-4,
+    lr_schedule: str = "cosine",
+    warmup: float = 0.05,
+    # Override the auto-generated `f"{results_label}-bs{batch_size}-seed{seed}"`
+    # run_id. Use this when resuming a run across a batch-size change so the
+    # wandb run + checkpoint dir stay continuous (e.g. v4-epochwin's BS=128→256
+    # cutover keeps the original `...-bs128-seed42` id to preserve the same
+    # trajectory). When None (default), preserves historical behavior.
+    run_id: str | None = None,
+    # Path (relative to the Modal volume mount) to a prebuilt Levanter cache
+    # tarball. When set, container downloads the tarball + extracts to
+    # /tmp/cache_<run_id> and uses that as cache_dir — bypasses the slow
+    # in-container build that hits Modal volume per-file metadata limits.
+    # Build via scripts/build_cache_modal.py first; resulting tarball lives
+    # at e.g. `cache_tarballs/<name>.tar` on the volume. When None, fall back
+    # to building the cache directly under `{results_dir}/cache`.
+    cache_tarball_path: str | None = None,
 ) -> dict:
     """200M-or-other preset training body for the bakeoff probe.
 
@@ -540,22 +564,56 @@ def _train_bakeoff_impl(
 
     train_volume.reload()
 
-    parquet_dir = parquet_root
+    # parquet_root may be a single dir (str) or a list of dirs to concatenate
+    # at the train-urls level. The latter is used for the v4-epochwin BS-256
+    # cutover where we mix shards 1-3 (seeds 43/44/45) for a 3× larger epoch.
+    parquet_roots = [parquet_root] if isinstance(parquet_root, str) else list(parquet_root)
     results_dir = f"{MOUNT}/results/{results_label}"
-    cache_dir = f"{results_dir}/cache"
     Path(results_dir).mkdir(parents=True, exist_ok=True)
 
-    worker_dirs = sorted(Path(parquet_dir).glob("worker-*"))
-    if not worker_dirs:
-        raise FileNotFoundError(f"no worker-*/ shards under {parquet_dir}")
-    parquet_glob = f"{parquet_dir}/worker-*/*.parquet"
-    meta_path = f"{worker_dirs[0]}/meta.json"
-    meta = json.loads(Path(meta_path).read_text())
+    # If caller supplied a prebuilt cache tarball, extract it to local SSD
+    # and use that as cache_dir. Falls back to building the cache in-place
+    # on the Modal volume otherwise.
+    if cache_tarball_path:
+        import time as _time
+        tar_src = f"{MOUNT}/{cache_tarball_path.lstrip('/')}"
+        if not Path(tar_src).exists():
+            raise FileNotFoundError(f"prebuilt cache tarball not found: {tar_src}")
+        local_cache = f"/tmp/cache_{results_label}"
+        Path(local_cache).mkdir(parents=True, exist_ok=True)
+        err(f"[bakeoff] extracting prebuilt cache tarball {tar_src} → {local_cache}")
+        t0 = _time.time()
+        subprocess.run(["tar", "-xf", tar_src, "-C", local_cache], check=True)
+        err(f"[bakeoff] cache extracted in {_time.time() - t0:.1f}s")
+        cache_dir = local_cache
+    else:
+        cache_dir = f"{results_dir}/cache"
+
+    parquet_globs: list[str] = []
+    metas: list[dict] = []
+    for pr in parquet_roots:
+        wds = sorted(Path(pr).glob("worker-*"))
+        if not wds:
+            raise FileNotFoundError(f"no worker-*/ shards under {pr}")
+        parquet_globs.append(f"{pr}/worker-*/*.parquet")
+        metas.append(json.loads((wds[0] / "meta.json").read_text()))
+
+    # Sanity check: every shard must agree on vocab, patch_size, codec, M
+    # (otherwise concatenating them at train_urls would silently mix
+    # incompatible sequences).
+    key_fields = ("patch_size", "density_codec_name", "patches_per_material")
+    first_meta = metas[0]
+    for pr, m in zip(parquet_roots[1:], metas[1:], strict=True):
+        mismatch = {k: (first_meta.get(k), m.get(k)) for k in key_fields if first_meta.get(k) != m.get(k)}
+        if mismatch or first_meta["vocab"]["total_size"] != m["vocab"]["total_size"]:
+            raise ValueError(f"shard {pr} disagrees with {parquet_roots[0]}: {mismatch}")
+    meta = first_meta
     vocab_size = meta["vocab"]["total_size"]
+    err(f"[bakeoff] {len(parquet_roots)} parquet root(s): {parquet_roots}")
     err(f"[bakeoff] vocab_size={vocab_size}, patch_size={meta['patch_size']}, "
         f"codec={meta['density_codec_name']}, model={model_preset}")
 
-    source = UrlDatasetSourceConfig(train_urls=[parquet_glob])
+    source = UrlDatasetSourceConfig(train_urls=parquet_globs)
     prebuilt_fmt = PrebuiltLmDatasetFormat(input_ids_key="input_ids")
     component = DatasetComponent(
         source=source, cache_dir=cache_dir, format=prebuilt_fmt,
@@ -705,7 +763,10 @@ def _train_bakeoff_impl(
     # `tomat-lmq-P19` is the canonical P19/v3 project).
     project = wandb_project or f"tomat-{meta['density_codec_name']}-P{meta['patch_size']}"
     group = f"bakeoff-modal-{model_preset}"
-    run_id = f"{results_label}-bs{batch_size}-seed{seed}"
+    # Caller can override the auto-generated id when resuming across a
+    # BS change — keeps the same wandb run + ckpt path despite the new BS.
+    auto_run_id = f"{results_label}-bs{batch_size}-seed{seed}"
+    run_id = run_id if run_id is not None else auto_run_id
     tags = ["bakeoff", "modal", f"model{model_preset}",
             f"bs{batch_size}", f"seed{seed}"]
     if maskgit_mode:
@@ -748,8 +809,9 @@ def _train_bakeoff_impl(
         mp=mp_policy,
     )
     optimizer = AdamConfig(
-        learning_rate=3e-4, weight_decay=0.0,
-        warmup=0.05, min_lr_ratio=0.0,
+        learning_rate=learning_rate, weight_decay=0.0,
+        warmup=warmup, min_lr_ratio=0.0,
+        lr_schedule=lr_schedule,
         beta1=0.9, beta2=0.95,
     )
     config = TrainLmConfig(
@@ -844,7 +906,7 @@ def train_bakeoff_h200x8(
     label: str,
     results_label: str,
     model_preset: str,
-    parquet_root: str,
+    parquet_root: str | list[str],
     gradient_checkpointing: bool = True,
     compute_dtype: str = "bfloat16",
     lmq_path: str | None = None,
@@ -858,6 +920,11 @@ def train_bakeoff_h200x8(
     shuffle_io_block_size: int = 64,
     shuffle_window_blocks: int = 1024,
     val_seqs: int = 0,
+    learning_rate: float = 3e-4,
+    lr_schedule: str = "cosine",
+    warmup: float = 0.05,
+    run_id: str | None = None,
+    cache_tarball_path: str | None = None,
 ) -> dict:
     """8× H200 bakeoff probe; same SM as H100, 1.4× HBM bandwidth."""
     return _train_bakeoff_impl(
@@ -875,6 +942,11 @@ def train_bakeoff_h200x8(
         shuffle_io_block_size=shuffle_io_block_size,
         shuffle_window_blocks=shuffle_window_blocks,
         val_seqs=val_seqs,
+        learning_rate=learning_rate,
+        lr_schedule=lr_schedule,
+        warmup=warmup,
+        run_id=run_id,
+        cache_tarball_path=cache_tarball_path,
     )
 
 
