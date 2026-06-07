@@ -672,10 +672,41 @@ function RunsIndex() {
   const queuedCount = ordered?.filter(isQueued).length ?? 0
   const incompleteCount = ordered?.filter(isIncomplete).length ?? 0
 
-  // Build timeline series from any cards that have history loaded.
-  // Order matters for color stability — use index from `ordered`.
+  // Step-range filter driven by the timeline plot's drag-to-zoom in `loss`
+  // x-mode (axis = `global_step`). When the user zooms to e.g. [0, 3000], any
+  // run whose entire step trajectory falls outside the visible range
+  // contributes nothing to the plot — hide it from the legend AND from the
+  // card list below, so the dashboard view stays internally consistent. The
+  // plot calls `onStepRangeChange(range | null)` on relayout; null means
+  // auto-range OR a non-`loss` x-mode (steps don't translate to wallclock
+  // axes). See `RunsTimelinePlot.onStepRangeChange` for the contract.
+  const [stepZoomRange, setStepZoomRange] = useState<[number, number] | null>(null)
+  const inStepRangeIds = useMemo(() => {
+    if (!stepZoomRange || !ordered) return null
+    const [lo, hi] = stepZoomRange
+    const s = new Set<string>()
+    for (const c of ordered) {
+      // No manifest yet (placeholder PENDING/BUILDING card): keep visible —
+      // there's no step data to disqualify it. last_train_step falls back to
+      // step_max for older manifests that pre-date that field. Treat a
+      // missing upper bound as Infinity (still-training), missing lower as 0.
+      const h = c.manifest?.history
+      const firstStep = h?.step_min ?? 0
+      const lastStep = h?.last_train_step ?? h?.step_max ?? Infinity
+      if (firstStep <= hi && lastStep >= lo) s.add(c.id)
+    }
+    return s
+  }, [ordered, stepZoomRange])
+
+  // Build timeline series from any cards that have history loaded. Order
+  // matters for color stability — use index from `ordered`. When the user
+  // has zoomed the x-axis in `loss` mode, drop runs whose step range is
+  // entirely outside the visible window: their trace contributes nothing,
+  // and keeping them in the legend (custom legend = `filteredRuns.length`)
+  // is visually misleading.
   const timelineSeries: RunTimelineSeries[] = (ordered ?? [])
     .filter((c) => c.history != null)
+    .filter((c) => inStepRangeIds == null || inStepRangeIds.has(c.id))
     .map((c) => ({
       id: c.id,
       history: c.history!,
@@ -762,6 +793,18 @@ function RunsIndex() {
   const pinnedRunId = highlight.pinnedTrace
     ? labelToId.get(highlight.pinnedTrace) ?? null
     : null
+
+  // Clear the pin if the pinned run drops out of the visible step-range zoom
+  // (`inStepRangeIds` excludes it). Without this, pinning a run and then
+  // zooming the plot to a window that doesn't intersect its step trajectory
+  // leaves the plot soloed-to-empty (no traces) — confusing for the user.
+  // Plot pins the cleared run in by re-clicking once the zoom is reset.
+  useEffect(() => {
+    if (!pinnedRunId) return
+    if (inStepRangeIds && !inStepRangeIds.has(pinnedRunId)) {
+      highlight.clearPin()
+    }
+  }, [pinnedRunId, inStepRangeIds, highlight])
 
   // Per-run rich haystack (label + tags + YYMMDD created/last-activity +
   // hardware tokens + lineage). Built once for all cards, then keyed by both
@@ -865,15 +908,22 @@ function RunsIndex() {
     const tagFiltered = tagMatchedIdsExpanded
       ? ordered.filter((c) => tagMatchedIdsExpanded.has(c.id))
       : ordered
-    const pinned = pinnedRunId ? tagFiltered.find((c) => c.id === pinnedRunId) : null
+    // Step-range hard filter: runs whose step trajectory falls entirely
+    // outside the loss-mode zoom range are dropped from the card list to
+    // match what the plot/legend show. `inStepRangeIds == null` (no zoom set
+    // or non-loss x-mode) passes through.
+    const stepFiltered = inStepRangeIds
+      ? tagFiltered.filter((c) => inStepRangeIds.has(c.id))
+      : tagFiltered
+    const pinned = pinnedRunId ? stepFiltered.find((c) => c.id === pinnedRunId) : null
     const hovered = plotHoverRunId && plotHoverRunId !== pinnedRunId
-      ? tagFiltered.find((c) => c.id === plotHoverRunId)
+      ? stepFiltered.find((c) => c.id === plotHoverRunId)
       : null
     const taken = new Set<string>()
     if (pinned) taken.add(pinned.id)
     if (hovered) taken.add(hovered.id)
-    const rest = tagFiltered.filter((c) => !taken.has(c.id))
-    const top: typeof tagFiltered = []
+    const rest = stepFiltered.filter((c) => !taken.has(c.id))
+    const top: typeof stepFiltered = []
     if (pinned) top.push(pinned)
     if (hovered) top.push(hovered)
     if (!matchedIdsExpanded || matchedIdsExpanded.size === 0) {
@@ -882,7 +932,7 @@ function RunsIndex() {
     const matched = rest.filter((c) => matchedIdsExpanded.has(c.id))
     const others = rest.filter((c) => !matchedIdsExpanded.has(c.id))
     return [...top, ...matched, ...others]
-  }, [ordered, pinnedRunId, plotHoverRunId, matchedIdsExpanded, tagMatchedIdsExpanded])
+  }, [ordered, pinnedRunId, plotHoverRunId, matchedIdsExpanded, tagMatchedIdsExpanded, inStepRangeIds])
 
   // On (re)pin, scroll the now-top pinned card into view.
   useEffect(() => {
@@ -977,6 +1027,7 @@ function RunsIndex() {
             onTagFiltersChange={onTagFiltersChange}
             ancestorsOn={ancestorsOn}
             onAncestorsChange={setAncestorsOn}
+            onStepRangeChange={setStepZoomRange}
           />
         </div>
       )}
