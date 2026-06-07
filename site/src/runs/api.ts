@@ -487,6 +487,8 @@ export interface ModalApp {
   n_running_tasks: number
   created_at_ms: number | null
   stopped_at_ms: number | null
+  /** Modal app id (`ap-…`). Optional — older snapshots predate the sync writing it. */
+  app_id?: string
   /** fc-id → probe result. Empty when no --fc-id was passed to `tomat modal sync`. */
   function_calls: Record<string, ModalFunctionCall>
 }
