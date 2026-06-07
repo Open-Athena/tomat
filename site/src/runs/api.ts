@@ -96,6 +96,11 @@ export interface RunsSnapshot {
   runs: Record<string, RunsSnapshotEntry | null>
   iris: IrisState | null
   modal: ModalState | null
+  /** `pending-fires.json` — Modal training fires `tomat modal pending-fire add`
+   *  recorded ahead of their wandb session opening. Renders placeholder cards
+   *  for runs not yet in `runs`. Optional for back-compat with snapshots from
+   *  before the feed was added. */
+  pending_fires?: PendingFires | null
 }
 
 export async function fetchRunsSnapshot(): Promise<RunsSnapshot> {
@@ -504,6 +509,62 @@ export async function fetchModalState(): Promise<ModalState> {
   const r = await fetch(`${API_BASE}/api/modal-state.json`)
   if (!r.ok) throw new Error(`fetchModalState ${r.status}`)
   return r.json()
+}
+
+// ── pending-fires.json (Modal training fires not yet wandb-manifested) ─────
+// Written by `tomat modal pending-fire add` immediately after `fn.spawn(...)`
+// in `scripts/train_smoke_modal.py`, so the /runs dashboard can render a
+// placeholder card during the 15-30 min pre-wandb window (container starting,
+// JAX compile, ckpt load). GC'd by `tomat runs sync` once the wandb manifest
+// lands on R2. Schema mirrors the python helper in `tomat::pending_fire_add`.
+
+export interface PendingFire {
+  run_id: string
+  fc_id: string
+  app_name: string
+  function_name: string
+  spawned_at_ms: number
+  hardware: string
+  model_preset: string
+  batch_size: number
+  seed: number
+  intended_steps: number
+  results_label: string
+  wandb_project: string
+  loss_type: string
+  kl_sigma: number | null
+  maskgit_prior: string
+  tags: string[]
+}
+
+export interface PendingFires {
+  schema_version: number
+  synced_at: string
+  fires: PendingFire[]
+}
+
+export async function fetchPendingFires(): Promise<PendingFires | null> {
+  const r = await fetch(`${API_BASE}/api/pending-fires.json`)
+  if (r.status === 404) return null
+  if (!r.ok) throw new Error(`fetchPendingFires ${r.status}`)
+  return r.json()
+}
+
+/** Find the `ModalFunctionCall` probe (if any) for one pending fire's fc_id.
+ *  `tomat modal sync --fc-id <fc>` probes only fc-ids that were passed at
+ *  sync time; without that probe we just have app-level state. The pending
+ *  fire still renders fine — the placeholder card falls back to the app's
+ *  state alone. */
+export function modalFcForPending(
+  modal: ModalState | null | undefined,
+  fc_id: string,
+): ModalFunctionCall | null {
+  if (!modal) return null
+  for (const app of Object.values(modal.apps)) {
+    const fc = app.function_calls[fc_id]
+    if (fc) return fc
+  }
+  return null
 }
 
 /** A run is "Modal-hosted" when its name carries our convention's

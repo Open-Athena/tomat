@@ -2,8 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { enumParam, useUrlState } from 'use-prms'
 import { Tooltip } from '../Tooltip'
-import { evalJobsByRun, fetchEval, fetchEvalsIndex, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchRunCost, fetchRunsSnapshot, irisJobIdForRun, modalAppForRun, parquetUrl } from './api'
-import type { EvalPoint } from './api'
+import { evalJobsByRun, fetchEval, fetchEvalsIndex, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchRunCost, fetchRunsSnapshot, irisJobIdForRun, isModalRun, modalAppForRun, modalFcForPending, parquetUrl } from './api'
+import type { EvalPoint, ModalApp, ModalFunctionCall, PendingFire } from './api'
 import { concatHistories, fetchRunHistory, type RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
 import { RecentEvents } from './RecentEvents'
@@ -163,6 +163,178 @@ function RunCard({ data, activeRunId, pinnedRunId, parentWandbUrl, parentColor, 
   )
 }
 
+// ── pending-fire placeholder card ──────────────────────────────────────────
+// Renders the `pending-fires.json` entries — Modal training fires that were
+// `fn.spawn(...)`-ed but haven't opened their wandb session yet (cache build /
+// JIT compile / ckpt load takes 15-30 min before the first metric lands).
+//
+// State for these cards is sourced ENTIRELY from Modal's lifecycle — the fc
+// probe (when present in the modal-sync snapshot) plus the app-level state.
+// We intentionally do NOT touch wandb's run.state for these — see memory
+// `feedback_no_wandb_for_state`. The state label maps:
+//   - fc probe not yet visible (sync hasn't run with --fc-id) → SPAWNED
+//   - fc probe present + status=pending  → BUILDING (container starting)
+//   - fc probe present + has task_id, status=pending → RUNNING (container up,
+//     no wandb yet — JAX init / first iter / cache extract)
+//   - fc probe present + status=success → FINISHED (will be GC'd soon)
+//   - fc probe present + status in (failure, terminated, …) → FAILED
+//
+// All other Modal states pass through (unknown_*).
+type PendingState = 'SPAWNED' | 'BUILDING' | 'RUNNING' | 'FINISHED'
+                  | 'FAILED' | 'UNKNOWN'
+
+const PENDING_STATE_STYLES: Record<PendingState, { bg: string; fg: string }> = {
+  SPAWNED:  { bg: '#0366d6', fg: '#fff' },
+  BUILDING: { bg: '#b08800', fg: '#fff' },
+  RUNNING:  { bg: '#22863a', fg: '#fff' },
+  FINISHED: { bg: '#22863a', fg: '#fff' },
+  FAILED:   { bg: '#cb2431', fg: '#fff' },
+  UNKNOWN:  { bg: '#6a737d', fg: '#fff' },
+}
+
+function pendingFireState(fc: ModalFunctionCall | null): PendingState {
+  if (!fc) return 'SPAWNED'
+  if (fc.error) return 'FAILED'
+  if (fc.inputs.length === 0) return 'SPAWNED'
+  const inp = fc.inputs[0]
+  switch (inp.status) {
+    case 'success': return 'FINISHED'
+    case 'failure':
+    case 'terminated':
+    case 'timeout':
+    case 'init_failure':
+    case 'internal_failure':
+    case 'idle_timeout':
+      return 'FAILED'
+    case 'pending':
+      // No task_id assigned yet → container hasn't started.
+      // task_id present → container up, training side may or may not have
+      // started touching wandb. We label this RUNNING for the placeholder
+      // (BUILDING would understate the work being done by the GPU).
+      return inp.task_id ? 'RUNNING' : 'BUILDING'
+    default: return 'UNKNOWN'
+  }
+}
+
+function PendingStateBadge({ state, fc, app }: {
+  state: PendingState
+  fc: ModalFunctionCall | null
+  app: ModalApp | null
+}) {
+  const style = PENDING_STATE_STYLES[state]
+  const tipLines: string[] = [`modal-derived state: ${state}`]
+  if (app) tipLines.push(`app=${app.description} app_state=${app.state}`)
+  if (fc) {
+    tipLines.push(`fc=${fc.function_call_id}`)
+    if (fc.error) tipLines.push(`fc error: ${fc.error}`)
+    for (const inp of fc.inputs) {
+      tipLines.push(`input=${inp.status}${inp.task_id ? ` task=${inp.task_id.slice(0, 10)}…` : ''}`)
+    }
+  } else {
+    tipLines.push('no fc probe yet (run `tomat modal sync --fc-id <fc>`)')
+  }
+  return (
+    <Tooltip content={tipLines.join(' · ')}>
+      <span style={{
+        backgroundColor: style.bg, color: style.fg,
+        padding: '1px 6px', borderRadius: 3,
+        fontSize: '0.75rem', fontFamily: 'monospace',
+      }}>
+        {state}
+      </span>
+    </Tooltip>
+  )
+}
+
+interface PendingFireCardProps {
+  fire: PendingFire
+  app: ModalApp | null
+  fc: ModalFunctionCall | null
+}
+
+function PendingFireCard({ fire, app, fc }: PendingFireCardProps) {
+  const state = pendingFireState(fc)
+  const spawnedAgo = (() => {
+    const dt = (Date.now() - fire.spawned_at_ms) / 1000
+    if (dt < 60) return `${dt.toFixed(0)}s ago`
+    if (dt < 3600) return `${(dt / 60).toFixed(0)}m ago`
+    if (dt < 86400) return `${(dt / 3600).toFixed(1)}h ago`
+    return `${(dt / 86400).toFixed(1)}d ago`
+  })()
+  const appUrl = `https://modal.com/apps/open-athena/main/deployed/${fire.app_name}?activeTab=logs`
+  // Compose the loss-config chip text — `loss_type` plus `kl_sigma` (when
+  // relevant) plus the maskgit_prior.
+  const lossChip = fire.kl_sigma != null
+    ? `${fire.loss_type} σ=${fire.kl_sigma}`
+    : fire.loss_type
+  return (
+    <div style={{
+      position: 'relative',
+      border: '1px dashed #4a4a4a',
+      borderRadius: 6,
+      padding: '0.6rem 1rem 0.6rem 1.2rem',
+      marginBottom: '0.6rem',
+      backgroundColor: '#161616',
+    }}>
+      <div style={{
+        position: 'absolute', left: 0, top: 0, bottom: 0, width: 4,
+        backgroundColor: '#0366d6', zIndex: 1,
+      }} />
+      <div style={{
+        display: 'grid', gridTemplateColumns: '1fr auto', gap: '0.4rem 1rem',
+      }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+            <PendingStateBadge state={state} fc={fc} app={app} />
+            <span style={{ fontFamily: 'monospace', fontSize: '0.9rem', color: '#ddd' }}>
+              {fire.run_id}
+            </span>
+            <Tooltip content={`open Modal app logs (${fire.app_name})\nfc: ${fire.fc_id}`}>
+              <a href={appUrl} target="_blank" rel="noreferrer"
+                style={{ fontSize: '0.75rem', color: '#888',
+                  display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+                <img src="/modal.png" alt="modal"
+                  style={{ height: 18, width: 'auto', verticalAlign: 'middle' }} />
+                ↗
+              </a>
+            </Tooltip>
+            <Tooltip content="placeholder card — pending wandb session, sourced from `pending-fires.json`">
+              <span style={{
+                fontSize: '0.66rem', fontFamily: 'monospace', color: '#888',
+                border: '1px solid #444', borderRadius: 8, padding: '0 6px',
+              }}>
+                placeholder
+              </span>
+            </Tooltip>
+          </div>
+          <div style={{ marginTop: '0.35rem', fontSize: '0.8rem', color: '#ccc',
+                        display: 'flex', flexWrap: 'wrap', gap: '0.4rem 0.9rem' }}>
+            <span style={{ color: HW_COLORS['modal-gpu'], fontWeight: 600 }}>
+              {fire.hardware}
+            </span>
+            <span>{fire.model_preset}</span>
+            <span>BS={fire.batch_size}</span>
+            <span>{lossChip}</span>
+            <span>prior={fire.maskgit_prior}</span>
+            <Tooltip content="num_train_steps the spawn requested">
+              <span>target {fire.intended_steps.toLocaleString()}</span>
+            </Tooltip>
+          </div>
+          <div style={{ marginTop: '0.3rem', fontSize: '0.75rem', color: '#888' }}>
+            spawned {spawnedAgo} · {fire.wandb_project} · awaiting wandb session
+            {fire.tags.length > 0 && <> · tags: {fire.tags.join(', ')}</>}
+          </div>
+        </div>
+        <div style={{ minWidth: 120, fontSize: '0.75rem', color: '#888',
+                      textAlign: 'right', fontFamily: 'monospace' }}>
+          <div>fc {fire.fc_id.slice(0, 14)}…</div>
+          <div style={{ marginTop: 4 }}>fn {fire.function_name}</div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // Genuinely executing right now: iris RUNNING, or a job-less run (e.g. Modal)
 // that wandb still reports as running AND has logged recently.
 //
@@ -180,7 +352,17 @@ function RunCard({ data, activeRunId, pinnedRunId, parentWandbUrl, parentColor, 
 const RUNNING_RECENCY_MS = 60 * 60 * 1000
 function isRunning(c: RunCardData): boolean {
   if (c.job?.state === 'RUNNING') return true
-  if (!c.job && c.manifest?.run?.state === 'running') {
+  // For Modal runs the source of truth is the Modal lifecycle, not wandb's
+  // run.state — per `feedback_no_wandb_for_state`, wandb stamps "crashed" on
+  // any client disconnect (including intentional kills) and stays "running"
+  // for zombies. A Modal run is genuinely running iff the matched app is
+  // `deployed` and has running tasks. See ModalBadge for the same rule.
+  if (!c.job && isModalRun(c.id) && c.modalApp) {
+    return c.modalApp.state === 'deployed' && c.modalApp.n_running_tasks > 0
+  }
+  if (!c.job && !isModalRun(c.id) && c.manifest?.run?.state === 'running') {
+    // Non-Modal job-less runs (no iris, no -modal- in the name) — fall back
+    // to wandb-state with the recency gate, as before.
     const tsMax = c.manifest?.history?.ts_max
     if (typeof tsMax === 'number'
         && Date.now() - tsMax * 1000 < RUNNING_RECENCY_MS) {
@@ -335,6 +517,7 @@ function RunsIndex() {
 
   const iris = snapshotQ.data?.iris ?? null
   const modal = snapshotQ.data?.modal ?? null
+  const pendingFires = snapshotQ.data?.pending_fires ?? null
 
   // Active-run set drives the per-run history poll interval. While iris hasn't
   // loaded yet, treat every run as active (fail-open to fast polling for
@@ -446,6 +629,34 @@ function RunsIndex() {
     }
     return out
   }, [iris, modal, visibleSet, evalByRun])
+
+  // Pending-fire placeholder rows — Modal training fires recorded by
+  // `tomat modal pending-fire add` immediately after `fn.spawn(...)`, before
+  // the trainer container opens its wandb session. We pre-filter out fires
+  // whose run_id is already covered by the manifest-derived `visible` set
+  // (so a freshly-synced run doesn't double-render) or the iris-derived
+  // `pendingCards` set (so an iris-pending TPU run with a matching fire id
+  // isn't shadowed). The CLI's `gc` pass keeps R2 in sync over time, but
+  // this client-side filter avoids a stale-window double-render.
+  const pendingFireRows: { fire: PendingFire; app: ModalApp | null; fc: ModalFunctionCall | null }[] = useMemo(() => {
+    const fires = pendingFires?.fires ?? []
+    if (fires.length === 0) return []
+    const irisPendingIds = new Set(pendingCards.map((c) => c.id))
+    const out: { fire: PendingFire; app: ModalApp | null; fc: ModalFunctionCall | null }[] = []
+    for (const fire of fires) {
+      if (visibleSet.has(fire.run_id)) continue
+      if (irisPendingIds.has(fire.run_id)) continue
+      if (EXCLUDED_RUNS.has(fire.run_id)) continue
+      const fc = modalFcForPending(modal, fire.fc_id)
+      // Prefer the (single) deployed `tomat-train-smoke` app — the same
+      // `modalAppForRun` heuristic used by manifest-derived Modal cards.
+      const app = modalAppForRun(modal, fire.run_id)
+      out.push({ fire, app, fc })
+    }
+    // Newest first within the placeholder bucket.
+    out.sort((a, b) => b.fire.spawned_at_ms - a.fire.spawned_at_ms)
+    return out
+  }, [pendingFires, modal, visibleSet, pendingCards])
 
   // URL-persisted card sort mode (`?sort=`). Default 'active' = the existing
   // bucket-by-state + activity-desc behavior; others let the user re-key on
@@ -769,6 +980,18 @@ function RunsIndex() {
           />
         </div>
       )}
+      {pendingFireRows.length > 0 && (
+        <div style={{
+          marginBottom: '0.4rem', fontSize: '0.72rem', color: '#888',
+        }}>
+          {pendingFireRows.length} pending fire{pendingFireRows.length > 1 ? 's' : ''}
+          {' '}— awaiting wandb session (see{' '}
+          <code>tomat modal pending-fire list</code>)
+        </div>
+      )}
+      {pendingFireRows.map(({ fire, app, fc }) => (
+        <PendingFireCard key={fire.run_id} fire={fire} app={app} fc={fc} />
+      ))}
       {displayed && displayed.map((c) => {
         const faded = matchedIdsExpanded && matchedIdsExpanded.size > 0 && !matchedIdsExpanded.has(c.id)
         // Look up the parent's wandb URL from the snapshot's manifest map
