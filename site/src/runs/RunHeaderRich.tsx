@@ -1307,6 +1307,11 @@ export function RunHeaderRich({
               : formatFlops(nFlops, flopUnit)}
             </>
           )}
+          {nFlops != null && data.cost?.msrp_usd != null && data.cost.msrp_usd > 0 && (
+            <Tooltip content={`$${data.cost.msrp_usd.toFixed(2)} MSRP / ${(nFlops / 1e18).toFixed(1)} EF`}>
+              <> · <b>${(data.cost.msrp_usd / (nFlops / 1e18)).toFixed(2)}</b>/EF</>
+            </Tooltip>
+          )}
         </div>
         {/* % training chip — sum(train-active windows ∩ attempt windows) /
             (now or finished_at − submitted_at). Only renders when we have
