@@ -203,6 +203,13 @@ export const EPOCH_SEQUENCES: Record<string, number> = {
   // same shard structure; just permuted. Pick this up via `TOMAT_LABEL` to
   // eliminate the 1024-step BlockShuffleConfig sawtooth (spec 44).
   'train-full-v3-shuffled': 4954176,
+  // Re-seeded copies of train-full-v3 (P=19, 64 patches/mat, different patch
+  // seed per shard). Row count from worker meta.json: 256 workers × 19392 rows
+  // = 4,964,352. ~0.2% larger than train-full-v3 (different oversize filter
+  // outcomes at the new seed). Used by the LF-ablation runs (spawn_lf_ablation.py).
+  'train-full-v3-shard1': 4964352,
+  'train-full-v3-shard2': 4964352,
+  'train-full-v3-shard3': 4964352,
 }
 
 /** Data label (tokenization) of a run.
