@@ -921,7 +921,7 @@ def _train_bakeoff_impl(
     gpu="H100:8",
     volumes={MOUNT: train_volume},
     secrets=[wandb_secret, gcp_secret],
-    timeout=72000,  # 20h — 10k bs=256 at ~6 s/step ≈ 16.7h (+ slack). Don't exceed Modal's 24h cap.
+    timeout=86400,  # 24h — Modal's max per-call cap. Was 20h; v4-epochwin hit it mid-write of step-92592 (2026-06-08), forcing a manual resume.
 )
 def train_bakeoff_h100x8(
     steps: int,
@@ -1017,7 +1017,7 @@ def main_bakeoff_h100x8(
     gpu="H200:8",
     volumes={MOUNT: train_volume},
     secrets=[wandb_secret, gcp_secret],
-    timeout=72000,  # 20h — matches h100x8; MG 10k @ bs=128 should fit comfortably.
+    timeout=86400,  # 24h — Modal's max per-call cap. Matches h100x8.
 )
 def train_bakeoff_h200x8(
     steps: int,
