@@ -564,7 +564,19 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       // too so the x-unified tooltip shows distinct lines per segment
       // instead of three identical "TL (train/loss)" rows.
       const segName = N > 1 && !isLatest ? `${name} #${segIdx + 1}/${N}` : name
-      const { mean: ySmoothed, std: yStd } = computeSmoothedSeries(s.ys, smooth)
+      // Bypass smoothing for sparse traces — VL on a long run carries ~5-20
+      // points across 10k+ steps, and sample-index rolling with window >
+      // len(ys) collapses every output to the global mean → flat line. Same
+      // rationale as the MT/MV exemption at `evalMedianTrace` below; VL ends
+      // up here because it's logically grouped with TL into one
+      // `smoothedSeriesTraces` call. Threshold 30 is well above typical VL
+      // counts and well below TL's 1000s, so TL still smooths normally.
+      const SPARSE_THRESHOLD = 30
+      const nonNullYs = s.ys.reduce((acc, y) => acc + (y == null ? 0 : 1), 0)
+      const isSparse = nonNullYs < SPARSE_THRESHOLD
+      const { mean: ySmoothed, std: yStd } = isSparse
+        ? { mean: s.ys, std: null as (number | null)[] | null }
+        : computeSmoothedSeries(s.ys, smooth)
       const segGsteps = customGsteps(s)
       // Gap-break the main-line arrays so plotly doesn't connect across pauses.
       // We insert one extra `null` y entry between the gap-start and gap-end
