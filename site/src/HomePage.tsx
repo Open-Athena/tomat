@@ -87,9 +87,7 @@ export function HomePage() {
       <h2>Status</h2>
       <p className="meta">
         Honest free-running mat-NMAE: <strong>not competitive yet</strong>.
-        Previously-cited 0.96 % was teacher-forced + had a bidir-attn eval
-        bug — retracted (<a href="#/posts/05-the-80k-run-was-tf-cheating">post
-        05</a>). Current MaskGIT-from-scratch + LF-ablation work targets the
+        Current MaskGIT-from-scratch + LF-ablation work targets the
         AR-train / FR-eval gap directly (<a href="#/posts/13-why-pure-emd-collapses">post 13</a>).
         Reference: ChargE3Net (
         <ExtLink href="https://arxiv.org/abs/2312.05388">arxiv:2312.05388</ExtLink>
