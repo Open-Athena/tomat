@@ -1308,9 +1308,12 @@ export function RunHeaderRich({
             </>
           )}
           {nFlops != null && data.cost?.msrp_usd != null && data.cost.msrp_usd > 0 && (
-            <Tooltip content={`$${data.cost.msrp_usd.toFixed(2)} MSRP / ${(nFlops / 1e18).toFixed(1)} EF`}>
-              <> · <b>${(data.cost.msrp_usd / (nFlops / 1e18)).toFixed(2)}</b>/EF</>
-            </Tooltip>
+            <>
+              {' · '}
+              <Tooltip content={`$${data.cost.msrp_usd.toFixed(2)} MSRP / ${(nFlops / 1e18).toFixed(1)} EF`}>
+                <span><b>${(data.cost.msrp_usd / (nFlops / 1e18)).toFixed(2)}</b>/EF</span>
+              </Tooltip>
+            </>
           )}
         </div>
         {/* % training chip — sum(train-active windows ∩ attempt windows) /
