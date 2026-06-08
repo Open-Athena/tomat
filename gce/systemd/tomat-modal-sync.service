@@ -1,0 +1,16 @@
+[Unit]
+Description=tomat: sync Modal app + function-call state to R2 (every 1 min)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ryan
+WorkingDirectory=/home/ryan/tomat
+EnvironmentFile=-/etc/default/tomat-monitor
+ExecStart=/home/ryan/tomat/gce/sync/modal-sync.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

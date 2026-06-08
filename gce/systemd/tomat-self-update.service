@@ -1,0 +1,16 @@
+[Unit]
+Description=tomat: pull latest main + re-install systemd units (every 5 min)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ryan
+WorkingDirectory=/home/ryan/tomat
+EnvironmentFile=-/etc/default/tomat-monitor
+ExecStart=/home/ryan/tomat/gce/sync/self-update.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

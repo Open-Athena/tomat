@@ -1,0 +1,11 @@
+[Unit]
+Description=tomat: sync Modal state — every 1 min
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=1min
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

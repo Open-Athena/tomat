@@ -1,0 +1,16 @@
+[Unit]
+Description=tomat: sync m-eval JSONs from GCS to R2 (every 10 min)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ryan
+WorkingDirectory=/home/ryan/tomat
+EnvironmentFile=-/etc/default/tomat-monitor
+ExecStart=/home/ryan/tomat/gce/sync/evals-sync.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

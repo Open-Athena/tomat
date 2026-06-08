@@ -1,0 +1,11 @@
+[Unit]
+Description=tomat: self-update from main — every 5 min
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
