@@ -93,13 +93,18 @@ export interface RunCardData {
   /** Per-run Modal function-call binding, when known. The fc-id comes from
    *  `pending_fires.json`'s `run_id → fc_id` map (the spawn wrapper records
    *  it at fire time); the resolved `ModalFunctionCall` (state, container)
-   *  comes from `modal-state.json` via `modalFcForPending`. Used to deep-
-   *  link the run's Modal icon directly to its specific function call, so
-   *  the user lands on this run's container view instead of the multiplexed
-   *  app-wide log stream. Null when no pending-fire is recorded for this
-   *  run (true for any Modal run fired before the spawn wrapper added
-   *  pending-fire bookkeeping). */
+   *  comes from `modal-state.json` via `modalFcForPending`. Null when no
+   *  pending-fire is recorded for this run (true for any Modal run fired
+   *  before the spawn wrapper added pending-fire bookkeeping), OR when
+   *  `tomat modal sync --fc-id <fc>` hasn't probed the fc yet (state
+   *  unknown). For the latter case use `modalFcId` instead — the raw fc-id
+   *  is available even without a Modal-state probe. */
   modalFc?: ModalFunctionCall | null
+  /** Raw per-run Modal fc-id from pending-fires, independent of whether the
+   *  Modal-state snapshot has probed it. Used by the Modal-icon deep link
+   *  (which only needs the id, not the runtime state). Null only when no
+   *  pending-fire is recorded for this run. */
+  modalFcId?: string | null
   /** Spec 46 Phase A: tiny MSRP summary inlined in `/api/runs-snapshot.json`.
    *  Used by the "$X MSRP" chip on cards + detail-page header. Null when
    *  the run hasn't been `tomat cost compute`-d yet. */
@@ -1124,7 +1129,11 @@ export function RunHeaderRich({
             // fired before the spawn wrapper added pending-fire bookkeeping).
             const liveApp = data.modalApp
             const appName = liveApp?.description ?? 'tomat-train-smoke'
-            const fcId = data.modalFc?.function_call_id ?? null
+            // Prefer `data.modalFcId` (raw fc-id from pending-fires; available
+            // even if `tomat modal sync --fc-id <fc>` hasn't probed this fc
+            // yet). `data.modalFc` only resolves when the probe has run,
+            // which is intermittent for newly-fired runs.
+            const fcId = data.modalFcId ?? data.modalFc?.function_call_id ?? null
             // URL patterns we tested: `/apps/<ws>/main/deployed/<app>/<fc>`
             // returns 404 (Modal doesn't accept the fc as a path segment).
             // `?activeTab=calls&functionCallId=<fc>` returns 200 and

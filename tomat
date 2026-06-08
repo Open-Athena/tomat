@@ -1177,20 +1177,18 @@ def runs_sync(substr: str, bucket: str, prefix: str, project: str | None, dry_ru
         err(f"[sync] WARN: cost compute failed for {r.name}: "
             f"{type(e).__name__}: {e}")
 
-    # Drop this run from `pending-fires.json` now that its wandb manifest
-    # has landed on R2 — the dashboard's placeholder card has been
-    # superseded by the real manifest-derived card. Failures non-fatal.
-    try:
-        doc = _load_pending_fires(bucket)
-        fires = doc.get("fires", [])
-        kept = [f for f in fires if f.get("run_id") != r.name]
-        if len(kept) != len(fires):
-            doc["fires"] = kept
-            _save_pending_fires(doc, bucket=bucket)
-            err(f"[sync] pruned {r.name} from pending-fires.json")
-    except Exception as e:
-        err(f"[sync] WARN: pending-fires prune failed for {r.name}: "
-            f"{type(e).__name__}: {e}")
+    # NOTE: pending-fires entries used to be pruned here once the manifest
+    # landed. That was for the placeholder-card use case (hide the
+    # placeholder once the real manifest exists), but the dashboard side
+    # already filters those out via `visibleSet.has(fire.run_id)` in
+    # RunsPage's placeholder build — so the prune was redundant for that.
+    #
+    # The run→fc-id binding in pending-fires IS still load-bearing: it
+    # drives the run-detail Modal-icon deep-link (per RunHeaderRich's
+    # `data.modalFcId`). Pruning here broke that link for every run whose
+    # manifest had landed — so the link silently fell back to the
+    # unfiltered calls tab. Keep the entry; `pending_fire_add` already
+    # de-dupes per run_id (latest fire wins), so re-fires update in place.
 
 
 @runs.command("wallclock-plot")

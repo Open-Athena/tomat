@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { enumParam, useUrlState } from 'use-prms'
 import { Tooltip } from '../Tooltip'
-import { evalJobsByRun, fetchCronHeartbeat, fetchEval, fetchEvalsIndex, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchPendingFires, fetchRunCost, fetchRunsSnapshot, irisJobIdForRun, isModalRun, modalAppForRun, modalFcForPending, pendingFcForRun, parquetUrl } from './api'
+import { evalJobsByRun, fetchCronHeartbeat, fetchEval, fetchEvalsIndex, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchPendingFires, fetchRunCost, fetchRunsSnapshot, irisJobIdForRun, isModalRun, modalAppForRun, modalFcForPending, pendingFcForRun, pendingFcIdForRun, parquetUrl } from './api'
 import type { EvalPoint, ModalApp, ModalFunctionCall, PendingFire } from './api'
 import { concatHistories, fetchRunHistory, type RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
@@ -599,6 +599,7 @@ function RunsIndex() {
           job: iris?.jobs[irisJobIdForRun(id)] ?? null,
           modalApp,
           modalFc: pendingFcForRun(pendingFires, modal, id),
+          modalFcId: pendingFcIdForRun(pendingFires, id),
           history: historyQs[idx]?.data ?? null,
           evalJobs: evalByRun.get(id) ?? [],
           color: colorForIndex(idx),
@@ -635,6 +636,7 @@ function RunsIndex() {
         job,
         modalApp: modalAppForRun(modal, runId),
         modalFc: pendingFcForRun(pendingFires, modal, runId),
+        modalFcId: pendingFcIdForRun(pendingFires, runId),
         history: null,
         evalJobs: evalByRun.get(runId) ?? [],
         color: '#888',
@@ -1399,6 +1401,7 @@ function RunDetail({ runId }: { runId: string }) {
     job: irisQ.data?.jobs[irisJobIdForRun(runId)] ?? null,
     modalApp: detailModalCandidate && (detailModalRecent || detailRunRecent) ? detailModalCandidate : null,
     modalFc: pendingFcForRun(pendingFiresQ.data ?? null, modalQ.data ?? null, runId),
+    modalFcId: pendingFcIdForRun(pendingFiresQ.data ?? null, runId),
     history,
     evalJobs,
     color: '#888',
