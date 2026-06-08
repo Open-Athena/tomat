@@ -90,6 +90,16 @@ export interface RunCardData {
    *  `ModalBadge` to replace the wandb-state fallback with real Modal
    *  state (cache-build / queued / running / failed). */
   modalApp?: ModalApp | null
+  /** Per-run Modal function-call binding, when known. The fc-id comes from
+   *  `pending_fires.json`'s `run_id → fc_id` map (the spawn wrapper records
+   *  it at fire time); the resolved `ModalFunctionCall` (state, container)
+   *  comes from `modal-state.json` via `modalFcForPending`. Used to deep-
+   *  link the run's Modal icon directly to its specific function call, so
+   *  the user lands on this run's container view instead of the multiplexed
+   *  app-wide log stream. Null when no pending-fire is recorded for this
+   *  run (true for any Modal run fired before the spawn wrapper added
+   *  pending-fire bookkeeping). */
+  modalFc?: ModalFunctionCall | null
   /** Spec 46 Phase A: tiny MSRP summary inlined in `/api/runs-snapshot.json`.
    *  Used by the "$X MSRP" chip on cards + detail-page header. Null when
    *  the run hasn't been `tomat cost compute`-d yet. */
@@ -1093,7 +1103,7 @@ export function RunHeaderRich({
             </Tooltip>
           )}
           {isModalRun(id) && (() => {
-            // The modal-logs LINK is independent of whether the run still has
+            // The modal LINK is independent of whether the run still has
             // a live `modalApp` association. The badge-side `RunsPage` drops
             // `data.modalApp` for stale runs (so the badge stops misclaiming
             // RUNNING), but a finished Modal run's logs are still useful to
@@ -1105,16 +1115,34 @@ export function RunHeaderRich({
             // live `data.modalApp.description` matches that when present,
             // and `modalAppForRun` filters by the same constant, so falling
             // back to it is safe even without a live association.
+            //
+            // Deep-link to the specific function call when we have a
+            // pending-fires-bound fc-id for this run. The plain app URL
+            // would land on combined-across-all-fires logs — mostly noise
+            // from sibling runs hosted under the same app. Fall back to
+            // app URL only when no fc is recorded (e.g. older Modal runs
+            // fired before the spawn wrapper added pending-fire bookkeeping).
             const liveApp = data.modalApp
             const appName = liveApp?.description ?? 'tomat-train-smoke'
-            const appUrl = `https://modal.com/apps/open-athena/main/deployed/${appName}?activeTab=logs`
+            const fcId = data.modalFc?.function_call_id ?? null
+            // URL patterns we tested: `/apps/<ws>/main/deployed/<app>/<fc>`
+            // returns 404 (Modal doesn't accept the fc as a path segment).
+            // `?activeTab=calls&functionCallId=<fc>` returns 200 and
+            // pre-filters the calls table to just this call. Fall back to
+            // the calls tab unfiltered when we have no fc-id — better than
+            // the combined-logs default which is mostly noise.
+            const appUrl = fcId
+              ? `https://modal.com/apps/open-athena/main/deployed/${appName}?activeTab=calls&functionCallId=${fcId}`
+              : `https://modal.com/apps/open-athena/main/deployed/${appName}?activeTab=calls`
             const fcs = liveApp ? Object.values(liveApp.function_calls) : []
             fcs.sort((a, b) => b.function_call_id.localeCompare(a.function_call_id))
             const latestFc = fcs[0]
-            const tooltip = liveApp
-              ? `open Modal app logs (${liveApp.app_id ?? appName})`
-                + (latestFc ? `\nlatest fc: ${latestFc.function_call_id}` : '')
-              : `open Modal app logs (${appName})\n(this run has finished — no live app association)`
+            const tooltip = fcId
+              ? `open Modal call (${fcId})`
+              : liveApp
+                ? `open Modal app (${liveApp.app_id ?? appName})\n(no pending-fire fc-id for this run)`
+                  + (latestFc ? `\nlatest fc seen in app: ${latestFc.function_call_id}` : '')
+                : `open Modal app (${appName})\n(this run has finished — no live app association)`
             return (
               <Tooltip content={tooltip}>
                 <a href={appUrl} target="_blank" rel="noreferrer"

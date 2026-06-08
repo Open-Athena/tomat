@@ -587,6 +587,38 @@ export function modalFcForPending(
   return null
 }
 
+/** Resolve the `ModalFunctionCall` for a given run_id, via pending-fires +
+ *  modal-state. Returns null when no pending-fire is recorded for the run
+ *  (true for any Modal run fired before the spawn wrapper started writing
+ *  pending-fire entries) or when the fc isn't in the Modal state snapshot
+ *  yet. Used by `RunCardData.modalFc` so the run-detail Modal link can
+ *  deep-link to the specific call. When multiple pending-fires exist for
+ *  the same run_id (re-fires after a kill), prefers the most recently
+ *  spawned one. */
+export function pendingFcForRun(
+  pendingFires: PendingFires | null | undefined,
+  modal: ModalState | null | undefined,
+  runId: string,
+): ModalFunctionCall | null {
+  const fires = (pendingFires?.fires ?? []).filter((f) => f.run_id === runId)
+  if (fires.length === 0) return null
+  fires.sort((a, b) => b.spawned_at_ms - a.spawned_at_ms)
+  return modalFcForPending(modal, fires[0].fc_id)
+}
+
+/** Same as `pendingFcForRun` but returns the raw fc-id, even when the Modal
+ *  state snapshot hasn't probed the fc yet. Useful for the per-run Modal
+ *  link (which only needs the fc-id, not the call's runtime state). */
+export function pendingFcIdForRun(
+  pendingFires: PendingFires | null | undefined,
+  runId: string,
+): string | null {
+  const fires = (pendingFires?.fires ?? []).filter((f) => f.run_id === runId)
+  if (fires.length === 0) return null
+  fires.sort((a, b) => b.spawned_at_ms - a.spawned_at_ms)
+  return fires[0].fc_id
+}
+
 /** A run is "Modal-hosted" when its name carries our convention's
  *  `-modal-` infix (e.g. `train-mg-modal-h200x8-tz-v3-bs128-seed42`).
  *  This is a name-pattern heuristic, not a wandb-tag check — keeps the

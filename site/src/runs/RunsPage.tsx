@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { enumParam, useUrlState } from 'use-prms'
 import { Tooltip } from '../Tooltip'
-import { evalJobsByRun, fetchCronHeartbeat, fetchEval, fetchEvalsIndex, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchRunCost, fetchRunsSnapshot, irisJobIdForRun, isModalRun, modalAppForRun, modalFcForPending, parquetUrl } from './api'
+import { evalJobsByRun, fetchCronHeartbeat, fetchEval, fetchEvalsIndex, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchPendingFires, fetchRunCost, fetchRunsSnapshot, irisJobIdForRun, isModalRun, modalAppForRun, modalFcForPending, pendingFcForRun, parquetUrl } from './api'
 import type { EvalPoint, ModalApp, ModalFunctionCall, PendingFire } from './api'
 import { concatHistories, fetchRunHistory, type RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
@@ -598,6 +598,7 @@ function RunsIndex() {
           manifest,
           job: iris?.jobs[irisJobIdForRun(id)] ?? null,
           modalApp,
+          modalFc: pendingFcForRun(pendingFires, modal, id),
           history: historyQs[idx]?.data ?? null,
           evalJobs: evalByRun.get(id) ?? [],
           color: colorForIndex(idx),
@@ -633,6 +634,7 @@ function RunsIndex() {
         manifest: null,
         job,
         modalApp: modalAppForRun(modal, runId),
+        modalFc: pendingFcForRun(pendingFires, modal, runId),
         history: null,
         evalJobs: evalByRun.get(runId) ?? [],
         color: '#888',
@@ -1282,6 +1284,14 @@ function RunDetail({ runId }: { runId: string }) {
   const modalQ = useQuery({
     queryKey: ['modal'], queryFn: fetchModalState, refetchInterval: REFETCH_MS.iris,
   })
+  // Pending-fires sidecar — needed to resolve this run's bound Modal fc-id
+  // so the Modal-icon deep-links to the specific call (not the multiplexed
+  // app log stream). Cheap small JSON; reuses the same cron + refetch
+  // cadence as modal-state.
+  const pendingFiresQ = useQuery({
+    queryKey: ['pending-fires'], queryFn: fetchPendingFires,
+    refetchInterval: REFETCH_MS.iris,
+  })
   // Per-task attempt history sidecar — written by `tomat iris sync` alongside
   // iris-state.json. 404s are normal (e.g. before the cron has caught a new
   // training run) and resolve to null without poisoning the query.
@@ -1388,6 +1398,7 @@ function RunDetail({ runId }: { runId: string }) {
     manifest,
     job: irisQ.data?.jobs[irisJobIdForRun(runId)] ?? null,
     modalApp: detailModalCandidate && (detailModalRecent || detailRunRecent) ? detailModalCandidate : null,
+    modalFc: pendingFcForRun(pendingFiresQ.data ?? null, modalQ.data ?? null, runId),
     history,
     evalJobs,
     color: '#888',
