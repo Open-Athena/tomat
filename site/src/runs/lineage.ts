@@ -131,8 +131,15 @@ export interface RunSegment {
 }
 
 export const SEGMENTS: Record<string, RunSegment[]> = {
-  // Entries are added per-run as needed; the empty default keeps every
-  // un-declared run on the single-(BS, label) `epochOfStep` fallback path.
+  // v4-epochwin: TS0 trained on `train-full-v3` at BS=128 through step 76186,
+  // then TS1 cut over to the re-seeded `train-full-v3-shard1` at BS=256.
+  // Without this entry the manifest's sync-time (BS, label) drove epoch
+  // math for the whole run, over-reporting by ~1.7× at the current step.
+  // Per-segment numbers at step 90,982 (spec 54): 1.97 + 0.76 = 2.73.
+  'train-mg-modal-h200x8-tz-v4-epochwin-bs128-seed42': [
+    { startStep: 0,     endStep: 76186,    dataLabel: 'train-full-v3',        batchSize: 128 },
+    { startStep: 76186, endStep: Infinity, dataLabel: 'train-full-v3-shard1', batchSize: 256 },
+  ],
 }
 
 /** Segments for `runName`, or `null` if none are declared. */
