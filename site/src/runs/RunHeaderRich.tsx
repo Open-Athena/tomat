@@ -1134,24 +1134,44 @@ export function RunHeaderRich({
             // yet). `data.modalFc` only resolves when the probe has run,
             // which is intermittent for newly-fired runs.
             const fcId = data.modalFcId ?? data.modalFc?.function_call_id ?? null
-            // URL patterns we tested: `/apps/<ws>/main/deployed/<app>/<fc>`
-            // returns 404 (Modal doesn't accept the fc as a path segment).
-            // `?activeTab=calls&functionCallId=<fc>` returns 200 and
-            // pre-filters the calls table to just this call. Fall back to
-            // the calls tab unfiltered when we have no fc-id — better than
-            // the combined-logs default which is mostly noise.
-            const appUrl = fcId
-              ? `https://modal.com/apps/open-athena/main/deployed/${appName}?activeTab=calls&functionCallId=${fcId}`
-              : `https://modal.com/apps/open-athena/main/deployed/${appName}?activeTab=calls`
+            const appId = liveApp?.app_id ?? null
+            // function_name comes from the probed fc only — we don't have it
+            // from pending-fires alone.
+            const fnName = data.modalFc?.function_name ?? null
+            const fnId = (fnName && liveApp?.function_ids)
+              ? liveApp.function_ids[fnName] ?? null
+              : null
+            // Modal URL pattern for per-call App Logs view (verified empirically
+            // 2026-06-08, ryan's working example):
+            //   /apps/<ws>/main/<ap-id>?activeTab=logs&functionId=<fu>&fcId=<fc>
+            // The `logs` tab (NOT `calls`) is the most useful landing page —
+            // full-width log stream + timestamp histogram, all filtered to
+            // this specific call. Fallback chain:
+            //   1. Have app_id + function_id + fc_id → full deep-link
+            //   2. Have app_id + fc_id (no fn_id yet) → app + fc filter
+            //   3. Have app_id alone → app overview (ap-id path)
+            //   4. Nothing → app overview by name
+            let appUrl: string
+            if (appId && fnId && fcId) {
+              appUrl = `https://modal.com/apps/open-athena/main/${appId}?activeTab=logs&functionId=${fnId}&fcId=${fcId}`
+            } else if (appId && fcId) {
+              appUrl = `https://modal.com/apps/open-athena/main/${appId}?activeTab=logs&fcId=${fcId}`
+            } else if (appId) {
+              appUrl = `https://modal.com/apps/open-athena/main/${appId}`
+            } else {
+              appUrl = `https://modal.com/apps/open-athena/main/deployed/${appName}`
+            }
             const fcs = liveApp ? Object.values(liveApp.function_calls) : []
             fcs.sort((a, b) => b.function_call_id.localeCompare(a.function_call_id))
             const latestFc = fcs[0]
-            const tooltip = fcId
-              ? `open Modal call (${fcId})`
-              : liveApp
-                ? `open Modal app (${liveApp.app_id ?? appName})\n(no pending-fire fc-id for this run)`
-                  + (latestFc ? `\nlatest fc seen in app: ${latestFc.function_call_id}` : '')
-                : `open Modal app (${appName})\n(this run has finished — no live app association)`
+            const tooltip = fnId && fcId
+              ? `open Modal logs (${fnName})\nfc ${fcId}`
+              : fcId
+                ? `open Modal app\nfc ${fcId} (function_id not yet captured — link may not pre-filter)`
+                : liveApp
+                  ? `open Modal app (${appId ?? appName})\n(no pending-fire fc-id for this run)`
+                    + (latestFc ? `\nlatest fc seen in app: ${latestFc.function_call_id}` : '')
+                  : `open Modal app (${appName})\n(this run has finished — no live app association)`
             return (
               <Tooltip content={tooltip}>
                 <a href={appUrl} target="_blank" rel="noreferrer"

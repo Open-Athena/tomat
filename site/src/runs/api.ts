@@ -516,6 +516,12 @@ export interface ModalApp {
   app_id?: string
   /** fc-id → probe result. Empty when no --fc-id was passed to `tomat modal sync`. */
   function_calls: Record<string, ModalFunctionCall>
+  /** function_name → function_id (`fu-…`) for every function in this app.
+   *  Populated by `AppGetLayout`. Used by the Modal-icon deep-link to
+   *  build `?activeTab=logs&functionId=<fu>&fcId=<fc>` — the per-call
+   *  filtered logs view. Empty for snapshots predating the `AppGetLayout`
+   *  capture; in that case the link falls back to the app overview. */
+  function_ids?: Record<string, string>
 }
 
 export interface ModalState {

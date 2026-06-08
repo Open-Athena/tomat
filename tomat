@@ -1845,7 +1845,23 @@ def _modal_snapshot_via_sdk(
             if a.description not in app_names:
                 continue
             state_name = _MODAL_APP_STATE_NAMES.get(int(a.state), f"unknown_{a.state}")
+            # Per-app function_name → function_id map (e.g. `train_bakeoff_h200x8` →
+            # `fu-6YvCHXuJPPa1UNcKsC2QVH`). Modal's URL pattern for deep-linking to
+            # a specific fc's logs requires the function_id, NOT just the function
+            # name. `FunctionGetCallGraph` doesn't return the function_id, but
+            # `AppGetLayout` does — one extra RPC per app, cheap.
+            try:
+                t2 = time.monotonic()
+                layout = await client.stub.AppGetLayout(
+                    api_pb2.AppGetLayoutRequest(app_id=a.app_id),
+                )
+                err(f"[modal-rpc AppGetLayout {a.app_id} {int((time.monotonic()-t2)*1000)}ms]")
+                fn_ids = dict(layout.app_layout.function_ids)
+            except Exception as e:
+                err(f"[modal sync] AppGetLayout({a.app_id}) failed: {e}")
+                fn_ids = {}
             app_entry = {
+                "app_id": a.app_id,  # `ap-…` — populated for the TS `ModalApp.app_id` field
                 "description": a.description,
                 "state": state_name,
                 "state_code": int(a.state),
@@ -1853,6 +1869,7 @@ def _modal_snapshot_via_sdk(
                 "created_at_ms": int(a.created_at * 1000) if a.created_at else None,
                 "stopped_at_ms": int(a.stopped_at * 1000) if a.stopped_at else None,
                 "function_calls": {},  # fc_id → probe result (populated below)
+                "function_ids": fn_ids,  # function_name → fu-id for deep-links
             }
             apps[a.app_id] = app_entry
 
