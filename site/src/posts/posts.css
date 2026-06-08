@@ -153,3 +153,24 @@
 /* KaTeX color in dark mode — its default works but explicitly inherit the
  * theme foreground so inline math sits naturally with surrounding text. */
 .post .katex { color: var(--fg); }
+
+/* Heading permalinks (rehype-slug + rehype-autolink-headings).
+ * `.heading-anchor` is the "#" appended to each heading; hidden until the
+ * heading is hovered, where it fades in. `scroll-margin-top` keeps a hash-
+ * navigated heading from getting hidden under the sticky header. */
+.post :where(h1, h2, h3, h4, h5, h6) {
+  scroll-margin-top: 4rem;
+  position: relative;
+}
+.post :where(h1, h2, h3, h4, h5, h6) .heading-anchor {
+  opacity: 0;
+  margin-left: 0.4em;
+  text-decoration: none;
+  color: var(--fg-muted, #888);
+  font-weight: normal;
+  transition: opacity 120ms ease;
+}
+.post :where(h1, h2, h3, h4, h5, h6):hover .heading-anchor,
+.post :where(h1, h2, h3, h4, h5, h6) .heading-anchor:focus {
+  opacity: 0.8;
+}

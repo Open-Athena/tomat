@@ -12,6 +12,8 @@ import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import rehypeHighlight from 'rehype-highlight'
+import rehypeSlug from 'rehype-slug'
+import rehypeAutolinkHeadings from 'rehype-autolink-headings'
 import 'katex/dist/katex.min.css'
 import 'highlight.js/styles/github-dark.css'
 import { ThemeToggle } from '../theme'
@@ -134,7 +136,22 @@ function PostDetail({ slug }: { slug: string }) {
         <article className="post">
           <ReactMarkdown
             remarkPlugins={[remarkGfm, remarkMath]}
-            rehypePlugins={[rehypeKatex, rehypeHighlight]}
+            rehypePlugins={[
+              rehypeKatex,
+              rehypeHighlight,
+              // Each heading gets an `id` attribute from its slugified text
+              // (e.g. `## Free-running eval` → `id="free-running-eval"`), so
+              // anyone can permalink it via `#section-slug`. Then the
+              // autolink plugin wraps each heading in an `<a>` that copies
+              // the URL on click — visually a "#" icon next to the heading
+              // styled in posts.css.
+              rehypeSlug,
+              [rehypeAutolinkHeadings, {
+                behavior: 'append',
+                properties: { className: ['heading-anchor'], ariaLabel: 'permalink' },
+                content: { type: 'text', value: ' #' },
+              }],
+            ]}
           >
             {body}
           </ReactMarkdown>
