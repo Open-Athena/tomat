@@ -62,3 +62,10 @@ else
     done <<<"$ACTIVE_RUNS"
     echo "synced $LAST_RUN_COUNT runs, $LAST_FAILURE_COUNT failures"
 fi
+
+# Heartbeat → R2: dashboard reads this to surface "cron last fired Xm ago".
+# Idle ticks still write a heartbeat so we can distinguish "cron alive but
+# idle" from "cron down".
+if [[ -x "$REPO_DIR/gce/sync/heartbeat.sh" ]]; then
+    "$REPO_DIR/gce/sync/heartbeat.sh" "$LAST_RUN_COUNT" "$LAST_FAILURE_COUNT" || true
+fi

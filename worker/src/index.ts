@@ -16,6 +16,7 @@
  *   GET  /api/voxel-corr/:label.bin.gzip — gzipped int8 corr-matrix blob (upper-triangle)
  *   GET  /api/modal-state.json           — Modal app + function-call snapshot (synced by tomat modal sync)
  *   GET  /api/pending-fires.json         — Modal-spawned training fires not yet wandb-manifested (synced by tomat modal pending-fire add)
+ *   GET  /api/cron-heartbeat.json        — GCE-VM cron last-fired timestamp (written by gce/sync/runs-sync-active.sh)
  *   GET  /api/files/list?prefix=&cursor= — generic R2 list (under FILES_PREFIX allow-list)
  *   GET  /api/files/get?path=…           — generic R2 get with Range support
  *   GET  /health
@@ -606,6 +607,14 @@ export default {
 			// `fn.spawn(...)`, GC'd after the wandb manifest lands. Powers
 			// placeholder cards on /runs during the pre-wandb window.
 			return serveR2Object(req, env, 'tomat/pending-fires.json');
+		}
+
+		if (path === '/api/cron-heartbeat.json') {
+			// Written every 2 min by `gce/sync/runs-sync-active.sh`'s
+			// `heartbeat.sh` tail. Lets the dashboard render a "cron last
+			// fired Xm ago" chip so we notice when the GCE-VM monitor
+			// goes silent.
+			return serveR2Object(req, env, 'tomat/cron-heartbeat.json');
 		}
 
 		// /api/iris-attempts/<label>.json — per-task attempt history sidecar,

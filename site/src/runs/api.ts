@@ -109,6 +109,26 @@ export async function fetchRunsSnapshot(): Promise<RunsSnapshot> {
   return r.json()
 }
 
+/** Heartbeat the GCE-VM monitor writes every 2 min after `runs-sync-active`.
+ *  Lets the dashboard surface "cron last fired Xm ago" — when the chip goes
+ *  red (≥ ~5 min stale) the VM is silent and badges + sparklines will start
+ *  drifting. */
+export interface CronHeartbeat {
+  ts: string
+  host?: string
+  last_run_count?: number
+  last_failure_count?: number
+}
+
+export async function fetchCronHeartbeat(): Promise<CronHeartbeat | null> {
+  const r = await fetch(`${API_BASE}/api/cron-heartbeat.json`)
+  // 404 (R2 object not yet written) → null; the FE renders "—" in that case
+  // rather than spamming console errors.
+  if (r.status === 404) return null
+  if (!r.ok) throw new Error(`fetchCronHeartbeat ${r.status}`)
+  return r.json()
+}
+
 export function parquetUrl(runId: string): string {
   return `${API_BASE}/api/runs/${encodeURIComponent(runId)}/raw.parquet`
 }

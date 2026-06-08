@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { enumParam, useUrlState } from 'use-prms'
 import { Tooltip } from '../Tooltip'
-import { evalJobsByRun, fetchEval, fetchEvalsIndex, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchRunCost, fetchRunsSnapshot, irisJobIdForRun, isModalRun, modalAppForRun, modalFcForPending, parquetUrl } from './api'
+import { evalJobsByRun, fetchCronHeartbeat, fetchEval, fetchEvalsIndex, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchRunCost, fetchRunsSnapshot, irisJobIdForRun, isModalRun, modalAppForRun, modalFcForPending, parquetUrl } from './api'
 import type { EvalPoint, ModalApp, ModalFunctionCall, PendingFire } from './api'
 import { concatHistories, fetchRunHistory, type RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
@@ -497,6 +497,17 @@ function RunsIndex() {
     refetchInterval: REFETCH_MS.snapshot,
   })
 
+  // GCE-VM cron heartbeat — written every 2 min by `runs-sync-active.sh` →
+  // R2. Surfaced as a small "cron 1m ago" chip in the header so we notice
+  // when the VM stops syncing (badges/sparklines will drift but won't
+  // visibly error). Refresh roughly once a minute; chip cadence is bounded
+  // by the cron's own 2-min cadence regardless.
+  const cronHeartbeatQ = useQuery({
+    queryKey: ['cron-heartbeat'],
+    queryFn: fetchCronHeartbeat,
+    refetchInterval: 60_000,
+  })
+
   // Runs in the index that have a non-null manifest, in stable order. Runs
   // present in the R2 index but with `manifest: null` (just created, never
   // synced) are dropped from the dashboard — they'd just render as empty
@@ -986,6 +997,35 @@ function RunsIndex() {
         <code>tomat runs sync</code>. iris state via{' '}
         <code>tomat iris sync</code>
         {iris && <> (snapshot {timeAgo(iris.synced_at)})</>}
+        {cronHeartbeatQ.data && (
+          <>
+            {' · '}
+            <Tooltip
+              content={
+                <div style={{ fontSize: '0.8rem' }}>
+                  GCE-VM cron heartbeat — last <code>runs-sync-active</code> tick.
+                  <br />
+                  ran <b>{cronHeartbeatQ.data.last_run_count ?? 0}</b> sync(s)
+                  {cronHeartbeatQ.data.last_failure_count != null && (
+                    <>, <b>{cronHeartbeatQ.data.last_failure_count}</b> failure(s)</>
+                  )}
+                  {cronHeartbeatQ.data.host && <> on <code>{cronHeartbeatQ.data.host}</code></>}
+                </div>
+              }
+            >
+              <span
+                style={{
+                  color:
+                    (Date.now() - new Date(cronHeartbeatQ.data.ts).getTime()) > 5 * 60_000
+                      ? 'crimson'
+                      : '#888',
+                }}
+              >
+                cron {timeAgo(cronHeartbeatQ.data.ts)}
+              </span>
+            </Tooltip>
+          </>
+        )}
         . See{' '}
         <a href="https://github.com/Open-Athena/tomat/blob/main/specs/23-runs-dashboard.md">
           spec
