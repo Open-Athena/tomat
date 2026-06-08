@@ -1,4 +1,4 @@
-# Why pure-EMD loss collapses (the actual math)
+# Why pure-EMD loss collapses
 
 **Status**: living analysis — update as new ablations land.
 
