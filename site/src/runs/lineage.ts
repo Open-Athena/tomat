@@ -99,6 +99,47 @@ export function lineageFor(runName: string): RunLineage | null {
   return RUN_LINEAGE[runName] ?? null
 }
 
+// ── Run segments (data-label / batch-size cutovers within one run) ──────────
+//
+// A "segment" is a half-open `[startStep, endStep)` slice of a run during
+// which the data label and batch size were both constant. Used by
+// `epochOfStep` (runMeta.ts) so the epoch coordinate is correct for runs
+// that changed config mid-stream (e.g. shard cutover, BS bump).
+//
+// Conventions:
+//   • Segments are contiguous and sorted by `startStep`.
+//   • First segment's `startStep` is the run's first step (typically 0).
+//   • Trailing segment's `endStep` is `Infinity` ("continues to the latest
+//     step we see"), so we don't have to bump this table every time the run
+//     logs new rows.
+//   • `dataLabel` must be a key of `EPOCH_SEQUENCES` (runMeta.ts) — unknown
+//     labels make `epochOfStep` return `null` rather than guess.
+//
+// This is NOT auto-derived from `annotations.ts`: annotations are display-only
+// labels (e.g. "TS0", "TS1"), segments are arithmetic-bearing config. Author
+// keeps them in lockstep when both apply.
+export interface RunSegment {
+  /** Inclusive lower bound. Typically 0 or the prior segment's `endStep`. */
+  startStep: number
+  /** Exclusive upper bound. `Infinity` means "until the latest step". */
+  endStep: number
+  /** Key into `EPOCH_SEQUENCES` — the tokenization-cache label active during
+   *  this segment. Unknown labels make `epochOfStep` return `null`. */
+  dataLabel: string
+  /** `trainer.train_batch_size` active during this segment. */
+  batchSize: number
+}
+
+export const SEGMENTS: Record<string, RunSegment[]> = {
+  // Entries are added per-run as needed; the empty default keeps every
+  // un-declared run on the single-(BS, label) `epochOfStep` fallback path.
+}
+
+/** Segments for `runName`, or `null` if none are declared. */
+export function segmentsFor(runName: string): RunSegment[] | null {
+  return SEGMENTS[runName] ?? null
+}
+
 /** Walk the lineage map upward from `runName`, collecting every ancestor
  *  (parent, grandparent, …). Stops at the root or a cycle (defensive — there
  *  shouldn't be any). The starting `runName` itself is NOT included. */

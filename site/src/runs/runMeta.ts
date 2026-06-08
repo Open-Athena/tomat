@@ -7,6 +7,9 @@
 
 import type { RunManifest } from './api'
 import type { RunHistory } from './parquet'
+// `.ts` extension keeps the node-test runner (`--experimental-strip-types`)
+// happy while remaining compatible with Vite + `moduleResolution: bundler`.
+import { segmentsFor, type RunSegment } from './lineage.ts'
 
 export const LOOKBACK_HOURS = 6
 export const LOOKBACK_SEC = LOOKBACK_HOURS * 3600
@@ -290,21 +293,71 @@ export function nEpochsOf(manifest: RunManifest | null): number | null {
   return tok / (epochSeqs * seqLen)
 }
 
-/** Fractional epoch count at training `step`: `step · batch_size / epoch_seqs`.
- *  Pure rescaling of `step` (same monotonicity / linearity, just a different
- *  unit). Algebraically equivalent to `nEpochsOf` evaluated at `step` (the
- *  chip on the run card / detail page) — using `train_batch_size` instead of
- *  `total_tokens` so we can compute the epoch coordinate for ANY step, not
- *  just the latest one in the summary.
+/** Fractional epoch count at training `step`. For runs declared in
+ *  `SEGMENTS` (`lineage.ts`) — i.e. runs that changed data label or batch
+ *  size mid-stream — the result is `Σ_segs (Δstep · bs) / epoch_seqs`. For
+ *  every other run the manifest's single (`train_batch_size`, data label)
+ *  pair drives the computation, algebraically equivalent to `nEpochsOf`
+ *  evaluated at `step`.
  *
- *  Returns null when the manifest doesn't carry the data needed —
- *  `train_batch_size` missing, data label unknown, or no `EPOCH_SEQUENCES`
- *  entry for that label. */
+ *  Returns null when the data needed for the computation isn't available —
+ *  e.g. fallback path's `train_batch_size` missing or data label unknown, or
+ *  a declared segment's `dataLabel` isn't in `EPOCH_SEQUENCES`. */
 export function epochOfStep(step: number, manifest: RunManifest | null): number | null {
+  const runName = manifest?.run?.name
+  const segs = runName ? segmentsFor(runName) : null
+  if (segs && segs.length > 0) {
+    let total = 0
+    for (const seg of segs) {
+      const segStart = seg.startStep
+      const segEnd = Math.min(step, seg.endStep)
+      if (segEnd <= segStart) continue
+      const rows = EPOCH_SEQUENCES[seg.dataLabel]
+      if (rows == null) return null   // unknown label → can't compute honestly
+      total += ((segEnd - segStart) * seg.batchSize) / rows
+    }
+    return total
+  }
+  // Fallback (no segments declared): single-segment math from manifest.
   const bs = batchSizeOf(manifest)
   const epochSeqs = epochSequencesOf(manifest)
   if (bs == null || epochSeqs == null) return null
   return (step * bs) / epochSeqs
+}
+
+/** Per-segment epoch contribution at training `step`, when the run is
+ *  declared in `SEGMENTS`. Each entry is the originating segment plus the
+ *  number of epochs that segment contributes to the total at `step` (its
+ *  share of `(Δstep · bs) / epoch_seqs`).
+ *
+ *  Returns `null` when no segments are declared (fallback path); callers
+ *  render the bare chip in that case. Returns `[]` for `step <= 0`. The
+ *  array is the prefix of segments whose `startStep <= step`; segments
+ *  entirely past `step` are omitted. */
+export interface EpochSegmentContribution {
+  segment: RunSegment
+  /** Clamped to `step` if `step` lands inside this segment. */
+  endStep: number
+  /** This segment's contribution to the running total. */
+  epochs: number
+}
+export function epochBreakdownAtStep(
+  step: number, manifest: RunManifest | null,
+): EpochSegmentContribution[] | null {
+  const runName = manifest?.run?.name
+  const segs = runName ? segmentsFor(runName) : null
+  if (!segs || segs.length === 0) return null
+  const out: EpochSegmentContribution[] = []
+  for (const seg of segs) {
+    if (step <= seg.startStep) break
+    const segEnd = Math.min(step, seg.endStep)
+    const rows = EPOCH_SEQUENCES[seg.dataLabel]
+    const epochs = rows == null
+      ? Number.NaN
+      : ((segEnd - seg.startStep) * seg.batchSize) / rows
+    out.push({ segment: seg, endStep: segEnd, epochs })
+  }
+  return out
 }
 
 // `formatFlops` lives in `./flops.format` now; the URL-backed unit
@@ -312,8 +365,8 @@ export function epochOfStep(step: number, manifest: RunManifest | null): number 
 // either path. The single-arg signature `formatFlops(n)` still works and
 // defaults to `EF` ("240 EF"); for the prior scientific-notation display
 // ("2.4e20"), pass `formatFlops(n, 'sci')` explicitly.
-export { formatFlops } from './flops.format'
-export type { FlopUnit } from './flops.format'
+export { formatFlops } from './flops.format.ts'
+export type { FlopUnit } from './flops.format.ts'
 
 /** Tokenizer generation, from the authoritative wandb project name
  *  (`tomat-…-P14` = v2 patch tokenizer, `…-P19` = v3). The run *name* is not
