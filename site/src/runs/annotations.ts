@@ -41,6 +41,24 @@ export const RUN_ANNOTATIONS: Record<string, RunAnnotation[]> = {
       label: 'TS0→TS1, BS 128→256, LR 3e-5→4e-5',
     },
   ],
+  // 4-way LF ablation, KL-Gauss(σ=0.5) arm. Three consecutive resumes, each
+  // re-extending num_train_steps → cosine schedule recomputed over the new
+  // horizon. First two are pure "stretch the cosine"; the third (9k) also
+  // flips to constant LR + epochwin shuffle (sawtooth-removal cutover).
+  'train-mg-modal-h200x8-tz-fs-kl-s05-ts1-bs128-seed42': [
+    {
+      step: 1000,
+      label: 'smoke (1k) → 6k extension',
+    },
+    {
+      step: 6000,
+      label: '6k → 20k extension; cosine re-stretched → big TL spike',
+    },
+    {
+      step: 9190,
+      label: 'cosine→constant LR + shuffle 1024→77568 (epochwin)',
+    },
+  ],
 }
 
 /** Annotations for `runName`, or empty list. */
