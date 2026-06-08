@@ -1052,28 +1052,50 @@ export function RunHeaderRich({
           />
           {job && <IrisBadge job={job} attempts={attempts} incomplete={incomplete} />}
           {!job && modalApp && <ModalBadge app={modalApp} wandbStale={wandbStale} />}
-          {!job && !modalApp && (
-            // No iris job AND no matched Modal app → we have no ground-truth
-            // signal about the underlying job's state. Don't infer from
-            // wandb's `run.state` — wandb stamps "crashed" on any client
-            // disconnect (including intentional kills), so it's unreliable
-            // as a status source. Show UNKNOWN. (See memory:
-            // feedback_no_wandb_for_state.)
-            <Tooltip content={
-              manifest
-                ? `no iris job or modal app matched; wandb last state was "${manifest.run?.state}" but we don't infer state from wandb`
-                : 'no iris job, no modal app, no manifest — nothing to derive state from'
-            }>
-              <span
-                style={{
-                  backgroundColor: '#6a737d',
-                  color: '#fff', padding: '1px 6px', borderRadius: 3,
-                  fontSize: '0.75rem', fontFamily: 'monospace',
-                }}>
-                UNKNOWN
-              </span>
-            </Tooltip>
-          )}
+          {!job && !modalApp && (() => {
+            // No iris job AND no matched Modal app → we lack a live
+            // ground-truth signal. Wandb's `crashed` state is unreliable
+            // (stamps on any client disconnect, including intentional
+            // kills) — DON'T infer running/crashed from wandb. BUT
+            // wandb's `finished` state IS reliable: the trainer only
+            // calls `wandb.finish()` after a clean exit; nothing else
+            // can write that state. So we can show FINISHED when
+            // wandb says so, even without iris/Modal corroboration.
+            // All other wandb states (`crashed`, `failed`, `running`,
+            // `killed`) collapse to UNKNOWN per the memory
+            // `feedback_no_wandb_for_state`.
+            const wandbState = manifest?.run?.state
+            if (wandbState === 'finished') {
+              return (
+                <Tooltip content="wandb explicitly reported `finished` (trainer called wandb.finish() cleanly)">
+                  <span
+                    style={{
+                      backgroundColor: '#1f6feb',
+                      color: '#fff', padding: '1px 6px', borderRadius: 3,
+                      fontSize: '0.75rem', fontFamily: 'monospace',
+                    }}>
+                    FINISHED
+                  </span>
+                </Tooltip>
+              )
+            }
+            return (
+              <Tooltip content={
+                manifest
+                  ? `no iris job or modal app matched; wandb last state was "${wandbState}" but we don't infer state from wandb (only "finished" is reliable)`
+                  : 'no iris job, no modal app, no manifest — nothing to derive state from'
+              }>
+                <span
+                  style={{
+                    backgroundColor: '#6a737d',
+                    color: '#fff', padding: '1px 6px', borderRadius: 3,
+                    fontSize: '0.75rem', fontFamily: 'monospace',
+                  }}>
+                  UNKNOWN
+                </span>
+              </Tooltip>
+            )
+          })()}
           {linkRunName ? (
             <a
               href={`#/runs/${id}`}

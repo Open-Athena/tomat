@@ -394,6 +394,12 @@ const EXCLUDED_RUNS: ReadonlySet<string> = new Set([
   'train-full-v3-200M-bs256-emd-do-15k-v5p16-shuf1k-zf-r2',
   // Pyspy profiling smoke (500 steps).
   'train-full-v3-200M-bs128-emd-do-500-v5p16-shuf1k-pyspy-3',
+  // Misfire 2026-06-08: v4-epochwin resume v1 used default run_id template
+  // `<results_label>-bs<batch_size>-seed<seed>` with batch_size=256, which
+  // landed on a fresh wandb run `…-bs256-seed42` instead of resuming the
+  // canonical `…-bs128-seed42`. Cancelled after ~360 steps; re-fired with
+  // explicit `run_id="…-bs128-seed42"` (the actual v4-epochwin resume).
+  'train-mg-modal-h200x8-tz-v4-epochwin-bs256-seed42',
 ])
 
 /** Sort mode for the runs card list, URL-persisted via `?sort=`.
