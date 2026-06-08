@@ -25,6 +25,8 @@ import { computeTrainingFraction, formatDurationShort } from './trainingFraction
 import { lineageFor } from './lineage'
 import type { RunHistory } from './parquet'
 import {
+  epochBreakdownAtStep,
+  epochOfStep,
   formatStepCount,
   freshnessColor,
   HW_COLORS,
@@ -981,7 +983,17 @@ export function RunHeaderRich({
   // as a percentage (cont7k-ext logs 1.73 = 1.73%), so display as-is — no ×100.
   const mtNmae = manifest?.summary?.['eval/mat_nmae/train_200/mean']
   const mvNmae = manifest?.summary?.['eval/mat_nmae/val_200/mean']
-  const nEpochs = nEpochsOf(manifest)
+  // Epoch displayed in the chip. For runs declared in `SEGMENTS` (lineage.ts),
+  // compute segment-aware epoch-at-current-step so the chip + tooltip
+  // breakdown agree. Otherwise fall back to `nEpochsOf` (the original
+  // total_tokens-driven scalar) so undeclared runs render identically.
+  const epochBreakdown = stepsDoneRaw != null
+    ? epochBreakdownAtStep(stepsDoneRaw, manifest)
+    : null
+  const epochSegmented = stepsDoneRaw != null && epochBreakdown != null
+    ? epochOfStep(stepsDoneRaw, manifest)
+    : null
+  const nEpochs = epochSegmented ?? nEpochsOf(manifest)
   const nFlops = nFlopsOf(manifest)
   // FLOP-unit preference (`?fopu=EF|PF|TF|sci`). Default EF. Same hook on
   // every card so the chip group below the plot drives every per-card pill.
@@ -1210,9 +1222,32 @@ export function RunHeaderRich({
                 directly below the step counter so it's visible at a glance
                 regardless of which x-axis the WallclockPlot is showing.
                 Hidden when the data label / batch size needed for the
-                computation isn't in the manifest. */}
+                computation isn't in the manifest. Segmented runs (declared
+                in lineage.ts SEGMENTS) get a tooltip showing the per-
+                segment breakdown so the discrepancy with single-(BS,label)
+                math is auditable from the chip itself. */}
             {nEpochs != null && (
-              <Tooltip content="fractional passes over the training set, computed from total_tokens / (epoch_sequences × train_seq_len)">
+              <Tooltip content={
+                epochBreakdown && epochBreakdown.length > 0
+                  ? (
+                    <div style={{ fontFamily: 'monospace', fontSize: '0.72rem' }}>
+                      <div style={{ marginBottom: 4 }}>
+                        epochs at step {stepsDoneRaw?.toLocaleString()}, by segment:
+                      </div>
+                      {epochBreakdown.map(({ segment, endStep, epochs }, i) => (
+                        <div key={i}>
+                          {`#${i + 1} ${segment.dataLabel}, BS=${segment.batchSize}, `}
+                          {`${segment.startStep.toLocaleString()} → ${endStep.toLocaleString()}: `}
+                          <b>{Number.isFinite(epochs) ? epochs.toFixed(2) : '—'}</b>
+                        </div>
+                      ))}
+                      <div style={{ marginTop: 4 }}>
+                        total: <b>{nEpochs.toFixed(2)}</b>
+                      </div>
+                    </div>
+                  )
+                  : 'fractional passes over the training set, computed from total_tokens / (epoch_sequences × train_seq_len)'
+              }>
                 <div style={{ marginTop: 3, fontSize: '0.78rem' }}>
                   epoch <b>{nEpochs.toFixed(2)}</b>
                 </div>
