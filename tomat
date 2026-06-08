@@ -1922,7 +1922,14 @@ def _modal_snapshot_via_sdk(
               "spawn returned an fc-id and we want its build / queue / "
               "run status visible on the dashboard ahead of the wandb "
               "session opening. App-level state is sourced regardless.")
-def modal_sync(bucket: str, key: str, dry_run: bool, fc_ids: tuple[str, ...]):
+@click.option("-A", "--all-pending", is_flag=True,
+              help="Probe EVERY fc-id in R2's pending-fires.json — the union of "
+                   "fc-ids that any spawn wrapper recorded. Used by the GCE "
+                   "cron so modal-state.json keeps the active fcs probed each "
+                   "minute without callers having to list them explicitly. "
+                   "Composes with `--fc-id` (extra ids are merged).")
+def modal_sync(bucket: str, key: str, dry_run: bool, fc_ids: tuple[str, ...],
+               all_pending: bool):
     """Snapshot Modal app + function-call state → R2.
 
     Powers the Modal-state badge on tomat.oa.dev/runs (analog to the iris
@@ -1967,6 +1974,24 @@ def modal_sync(bucket: str, key: str, dry_run: bool, fc_ids: tuple[str, ...]):
       - When no --fc-id is passed we still write the app-state snapshot,
         which is what the runs dashboard's badge falls back to.
     """
+    # Merge --all-pending fc-ids (from R2's pending-fires.json) into the
+    # explicit --fc-id list. Used by the GCE cron so the periodic sync
+    # keeps every spawned-but-unfinished fc probed.
+    if all_pending:
+        try:
+            pending_doc = _load_pending_fires(bucket)
+            pending_ids = tuple(
+                f["fc_id"] for f in pending_doc.get("fires", []) if f.get("fc_id")
+            )
+            extra = tuple(fcid for fcid in pending_ids if fcid not in fc_ids)
+            if extra:
+                err(f"[modal sync] --all-pending adds {len(extra)} fc-id(s) "
+                    f"from pending-fires.json: {list(extra)[:5]}"
+                    f"{'…' if len(extra) > 5 else ''}")
+                fc_ids = fc_ids + extra
+        except Exception as e:
+            err(f"[modal sync] WARN: --all-pending load failed ({type(e).__name__}: {e})")
+
     apps = _modal_snapshot_via_sdk(
         app_names=TOMAT_MODAL_APP_NAMES,
         extra_fc_ids=fc_ids,

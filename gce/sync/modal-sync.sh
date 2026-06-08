@@ -9,4 +9,4 @@ set -euo pipefail
 REPO_DIR="${TOMAT_REPO_DIR:-$HOME/tomat}"
 cd "$REPO_DIR"
 
-./tomat modal sync
+./tomat modal sync --all-pending
