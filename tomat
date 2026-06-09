@@ -3653,6 +3653,12 @@ def train(
     if steps_per_eval is not None:
         env_vars.append(("TOMAT_STEPS_PER_EVAL", str(steps_per_eval)))
     env_vars.append(("TOMAT_GRADIENT_CHECKPOINTING", "1" if grad_ckpt else "0"))
+    # Hard-fail on missing-ckpt when a resume is intended. Without this, Levanter
+    # silently falls back to fresh-init if the ckpt path is wrong or unreadable,
+    # so the run quietly starts at step 0. Trainer-side: `train_tomat_tpu.py`
+    # gates `discover_latest_checkpoint(...) is None` on this env var.
+    if resume_mode or from_ckpt is not None:
+        env_vars.append(("TOMAT_REQUIRE_RESUME", "1"))
     # Always emit — shuffle is on by default; `--shuffle-window-blocks 0` is
     # the explicit opt-out (the trainer's own env default then never applies).
     env_vars.append(("TOMAT_SHUFFLE_WINDOW_BLOCKS", str(shuffle_window_blocks)))

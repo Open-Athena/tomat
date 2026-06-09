@@ -1067,6 +1067,24 @@ def main():
               f"{output_path}/checkpoints (may incur cross-region egress).",
               file=sys.stderr, flush=True)
         temp_base_path = None
+    # Hard-fail on missing-ckpt when a resume is expected. Without this, Levanter's
+    # `load_checkpoint_or_initialize` silently falls back to fresh init — which is
+    # how a `--resume` job can quietly start at step 0 instead of the intended
+    # step (e.g. Modal-to-TPU cross-platform resume with a ckpt-format mismatch).
+    # The CLI sets `TOMAT_REQUIRE_RESUME=1` whenever `--resume` or `--from-ckpt`
+    # is passed; we then assert the expected ckpt is discoverable.
+    if os.environ.get("TOMAT_REQUIRE_RESUME") == "1":
+        from levanter.checkpoint import discover_latest_checkpoint
+        ckpt_dir = f"{output_path}/checkpoints/{run_id}"
+        discovered = discover_latest_checkpoint(ckpt_dir)
+        if discovered is None:
+            raise RuntimeError(
+                f"TOMAT_REQUIRE_RESUME=1 but no Levanter-discoverable ckpt at "
+                f"{ckpt_dir} (no metadata.json found). Refusing to silently start "
+                f"from step 0. Inspect with `gsutil ls {ckpt_dir}/`."
+            )
+        print(f"[require-resume] OK: will resume from {discovered}", flush=True)
+
     checkpointer = CheckpointerConfig(
         base_path=f"{output_path}/checkpoints",
         temporary_base_path=temp_base_path,
