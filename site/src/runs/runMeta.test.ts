@@ -13,16 +13,26 @@ import { strict as assert } from 'node:assert'
 import { afterEach, describe, it } from 'node:test'
 import type { RunManifest } from './api.ts'
 import { SEGMENTS } from './lineage.ts'
-import { epochBreakdownAtStep, epochOfStep, EPOCH_SEQUENCES } from './runMeta.ts'
+import {
+  costBreakdownAtStep,
+  epochBreakdownAtStep,
+  epochOfStep,
+  EPOCH_SEQUENCES,
+  segmentBreakdownAtStep,
+  totalFlopsAtStep,
+  totalTokensAtStep,
+} from './runMeta.ts'
 
 // Minimal manifest factory — only the fields `epochOfStep` reads. `name` is
 // the SEGMENTS key; `train_batch_size` + `cache_dir` drive the fallback path.
 function mkManifest({
-  name, batchSize, dataLabel,
+  name, batchSize, dataLabel, seqLen, paramCount,
 }: {
   name: string
   batchSize?: number
   dataLabel?: string
+  seqLen?: number
+  paramCount?: number
 }): RunManifest {
   return {
     schema_version: 1,
@@ -33,9 +43,10 @@ function mkManifest({
       config: {
         ...(batchSize != null ? { trainer: { train_batch_size: batchSize } } : {}),
         ...(dataLabel != null ? { data: { cache_dir: `/x/cache/${dataLabel}/` } } : {}),
+        ...(seqLen != null ? { train_seq_len: seqLen } : {}),
       },
     },
-    summary: {},
+    summary: paramCount != null ? { parameter_count: paramCount } : {},
     history: { rows: 0, step_min: 0, step_max: 0, ts_min: 0, ts_max: 0 },
   }
 }
@@ -178,5 +189,139 @@ describe('epochBreakdownAtStep', () => {
     assert.ok(breakdown != null)
     assert.equal(breakdown.length, 1)
     assert.equal(breakdown[0].endStep, 50)
+  })
+})
+
+describe('totalTokensAtStep', () => {
+  it('fallback path: step · batch_size · seq_len from the manifest', () => {
+    const m = mkManifest({
+      name: TEST_FALLBACK_NAME, batchSize: 128, dataLabel: 'train-full-v3',
+      seqLen: 8192,
+    })
+    assert.equal(totalTokensAtStep(1000, m), 1000 * 128 * 8192)
+  })
+
+  it('returns null when seq_len is missing', () => {
+    const m = mkManifest({
+      name: TEST_FALLBACK_NAME, batchSize: 128, dataLabel: 'train-full-v3',
+    })
+    assert.equal(totalTokensAtStep(1000, m), null)
+  })
+
+  it('segmented: sums per-segment (Δstep · bs · seq_len)', () => {
+    SEGMENTS[TEST_TWO_SEG] = [
+      { startStep: 0,   endStep: 100,      dataLabel: 'train-full-v3',        batchSize: 128 },
+      { startStep: 100, endStep: Infinity, dataLabel: 'train-full-v3-shard1', batchSize: 256 },
+    ]
+    const m = mkManifest({ name: TEST_TWO_SEG, seqLen: 8192 })
+    // step 200 = full first seg (100 · 128 · 8192) + full 100 of second (100 · 256 · 8192)
+    const expected = 100 * 128 * 8192 + 100 * 256 * 8192
+    assert.equal(totalTokensAtStep(200, m), expected)
+  })
+
+  it('segmented: clamps end of last segment to `step`', () => {
+    SEGMENTS[TEST_TWO_SEG] = [
+      { startStep: 0,   endStep: 100,      dataLabel: 'train-full-v3',        batchSize: 128 },
+      { startStep: 100, endStep: Infinity, dataLabel: 'train-full-v3-shard1', batchSize: 256 },
+    ]
+    const m = mkManifest({ name: TEST_TWO_SEG, seqLen: 8192 })
+    // step 150 = full first seg + 50 steps of second
+    const expected = 100 * 128 * 8192 + 50 * 256 * 8192
+    assert.equal(totalTokensAtStep(150, m), expected)
+  })
+})
+
+describe('totalFlopsAtStep', () => {
+  it('fallback: 6 · parameter_count · totalTokens', () => {
+    const m = mkManifest({
+      name: TEST_FALLBACK_NAME, batchSize: 128, dataLabel: 'train-full-v3',
+      seqLen: 8192, paramCount: 200_000_000,
+    })
+    const tokens = 1000 * 128 * 8192
+    assert.equal(totalFlopsAtStep(1000, m), 6 * 200_000_000 * tokens)
+  })
+
+  it('returns null when parameter_count is missing', () => {
+    const m = mkManifest({
+      name: TEST_FALLBACK_NAME, batchSize: 128, dataLabel: 'train-full-v3',
+      seqLen: 8192,
+    })
+    assert.equal(totalFlopsAtStep(1000, m), null)
+  })
+
+  it('segmented: 6 · N · (segment-aware tokens)', () => {
+    SEGMENTS[TEST_TWO_SEG] = [
+      { startStep: 0,   endStep: 100,      dataLabel: 'train-full-v3',        batchSize: 128 },
+      { startStep: 100, endStep: Infinity, dataLabel: 'train-full-v3-shard1', batchSize: 256 },
+    ]
+    const m = mkManifest({
+      name: TEST_TWO_SEG, seqLen: 8192, paramCount: 200_000_000,
+    })
+    const tokens = 100 * 128 * 8192 + 50 * 256 * 8192
+    assert.equal(totalFlopsAtStep(150, m), 6 * 200_000_000 * tokens)
+  })
+})
+
+describe('segmentBreakdownAtStep', () => {
+  it('returns one entry per touched segment with steps / tokens / flops / epochs', () => {
+    SEGMENTS[TEST_TWO_SEG] = [
+      { startStep: 0,   endStep: 100,      dataLabel: 'train-full-v3',        batchSize: 128 },
+      { startStep: 100, endStep: Infinity, dataLabel: 'train-full-v3-shard1', batchSize: 256 },
+    ]
+    const m = mkManifest({
+      name: TEST_TWO_SEG, seqLen: 8192, paramCount: 200_000_000,
+    })
+    const out = segmentBreakdownAtStep(150, m)
+    assert.ok(out != null)
+    assert.equal(out.length, 2)
+    assert.equal(out[0].steps, 100)
+    assert.equal(out[0].sequences, 100 * 128)
+    assert.equal(out[0].tokens, 100 * 128 * 8192)
+    assert.equal(out[0].flops, 6 * 200_000_000 * 100 * 128 * 8192)
+    assert.equal(out[0].epochs, (100 * 128) / EPOCH_SEQUENCES['train-full-v3'])
+    assert.equal(out[1].steps, 50)
+    assert.equal(out[1].sequences, 50 * 256)
+    assert.equal(out[1].tokens, 50 * 256 * 8192)
+    assert.equal(out[1].flops, 6 * 200_000_000 * 50 * 256 * 8192)
+    assert.equal(out[1].epochs, (50 * 256) / EPOCH_SEQUENCES['train-full-v3-shard1'])
+  })
+
+  it('returns null when no segments are declared', () => {
+    const m = mkManifest({
+      name: TEST_FALLBACK_NAME, batchSize: 128, dataLabel: 'train-full-v3',
+      seqLen: 8192,
+    })
+    assert.equal(segmentBreakdownAtStep(1000, m), null)
+  })
+})
+
+describe('costBreakdownAtStep', () => {
+  it('splits total MSRP across segments proportional to tokens', () => {
+    SEGMENTS[TEST_TWO_SEG] = [
+      { startStep: 0,   endStep: 100,      dataLabel: 'train-full-v3',        batchSize: 128 },
+      { startStep: 100, endStep: Infinity, dataLabel: 'train-full-v3-shard1', batchSize: 256 },
+    ]
+    const m = mkManifest({
+      name: TEST_TWO_SEG, seqLen: 8192, paramCount: 200_000_000,
+    })
+    const totalCost = 300
+    const out = costBreakdownAtStep(150, m, totalCost)
+    assert.ok(out != null)
+    assert.equal(out.length, 2)
+    const tok0 = 100 * 128 * 8192
+    const tok1 = 50 * 256 * 8192
+    const total = tok0 + tok1
+    assert.equal(out[0].msrp_usd, (tok0 / total) * totalCost)
+    assert.equal(out[1].msrp_usd, (tok1 / total) * totalCost)
+    // The shares must sum back to the total.
+    assert.equal(out[0].msrp_usd + out[1].msrp_usd, totalCost)
+  })
+
+  it('returns null when no segments are declared', () => {
+    const m = mkManifest({
+      name: TEST_FALLBACK_NAME, batchSize: 128, dataLabel: 'train-full-v3',
+      seqLen: 8192,
+    })
+    assert.equal(costBreakdownAtStep(1000, m, 100), null)
   })
 })

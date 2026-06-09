@@ -1451,7 +1451,7 @@ function RunDetail({ runId }: { runId: string }) {
         marginBottom: '1rem',
         backgroundColor: '#181818',
       }}>
-        <RunHeaderRich data={headerData} linkRunName={false} />
+        <RunHeaderRich data={headerData} linkRunName={false} showSegmentBreakdown />
       </div>
       {ancestors.length > 0 && (
         <LineageToggle

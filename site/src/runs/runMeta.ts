@@ -360,6 +360,141 @@ export function epochBreakdownAtStep(
   return out
 }
 
+// ── segment-aware totals: tokens / FLOPs / MSRP ────────────────────────────
+//
+// Same shape as `epochBreakdownAtStep`: partition the run's training step
+// space using the `SEGMENTS[runName]` table, compute each segment's
+// contribution, and sum.
+//
+// - tokens: `(Δstep · bs) · seq_len`
+// - FLOPs:  `6 · parameter_count · tokens`
+// - MSRP:   proportional to tokens share — `(tokens_seg / tokens_total) · total_msrp`
+//   The cost.json sidecar already integrates attempt-level wallclock × rate
+//   and produces a single honest scalar for the whole run; we split that
+//   scalar across segments by training contribution rather than re-deriving
+//   wallclock-per-segment (which would require timestamp ↔ step mapping that
+//   the parquet doesn't always have post-resume).
+//
+// `seq_len` is read from the manifest's single `train_seq_len` config — runs
+// don't currently change seq_len mid-stream, and there's no SEGMENTS slot
+// for per-segment seq_len. If a run ever does, add `seqLen` to `RunSegment`.
+
+/** One segment's contribution to the totals at training `step`. */
+export interface SegmentContribution {
+  segment: RunSegment
+  /** Clamped to `step` if `step` lands inside this segment. */
+  endStep: number
+  /** Steps this segment contributed at `step` (= `endStep - startStep`). */
+  steps: number
+  /** Sequences trained = `steps · batchSize`. */
+  sequences: number
+  /** Tokens trained = `sequences · seq_len`. NaN when seq_len unknown. */
+  tokens: number
+  /** FLOPs = `6 · parameter_count · tokens`. NaN when either is unknown. */
+  flops: number
+  /** Epochs contribution; NaN when the segment's data label is unknown. */
+  epochs: number
+}
+
+/** Per-segment breakdown at training `step`. Returns `null` when no segments
+ *  are declared for the run (fallback callers render single-segment totals). */
+export function segmentBreakdownAtStep(
+  step: number, manifest: RunManifest | null,
+): SegmentContribution[] | null {
+  const runName = manifest?.run?.name
+  const segs = runName ? segmentsFor(runName) : null
+  if (!segs || segs.length === 0) return null
+  const seqLen = seqLenOf(manifest)
+  const paramCount = (() => {
+    const n = manifest?.summary?.['parameter_count']
+    return typeof n === 'number' && n > 0 ? n : null
+  })()
+  const out: SegmentContribution[] = []
+  for (const seg of segs) {
+    if (step <= seg.startStep) break
+    const endStep = Math.min(step, seg.endStep)
+    const steps = endStep - seg.startStep
+    const sequences = steps * seg.batchSize
+    const tokens = seqLen != null ? sequences * seqLen : Number.NaN
+    const flops = (paramCount != null && Number.isFinite(tokens))
+      ? 6 * paramCount * tokens : Number.NaN
+    const rows = EPOCH_SEQUENCES[seg.dataLabel]
+    const epochs = rows == null ? Number.NaN : sequences / rows
+    out.push({ segment: seg, endStep, steps, sequences, tokens, flops, epochs })
+  }
+  return out
+}
+
+/** Total tokens trained at `step`, segment-aware. Sums `Δstep · bs · seq_len`
+ *  per declared segment. Falls back to single-segment math from the manifest
+ *  (`stepsDone · train_batch_size · train_seq_len`) when no segments are
+ *  declared. Returns `null` when required config (batch size / seq len) is
+ *  missing. */
+export function totalTokensAtStep(
+  step: number, manifest: RunManifest | null,
+): number | null {
+  const seqLen = seqLenOf(manifest)
+  if (seqLen == null) return null
+  const breakdown = segmentBreakdownAtStep(step, manifest)
+  if (breakdown != null) {
+    let total = 0
+    for (const c of breakdown) {
+      if (!Number.isFinite(c.tokens)) return null
+      total += c.tokens
+    }
+    return total
+  }
+  const bs = batchSizeOf(manifest)
+  if (bs == null) return null
+  return step * bs * seqLen
+}
+
+/** Total forward+backward FLOPs at `step`, segment-aware (6·N·D with
+ *  segment-aware tokens). Falls back to single-segment math when no
+ *  segments are declared. Returns `null` when parameter count or tokens
+ *  can't be computed. */
+export function totalFlopsAtStep(
+  step: number, manifest: RunManifest | null,
+): number | null {
+  const n = manifest?.summary?.['parameter_count']
+  if (typeof n !== 'number' || n <= 0) return null
+  const tokens = totalTokensAtStep(step, manifest)
+  if (tokens == null) return null
+  return 6 * n * tokens
+}
+
+/** Per-segment MSRP share at `step`. Splits `totalMsrpUsd` (from cost.json)
+ *  by each segment's token contribution. Returns `null` when no segments are
+ *  declared or when tokens can't be computed honestly. */
+export function costBreakdownAtStep(
+  step: number, manifest: RunManifest | null, totalMsrpUsd: number,
+): { segment: RunSegment; endStep: number; msrp_usd: number }[] | null {
+  const breakdown = segmentBreakdownAtStep(step, manifest)
+  if (breakdown == null) return null
+  let totalTok = 0
+  for (const c of breakdown) {
+    if (!Number.isFinite(c.tokens)) return null
+    totalTok += c.tokens
+  }
+  if (totalTok <= 0) return null
+  return breakdown.map((c) => ({
+    segment: c.segment,
+    endStep: c.endStep,
+    msrp_usd: (c.tokens / totalTok) * totalMsrpUsd,
+  }))
+}
+
+/** Compact human-readable token count: 1.2e9 → "1.2B", 4.5e6 → "4.5M".
+ *  Plain integer with locale grouping below 1 M; "TB" (trillion) past 1e12. */
+export function formatTokens(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0'
+  if (n >= 1e12) return `${(n / 1e12).toFixed(1)}T`
+  if (n >= 1e9)  return `${(n / 1e9).toFixed(1)}B`
+  if (n >= 1e6)  return `${(n / 1e6).toFixed(1)}M`
+  if (n >= 1e3)  return `${(n / 1e3).toFixed(1)}k`
+  return Math.round(n).toLocaleString('en-US')
+}
+
 // `formatFlops` lives in `./flops.format` now; the URL-backed unit
 // preference (`?fopu=`) is in `./flops`. Re-export so callers can import
 // either path. The single-arg signature `formatFlops(n)` still works and

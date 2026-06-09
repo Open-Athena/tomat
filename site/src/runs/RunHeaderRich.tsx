@@ -25,9 +25,11 @@ import { computeTrainingFraction, formatDurationShort } from './trainingFraction
 import { lineageFor } from './lineage'
 import type { RunHistory } from './parquet'
 import {
+  costBreakdownAtStep,
   epochBreakdownAtStep,
   epochOfStep,
   formatStepCount,
+  formatTokens,
   freshnessColor,
   HW_COLORS,
   nEpochsOf,
@@ -37,10 +39,15 @@ import {
   parseTargetSteps,
   recentStepPoints,
   secsAgo,
+  segmentBreakdownAtStep,
   stepsInWindow,
   timeAgo,
+  totalFlopsAtStep,
+  totalTokensAtStep,
+  type SegmentContribution,
 } from './runMeta'
 import { formatFlops, useFlopUnit } from './flops'
+import type { FlopUnit } from './flops.format'
 import { tagsFor, type RunTag } from './tags'
 
 // ── small SVG sparkline (no plotly) ─────────────────────────────────────────
@@ -915,6 +922,104 @@ function CostChip({ runId, summary }: {
   )
 }
 
+// ── per-segment breakdown panel (detail page only) ─────────────────────────
+// Renders one row per declared segment: data label, BS, step range, then
+// tokens / FLOPs / epochs / MSRP share. Hidden on cards (too cluttered) —
+// `RunHeaderRich`'s `showSegmentBreakdown` opt-in controls it.
+
+function SegmentBreakdownPanel({ contributions, costBreakdown, flopUnit }: {
+  contributions: SegmentContribution[]
+  costBreakdown: { msrp_usd: number }[] | null
+  flopUnit: FlopUnit
+}) {
+  let totalSteps = 0, totalTokens = 0, totalFlops = 0, totalEpochs = 0, totalCost = 0
+  for (let i = 0; i < contributions.length; i++) {
+    const c = contributions[i]
+    totalSteps += c.steps
+    if (Number.isFinite(c.tokens)) totalTokens += c.tokens
+    if (Number.isFinite(c.flops))  totalFlops  += c.flops
+    if (Number.isFinite(c.epochs)) totalEpochs += c.epochs
+    if (costBreakdown && costBreakdown[i]) totalCost += costBreakdown[i].msrp_usd
+  }
+  return (
+    <div style={{
+      marginTop: '0.75rem',
+      padding: '0.5rem 0.75rem',
+      border: '1px solid #2a2a2a',
+      borderRadius: 4,
+      backgroundColor: '#141414',
+      fontFamily: 'monospace', fontSize: '0.72rem', color: '#ccc',
+    }}>
+      <div style={{ color: '#888', marginBottom: 4, fontSize: '0.7rem' }}>
+        per-segment training totals
+      </div>
+      <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+        <thead>
+          <tr style={{ color: '#888', textAlign: 'left' }}>
+            <th style={{ padding: '2px 6px 2px 0', fontWeight: 400 }}>seg</th>
+            <th style={{ padding: '2px 6px', fontWeight: 400 }}>label</th>
+            <th style={{ padding: '2px 6px', fontWeight: 400, textAlign: 'right' }}>BS</th>
+            <th style={{ padding: '2px 6px', fontWeight: 400 }}>steps</th>
+            <th style={{ padding: '2px 6px', fontWeight: 400, textAlign: 'right' }}>tokens</th>
+            <th style={{ padding: '2px 6px', fontWeight: 400, textAlign: 'right' }}>FLOPs</th>
+            <th style={{ padding: '2px 6px', fontWeight: 400, textAlign: 'right' }}>epochs</th>
+            {costBreakdown && (
+              <th style={{ padding: '2px 6px', fontWeight: 400, textAlign: 'right' }}>MSRP</th>
+            )}
+          </tr>
+        </thead>
+        <tbody>
+          {contributions.map((c, i) => (
+            <tr key={i}>
+              <td style={{ padding: '2px 6px 2px 0', color: '#888' }}>#{i + 1}</td>
+              <td style={{ padding: '2px 6px' }}>{c.segment.dataLabel}</td>
+              <td style={{ padding: '2px 6px', textAlign: 'right' }}>{c.segment.batchSize}</td>
+              <td style={{ padding: '2px 6px' }}>
+                {c.segment.startStep.toLocaleString()}→{c.endStep.toLocaleString()}
+                <span style={{ color: '#888' }}> ({c.steps.toLocaleString()})</span>
+              </td>
+              <td style={{ padding: '2px 6px', textAlign: 'right' }}>
+                {Number.isFinite(c.tokens) ? formatTokens(c.tokens) : '—'}
+              </td>
+              <td style={{ padding: '2px 6px', textAlign: 'right' }}>
+                {Number.isFinite(c.flops) ? formatFlops(c.flops, flopUnit) : '—'}
+              </td>
+              <td style={{ padding: '2px 6px', textAlign: 'right' }}>
+                {Number.isFinite(c.epochs) ? c.epochs.toFixed(2) : '—'}
+              </td>
+              {costBreakdown && (
+                <td style={{ padding: '2px 6px', textAlign: 'right' }}>
+                  ${costBreakdown[i]?.msrp_usd.toFixed(2) ?? '—'}
+                </td>
+              )}
+            </tr>
+          ))}
+          <tr style={{ borderTop: '1px solid #333', color: '#ddd' }}>
+            <td style={{ padding: '4px 6px 2px 0', color: '#888' }}>Σ</td>
+            <td style={{ padding: '4px 6px 2px 6px' }} />
+            <td style={{ padding: '4px 6px 2px 6px' }} />
+            <td style={{ padding: '4px 6px 2px 6px' }}>{totalSteps.toLocaleString()}</td>
+            <td style={{ padding: '4px 6px 2px 6px', textAlign: 'right' }}>
+              <b>{formatTokens(totalTokens)}</b>
+            </td>
+            <td style={{ padding: '4px 6px 2px 6px', textAlign: 'right' }}>
+              <b>{formatFlops(totalFlops, flopUnit)}</b>
+            </td>
+            <td style={{ padding: '4px 6px 2px 6px', textAlign: 'right' }}>
+              <b>{totalEpochs.toFixed(2)}</b>
+            </td>
+            {costBreakdown && (
+              <td style={{ padding: '4px 6px 2px 6px', textAlign: 'right' }}>
+                <b>${totalCost.toFixed(2)}</b>
+              </td>
+            )}
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
 // ── RunHeaderRich ───────────────────────────────────────────────────────────
 
 const navigate = (path: string) => {
@@ -937,10 +1042,15 @@ export interface RunHeaderRichProps {
   /** When true (the default on cards), the run name is a link to the detail
    *  page. On the detail page itself we render it as plain text. */
   linkRunName?: boolean
+  /** When true (default on detail page, off on cards), render the per-segment
+   *  totals breakdown (steps / tokens / FLOPs / MSRP / epochs) below the main
+   *  chip row. Only meaningful when the run has ≥2 declared segments. */
+  showSegmentBreakdown?: boolean
 }
 
 export function RunHeaderRich({
   data, parentWandbUrl, parentColor, onScrollToParent, linkRunName = true,
+  showSegmentBreakdown = false,
 }: RunHeaderRichProps) {
   const { id, manifest, job, history, evalJobs, err, attempts, modalApp } = data
   const incomplete = isIncomplete(data)
@@ -1009,7 +1119,29 @@ export function RunHeaderRich({
     ? epochOfStep(stepsDoneRaw, manifest)
     : null
   const nEpochs = epochSegmented ?? nEpochsOf(manifest)
-  const nFlops = nFlopsOf(manifest)
+  // Segment-aware totals: prefer per-segment summation over wandb's single
+  // summary scalars when the run is declared in `SEGMENTS` (lineage.ts).
+  // Otherwise fall back to the summary values so undeclared runs render
+  // exactly as before. `nFlopsOf` reads `summary.throughput/total_tokens *
+  // 6 * parameter_count`; on a BS-cutover run that summary scalar can
+  // disagree with the (Δstep · bs · seq_len) integration — segment-aware
+  // makes the chip line up with the per-segment breakdown panel below.
+  const nFlopsSegmented = stepsDoneRaw != null
+    ? totalFlopsAtStep(stepsDoneRaw, manifest)
+    : null
+  const nFlops = epochBreakdown != null
+    ? nFlopsSegmented
+    : nFlopsOf(manifest)
+  const nTokensSegmented = stepsDoneRaw != null
+    ? totalTokensAtStep(stepsDoneRaw, manifest)
+    : null
+  const nTokens = nTokensSegmented
+  const segmentContributions = stepsDoneRaw != null
+    ? segmentBreakdownAtStep(stepsDoneRaw, manifest)
+    : null
+  const costSegments = stepsDoneRaw != null && data.cost?.msrp_usd != null && data.cost.msrp_usd > 0
+    ? costBreakdownAtStep(stepsDoneRaw, manifest, data.cost.msrp_usd)
+    : null
   // FLOP-unit preference (`?fopu=EF|PF|TF|sci`). Default EF. Same hook on
   // every card so the chip group below the plot drives every per-card pill.
   const [flopUnit] = useFlopUnit()
@@ -1035,6 +1167,7 @@ export function RunHeaderRich({
   const rate6h = useMemo(() => history ? stepsInWindow(history, 6 * 3600) : null, [history])
 
   return (
+    <>
     <div style={{
       display: 'grid',
       gridTemplateColumns: '1fr auto',
@@ -1386,6 +1519,15 @@ export function RunHeaderRich({
               : formatFlops(nFlops, flopUnit)}
             </>
           )}
+          {nTokens != null && (
+            <Tooltip content={
+              segmentContributions != null && segmentContributions.length > 1
+                ? `tokens trained at step ${stepsDoneRaw?.toLocaleString()}: sum of per-segment (Δstep · bs · seq_len)`
+                : `tokens trained at step ${stepsDoneRaw?.toLocaleString()} = step · bs · seq_len`
+            }>
+              <span> · {formatTokens(nTokens)} tok</span>
+            </Tooltip>
+          )}
           {nFlops != null && data.cost?.msrp_usd != null && data.cost.msrp_usd > 0 && (
             <>
               {' · '}
@@ -1418,6 +1560,14 @@ export function RunHeaderRich({
         )}
       </div>
     </div>
+    {showSegmentBreakdown && segmentContributions != null && segmentContributions.length >= 2 && (
+      <SegmentBreakdownPanel
+        contributions={segmentContributions}
+        costBreakdown={costSegments}
+        flopUnit={flopUnit}
+      />
+    )}
+    </>
   )
 }
 
