@@ -240,7 +240,7 @@ def strip_iris_log(text: str) -> str:
 
 # iris requires --prefix to be `/<user>/<jobname>` (2+ segments). We fan
 # out across the conventional job-name prefixes used in tomat work.
-DEFAULT_IRIS_PREFIXES = ("/ryan/tomat", "/ryan/train", "/ryan/eval")
+DEFAULT_IRIS_PREFIXES = ("/ryan/tomat", "/ryan/train", "/ryan/eval", "/ryan/kl")
 
 
 def iris_list_lines(prefixes: tuple[str, ...] = DEFAULT_IRIS_PREFIXES, state: str | None = None) -> list[str]:
@@ -1498,7 +1498,7 @@ def _iris_job_list_json(prefix: str, timeout: int = 60) -> list[dict]:
 # Used by `iris sync` to decide which parent jobs warrant a per-label
 # attempts sidecar (training runs only — not the m-eval / tomat-eval
 # sidecar jobs, which would just bloat the snapshot).
-TRAINING_JOB_RE = re.compile(r"^/[^/]+/(train-[^/]+)$")
+TRAINING_JOB_RE = re.compile(r"^/[^/]+/(train-[^/]+|kl-[^/]+)$")
 
 
 @iris_grp.command("attempts")
@@ -4030,6 +4030,7 @@ def cache_mirror(data_label: str, source: str, targets: str | None, splits: str,
 
 @cache_grp.command("build")
 @click.option("-l", "--data-label", default="train-full-v3", help="data label whose cache to build")
+@click.option("--suffix", default=None, help="suffix to append to job name (avoid collision with stuck prior fires)")
 @click.option("--bucket", default=None, help=f"bucket where the cache should land (default: {GCS_BUCKET})")
 @click.option("--lmq-path", default=None, help="TOMAT_LMQ_PATH (default = {bucket}/codecs/lmq-v2-16k.npz)")
 @click.option("--cpu", default=16, type=int, help="iris --cpu")
@@ -4040,6 +4041,7 @@ def cache_mirror(data_label: str, source: str, targets: str | None, splits: str,
 @click.option("-d", "--dry-run", is_flag=True, help="print iris cmd without firing")
 def cache_build(
     data_label: str,
+    suffix: str | None,
     bucket: str | None,
     lmq_path: str | None,
     cpu: int,
@@ -4063,6 +4065,8 @@ def cache_build(
     lmq_path = lmq_path or f"{bucket}/codecs/lmq-v2-16k.npz"
     wandb_key = os.environ.get("WANDB_API_KEY", "<WANDB_API_KEY>")
     job_name = f"cache-build-{data_label}-{bucket.rsplit('/', 1)[0].rsplit('-', 1)[-1]}"
+    if suffix:
+        job_name = f"{job_name}-{suffix}"
 
     env_vars: list[tuple[str, str]] = [
         ("WANDB_API_KEY", wandb_key),
