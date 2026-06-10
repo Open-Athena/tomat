@@ -488,13 +488,20 @@ def maskgit_aware_loss(
             # src/tomat/float_codec.py boundaries). Integral from ρ_0 to ρ_{n-1};
             # tails contribute 0 when ρ_true ∈ [ρ_0, ρ_{n-1}] (always true since
             # the codec covers the full density range).
-            probs = jax.nn.softmax(logits_arr, axis=-1)         # (B, Pos, V)
+            #
+            # The (F_P − 1[x≥t])² integrand splits into two cases by bin: where
+            # the bin is below ρ_true, integrand = F_P²; above, integrand = (1 − F_P)².
+            # Combining via `where(above, 1 − F_P, −F_P)` avoids casting the
+            # bool to float and skips the explicit `F_P − F_t` materialization
+            # — fuses better in XLA than `cumsum → cast → sub → square → einsum`.
+            probs = jax.nn.softmax(logits_arr, axis=-1)              # (B, Pos, V)
             p_dens = probs[..., args.density_lo : args.density_hi]   # (B, Pos, n_dens)
             sorted_rho = decode_all_arr[args.density_lo : args.density_hi]  # (n_dens,)
             gaps = jnp.diff(sorted_rho)                              # (n_dens - 1,)
             f_p = jnp.cumsum(p_dens, axis=-1)[..., :-1]              # (B, Pos, n_dens - 1)
-            f_t = (sorted_rho[None, None, :-1] >= rho_true[..., None]).astype(jnp.float32)
-            crps_per_pos = jnp.einsum("bpv,v->bp", (f_p - f_t) ** 2, gaps)
+            above = sorted_rho[None, None, :-1] >= rho_true[..., None]  # bool (B, Pos, n_dens - 1)
+            diff = jnp.where(above, 1.0 - f_p, -f_p)                 # (B, Pos, n_dens - 1)
+            crps_per_pos = jnp.einsum("bpv,v->bp", diff * diff, gaps)
             combined = jnp.where(is_density_target, crps_per_pos, ce_per_pos)
     else:
         # CE at masked positions: no shift — target at t is original token at t.
