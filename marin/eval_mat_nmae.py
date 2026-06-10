@@ -701,8 +701,19 @@ def main():
     vocab_size = meta["vocab"]["total_size"]
     # In MaskGIT mode the model was trained with a +1 vocab (MASK token at end).
     # Bump vocab_size to match the checkpoint's embedding table.
+    #
+    # `--mode maskgit` always bumps. For `--mode teacher` against a model
+    # trained with MaskGIT (e.g. `train-mg-modal-h200x8-tz-v4-epochwin-*`
+    # evaluated TF-style), the ckpt has +1 vocab and Haliax raises an axis-
+    # size mismatch. Detect MG-trained models from the ckpt path / run name
+    # so the right MASK_ID lands without needing an extra env-var.
     MASK_ID: int | None = None
-    if eval_mode == "maskgit":
+    _mg_trained = (
+        os.environ.get("TOMAT_EVAL_FORCE_MG_VOCAB") == "1"
+        or "mg-" in os.environ.get("TOMAT_EVAL_RUN_LABEL", "")
+        or "mg-" in checkpoint_path
+    )
+    if eval_mode == "maskgit" or _mg_trained:
         MASK_ID = vocab_size
         vocab_size = vocab_size + 1
     patch_size_meta = meta.get("patch_size")
