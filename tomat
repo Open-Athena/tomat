@@ -2336,6 +2336,8 @@ def evals():
 @click.option("-T", "--num-tasks", default=1, type=int, help="Fan out the mat set across N iris jobs. Each job gets a contiguous slice of size ~n_mats/N via the eval script's existing TOMAT_EVAL_SKIP+TOMAT_EVAL_N_MATS env vars. Per-task results land at `<set>-<mode>/step-<N>-task-<i>.json`; `tomat evals sync` aggregates them. Use when free-running eval at n_mats=200 is too slow on a single task (see specs/38).")
 @click.option("-b", "--eval-batch", default=32, type=int)
 @click.option("-t", "--tpu", default="v6e-8")
+@click.option("--zone", default=None, help="iris --zone (e.g. europe-west4-a); pin eval slice to the ckpt-bucket region to avoid x-reg ckpt-read egress. Repeatable via comma-sep list.")
+@click.option("--region", default=None, help="iris --region (e.g. europe-west4); broader pin than --zone.")
 @click.option("--decoder", default="median")
 @click.option("-d", "--dry-run", is_flag=True, help="print iris commands without executing")
 @click.option("-D", "--debug-dump-mat", default="", help="dump per-voxel rho_pred/rho_true (and per-patch flat arrays in free mode) to GCS for this mp_id; overrides n_mats")
@@ -2359,6 +2361,8 @@ def evals_fire(
     num_tasks: int,
     eval_batch: int,
     tpu: str,
+    zone: str | None,
+    region: str | None,
     decoder: str,
     dry_run: bool,
     debug_dump_mat: str,
@@ -2533,6 +2537,14 @@ def evals_fire(
                     IRIS_BIN, "--cluster=marin", "job", "run",
                     "--tpu", tpu, "--enable-extra-resources", "--priority", "interactive",
                     "--cpu", "32", "--memory", "64GB",
+                ]
+                if zone:
+                    for z in zone.split(","):
+                        cmd += ["--zone", z]
+                if region:
+                    for r in region.split(","):
+                        cmd += ["--region", r]
+                cmd += [
                     "--env-vars", "WANDB_API_KEY", wandb_key,
                     "--env-vars", "TOMAT_LABEL", eval_label,
                     "--env-vars", "TOMAT_MODEL", model,
