@@ -40,6 +40,18 @@ import { annotationsFor, type RunAnnotation } from './annotations'
 import { computeSmoothedSeries } from './smoothing'
 import { FlopUnitChips, formatFlops, useFlopUnit } from './flops'
 
+/** Ancestor metadata for a lineage-glued history. Each entry corresponds to
+ *  one part of the concatenated `history` (root → parent order, the order
+ *  `concatHistories` was called with — minus the current run, which is the
+ *  tail). `rowCount` is the number of rows that ancestor contributed; the
+ *  plot uses these to map rows back to their source run, override the trace
+ *  color to `color`, and tag the segment in tooltips with `name`. */
+export interface LineageAncestor {
+  name: string
+  rowCount: number
+  color: string
+}
+
 interface Props {
   history: RunHistory
   evalSeries: RunEval | null
@@ -58,6 +70,11 @@ interface Props {
    *  data needed (data label not in `EPOCH_SEQUENCES`, `train_batch_size`
    *  missing), the `epoch` button is hidden. */
   manifest?: RunManifest | null
+  /** Ancestor lineage (root → parent). When non-null, the plot splits each
+   *  metric's trace into per-ancestor + current-run sub-series so each
+   *  ancestor renders in its own color (full opacity, no recency-ramp).
+   *  The current run keeps the existing restart-segment opacity-ramp. */
+  lineageInfo?: LineageAncestor[] | null
 }
 
 type XMode = 'time' | 'elapsed' | 'step' | 'epoch' | 'flop'
@@ -116,7 +133,7 @@ const TZ_LABEL: string = (() => {
   }
 })()
 
-export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step', attempts, manifest = null }: Props) {
+export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step', attempts, manifest = null, lineageInfo = null }: Props) {
   const { isDark } = useTheme()
   // Wrapper around <Plot> so we can DOM-walk to the `.js-plotly-plot` element
   // and call `Plotly.restyle` on the band traces directly. Bands have
@@ -382,29 +399,83 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   // next train step. `lifecycle/trainer_started` is the unambiguous signal:
   // one entry per trainer process boot.
   //
-  // With one start, this returns `[0]` and the whole run renders as a
-  // single trace as before.
-  const segmentStarts = useMemo<number[]>(() => {
+  // When the history is lineage-glued (`history.partRowCounts` from
+  // `concatHistories`), we ALSO split at every ancestor boundary so each
+  // ancestor's portion can render in its own color (full opacity, no
+  // recency-ramp). Each segment tracks which lineage part it belongs to
+  // (`partIdx`): 0..ancestors.length-1 → that ancestor, ancestors.length →
+  // current run.
+  //
+  // With one start and no lineage, this returns `[{ start: 0, partIdx: 0 }]`
+  // and the whole run renders as a single trace as before.
+  type SegMeta = { start: number; partIdx: number }
+  const segments = useMemo<SegMeta[]>(() => {
+    // partOfRaw: raw-row-index → which concat-part the row came from. The
+    // last part (index `partRowCounts.length - 1`) is the current run; the
+    // rest are ancestors in root→parent order.
+    const partRowCounts = history.partRowCounts
+    const numParts = partRowCounts?.length ?? 1
+    const currentPartIdx = numParts - 1
+    const partOfRaw = (rawIdx: number): number => {
+      if (!partRowCounts || numParts === 1) return 0
+      let acc = 0
+      for (let p = 0; p < partRowCounts.length; p++) {
+        acc += partRowCounts[p]
+        if (rawIdx < acc) return p
+      }
+      return numParts - 1
+    }
+    // Trainer_started timestamps from the CURRENT run's portion only —
+    // ancestor parts get one segment each (so they each get one solid color,
+    // no intra-ancestor restart-fade noise on top of the cross-part color
+    // story).
     const startedCol = cols.get('lifecycle/trainer_started') ?? []
-    const startTsRaw: number[] = []
+    const startTsCurrent: number[] = []
     for (let i = 0; i < startedCol.length; i++) {
       if (startedCol[i] === 1 && timestamps[i] != null) {
-        startTsRaw.push(timestamps[i] as number)
+        if (partOfRaw(i) === currentPartIdx) {
+          startTsCurrent.push(timestamps[i] as number)
+        }
       }
     }
-    startTsRaw.sort((a, b) => a - b)
-    if (startTsRaw.length === 0) return [0]
-    // First segment always starts at index 0. For each subsequent
-    // trainer_started ts, find the first `ordered` index whose ts >= that ts.
-    const out: number[] = [0]
-    let k = 0
-    for (let s = 1; s < startTsRaw.length; s++) {
-      while (k < ordered.length && (ordered[k].ts as number) < startTsRaw[s]) k++
-      if (out[out.length - 1] !== k && k < ordered.length) out.push(k)
+    startTsCurrent.sort((a, b) => a - b)
+    if (ordered.length === 0) return [{ start: 0, partIdx: currentPartIdx }]
+    // Walk `ordered` in ts order; insert seams at part-changes (for lineage
+    // glue) and at the first `ordered` index whose ts is ≥ each
+    // trainer_started ts within the current run's portion.
+    const out: SegMeta[] = []
+    let nextStartTsIdx = 0
+    let lastPartIdx = -1
+    for (let k = 0; k < ordered.length; k++) {
+      const { ts, i } = ordered[k]
+      const p = partOfRaw(i)
+      // Advance the trainer_started pointer past any starts whose ts we've
+      // now caught up to. Each such advance marks "this k is the first row
+      // at-or-after the start". We push a seam for each pending start (after
+      // the first one — the very first start aligns with the first current-
+      // run row, which is already a seam from the part transition or from
+      // k===0).
+      let restartHere = false
+      while (nextStartTsIdx < startTsCurrent.length
+             && startTsCurrent[nextStartTsIdx] <= (ts as number)) {
+        // Skip the very first trainer_started — it coincides with the
+        // current run's start (already a seam via partChanged / k===0). Only
+        // 2nd+ starts indicate intra-run restarts.
+        if (nextStartTsIdx > 0) restartHere = true
+        nextStartTsIdx++
+      }
+      const partChanged = p !== lastPartIdx
+      if (k === 0 || partChanged || restartHere) {
+        if (out.length === 0 || out[out.length - 1].start !== k) {
+          out.push({ start: k, partIdx: p })
+        }
+      }
+      lastPartIdx = p
     }
     return out
-  }, [ordered, cols, timestamps])
-  const numSegments = segmentStarts.length
+  }, [ordered, cols, timestamps, history.partRowCounts])
+  const numSegments = segments.length
+  const segmentStarts = useMemo(() => segments.map((s) => s.start), [segments])
 
   // Segment index for a given index into `ordered`. Binary search over
   // `segmentStarts` (monotonic).
@@ -416,6 +487,13 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       else hi = mid - 1
     }
     return best
+  }
+  // partIdx → ancestor name, or null when partIdx is the current-run tail.
+  // `lineageInfo` is root→parent; its length is `partRowCounts.length - 1`,
+  // so any partIdx === lineageInfo.length is the current run.
+  function ancestorOf(partIdx: number): LineageAncestor | null {
+    if (!lineageInfo) return null
+    return lineageInfo[partIdx] ?? null
   }
 
   // Returns one Series per restart segment. Empty segments are preserved at
@@ -532,38 +610,84 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   // matching logic upstream remains correct) and a shared `legendgroup` so
   // pltly's solo/fade + our `applyBandFade` desaturate them together.
   //
-  // For runs with restart segments (`segments.length > 1`), older segments
-  // render at low opacity so the latest segment dominates visually. Only the
-  // latest segment gets a legend entry; the older segments share its
-  // `legendgroup` so the legend toggle hides/shows the whole stack.
+  // For runs with restart segments (`seriesPerSeg.length > 1`), older
+  // current-run segments render at low opacity so the latest segment
+  // dominates visually. Only the latest current-run segment gets a legend
+  // entry; older current-run segments share its `legendgroup` so the
+  // legend toggle hides/shows the whole stack.
+  //
+  // Ancestor (lineage-glued) segments instead render in their ancestor's
+  // OWN color (looked up via `ancestorOf(segments[segIdx].partIdx)`) at full
+  // opacity, in a per-ancestor legendgroup so each ancestor has its own
+  // legend row + a hover-fade story independent from the current run's
+  // metric stack.
   type SmoothedTrace = Record<string, unknown>
   function smoothedSeriesTraces(
-    segments: Series[], name: string, color: string, lineWidth: number, lg: string,
+    seriesPerSeg: Series[], name: string, color: string, lineWidth: number, lg: string,
   ): SmoothedTrace[] {
-    const N = segments.length
-    // Most-recent segment with data — gets the legend entry + full opacity.
-    // Without this anchor (just using `N - 1`), a fresh resume that hasn't
-    // logged any rows yet would render no legend entry and no full-opacity
-    // trace — the entire plot would be older segments at fade.
-    let lastNonEmpty = -1
-    for (let i = N - 1; i >= 0; i--) {
-      if (segments[i].xs.length > 0) { lastNonEmpty = i; break }
+    const N = seriesPerSeg.length
+    // Index of the most-recent CURRENT-RUN segment with data — gets the
+    // legend entry + full opacity. Ancestor segments do NOT use this anchor
+    // (each ancestor stands on its own). Without it, a fresh resume that
+    // hasn't logged any rows yet would render no legend entry and no
+    // full-opacity trace — the entire plot would be older segments at fade.
+    let lastNonEmptyCurrent = -1
+    // Total count of current-run segments (drives the in-run `#k/N` label).
+    // Includes empty ones for index stability, matching pre-lineage behavior
+    // for non-glued plots.
+    let firstCurrentSeg = -1
+    for (let i = 0; i < N; i++) {
+      const sm = segments[i]
+      const isCurrent = !ancestorOf(sm.partIdx)
+      if (isCurrent && firstCurrentSeg === -1) firstCurrentSeg = i
+      if (isCurrent && seriesPerSeg[i].xs.length > 0) lastNonEmptyCurrent = i
     }
+    const numCurrentSegs = firstCurrentSeg === -1 ? 0 : N - firstCurrentSeg
     const out: SmoothedTrace[] = []
-    segments.forEach((s, segIdx) => {
+    seriesPerSeg.forEach((s, segIdx) => {
       if (s.xs.length === 0) return
-      const isLatest = segIdx === lastNonEmpty
-      // Linear ramp anchored on lastNonEmpty: oldest = 0.40, latest = 1.0.
-      // Floor at 0.40 (was 0.18) so older trajectories stay readable as
-      // individual lines, not just an overlapping smear. Aggregate alpha
-      // from many overlapping segments is still bounded by 1.0.
-      const opacity = lastNonEmpty <= 0 ? 1
-        : 0.40 + 0.60 * (segIdx / lastNonEmpty)
-      // Label per-segment as `<name> #k/N` (1-based, matches the
-      // restart-segment header count). The hovertemplate uses `segName`
-      // too so the x-unified tooltip shows distinct lines per segment
-      // instead of three identical "TL (train/loss)" rows.
-      const segName = N > 1 && !isLatest ? `${name} #${segIdx + 1}/${N}` : name
+      const segMeta = segments[segIdx]
+      const ancestor = ancestorOf(segMeta.partIdx)
+      const isCurrent = !ancestor
+      const isLatest = isCurrent && segIdx === lastNonEmptyCurrent
+      // Color override + opacity / legend strategy:
+      //   - ancestor segments: full opacity, ancestor's color, per-ancestor
+      //     legendgroup so each ancestor has its own legend row;
+      //   - current-run segments: existing ramp anchored on lastNonEmptyCurrent.
+      let traceColor: string
+      let opacity: number
+      let legendGroup: string
+      let groupTitle: string
+      let showLegend: boolean
+      let segName: string
+      if (ancestor) {
+        traceColor = ancestor.color
+        opacity = 1
+        // Each ancestor gets its own legend group so hover-fade and
+        // legend-toggle isolate the ancestor's metric stack from the
+        // current run's `losses` group. Group key is unique per ancestor.
+        legendGroup = `lineage:${ancestor.name}`
+        groupTitle = `ancestor: ${ancestor.name}`
+        showLegend = true  // one row per ancestor per metric
+        segName = `${name} · ${ancestor.name}`
+      } else {
+        traceColor = color
+        // Linear ramp anchored on the latest CURRENT-RUN segment: oldest
+        // current-run seg = 0.40, latest = 1.0. Floor at 0.40 (was 0.18) so
+        // older trajectories stay readable as individual lines.
+        const relIdx = segIdx - firstCurrentSeg
+        const lastRel = lastNonEmptyCurrent - firstCurrentSeg
+        opacity = lastRel <= 0 ? 1 : 0.40 + 0.60 * (relIdx / lastRel)
+        legendGroup = lg
+        groupTitle = 'losses (log)'
+        showLegend = isLatest
+        // Label per-segment as `<name> #k/N` (1-based, matches the
+        // restart-segment header count). The hovertemplate uses `segName`
+        // too so the x-unified tooltip shows distinct lines per segment
+        // instead of three identical "TL (train/loss)" rows.
+        segName = numCurrentSegs > 1 && !isLatest
+          ? `${name} #${relIdx + 1}/${numCurrentSegs}` : name
+      }
       // Bypass smoothing for sparse traces — VL on a long run carries ~5-20
       // points across 10k+ steps, and sample-index rolling with window >
       // len(ys) collapses every output to the global mean → flat line. Same
@@ -620,12 +744,12 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       const lineTrace: SmoothedTrace = {
         x: lineX, y: lineY, name: segName,
         type: 'scatter', mode: 'lines',
-        line: { color, width: lineWidth },
+        line: { color: traceColor, width: lineWidth },
         opacity,
         yaxis: 'y2',
-        legendgroup: lg,
-        legendgrouptitle: { text: 'losses (log)' },
-        showlegend: isLatest,
+        legendgroup: legendGroup,
+        legendgrouptitle: { text: groupTitle },
+        showlegend: showLegend,
         customdata: lineG,
         hovertemplate: `${segName} %{y:.3f}<br>gstep %{customdata}<extra></extra>`,
       }
@@ -641,16 +765,18 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       const bridgeTrace: SmoothedTrace | null = bridgeX.length > 0 ? {
         x: bridgeX, y: bridgeY, name: segName,
         type: 'scatter', mode: 'lines',
-        line: { color, width: lineWidth, dash: 'dot' },
+        line: { color: traceColor, width: lineWidth, dash: 'dot' },
         opacity,
         yaxis: 'y2',
-        legendgroup: lg,
+        legendgroup: legendGroup,
         showlegend: false,
         hoverinfo: 'none',
       } : null
-      // Only show ±σ bands on the latest segment — drawing 28 overlapping
-      // bands would just be noise, and the older trajectories already smear
-      // visually via opacity.
+      // Only show ±σ bands on the latest current-run segment — drawing 28
+      // overlapping bands would just be noise, and the older trajectories
+      // already smear visually via opacity. Ancestor segments are skipped
+      // here too: their context is "look at the previous color smoothly
+      // joining ours", not "what was that ancestor's intra-window σ".
       if (!bandsOn || !lineYStd || !isLatest) {
         out.push(lineTrace)
         if (bridgeTrace) out.push(bridgeTrace)
@@ -671,12 +797,12 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         x: lineX, y, name: segName,
         type: 'scatter', mode: 'lines',
         line: { width: 0, color: 'rgba(0,0,0,0)' },
-        yaxis: 'y2', legendgroup: lg,
+        yaxis: 'y2', legendgroup: legendGroup,
         showlegend: false,
         hoverinfo: 'skip',
         ...(fillKey ? { fill: 'tonexty', fillcolor: fillKey } : {}),
       })
-      const rgb = hexToRgbTuple(color)
+      const rgb = hexToRgbTuple(traceColor)
       const fillcolor = `rgba(${rgb}, 0.18)`
       out.push(edge(yLower, null), edge(yUpper, fillcolor), lineTrace)
       if (bridgeTrace) out.push(bridgeTrace)

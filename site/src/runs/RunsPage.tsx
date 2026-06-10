@@ -1361,6 +1361,31 @@ function RunDetail({ runId }: { runId: string }) {
     return concatHistories(ordered)
   }, [lineageMode, ownHistory, ancestors, ancestorHistoryQs])
   const history = lineageHistory
+  // Ancestor lineage metadata for the WallclockPlot — root → parent order
+  // (matches the prefix of `partRowCounts` on the concatenated history).
+  // Each ancestor gets a distinct fallback color from the shared palette;
+  // we don't have the runs-index `ordered` here (single-run page), so the
+  // per-card colors aren't available — the contrast palette is the only
+  // option, but it's stable and deterministic per (runId, ancestorIdx).
+  const lineageInfo = useMemo(() => {
+    if (lineageMode === 'seg') return null
+    if (ancestors.length === 0) return null
+    if (!history?.partRowCounts || history.partRowCounts.length < 2) return null
+    // `ancestors` is child→root; reverse to root→…→parent so it matches the
+    // concat order. partRowCounts has N+1 entries (N ancestors + 1 own); the
+    // last is `ownHistory.rowCount`, so we drop it for the ancestor list.
+    const rootFirst = [...ancestors].reverse()
+    const counts = history.partRowCounts.slice(0, rootFirst.length)
+    // Pick colors from a fixed contrast palette, offset by 2 so an ancestor's
+    // color doesn't visually collide with TL (`#ef5350`, red) or VL
+    // (`#ffa726`, amber) on the loss panel. Palette has 10 entries; we mod.
+    const ancestorColor = (i: number) => colorForIndex(i + 2)
+    return rootFirst.map((name, i) => ({
+      name,
+      rowCount: counts[i] ?? 0,
+      color: ancestorColor(i),
+    }))
+  }, [lineageMode, ancestors, history])
   const evalJobs = useMemo(
     () => evalJobsByRun(irisQ.data ?? undefined).get(runId) ?? [],
     [irisQ.data, runId],
@@ -1475,6 +1500,7 @@ function RunDetail({ runId }: { runId: string }) {
           runId={runId}
           attempts={attemptsQ.data ?? null}
           manifest={manifest}
+          lineageInfo={lineageInfo}
         />
       )}
       <EvalsPanel

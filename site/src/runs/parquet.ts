@@ -45,6 +45,13 @@ export interface RunHistory {
   steps: (number | null)[]
   /** per-column arrays, sparse (null where the metric wasn't logged) */
   cols: Map<keyof RunHistoryRow, (number | null)[]>
+  /** Per-part row counts when this history is the result of
+   *  `concatHistories(parts)`. Ordered ancestor-first → current run last;
+   *  `partRowCounts[k]` is the number of rows part k contributed (so
+   *  `sum(partRowCounts) === rowCount`). Absent for non-concatenated
+   *  histories (the un-lineaged case); consumers that don't care about
+   *  ancestry treat the whole thing as one stream. */
+  partRowCounts?: number[]
 }
 
 /**
@@ -107,9 +114,11 @@ export function concatHistories(parts: RunHistory[]): RunHistory {
   for (const k of allKeys) cols.set(k, [])
   const timestamps: (number | null)[] = []
   const steps: (number | null)[] = []
+  const partRowCounts: number[] = []
   let rowCount = 0
   for (const p of parts) {
     rowCount += p.rowCount
+    partRowCounts.push(p.rowCount)
     timestamps.push(...p.timestamps)
     steps.push(...p.steps)
     for (const k of allKeys) {
@@ -123,5 +132,5 @@ export function concatHistories(parts: RunHistory[]): RunHistory {
       }
     }
   }
-  return { rowCount, timestamps, steps, cols }
+  return { rowCount, timestamps, steps, cols, partRowCounts }
 }
