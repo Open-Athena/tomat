@@ -92,6 +92,14 @@ export const RUN_LINEAGE: Record<string, RunLineage> = {
     parent: 'train-mg-tz-11',
     parent_step: 20000,
   },
+
+  // kl-s05-tpu-cont-v3: TPU resume of the KL-Gauss σ=0.5 Modal run at
+  // step-20000 (its final ckpt; the from-scratch ts1 Modal run targeted
+  // num_train_steps=20000).
+  'kl-s05-tpu-cont-v3': {
+    parent: 'train-mg-modal-h200x8-tz-fs-kl-s05-ts1-bs128-seed42',
+    parent_step: 20000,
+  },
 }
 
 /** Lineage entry for `runName`, or `null` if it has no recorded parent. */

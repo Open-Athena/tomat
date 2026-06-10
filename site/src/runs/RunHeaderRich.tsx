@@ -1356,7 +1356,7 @@ export function RunHeaderRich({
                 <a href={irisUrl} target="_blank" rel="noreferrer"
                   style={{ fontSize: '0.75rem', color: '#888',
                     display: 'inline-flex', alignItems: 'center', gap: 2 }}>
-                  <img src="/tpu.png" alt="iris"
+                  <img src="/iris.png" alt="iris"
                     style={{ height: 18, width: 'auto', verticalAlign: 'middle' }} />
                   ↗
                 </a>
