@@ -465,9 +465,18 @@ def main():
     # 2026-05-31 (see memory: feedback_pull_task_logs_on_first_cascade).
     # Setting `JAX_PLATFORMS=tpu` here ensures the TPU path is taken
     # regardless of iris bootstrap timing.
-    os.environ.setdefault("JAX_PLATFORMS", "tpu")
-    from iris.runtime.jax_init import initialize_jax as _iris_initialize_jax
-    _iris_initialize_jax()
+    # Cache-build is a single-host CPU job, no TPU. Skip JAX init entirely —
+    # iris's `initialize_jax` calls `jax.distributed.initialize()` which then
+    # hangs/dies on `CoordinationService/RegisterTask` (UNIMPLEMENTED at first,
+    # DEADLINE_EXCEEDED on retry) because there's no peer to coordinate with.
+    # Levanter's cache-build path doesn't need JAX devices anyway. Skip + force
+    # CPU platform so any inadvertent JAX import doesn't try to grab a TPU.
+    if os.environ.get("TOMAT_BUILD_CACHE_ONLY") == "1":
+        os.environ.setdefault("JAX_PLATFORMS", "cpu")
+    else:
+        os.environ.setdefault("JAX_PLATFORMS", "tpu")
+        from iris.runtime.jax_init import initialize_jax as _iris_initialize_jax
+        _iris_initialize_jax()
     _maybe_spawn_pyspy_daemon()
     label = os.environ.get("TOMAT_LABEL", "val-full")
     steps = int(os.environ.get("TOMAT_STEPS", "1000"))
