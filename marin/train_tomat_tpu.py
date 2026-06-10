@@ -631,6 +631,12 @@ def main():
     mg_mask_prior = os.environ.get("TOMAT_MG_MASK_PRIOR", "cosine")
     mg_loss_type = os.environ.get("TOMAT_MG_LOSS_TYPE", "ce")
     mg_kl_sigma = float(os.environ.get("TOMAT_MG_KL_SIGMA", "0.5"))
+    mg_kl_sigma_unit = os.environ.get("TOMAT_MG_KL_SIGMA_UNIT", "value")
+    if mg_kl_sigma_unit not in ("value", "bin"):
+        raise ValueError(
+            f"TOMAT_MG_KL_SIGMA_UNIT must be 'value' or 'bin', got "
+            f"{mg_kl_sigma_unit!r}"
+        )
     if mg_mask_prior not in ("cosine", "uniform", "high", "absorbing"):
         raise ValueError(
             f"TOMAT_MG_MASK_PRIOR must be cosine/uniform/high/absorbing, "
@@ -937,6 +943,7 @@ def main():
             weight=density_l1_weight,
             loss_type=mg_loss_type,
             kl_sigma=mg_kl_sigma,
+            kl_sigma_unit=mg_kl_sigma_unit,
         )
         configure_maskgit_loss(mg_loss_args)
         print(f"[tomat-tpu] MaskGIT loss configured: penalty={penalty_val:.4f}")

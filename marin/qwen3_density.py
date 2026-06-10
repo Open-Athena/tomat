@@ -350,11 +350,21 @@ class MaskGITLossArgs:
     prior: str = "cosine"        # mask-ratio schedule: cosine|uniform|high|absorbing
     weight: float = 1.0          # λ multiplier on the EMD density term (ce_emd)
     loss_type: str = "ce"        # "ce" | "ce_emd" | "emd" | "kl_gauss" | "crps"
-    # KL-Gaussian: stddev (in ρ-units) of the soft target distribution.
-    # Target Q(v) ∝ exp(-(ρ_v − ρ_true)² / 2σ²), normalized over the density
-    # range. σ→0 recovers vanilla CE; σ large gives EMD-like smoothness.
+    # KL-Gaussian: stddev of the soft target distribution.
+    # Target Q(v) ∝ exp(-Δ² / 2σ²), normalized over the density range.
+    # σ→0 recovers vanilla CE; σ large gives EMD-like smoothness.
     # See `posts/13-why-pure-emd-collapses.md` §5.1.
+    #
+    # `kl_sigma_unit` controls Δ:
+    #   "value" (default, legacy) — Δ = ρ_v − ρ_true (density-value units).
+    #     With LMQ's equal-probability bin spacing, σ=0.5 covers HUNDREDS of
+    #     bins for low/mid density and only 1-3 bins for the high-density
+    #     tail → wildly inconsistent target structure across density regions.
+    #   "bin"   — Δ = (v − v_true) where v, v_true are bin indices. Uniform
+    #     resolution across the codec range; σ=5 means ~10 bins covered
+    #     regardless of density. Probably more principled; needs an ablation.
     kl_sigma: float = 0.5
+    kl_sigma_unit: str = "value"
 
 
 _VALID_LOSS_TYPES = ("ce", "ce_emd", "emd", "kl_gauss", "crps", "emd_atan")
@@ -372,6 +382,7 @@ def build_maskgit_loss_args(
     weight: float = 1.0,
     loss_type: str = "ce",
     kl_sigma: float = 0.5,
+    kl_sigma_unit: str = "value",
 ) -> MaskGITLossArgs:
     """Build `MaskGITLossArgs` from codec + config."""
     if loss_type not in _VALID_LOSS_TYPES:
@@ -380,6 +391,8 @@ def build_maskgit_loss_args(
         raise ValueError(f"prior must be cosine/uniform/high/absorbing, got {prior!r}")
     if loss_type == "kl_gauss" and not (kl_sigma > 0):
         raise ValueError(f"kl_sigma must be > 0 for kl_gauss, got {kl_sigma!r}")
+    if kl_sigma_unit not in ("value", "bin"):
+        raise ValueError(f"kl_sigma_unit must be 'value' or 'bin', got {kl_sigma_unit!r}")
     decode_all_np = np.full(Vocab.size, float(penalty), dtype=np.float32)
     decode_all_np[density_offset : density_offset + n_density_bins] = codec_recon.astype(np.float32)
     decode_all = hax.named(decode_all_np, Vocab)
@@ -392,6 +405,7 @@ def build_maskgit_loss_args(
         weight=weight,
         loss_type=loss_type,
         kl_sigma=kl_sigma,
+        kl_sigma_unit=kl_sigma_unit,
     )
 
 
@@ -473,10 +487,18 @@ def maskgit_aware_loss(
         density_bin_mask = (dens_idx >= args.density_lo) & (dens_idx < args.density_hi)  # (V,)
 
         if args.loss_type == "kl_gauss":
-            # Q(v) ∝ exp(-(ρ_v - ρ_true)² / 2σ²) over density range only.
+            # Q(v) ∝ exp(-Δ² / 2σ²) over density range only.
             # Loss = -Σ_v Q(v) log P(v) (= KL(Q‖P) up to entropy(Q) const).
+            # `kl_sigma_unit`:
+            #   "value" — Δ = ρ_v − ρ_true (density-value space, legacy)
+            #   "bin"   — Δ = bin_idx − target_bin_idx (uniform across codec)
             sigma = jnp.asarray(args.kl_sigma, dtype=jnp.float32)
-            log_q_unnorm = -((decode_all_arr[None, None, :] - rho_true[..., None]) ** 2) / (2.0 * sigma ** 2)
+            if args.kl_sigma_unit == "bin":
+                bin_idx_f = jnp.arange(V, dtype=jnp.float32)
+                tgt_f = targets_arr.astype(jnp.float32)
+                log_q_unnorm = -((bin_idx_f[None, None, :] - tgt_f[..., None]) ** 2) / (2.0 * sigma ** 2)
+            else:
+                log_q_unnorm = -((decode_all_arr[None, None, :] - rho_true[..., None]) ** 2) / (2.0 * sigma ** 2)
             log_q_masked = jnp.where(density_bin_mask[None, None, :], log_q_unnorm, -jnp.inf)
             log_q = jax.nn.log_softmax(log_q_masked, axis=-1)   # (B, Pos, V), normalized over density range
             q = jnp.exp(log_q)
