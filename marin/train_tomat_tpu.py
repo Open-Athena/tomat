@@ -545,12 +545,47 @@ def main():
                       flush=True)
                 BUCKET = _zone_local
             else:
-                # env has ckpts, local doesn't → keep env to preserve resume.
-                print(f"[tomat-tpu] bucket: {BUCKET} "
-                      f"(env-pinned preserved for resume; "
-                      f"worker_region={_worker_region}, "
-                      f"zone-local mirror={_zone_local} has no ckpts)",
-                      flush=True)
+                # env has ckpts, local doesn't → rebase the ckpt dir to local
+                # so subsequent writes (every keep_every ~2.5 GB on a 200M run)
+                # stay in-region. One-shot cross-region COPY at startup beats
+                # N cross-region WRITES over the rest of the run.
+                #
+                # JAX process 0 does the rsync; a multihost barrier ensures all
+                # workers wait before proceeding to Levanter's ckpt discovery.
+                # On rsync failure we fall back to env-pinned to preserve the
+                # ability to resume (just at the cost of cross-region writes).
+                import subprocess as _sp
+                import jax as _jax
+                _src = f"{_env_bucket}/{_ck_suffix}"
+                _dst = f"{_zone_local}/{_ck_suffix}"
+                _ok = True
+                if _jax.process_index() == 0:
+                    print(f"[tomat-tpu] cross-region ckpt rebase: rsync "
+                          f"{_src} → {_dst} …", flush=True)
+                    _rc = _sp.run(
+                        ["gsutil", "-m", "rsync", "-r", _src, _dst],
+                        check=False,
+                    )
+                    if _rc.returncode != 0:
+                        print(f"[tomat-tpu] WARN: rsync rc={_rc.returncode}; "
+                              f"falling back to env-pinned bucket "
+                              f"{_env_bucket} (will incur cross-region "
+                              f"writes)", flush=True)
+                        _ok = False
+                    else:
+                        print(f"[tomat-tpu] cross-region ckpt rebase: done",
+                              flush=True)
+                # All hosts wait for process 0 to finish before reading.
+                from jax.experimental.multihost_utils import sync_global_devices as _sync
+                _sync("xreg_ckpt_rebase")
+                if _ok:
+                    BUCKET = _zone_local
+                    print(f"[tomat-tpu] bucket: {_zone_local} "
+                          f"(zone-local override after x-reg rebase)",
+                          flush=True)
+                else:
+                    print(f"[tomat-tpu] bucket: {BUCKET} "
+                          f"(env-pinned; x-reg rebase failed)", flush=True)
 
     parquet_glob = f"{BUCKET}/tokenized/{label}/worker-*/*.parquet"
     meta_url = f"{BUCKET}/tokenized/{label}/worker-00/meta.json"
