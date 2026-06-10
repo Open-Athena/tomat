@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Plot, useTheme } from 'pltly/react'
+import { intParam, useUrlState } from 'use-prms'
 import { themedHoverlabel, ThemeToggle } from '../theme'
 import { API_BASE } from '../runs/api'
+
+/** Empirical MP charge-density grid resolution (~0.065 Å/voxel ≈ uniform
+ *  across the dataset; see scripts/analyze_voxel_resolution.py). Used to
+ *  surface a secondary distance axis in Å on the dist-corr plot. */
+const ANGSTROMS_PER_VOXEL = 0.065
 
 /** JSON sidecar shape — matches `tomat analyze voxel-corr-blob`. */
 interface CorrMetadata {
@@ -282,6 +288,114 @@ function buildTicks(v0: number, v1: number, P: number, N: number): AxisTick[] {
   return ticks
 }
 
+/** Aggregated stats (mean, σ, count) for one distance bin. */
+interface DistBin {
+  /** Lower edge of the bin, in voxel-index units. */
+  lo: number
+  /** Upper edge of the bin, in voxel-index units. */
+  hi: number
+  /** Bin midpoint = (lo + hi) / 2, voxel-index units. */
+  mid: number
+  /** Number of (i, j) pairs that fell in this bin (i < j only). */
+  count: number
+  /** Mean correlation across the bin. NaN if count = 0. */
+  mean: number
+  /** Population standard deviation across the bin. NaN if count = 0. */
+  std: number
+}
+
+interface DistCorrHist {
+  /** All non-empty bins, ordered by ascending distance. */
+  bins: DistBin[]
+  /** Total pairs aggregated (i < j, with d > 0). */
+  totalPairs: number
+  /** Max distance encountered = √3 · (P − 1). */
+  maxDist: number
+}
+
+/** Compute the (3D-Euclidean-distance) vs (decoded correlation) histogram
+ *  for every (i, j) with i < j in the P³×P³ matrix. Distances are in
+ *  voxel-index units; positions decode as pos = x + y·P + z·P². The d=0
+ *  diagonal is excluded. Bin edges are linear in [0, √3·(P−1)] across
+ *  `nBins` buckets. */
+function computeDistCorrHist(matrix: Int8Array, P: number, int8Scale: number, nBins: number): DistCorrHist {
+  const N = P * P * P
+  // Pre-decode each linear index into (x, y, z) integer coords. Avoids
+  // doing 3 divides+mods per pair (would be ~70M ops at P=19).
+  const xs = new Int8Array(N)
+  const ys = new Int8Array(N)
+  const zs = new Int8Array(N)
+  for (let i = 0; i < N; i++) {
+    const z = Math.floor(i / (P * P))
+    const y = Math.floor((i - z * P * P) / P)
+    const x = i - z * P * P - y * P
+    xs[i] = x
+    ys[i] = y
+    zs[i] = z
+  }
+
+  const maxDist = Math.sqrt(3) * (P - 1)
+  // Linear bins in [0, maxDist]. We skip d == 0 (diagonal) entirely.
+  const binW = maxDist / nBins
+  const sums = new Float64Array(nBins)
+  const sumSqs = new Float64Array(nBins)
+  const counts = new Uint32Array(nBins)
+
+  let totalPairs = 0
+  for (let i = 0; i < N; i++) {
+    const xi = xs[i], yi = ys[i], zi = zs[i]
+    const row = i * N
+    for (let j = i + 1; j < N; j++) {
+      const dx = xs[j] - xi
+      const dy = ys[j] - yi
+      const dz = zs[j] - zi
+      const d2 = dx * dx + dy * dy + dz * dz
+      if (d2 === 0) continue
+      const d = Math.sqrt(d2)
+      // Clamp the bin index for the d = maxDist corner pair.
+      let b = Math.floor(d / binW)
+      if (b >= nBins) b = nBins - 1
+      const c = matrix[row + j] * int8Scale
+      sums[b] += c
+      sumSqs[b] += c * c
+      counts[b] += 1
+      totalPairs += 1
+    }
+  }
+
+  const bins: DistBin[] = []
+  for (let b = 0; b < nBins; b++) {
+    if (counts[b] === 0) continue
+    const lo = b * binW
+    const hi = (b + 1) * binW
+    const n = counts[b]
+    const mean = sums[b] / n
+    // Population variance — clamp to ≥ 0 to handle catastrophic
+    // cancellation on near-uniform bins.
+    const var_ = Math.max(0, sumSqs[b] / n - mean * mean)
+    bins.push({ lo, hi, mid: (lo + hi) / 2, count: n, mean, std: Math.sqrt(var_) })
+  }
+  return { bins, totalPairs, maxDist }
+}
+
+/** Decode a row-major voxel index → (x, y, z) integer coords. */
+function decodePos(i: number, P: number): { x: number; y: number; z: number } {
+  const z = Math.floor(i / (P * P))
+  const y = Math.floor((i - z * P * P) / P)
+  const x = i - z * P * P - y * P
+  return { x, y, z }
+}
+
+/** 3D Euclidean distance between two voxel indices, in voxel-index units. */
+function voxelDistance(i: number, j: number, P: number): number {
+  const a = decodePos(i, P)
+  const b = decodePos(j, P)
+  const dx = a.x - b.x
+  const dy = a.y - b.y
+  const dz = a.z - b.z
+  return Math.sqrt(dx * dx + dy * dy + dz * dz)
+}
+
 async function loadCorrData(runLabel: string): Promise<CorrData> {
   // Blob + sidecar live on R2 (`tomat/voxel-corr/<label>.{json,bin.gzip}`),
   // served via the runs-API worker so the static site stays free of the ~12MB
@@ -365,6 +479,10 @@ interface CursorState {
   clientY: number
 }
 
+const DIST_BINS_DEFAULT = 40
+const DIST_BINS_MIN = 5
+const DIST_BINS_MAX = 200
+
 export function VoxelCorrPage({ parts }: Props) {
   const runLabel = parts[0] ?? KNOWN_RUNS[0].label
   const { isDark } = useTheme()
@@ -375,6 +493,8 @@ export function VoxelCorrPage({ parts }: Props) {
   const [showDiagonals, setShowDiagonals] = useState(true)
   const [viewport, setViewport] = useState<Viewport | null>(null)
   const [cursor, setCursor] = useState<CursorState | null>(null)
+  const [distBins, setDistBins] = useUrlState('distBins', intParam(DIST_BINS_DEFAULT))
+  const nBins = Math.max(DIST_BINS_MIN, Math.min(DIST_BINS_MAX, distBins))
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const wrapRef = useRef<HTMLDivElement | null>(null)
@@ -481,6 +601,15 @@ export function VoxelCorrPage({ parts }: Props) {
     if (data) setViewport(fullViewport(data.meta.n_voxels))
   }, [data])
 
+  /** Memoized distance-vs-correlation histogram. Recomputes when the
+   *  underlying matrix or bin count changes. ~23M pair iterations at
+   *  P=19 → ~300 ms one-shot on a typical laptop; the user can re-bin
+   *  via the URL knob below without re-loading. */
+  const distHist = useMemo(() => {
+    if (!data) return null
+    return computeDistCorrHist(data.matrix, data.meta.patch_size, data.meta.int8_scale, nBins)
+  }, [data, nBins])
+
   const cursorLabel = useMemo(() => {
     if (!cursor || !data) return ''
     const P = data.meta.patch_size
@@ -490,7 +619,10 @@ export function VoxelCorrPage({ parts }: Props) {
       const x = n - z * P * P - y * P
       return `(${x},${y},${z})`
     }
-    return `i=${cursor.i} ${decode(cursor.i)} · j=${cursor.j} ${decode(cursor.j)} · corr=${cursor.v.toFixed(3)}`
+    const d = voxelDistance(cursor.i, cursor.j, P)
+    const dA = d * ANGSTROMS_PER_VOXEL
+    return `i=${cursor.i} ${decode(cursor.i)} · j=${cursor.j} ${decode(cursor.j)} · ` +
+      `d=${d.toFixed(2)} (${dA.toFixed(2)} Å) · corr=${cursor.v.toFixed(3)}`
   }, [cursor, data])
 
   // Tick rulers (top + left) — HTML-rendered for crisp text. P² (and
@@ -520,8 +652,11 @@ export function VoxelCorrPage({ parts }: Props) {
         averaged over all patches in <code>{runLabel}</code>. Diagonals at
         offset k=P and k=P² are the spatial neighbors in raster order — if
         the model has learned local 3-D structure, these should be visibly
-        brighter than the off-diagonal background. Background on the
-        analysis: <a href="https://github.com/Open-Athena/tomat/blob/main/scripts/voxel_corr.py">
+        brighter than the off-diagonal background. The <em>3-D distance</em>
+        {' '}plot below decodes each (i, j) → (x, y, z) positions and asks
+        the same question more directly: does prediction-correlation decay
+        with 3-D Euclidean distance? Background on the analysis:{' '}
+        <a href="https://github.com/Open-Athena/tomat/blob/main/scripts/voxel_corr.py">
           scripts/voxel_corr.py</a>.
         {' '}<a href="#/">← home</a> · <a href="#/runs">runs dashboard</a>
       </p>
@@ -552,6 +687,37 @@ export function VoxelCorrPage({ parts }: Props) {
 
       {data && (
         <CurvePlot curve={data.meta.curve} patchSize={data.meta.patch_size} isDark={isDark} />
+      )}
+
+      {data && distHist && (
+        <>
+          <div className="voxel-corr-controls">
+            <label>
+              dist bins:{' '}
+              <input
+                type="number"
+                min={DIST_BINS_MIN}
+                max={DIST_BINS_MAX}
+                value={distBins}
+                onChange={e => {
+                  const v = Number(e.target.value)
+                  if (Number.isFinite(v)) setDistBins(v)
+                }}
+                style={{ width: '5em' }}
+              />
+            </label>
+            <span className="meta">
+              {distHist.totalPairs.toLocaleString()} pairs (i &lt; j, d &gt; 0) ·{' '}
+              max d = {distHist.maxDist.toFixed(2)} voxels ({(distHist.maxDist * ANGSTROMS_PER_VOXEL).toFixed(2)} Å)
+            </span>
+          </div>
+          <DistCorrPlot
+            hist={distHist}
+            patchSize={data.meta.patch_size}
+            hoverDist={cursor ? voxelDistance(cursor.i, cursor.j, data.meta.patch_size) : null}
+            isDark={isDark}
+          />
+        </>
       )}
 
       {data && viewport && (
@@ -693,6 +859,118 @@ function CurvePlot({ curve, patchSize, isDark }: { curve: number[]; patchSize: n
             { x: 1, yref: 'paper', y: 1.0, text: 'k=1', showarrow: false, font: { color: '#e91e63', size: 10 } },
             { x: P, yref: 'paper', y: 1.0, text: `k=P=${P}`, showarrow: false, font: { color: '#e91e63', size: 10 } },
             { x: P * P, yref: 'paper', y: 1.0, text: `k=P²=${P * P}`, showarrow: false, font: { color: '#e91e63', size: 10 } },
+          ],
+        }}
+        config={{ responsive: true, displayModeBar: false }}
+        style={{ width: '100%' }}
+      />
+    </div>
+  )
+}
+
+/** 3D-distance vs prediction-correlation plot. Tests the smoothness
+ *  hypothesis: pairs of voxels close in 3D space should have higher
+ *  prediction-correlation than pairs at long distance. A monotone-decay
+ *  curve = the model is producing locally smooth fields. A flat curve =
+ *  it isn't. The shaded band shows ±σ of correlation within each
+ *  distance bin. Anchor lines mark unit distance (nearest-neighbor) and
+ *  the patch-size scales. */
+function DistCorrPlot({
+  hist,
+  patchSize,
+  hoverDist,
+  isDark,
+}: {
+  hist: DistCorrHist
+  patchSize: number
+  hoverDist: number | null
+  isDark: boolean
+}) {
+  const P = patchSize
+  const mids = hist.bins.map(b => b.mid)
+  const means = hist.bins.map(b => b.mean)
+  const upper = hist.bins.map(b => b.mean + b.std)
+  const lower = hist.bins.map(b => b.mean - b.std)
+  const counts = hist.bins.map(b => b.count)
+  const xMax = hist.maxDist
+  // Optional pink hover-marker if the user is hovering a cell on the matrix.
+  const hoverShapes = hoverDist != null && hoverDist > 0
+    ? [{
+        type: 'line' as const,
+        x0: hoverDist,
+        x1: hoverDist,
+        yref: 'paper' as const,
+        y0: 0,
+        y1: 1,
+        line: { color: '#26c6da', width: 1.5, dash: 'dot' as const },
+      }]
+    : []
+  return (
+    <div className="plot-card" style={{ marginTop: '0.5rem' }}>
+      <Plot
+        data={[
+          // ±σ band — drawn first so the mean line sits on top. Use a
+          // 'tonexty' fill between the upper and lower trace.
+          {
+            x: mids,
+            y: upper,
+            type: 'scatter',
+            mode: 'lines',
+            line: { color: 'rgba(25, 118, 210, 0)', width: 0 },
+            hoverinfo: 'skip',
+            showlegend: false,
+            name: '+σ',
+          },
+          {
+            x: mids,
+            y: lower,
+            type: 'scatter',
+            mode: 'lines',
+            fill: 'tonexty',
+            fillcolor: 'rgba(25, 118, 210, 0.18)',
+            line: { color: 'rgba(25, 118, 210, 0)', width: 0 },
+            hoverinfo: 'skip',
+            showlegend: false,
+            name: '−σ',
+          },
+          {
+            x: mids,
+            y: means,
+            type: 'scatter',
+            mode: 'lines+markers',
+            line: { color: '#1976d2', width: 1.5 },
+            marker: { size: 4, color: '#1976d2' },
+            customdata: counts.map((c, i) => [c, hist.bins[i].std, mids[i] * ANGSTROMS_PER_VOXEL] as [number, number, number]),
+            hovertemplate:
+              'd=%{x:.2f} voxels (%{customdata[2]:.2f} Å)' +
+              '<br>mean corr=%{y:.4f} ± %{customdata[1]:.4f}' +
+              '<br>n=%{customdata[0]:,} pairs<extra></extra>',
+            name: 'mean ± σ corr',
+          },
+        ]}
+        layout={{
+          autosize: true,
+          height: 280,
+          margin: { t: 24, r: 30, b: 44, l: 60 },
+          title: { text: 'corr(ρ_i, ρ_j) vs 3-D voxel distance' },
+          xaxis: {
+            title: { text: '3-D distance ‖pos(i) − pos(j)‖₂ (voxel units; ~0.065 Å each)' },
+            range: [0, xMax],
+            zeroline: false,
+          },
+          yaxis: {
+            title: { text: 'mean corr (±σ band)' },
+            zeroline: true,
+          },
+          hoverlabel: themedHoverlabel(isDark),
+          shapes: [
+            { type: 'line', x0: 1, x1: 1, yref: 'paper', y0: 0, y1: 1, line: { color: '#e91e63', width: 1, dash: 'dash' } },
+            { type: 'line', x0: P, x1: P, yref: 'paper', y0: 0, y1: 1, line: { color: '#ff8a65', width: 1, dash: 'dash' } },
+            ...hoverShapes,
+          ],
+          annotations: [
+            { x: 1, yref: 'paper', y: 1.0, text: 'd=1 (NN)', showarrow: false, font: { color: '#e91e63', size: 10 } },
+            { x: P, yref: 'paper', y: 1.0, text: `d=P=${P}`, showarrow: false, font: { color: '#ff8a65', size: 10 } },
           ],
         }}
         config={{ responsive: true, displayModeBar: false }}
