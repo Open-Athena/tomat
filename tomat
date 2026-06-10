@@ -4095,7 +4095,7 @@ def cache_build(
 
     cmd = [
         IRIS_BIN, "--cluster=marin", "job", "run",
-        "--cpu", str(cpu), "--memory", memory, "--enable-extra-resources", "--priority", "interactive",
+        "--cpu", str(cpu), "--memory", memory, "--disk", "100GB", "--enable-extra-resources", "--priority", "interactive",
     ]
     for z in (zone or "").split(","):
         if z := z.strip():
