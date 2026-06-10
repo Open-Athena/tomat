@@ -240,7 +240,7 @@ def strip_iris_log(text: str) -> str:
 
 # iris requires --prefix to be `/<user>/<jobname>` (2+ segments). We fan
 # out across the conventional job-name prefixes used in tomat work.
-DEFAULT_IRIS_PREFIXES = ("/ryan/tomat", "/ryan/train", "/ryan/eval", "/ryan/kl")
+DEFAULT_IRIS_PREFIXES = ("/ryan/tomat", "/ryan/train", "/ryan/eval")
 
 
 def iris_list_lines(prefixes: tuple[str, ...] = DEFAULT_IRIS_PREFIXES, state: str | None = None) -> list[str]:
@@ -1498,7 +1498,7 @@ def _iris_job_list_json(prefix: str, timeout: int = 60) -> list[dict]:
 # Used by `iris sync` to decide which parent jobs warrant a per-label
 # attempts sidecar (training runs only — not the m-eval / tomat-eval
 # sidecar jobs, which would just bloat the snapshot).
-TRAINING_JOB_RE = re.compile(r"^/[^/]+/(train-[^/]+|kl-[^/]+)$")
+TRAINING_JOB_RE = re.compile(r"^/[^/]+/(train-[^/]+)$")
 
 
 @iris_grp.command("attempts")
@@ -2336,8 +2336,6 @@ def evals():
 @click.option("-T", "--num-tasks", default=1, type=int, help="Fan out the mat set across N iris jobs. Each job gets a contiguous slice of size ~n_mats/N via the eval script's existing TOMAT_EVAL_SKIP+TOMAT_EVAL_N_MATS env vars. Per-task results land at `<set>-<mode>/step-<N>-task-<i>.json`; `tomat evals sync` aggregates them. Use when free-running eval at n_mats=200 is too slow on a single task (see specs/38).")
 @click.option("-b", "--eval-batch", default=32, type=int)
 @click.option("-t", "--tpu", default="v6e-8")
-@click.option("--zone", default=None, help="iris --zone (e.g. europe-west4-a); pin eval slice to the ckpt-bucket region to avoid x-reg ckpt-read egress. Repeatable via comma-sep list.")
-@click.option("--region", default=None, help="iris --region (e.g. europe-west4); broader pin than --zone.")
 @click.option("--decoder", default="median")
 @click.option("-d", "--dry-run", is_flag=True, help="print iris commands without executing")
 @click.option("-D", "--debug-dump-mat", default="", help="dump per-voxel rho_pred/rho_true (and per-patch flat arrays in free mode) to GCS for this mp_id; overrides n_mats")
@@ -2361,8 +2359,6 @@ def evals_fire(
     num_tasks: int,
     eval_batch: int,
     tpu: str,
-    zone: str | None,
-    region: str | None,
     decoder: str,
     dry_run: bool,
     debug_dump_mat: str,
@@ -2537,14 +2533,6 @@ def evals_fire(
                     IRIS_BIN, "--cluster=marin", "job", "run",
                     "--tpu", tpu, "--enable-extra-resources", "--priority", "interactive",
                     "--cpu", "32", "--memory", "64GB",
-                ]
-                if zone:
-                    for z in zone.split(","):
-                        cmd += ["--zone", z]
-                if region:
-                    for r in region.split(","):
-                        cmd += ["--region", r]
-                cmd += [
                     "--env-vars", "WANDB_API_KEY", wandb_key,
                     "--env-vars", "TOMAT_LABEL", eval_label,
                     "--env-vars", "TOMAT_MODEL", model,
@@ -4042,7 +4030,6 @@ def cache_mirror(data_label: str, source: str, targets: str | None, splits: str,
 
 @cache_grp.command("build")
 @click.option("-l", "--data-label", default="train-full-v3", help="data label whose cache to build")
-@click.option("--suffix", default=None, help="suffix to append to job name (avoid collision with stuck prior fires)")
 @click.option("--bucket", default=None, help=f"bucket where the cache should land (default: {GCS_BUCKET})")
 @click.option("--lmq-path", default=None, help="TOMAT_LMQ_PATH (default = {bucket}/codecs/lmq-v2-16k.npz)")
 @click.option("--cpu", default=16, type=int, help="iris --cpu")
@@ -4053,7 +4040,6 @@ def cache_mirror(data_label: str, source: str, targets: str | None, splits: str,
 @click.option("-d", "--dry-run", is_flag=True, help="print iris cmd without firing")
 def cache_build(
     data_label: str,
-    suffix: str | None,
     bucket: str | None,
     lmq_path: str | None,
     cpu: int,
@@ -4077,8 +4063,6 @@ def cache_build(
     lmq_path = lmq_path or f"{bucket}/codecs/lmq-v2-16k.npz"
     wandb_key = os.environ.get("WANDB_API_KEY", "<WANDB_API_KEY>")
     job_name = f"cache-build-{data_label}-{bucket.rsplit('/', 1)[0].rsplit('-', 1)[-1]}"
-    if suffix:
-        job_name = f"{job_name}-{suffix}"
 
     env_vars: list[tuple[str, str]] = [
         ("WANDB_API_KEY", wandb_key),
@@ -4806,6 +4790,7 @@ def _compute_one_cost(
         detect_allocation_class,
         parse_tpu_hardware,
         parse_tpu_hardware_from_attempts,
+        parse_tpu_hardware_from_manifest,
         TpuVariant,
     )
     from datetime import datetime, timezone
@@ -4839,6 +4824,17 @@ def _compute_one_cost(
         if parsed is not None:
             notes.append(
                 f"hardware inferred from attempts sidecar worker hostname: "
+                f"{parsed[0]}-{parsed[1]}"
+            )
+    # Final fallback: read `summary.throughput/device_kind` + `num_devices`
+    # from the wandb manifest. Catches in-flight TPU runs whose iris job has
+    # churned past iris-state's snapshot AND whose attempts sidecar hasn't
+    # been written yet (e.g. `kl-s05-tpu-cont-v3` mid-run).
+    if parsed is None and not is_modal_run:
+        parsed = parse_tpu_hardware_from_manifest(manifest)
+        if parsed is not None:
+            notes.append(
+                f"hardware inferred from wandb summary device_kind: "
                 f"{parsed[0]}-{parsed[1]}"
             )
 

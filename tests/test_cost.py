@@ -14,6 +14,7 @@ from tomat.cost import (
     compute_modal_segment_from_manifest,
     compute_tpu_segment_from_manifest,
     parse_modal_gpu,
+    parse_tpu_hardware_from_manifest,
 )
 
 
@@ -176,6 +177,79 @@ def test_tpu_segment_unknown_variant():
     variant = TpuVariant(variant="v7e", num_chips=32, allocation_class="preemptible")
     assert compute_tpu_segment_from_manifest(
         variant, _manifest(ts_min=0.0, ts_max=3600.0),
+    ) is None
+
+
+# ── TPU: hardware inference from wandb summary ──────────────────────────────
+
+
+def _manifest_with_device(kind, n_devices, ts_min=None, ts_max=None):
+    """Fixture matching the manifest shape with `summary.throughput/device_kind`
+    + `summary.num_devices` populated (Levanter writes both on first step)."""
+    return {
+        "history": {"ts_min": ts_min, "ts_max": ts_max},
+        "summary": {
+            "throughput/device_kind": kind,
+            "num_devices": n_devices,
+        },
+        "run": {"state": "running"},
+    }
+
+
+def test_parse_tpu_hw_from_manifest_v6e16():
+    # The exact strings Levanter logged for `kl-s05-tpu-cont-v3` /
+    # `train-mg-tz-11-bs256`: "TPU v6 lite" → v6e, num_devices=16.
+    parsed = parse_tpu_hardware_from_manifest(
+        _manifest_with_device("TPU v6 lite", 16),
+    )
+    assert parsed == ("v6e", 16)
+
+
+def test_parse_tpu_hw_from_manifest_v5p():
+    parsed = parse_tpu_hardware_from_manifest(
+        _manifest_with_device("TPU v5p", 32),
+    )
+    assert parsed == ("v5p", 32)
+
+
+def test_parse_tpu_hw_from_manifest_case_insensitive():
+    # JAX historically capitalises the variant differently across versions
+    # ("TPU v6 lite" vs "TPU V6 LITE"); accept both.
+    parsed = parse_tpu_hardware_from_manifest(
+        _manifest_with_device("TPU V6 LITE", 16),
+    )
+    assert parsed == ("v6e", 16)
+
+
+def test_parse_tpu_hw_from_manifest_missing_fields():
+    # No device_kind, no num_devices, partial — all → None.
+    assert parse_tpu_hardware_from_manifest(None) is None
+    assert parse_tpu_hardware_from_manifest({}) is None
+    assert parse_tpu_hardware_from_manifest({"summary": {}}) is None
+    assert parse_tpu_hardware_from_manifest(
+        {"summary": {"throughput/device_kind": "TPU v6 lite"}}
+    ) is None
+    assert parse_tpu_hardware_from_manifest(
+        {"summary": {"num_devices": 16}}
+    ) is None
+
+
+def test_parse_tpu_hw_from_manifest_unknown_kind():
+    # An unknown device_kind string (CPU, GPU, future TPU variant) → None
+    # so the caller doesn't accidentally bill at a guessed rate.
+    assert parse_tpu_hardware_from_manifest(
+        _manifest_with_device("cpu", 1),
+    ) is None
+    assert parse_tpu_hardware_from_manifest(
+        _manifest_with_device("NVIDIA H100", 8),
+    ) is None
+
+
+def test_parse_tpu_hw_from_manifest_zero_devices():
+    # `num_devices=0` is a bug-shaped manifest (Levanter hadn't logged yet);
+    # don't synthesize a 0-chip segment.
+    assert parse_tpu_hardware_from_manifest(
+        _manifest_with_device("TPU v6 lite", 0),
     ) is None
 
 

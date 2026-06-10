@@ -80,6 +80,16 @@ _MODAL_GPU_RE = re.compile(
 _TPU_VARIANT_RE = re.compile(
     r"(?<![a-z0-9])(v5p|v6e|tpu)(\d+)(?![a-z0-9])", re.IGNORECASE,
 )
+# Levanter logs `throughput/device_kind = jax.devices()[0].device_kind` —
+# values like "TPU v6 lite" (v6e), "TPU v5p", "TPU v5 lite" (v5e). Used as
+# the wandb-summary fallback for run labels with no chip-count suffix
+# (e.g. `kl-s05-tpu-cont-v3`, `train-mg-tz-11-bs256`).
+DEVICE_KIND_TO_VARIANT = {
+    "tpu v6 lite": "v6e",
+    "tpu v5 lite": "v5e",
+    "tpu v5p": "v5p",
+    "tpu v4": "v4",
+}
 
 
 # Schema mirrors `tomat:76-92`. Bump version on incompatible changes.
@@ -435,6 +445,24 @@ def _parse_tpu_variant(label):
     return (family, chips)
 
 
+def _parse_tpu_variant_from_manifest(manifest):
+    """Read `(family, num_chips)` from `summary.throughput/device_kind` +
+    `summary.num_devices`. Used when the run name has no chip-count suffix
+    but the wandb run is reporting hardware (any Levanter TPU run is).
+    Mirrors `tomat.cost.parse_tpu_hardware_from_manifest` — kept inline so
+    the cron VM doesn't need the `tomat` package installed.
+    """
+    summary = (manifest or {}).get("summary") or {}
+    kind = summary.get("throughput/device_kind")
+    n = summary.get("num_devices")
+    if not isinstance(kind, str) or not isinstance(n, int) or n <= 0:
+        return None
+    family = DEVICE_KIND_TO_VARIANT.get(kind.strip().lower())
+    if family is None:
+        return None
+    return (family, n)
+
+
 def _modal_segment_from_manifest(label, manifest):
     """Modal cost segment from `history.ts_max - ts_min`. None when:
        - label has no Modal GPU suffix
@@ -490,23 +518,35 @@ def _tpu_segment_from_manifest(label, manifest):
     direction: it UNDERESTIMATES vs on-demand for reserved/serving slices,
     which is the right direction for a public MSRP chip — matches
     `tomat.cost.detect_allocation_class`'s default.
+
+    Returns `(segment_dict, source_note_or_None)` so the caller can record
+    a note when the hardware was inferred from the wandb summary fallback
+    rather than the run name itself.
     """
     parsed = _parse_tpu_variant(label)
+    source_note = None
     if parsed is None:
-        return None
+        parsed = _parse_tpu_variant_from_manifest(manifest)
+        if parsed is not None:
+            source_note = (
+                f"hardware inferred from wandb summary device_kind: "
+                f"{parsed[0]}-{parsed[1]}"
+            )
+    if parsed is None:
+        return None, None
     family, chips = parsed
     rates = TPU_RATES_USD_PER_CHIP_HR.get(family)
     if rates is None:
-        return None
+        return None, None
     rate = rates["preemptible"]
     hist = (manifest or {}).get("history") or {}
     ts_min, ts_max = hist.get("ts_min"), hist.get("ts_max")
     if not (isinstance(ts_min, (int, float)) and isinstance(ts_max, (int, float))
             and ts_max > ts_min):
-        return None
+        return None, None
     wallclock_sec = float(ts_max - ts_min)
     if wallclock_sec < 1.0:
-        return None
+        return None, None
     msrp = (wallclock_sec / 3600.0) * chips * rate
     return {
         "kind": "tpu",
@@ -517,7 +557,7 @@ def _tpu_segment_from_manifest(label, manifest):
         "source": "wandb history ts span (covers all iris re-fires)",
         "started_at_ms": int(ts_min * 1000),
         "finished_at_ms": int(ts_max * 1000),
-    }
+    }, source_note
 
 
 def _compute_and_upload_cost(s3, run_name, manifest):
@@ -531,7 +571,9 @@ def _compute_and_upload_cost(s3, run_name, manifest):
     seg = _modal_segment_from_manifest(run_name, manifest)
     notes = []
     if seg is None:
-        seg = _tpu_segment_from_manifest(run_name, manifest)
+        seg, tpu_note = _tpu_segment_from_manifest(run_name, manifest)
+        if tpu_note:
+            notes.append(tpu_note)
     else:
         notes.append(
             "Modal MSRP is an estimate from wandb-tracked wallclock × "

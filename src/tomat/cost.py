@@ -258,6 +258,45 @@ def parse_tpu_hardware_from_attempts(attempts: dict | None) -> tuple[str, int] |
     return None
 
 
+# Levanter's wandb summary reports `throughput/device_kind` as JAX's
+# `jax.devices()[0].device_kind` string (e.g. "TPU v6 lite", "TPU v5p",
+# "TPU v5 lite") + `num_devices` as the global chip count. Used as the
+# final fallback when neither the run name nor an attempts sidecar
+# discloses the hardware (current-in-flight runs whose iris job has
+# already churned past iris-state's snapshot — e.g. `kl-s05-tpu-cont-v3`).
+_DEVICE_KIND_TO_VARIANT: dict[str, str] = {
+    "tpu v6 lite": "v6e",
+    "tpu v5 lite": "v5e",  # noted for future; no published rate in our table
+    "tpu v5p": "v5p",
+    "tpu v4": "v4",        # noted for future; no published rate in our table
+}
+
+
+def parse_tpu_hardware_from_manifest(manifest: dict | None) -> tuple[str, int] | None:
+    """Recover `(variant, num_chips)` from a wandb manifest's summary.
+
+    Reads `summary.throughput/device_kind` ("TPU v6 lite", "TPU v5p", ...)
+    + `summary.num_devices` (global chip count = `jax.device_count()`).
+    Returns None when either field is missing or the device-kind string
+    isn't in `_DEVICE_KIND_TO_VARIANT`.
+
+    This is the broadest fallback — it catches any TPU run with wandb
+    history, even ones whose run name has no hw suffix AND no attempts
+    sidecar yet (e.g. a freshly-fired iris job before its first death).
+    """
+    if manifest is None:
+        return None
+    summary = manifest.get("summary") or {}
+    kind = summary.get("throughput/device_kind")
+    n = summary.get("num_devices")
+    if not isinstance(kind, str) or not isinstance(n, int) or n <= 0:
+        return None
+    variant = _DEVICE_KIND_TO_VARIANT.get(kind.strip().lower())
+    if variant is None:
+        return None
+    return variant, n
+
+
 def detect_allocation_class(attempts: dict | None) -> str:
     """Sniff the allocation class out of an attempts-sidecar's worker names.
 
