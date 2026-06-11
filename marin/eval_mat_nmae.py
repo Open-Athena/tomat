@@ -708,10 +708,15 @@ def main():
     # size mismatch. Detect MG-trained models from the ckpt path / run name
     # so the right MASK_ID lands without needing an extra env-var.
     MASK_ID: int | None = None
+    # MaskGIT-trained models have +1 vocab (MASK token at end of embedding table).
+    # Eval-side detection: name/path substring sniff. Generic loss-name prefixes
+    # (`kl-`, `crps-`, `emd-`, …) all imply MG since those LF arms only exist
+    # in the MaskGIT subclass; explicit `TOMAT_EVAL_FORCE_MG_VOCAB=1` is the
+    # escape hatch for anything else.
+    _name_blob = os.environ.get("TOMAT_EVAL_RUN_LABEL", "") + "::" + checkpoint_path
     _mg_trained = (
         os.environ.get("TOMAT_EVAL_FORCE_MG_VOCAB") == "1"
-        or "mg-" in os.environ.get("TOMAT_EVAL_RUN_LABEL", "")
-        or "mg-" in checkpoint_path
+        or any(tok in _name_blob for tok in ("mg-", "kl-", "crps-", "emd-", "tz-"))
     )
     if eval_mode == "maskgit" or _mg_trained:
         MASK_ID = vocab_size
