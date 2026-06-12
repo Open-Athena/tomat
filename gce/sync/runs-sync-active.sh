@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # tomat-runs-sync-active: sync the small set of "currently moving" runs.
 #
-# Active = wandb state == "running" OR last log emitted < 15 min ago
-# (cheap to determine via the already-cached snapshot the dashboard reads).
-# Runs that fail either test are picked up by the stale-sync timer instead
+# Active = wandb `run.state == "running"` (lower-case in the manifest;
+# see `RunManifest.run.state` in `site/src/runs/api.ts`) OR an iris job
+# state in {RUNNING, PENDING, BUILDING} (upper-case per worker.ts). Runs
+# that fail both tests are picked up by the stale-sync timer instead
 # (every 30 min), so we don't hammer wandb for every dead run every 2 min.
 #
 # Logs every per-run sync's stdout/stderr prefixed with `[<run>] ` so
@@ -11,8 +12,9 @@
 set -euo pipefail
 
 REPO_DIR="${TOMAT_REPO_DIR:-$HOME/tomat}"
-SNAPSHOT_URL="${TOMAT_SNAPSHOT_URL:-https://tomat.oa.dev/api/runs-snapshot.json}"
-ACTIVE_MAX_LOG_AGE_SEC="${TOMAT_ACTIVE_MAX_LOG_AGE_SEC:-900}"  # 15 min
+# tomat-runs-api Cloudflare Worker — same origin the FE reads. NOT the
+# `tomat.oa.dev` FE host: it serves the SPA, not the API.
+SNAPSHOT_URL="${TOMAT_SNAPSHOT_URL:-https://tomat-runs-api.openathena.workers.dev/api/runs-snapshot.json}"
 
 cd "$REPO_DIR"
 
@@ -27,19 +29,18 @@ if ! curl -sfL --max-time 20 -o "$SNAPSHOT_TMP" "$SNAPSHOT_URL"; then
     exit 0
 fi
 
-# Active filter:
-#   - iris reports state RUNNING / PENDING / BUILDING (uppercase per worker.ts)
-#   - OR snapshot-side last log < 15 min ago (via `last_log_sec_ago`
-#     when the snapshot exposes it; falls back to 9999 if absent so we
-#     don't accidentally treat every run as active).
-ACTIVE_RUNS=$(jq -r --argjson maxAge "$ACTIVE_MAX_LOG_AGE_SEC" '
+# Active filter union:
+#   - iris jobs in {RUNNING, PENDING, BUILDING} → strip the `/<owner>/`
+#     prefix from the key to get the label (which matches the wandb
+#     display name).
+#   - wandb runs whose manifest `run.state == "running"`.
+ACTIVE_RUNS=$(jq -r '
     ((.iris.jobs // {}) | to_entries[]
         | select(.value.state == "RUNNING" or .value.state == "PENDING" or .value.state == "BUILDING")
         | .key
         | capture("^/[^/]+/(?<label>.+)$").label),
     ((.runs // {}) | to_entries[]
-        | select(.value != null)
-        | select((.value.last_log_sec_ago // 9999) < $maxAge)
+        | select(.value != null and (.value.run.state // "") == "running")
         | .key)
 ' < "$SNAPSHOT_TMP" | sort -u)
 

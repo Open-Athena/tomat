@@ -5,10 +5,15 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=ryan
-WorkingDirectory=/home/ryan/tomat
-EnvironmentFile=-/etc/default/tomat-monitor
-ExecStart=/home/ryan/tomat/gce/sync/runs-sync-stale.sh
+User=ryan_williams_openathena_ai
+WorkingDirectory=/home/ryan_williams_openathena_ai/tomat
+Environment=PATH=/home/ryan_williams_openathena_ai/iris-sync-venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/ryan_williams_openathena_ai
+Environment=GOOGLE_APPLICATION_CREDENTIALS=/home/ryan_williams_openathena_ai/.config/gcloud/application_default_credentials.json
+Environment=AWS_SHARED_CREDENTIALS_FILE=/home/ryan_williams_openathena_ai/.aws/credentials
+Environment=AWS_PROFILE=cfo
+EnvironmentFile=/home/ryan_williams_openathena_ai/.wandb-api-key.env
+ExecStart=/home/ryan_williams_openathena_ai/tomat/gce/sync/runs-sync-stale.sh
 StandardOutput=journal
 StandardError=journal
 
