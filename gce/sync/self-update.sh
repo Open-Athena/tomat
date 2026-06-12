@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # tomat-self-update: pull latest main and re-install systemd units.
 #
-# `git pull --ff-only` is the deploy gate: if the local clone has diverged
-# (uncommitted edits, hand-applied hotfixes), this fails loud rather than
-# silently rewriting the work tree. Recover by ssh'ing in and resolving by
-# hand — the cron is meant for clean fast-forwards from main only.
+# Uses `git fetch && git reset --hard @{u}` rather than `git pull` so we
+# can never get wedged by a dirty work tree on the VM — `pull` fails on
+# any local mutation and would freeze the auto-deploy loop until someone
+# SSH'd in, but `reset --hard` blows past it. The VM clone is meant to be
+# strictly a mirror of `origin/main`; if you need to hand-edit the
+# checkout for debugging, accept that the next 5-min tick will wipe it.
 #
 # systemd-safety note: this script is itself launched by
 # `tomat-self-update.service`. When install.sh restarts a unit whose
@@ -17,16 +19,21 @@ set -euo pipefail
 REPO_DIR="${TOMAT_REPO_DIR:-$HOME/tomat}"
 cd "$REPO_DIR"
 
-# Fail fast on a dirty work tree — we don't want a hand-edited clone to
-# silently get overwritten by an --ff-only that suddenly succeeds.
-if ! git diff --quiet || ! git diff --cached --quiet; then
-    echo "self-update: work tree dirty, refusing to pull" >&2
-    git status --short >&2
-    exit 1
+BEFORE_SHA="$(git rev-parse HEAD)"
+
+# `git fetch` is the only network call this script makes; if it fails
+# (network glitch, GH ratelimit), we exit cleanly and the next tick will
+# retry. We do NOT want a transient fetch failure to leave the work tree
+# in some half-updated state.
+if ! git fetch --quiet; then
+    echo "self-update: git fetch failed; will retry next tick" >&2
+    exit 0
 fi
 
-BEFORE_SHA="$(git rev-parse HEAD)"
-git pull -q --ff-only
+# Hard-reset to the tracking branch's tip. Wipes any local edits — see
+# header comment for rationale.
+git reset --quiet --hard '@{u}'
+
 AFTER_SHA="$(git rev-parse HEAD)"
 
 if [[ "$BEFORE_SHA" == "$AFTER_SHA" ]]; then

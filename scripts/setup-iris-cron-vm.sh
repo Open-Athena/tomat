@@ -1,29 +1,40 @@
 #!/usr/bin/env bash
-# Idempotent setup for the `tomat-iris-cron` GCE VM (e2-small, us-east1-d).
+# First-time bring-up for the `tomat-iris-cron` GCE VM (e2-small, us-east1-d).
 #
 # NB: must be e2-small (2GB), not e2-micro (1GB) — installing wandb +
 # pyarrow into the venv OOM-wedges a 1GB VM (swap-thrash so deep that
 # even sshd can't get a login shell).
+#
+# Scope: this script handles ONLY the host-level + venv-level provisioning
+# that has to happen before the cron jobs themselves can be installed.
+# The actual cron units (systemd timers + sync scripts) live under
+# `gce/` in the tomat repo and are installed from there — see the
+# `gce/README.md` quickstart. This script's parting message hands off to
+# that flow.
 #
 # Prereqs (perform from the laptop before SSHing in):
 #   1. `gcloud compute scp` the artifacts to ~/ on the VM:
 #        - ~/.config/gcloud/application_default_credentials.json  (ADC)
 #        - ~/.aws/credentials                                     ([cfo] profile for R2)
 #        - ~/.wandb-api-key                                       (single-line WANDB_API_KEY)
-#        - scripts/iris-sync.py                                   (iris-state cron worker)
-#        - scripts/runs-sync.py                                   (wandb-runs cron worker)
 #        - scripts/setup-iris-cron-vm.sh                          (this script)
 #   2. `gcloud compute ssh` into the VM and `bash ~/setup-iris-cron-vm.sh`
 #
 # What this does:
-#   - apt-installs python3-venv, git, cron
-#   - creates a venv at ~/iris-sync-venv with marin-iris @ pinned SHA
+#   - apt-installs python3-venv, git, jq, curl, awscli, cron
+#   - creates a venv at ~/iris-sync-venv with marin-iris @ pinned SHA + the
+#     wandb / pyarrow / fsspec deps that the new `tomat runs sync` subcmd needs
 #   - ssh-keygens the key gcloud expects for IAP tunneling
-#   - drops the cron entry: minute-by-minute calls to iris-sync.py
-#   - leaves logs at ~/iris-sync.log
+#
+# After this finishes, the next steps are MANUAL (the operator clones the
+# repo and runs `gce/install.sh`):
+#
+#     git clone https://github.com/Open-Athena/tomat.git ~/tomat
+#     ~/tomat/gce/install.sh --check
+#     ~/tomat/gce/install.sh
 #
 # Re-run safely: each step is idempotent (won't clobber existing keys, venv,
-# or crontab entry).
+# or apt-installed packages).
 set -euo pipefail
 
 # Pin marin to the same commit the laptop venv has — daily-rotating dev
@@ -32,9 +43,13 @@ MARIN_SHA="674eb2a4f06ab6daf5478ebdceddcd76a277a5eb"
 MARIN_REPO="https://github.com/marin-community/marin"
 
 # --- apt deps --------------------------------------------------------------
+# `cron` is kept in the install list because the legacy ~/iris-sync.py and
+# ~/runs-sync.py crontab entries still run alongside the new systemd timers
+# during the cutover. Once those entries are removed (see gce/README.md
+# "Coexistence" section) `cron` can drop off this list.
 sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-    python3-venv python3-pip git cron
+    python3-venv python3-pip git jq curl awscli cron
 
 # --- python venv with marin-iris -------------------------------------------
 VENV="$HOME/iris-sync-venv"
@@ -71,53 +86,31 @@ if [ ! -f "$HOME/.ssh/google_compute_engine" ]; then
         -C "tomat-iris-cron@$(hostname)" -N ''
 fi
 
-# --- script placements + perms ---------------------------------------------
-chmod +x "$HOME/iris-sync.py" "$HOME/runs-sync.py"
-
-# wandb API key file (single-line) — runs-sync.py reads this if WANDB_API_KEY
-# isn't already in env. Cron strips env, so the file is the path of least
-# resistance.
+# --- wandb API key file ----------------------------------------------------
+# wandb API key file (single-line) — both legacy runs-sync.py and the
+# new gce/install.sh's `--check` look for this path. `gce/install.sh`
+# additionally synthesizes a sibling `~/.wandb-api-key.env` (KEY=VAL
+# form) for systemd's EnvironmentFile=.
 if [ ! -f "$HOME/.wandb-api-key" ]; then
-    echo "[setup] WARN: ~/.wandb-api-key missing — runs-sync.py will fail."
-    echo "[setup]       scp it from your laptop: gcloud compute scp ~/.wandb-api-key \$VM:~/"
+    echo "[setup] WARN: ~/.wandb-api-key missing — runs-sync.py and the new"
+    echo "[setup]       gce/install.sh --check will fail. scp it from your"
+    echo "[setup]       laptop: gcloud compute scp ~/.wandb-api-key \$VM:~/"
 fi
 chmod 600 "$HOME/.wandb-api-key" 2>/dev/null || true
 
-# --- cron entries ----------------------------------------------------------
-# Replace any prior `iris-sync.py` / `runs-sync.py` lines, idempotently.
-TMP_CRON=$(mktemp)
-crontab -l 2>/dev/null | grep -vE 'iris-sync\.py|runs-sync\.py' > "$TMP_CRON" || true
-# iris-sync every 5 min: each iris call rebuilds its IAP tunnel (~60s typical,
-# can spike to 200s); 3 prefixes serially fits comfortably in a 5-min cycle.
-echo "*/5 * * * * $VENV/bin/python $HOME/iris-sync.py >> $HOME/iris-sync.log 2>&1" >> "$TMP_CRON"
-# runs-sync every 1 min, flock-guarded: no IAP tunnel needed (wandb API +
-# R2 PUT only), but a sync of a large run's full history can take 40-95s
-# (it re-fetches all rows each tick), so `flock -n` skips the tick if the
-# prior runs-sync is still running — otherwise overlapping procs pile up
-# and can re-OOM the VM once several runs are active at once.
-echo "* * * * * /usr/bin/flock -n /tmp/runs-sync.lock $VENV/bin/python $HOME/runs-sync.py >> $HOME/runs-sync.log 2>&1" >> "$TMP_CRON"
-crontab "$TMP_CRON"
-rm -f "$TMP_CRON"
-
-# Make sure the cron daemon is running on first boot.
+# Make sure the cron daemon is running on first boot (still needed for the
+# legacy iris-sync / runs-sync entries until they're removed).
 sudo systemctl enable --now cron 2>/dev/null || sudo service cron start
 
-# --- sanity-check by running each script once now --------------------------
-echo "[setup] one-off iris-sync.py verification:"
-"$VENV/bin/python" "$HOME/iris-sync.py" || {
-    echo "[setup] iris-sync.py failed on first run — see output above"
-    exit 1
-}
-if [ -f "$HOME/.wandb-api-key" ]; then
-    echo "[setup] one-off runs-sync.py verification:"
-    "$VENV/bin/python" "$HOME/runs-sync.py" || {
-        echo "[setup] runs-sync.py failed on first run — see output above"
-        exit 1
-    }
-fi
-
 echo
-echo "[setup] DONE. crontab:"
-crontab -l
+echo "[setup] DONE. Host-level provisioning complete."
 echo
-echo "[setup] tail -f ~/iris-sync.log ~/runs-sync.log to watch cron runs"
+echo "[setup] Next: clone the tomat repo and install the systemd cron units."
+echo
+echo "    git clone https://github.com/Open-Athena/tomat.git ~/tomat"
+echo "    ~/tomat/gce/install.sh --check"
+echo "    ~/tomat/gce/install.sh"
+echo
+echo "[setup] See ~/tomat/gce/README.md for the journalctl recipes and the"
+echo "[setup] cutover plan for the legacy ~/iris-sync.py / ~/runs-sync.py"
+echo "[setup] crontab entries (additive coexistence during rollout)."

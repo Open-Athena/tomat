@@ -32,8 +32,11 @@ cat > "$PAYLOAD_TMP" <<JSON
 JSON
 
 # aws-cli is already on the VM (used by other tomat sync paths). Endpoint
-# URL routes to R2 instead of S3.
-aws s3 cp --quiet \
+# URL routes to R2 instead of S3. `--profile cfo` matches the section in
+# `~/.aws/credentials` that the existing runs-sync.py reads (see its
+# `setup_r2_client`); the systemd unit also exports `AWS_PROFILE=cfo` so
+# this is belt-and-suspenders.
+aws --profile "${AWS_PROFILE:-cfo}" s3 cp --quiet \
     --endpoint-url "$R2_ENDPOINT" \
     --content-type application/json \
     --cache-control "max-age=30" \

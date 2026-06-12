@@ -13,18 +13,34 @@
 #               restart changed services. Requires `sudo` for the
 #               /etc/systemd/system writes + `systemctl` calls.
 #
-# Authentication is expected to come from `/etc/default/tomat-monitor`
-# (the EnvironmentFile= on every service). That file is sensitive
-# (WANDB_API_KEY, R2 creds, GCS-ADC path) so it lives ONLY on the VM and
-# is not written by this script. We validate its keys exist; we never
-# print their values.
+# Authentication is read from the files the legacy crontab-based
+# iris-sync/runs-sync already provisioned on the VM:
+#   ~/.aws/credentials                              ([cfo] profile for R2)
+#   ~/.config/gcloud/application_default_credentials.json   (GCS + iris)
+#   ~/.wandb-api-key                                (single-line raw key)
+# `--check` validates each one is present; no values are ever printed.
+#
+# For systemd's `EnvironmentFile=` (which requires KEY=VAL lines, not the
+# raw single-line `~/.wandb-api-key` the existing Python scripts read),
+# this installer synthesizes `~/.wandb-api-key.env` as a sibling file
+# whenever the raw key changes. The raw file is NOT modified.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SYSTEMD_SRC="$SCRIPT_DIR/systemd"
 SYSTEMD_DST="/etc/systemd/system"
-ENV_FILE="${TOMAT_ENV_FILE:-/etc/default/tomat-monitor}"
+
+# VM-local auth paths. Hard-coded to match the live `tomat-iris-cron` VM
+# (Debian 12, user `ryan_williams_openathena_ai`). If we ever provision a
+# second monitor VM with a different user, factor these out — for now,
+# baking them in matches what the systemd units use.
+VM_HOME="${TOMAT_VM_HOME:-/home/ryan_williams_openathena_ai}"
+WANDB_KEY_RAW="$VM_HOME/.wandb-api-key"
+WANDB_KEY_ENV="$VM_HOME/.wandb-api-key.env"
+GCLOUD_ADC="$VM_HOME/.config/gcloud/application_default_credentials.json"
+AWS_CREDS="$VM_HOME/.aws/credentials"
+IRIS_VENV="$VM_HOME/iris-sync-venv"
 
 # Timers we enable + their paired services. (Each *.timer wakes its
 # *.service of the same basename via `Unit=` default.) Listed explicitly
@@ -44,13 +60,6 @@ SERVICES=(
     tomat-evals-sync.service
     tomat-self-update.service
 )
-# Required cred env keys (presence check only — never log values).
-REQUIRED_ENV_KEYS=(
-    WANDB_API_KEY
-    AWS_ACCESS_KEY_ID
-    AWS_SECRET_ACCESS_KEY
-    GOOGLE_APPLICATION_CREDENTIALS
-)
 
 CHECK_ONLY=0
 case "${1:-}" in
@@ -65,18 +74,64 @@ fail() { echo "  FAIL: $*" >&2; FAILED=$((FAILED + 1)); }
 
 FAILED=0
 
-echo "== check: env file =="
-if [[ ! -r "$ENV_FILE" ]]; then
-    fail "$ENV_FILE missing or unreadable"
+echo "== check: platform =="
+# systemd is Linux-only. macOS dev shells should run `--check` and bail
+# with a clear message rather than crashing later on missing systemctl.
+case "$(uname -s)" in
+    Linux) ok "kernel: $(uname -sr)" ;;
+    *) fail "requires Linux + systemd (got $(uname -s)); macOS dev hosts cannot install" ;;
+esac
+
+echo "== check: repo state =="
+# `.git` may be a directory (regular clone) or a file (git worktree
+# pointer); `rev-parse` handles both.
+if ! git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    fail "$REPO_DIR is not a git clone (need: git clone https://github.com/Open-Athena/tomat.git $VM_HOME/tomat)"
 else
-    ok "$ENV_FILE exists"
-    for key in "${REQUIRED_ENV_KEYS[@]}"; do
-        if grep -qE "^${key}=" "$ENV_FILE"; then
-            ok "$key set"
-        else
-            fail "$key missing from $ENV_FILE"
-        fi
-    done
+    ok "git clone: $REPO_DIR"
+fi
+
+echo "== check: ./tomat CLI =="
+if [[ -x "$REPO_DIR/tomat" ]]; then
+    ok "$REPO_DIR/tomat is executable"
+else
+    fail "$REPO_DIR/tomat missing or not executable"
+fi
+
+echo "== check: iris-sync-venv =="
+if [[ ! -d "$IRIS_VENV" ]]; then
+    fail "$IRIS_VENV missing (legacy crontab provisions this; see scripts/setup-iris-cron-vm.sh)"
+elif [[ ! -x "$IRIS_VENV/bin/python" ]]; then
+    fail "$IRIS_VENV/bin/python not executable"
+elif ! "$IRIS_VENV/bin/python" -c 'import wandb' >/dev/null 2>&1; then
+    fail "wandb not importable from $IRIS_VENV"
+else
+    ok "$IRIS_VENV/bin/python imports wandb"
+fi
+
+echo "== check: wandb api key =="
+if [[ ! -r "$WANDB_KEY_RAW" ]]; then
+    fail "$WANDB_KEY_RAW missing or unreadable"
+elif [[ ! -s "$WANDB_KEY_RAW" ]]; then
+    fail "$WANDB_KEY_RAW exists but is empty"
+else
+    ok "$WANDB_KEY_RAW present (non-empty)"
+fi
+
+echo "== check: gcloud ADC =="
+if [[ ! -r "$GCLOUD_ADC" ]]; then
+    fail "$GCLOUD_ADC missing (run: gcloud auth application-default login)"
+else
+    ok "$GCLOUD_ADC present"
+fi
+
+echo "== check: aws creds + [cfo] profile =="
+if [[ ! -r "$AWS_CREDS" ]]; then
+    fail "$AWS_CREDS missing"
+elif ! AWS_SHARED_CREDENTIALS_FILE="$AWS_CREDS" aws configure list --profile cfo >/dev/null 2>&1; then
+    fail "[cfo] profile missing from $AWS_CREDS"
+else
+    ok "[cfo] profile present in $AWS_CREDS"
 fi
 
 echo "== check: PATH tools =="
@@ -87,44 +142,6 @@ for tool in curl jq aws git gcloud systemctl; do
         fail "$tool not on PATH"
     fi
 done
-
-echo "== check: repo state =="
-if [[ ! -d "$REPO_DIR/.git" ]]; then
-    fail "$REPO_DIR is not a git clone"
-else
-    ok "git clone: $REPO_DIR"
-    if git -C "$REPO_DIR" pull --dry-run --ff-only >/dev/null 2>&1; then
-        ok "git pull --ff-only would succeed"
-    else
-        fail "git pull --dry-run --ff-only failed (diverged or no remote)"
-    fi
-fi
-
-echo "== check: ./tomat CLI =="
-if (cd "$REPO_DIR" && ./tomat --help >/dev/null 2>&1); then
-    ok "./tomat --help runs"
-else
-    fail "./tomat --help failed (venv / direnv broken?)"
-fi
-
-echo "== check: gcloud ADC =="
-if gcloud auth application-default print-access-token >/dev/null 2>&1; then
-    ok "gcloud ADC token mints"
-else
-    fail "gcloud auth application-default print-access-token failed"
-fi
-
-echo "== check: R2 access =="
-# Source env so AWS_* + endpoint vars are available for the test call.
-# Subshell so we don't leak creds into the parent.
-R2_ENDPOINT="${TOMAT_R2_ENDPOINT:-https://43a6f2d588b1483733189d39418ec5be.r2.cloudflarestorage.com}"
-R2_BUCKET="${TOMAT_R2_BUCKET:-openathena}"
-if ( set -a; . "$ENV_FILE" 2>/dev/null; set +a;
-     aws s3 ls "s3://$R2_BUCKET/tomat/" --endpoint-url "$R2_ENDPOINT" >/dev/null 2>&1 ); then
-    ok "s3 ls s3://$R2_BUCKET/tomat/ (R2) returned"
-else
-    fail "s3 ls against R2 failed"
-fi
 
 if (( FAILED > 0 )); then
     err ""
@@ -141,6 +158,25 @@ fi
 # ------------------------------------------------------------------
 # Install phase
 # ------------------------------------------------------------------
+
+# Synthesize the systemd-style env file from the raw single-line key, IFF
+# the raw key has changed (or the .env doesn't exist yet). The .env file
+# is `WANDB_API_KEY=<value>` — what systemd `EnvironmentFile=` expects.
+# The raw file is left untouched so the legacy `runs-sync.py` /
+# `iris-sync.py` Python scripts (which read it raw) keep working.
+echo ""
+echo "== install: synthesize ~/.wandb-api-key.env =="
+RAW_KEY="$(tr -d '\r\n ' < "$WANDB_KEY_RAW")"
+DESIRED_LINE="WANDB_API_KEY=$RAW_KEY"
+if [[ -r "$WANDB_KEY_ENV" ]] && [[ "$(cat "$WANDB_KEY_ENV")" == "$DESIRED_LINE" ]]; then
+    echo "  unchanged: $WANDB_KEY_ENV"
+else
+    umask 077
+    printf '%s\n' "$DESIRED_LINE" > "$WANDB_KEY_ENV"
+    chmod 0600 "$WANDB_KEY_ENV"
+    echo "  wrote:     $WANDB_KEY_ENV (mode 0600)"
+fi
+
 echo ""
 echo "== install: copy units =="
 
