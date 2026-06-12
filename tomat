@@ -3422,7 +3422,7 @@ def _write_submission_record(
 @click.option("--memory", default="64GB", help="iris --memory")
 @click.option("--max-retries", default=20, show_default=True, type=int, help="iris --max-retries (failure budget; iris default is 0, which classifies JAX-distributed leader-preempt cascades as fatal failures. 20 buys us ~20 sibling-cascade survivals before terminal.)")
 @click.option("-e", "--env", "extra_env", multiple=True, help="extra env var KEY=VAL (repeatable)")
-@click.option("--shuffle-window-blocks", type=int, default=1024, show_default=True, help="TOMAT_SHUFFLE_WINDOW_BLOCKS; BlockShuffle within-window mixing radius. Shuffle is ON by default — pass 0 to disable.")
+@click.option("--shuffle-window-blocks", default="auto", show_default=True, help="TOMAT_SHUFFLE_WINDOW_BLOCKS; BlockShuffle within-window mixing radius (int or `auto`). `auto` resolves on the trainer to the full epoch width for the active data label (ceildiv(epoch_seqs, io_block_size)) — the only honest default; anything smaller leaves intra-epoch ordering memorization on the table (the kl-bin5-fs sawtooth pre-step-34k). Pass 0 to disable shuffle.")
 @click.option("--shuffle-io-block-size", type=int, default=0, help="TOMAT_SHUFFLE_IO_BLOCK_SIZE; 0 = auto from meta (M)")
 @click.option("--share-cache/--no-share-cache", default=True, help="Trainer reads the mirrored cache at `<bucket>/cache/<data_label>/` (default on). With TOMAT_SHARE_CACHE=1, the trainer detects its actual GCE zone at startup and picks the local-region mirror — drop `--zone` to let iris park the slice wherever has capacity. `--no-share-cache` falls back to per-run rebuild under the canonical bucket.")
 @click.option("--watch-preempts/--no-watch-preempts", default=True, help="auto-fire `tomat preempts watch <LABEL>` in the background after launch (default on)")
@@ -3466,7 +3466,7 @@ def train(
     memory: str,
     max_retries: int,
     extra_env: tuple[str, ...],
-    shuffle_window_blocks: int,
+    shuffle_window_blocks: str,
     shuffle_io_block_size: int,
     share_cache: bool,
     watch_preempts: bool,
@@ -3692,7 +3692,8 @@ def train(
     if resume_mode or from_ckpt is not None:
         env_vars.append(("TOMAT_REQUIRE_RESUME", "1"))
     # Always emit — shuffle is on by default; `--shuffle-window-blocks 0` is
-    # the explicit opt-out (the trainer's own env default then never applies).
+    # the explicit opt-out and `auto` (default) defers epoch-window resolution
+    # to the trainer (`marin/train_tomat_tpu.py:_epoch_window_blocks`).
     env_vars.append(("TOMAT_SHUFFLE_WINDOW_BLOCKS", str(shuffle_window_blocks)))
     if shuffle_io_block_size > 0:
         env_vars.append(("TOMAT_SHUFFLE_IO_BLOCK_SIZE", str(shuffle_io_block_size)))

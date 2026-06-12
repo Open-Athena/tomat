@@ -360,6 +360,37 @@ _REGION_TO_CACHE_BUCKET = {
     "europe-west4": "gs://marin-eu-west4/tomat",
 }
 
+# Per-data-label sequence counts for the auto epoch-window shuffle default.
+# Kept in lockstep with `site/src/runs/runMeta.ts:EPOCH_SEQUENCES`. When you
+# add a new tokenized data label, update both. Row counts come from each
+# cache's `train/shard_ledger.json`.
+_EPOCH_SEQUENCES = {
+    "train-full-v3":          4_954_176,
+    "train-full-v3-shuffled": 4_954_176,
+    "train-full-v3-shard1":   4_964_352,
+    "train-full-v3-shard2":   4_964_352,
+    "train-full-v3-shard3":   4_964_352,
+}
+
+
+def _epoch_window_blocks(label: str, io_block_size: int) -> int:
+    """Block count covering one full epoch under the active io-block size.
+
+    Resolves the `TOMAT_SHUFFLE_WINDOW_BLOCKS=auto` default. Falls back to
+    a known-good large value (78125, matching the train-full-v3-shard1 epoch
+    we were running mid-2026-06) with a loud warning if the label is unknown
+    — better to over-shuffle than to silently land back at the 1024-block
+    sawtooth that bit kl-bin5-fs through step 34k.
+    """
+    seqs = _EPOCH_SEQUENCES.get(label)
+    if seqs is None:
+        fallback = 78125
+        print(f"[tomat-tpu] WARN: shuffle-window auto-default has no row count"
+              f" for label={label!r} (extend _EPOCH_SEQUENCES). Falling back"
+              f" to window_blocks={fallback}.")
+        return fallback
+    return -(-seqs // max(1, io_block_size))  # ceildiv
+
 
 def _detect_gce_region() -> str | None:
     """GCE region (e.g. 'us-east5') from the metadata server; None on failure."""
@@ -766,15 +797,29 @@ def main():
     # batches read in cache order, which for tomat means consecutive patches
     # from the same material (M=32 or 64 sequences/mat): only ~BS/M unique
     # mats per batch, hurting gradient quality. So shuffle is ON by default
-    # here — `TOMAT_SHUFFLE_WINDOW_BLOCKS` (default 1024) → `BlockShuffleConfig`:
+    # here — `TOMAT_SHUFFLE_WINDOW_BLOCKS` (default `auto` → epoch-window) →
+    # `BlockShuffleConfig`:
     #   - `io_block_size` (rows per IO chunk; default = M from meta) keeps
     #     each block as one mat's patches — cache-friendly sequential reads.
-    #   - `window_blocks` is the within-window mixing radius; 1024 blocks ×
-    #     M rows ≈ 32–65k rows per shuffle window. Set to 0 to disable.
-    shuffle_window_blocks = int(os.environ.get("TOMAT_SHUFFLE_WINDOW_BLOCKS", "1024"))
+    #   - `window_blocks` is the within-window mixing radius. The honest
+    #     default is to mix across an entire epoch — anything smaller leaves
+    #     intra-epoch ordering memorization on the table (kl-bin5-fs saw a
+    #     ~10× sawtooth on TL until we bumped window_blocks from the old
+    #     1024 to ~78125 mid-run; see memory `feedback_smoke_before_sweep`).
+    #     Auto-compute: `window_blocks = ceil(epoch_seqs / io_block_size)`.
+    #     Use the per-label EPOCH_SEQUENCES table below (mirrors the FE's
+    #     `site/src/runs/runMeta.ts:EPOCH_SEQUENCES`). Pass an explicit
+    #     integer to override; pass 0 to disable shuffle entirely.
     shuffle_io_block_size = int(
         os.environ.get("TOMAT_SHUFFLE_IO_BLOCK_SIZE", "0")
     ) or int(meta.get("patches_per_material", 32))
+    shuffle_window_env = os.environ.get("TOMAT_SHUFFLE_WINDOW_BLOCKS", "auto")
+    if shuffle_window_env in ("auto", ""):
+        shuffle_window_blocks = _epoch_window_blocks(label, shuffle_io_block_size)
+        print(f"[tomat-tpu] shuffle: auto epoch-window for label={label!r}"
+              f" → window_blocks={shuffle_window_blocks}")
+    else:
+        shuffle_window_blocks = int(shuffle_window_env)
     if shuffle_window_blocks > 0:
         shuffle_cfg: bool | int | BlockShuffleConfig = BlockShuffleConfig(
             io_block_size=shuffle_io_block_size,
