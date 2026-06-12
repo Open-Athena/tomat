@@ -1,1 +1,4 @@
 dist/
+test-results/
+tests/e2e/.report/
+playwright-report/
