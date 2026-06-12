@@ -267,7 +267,7 @@ def _history_block(table) -> dict:
     if table.num_rows == 0:
         return {"rows": 0, "step_min": None, "step_max": None,
                 "last_train_step": None,
-                "ts_min": None, "ts_max": None}
+                "ts_min": None, "ts_max": None, "last_row": {}}
     step_col = table.column("_step")
     ts_col = table.column("_timestamp")
     last_train_step: int | None = None
@@ -277,6 +277,23 @@ def _history_block(table) -> dict:
             if v is not None:
                 last_train_step = int(v)
                 break
+    # Build a "last non-null per column" row from the parquet's tail. Walks
+    # backward up to N rows; this is fine even when the trailing rows are
+    # cluster/* pings (train/loss is None there — keep walking). Used by
+    # `_build_manifest` to backfill summary fields for runs whose wandb
+    # summary-flush didn't include them.
+    last_row: dict[str, float | int | str] = {}
+    tail_rows = min(table.num_rows, 200)
+    if tail_rows > 0:
+        tail = table.slice(table.num_rows - tail_rows, tail_rows)
+        for col_name in tail.schema.names:
+            if col_name.startswith("_") or col_name == "global_step":
+                continue
+            col = tail.column(col_name).to_pylist()
+            for v in reversed(col):
+                if v is not None:
+                    last_row[col_name] = v
+                    break
     return {
         "rows": table.num_rows,
         "step_min": int(step_col[0].as_py()),
@@ -284,12 +301,34 @@ def _history_block(table) -> dict:
         "last_train_step": last_train_step,
         "ts_min": float(ts_col[0].as_py()) if ts_col[0].is_valid else None,
         "ts_max": float(ts_col[-1].as_py()) if ts_col[-1].is_valid else None,
+        "last_row": last_row,
     }
 
 
 def _build_manifest(primary, history: dict) -> dict:
     """Assemble the manifest dict from a wandb Run + a `history` block."""
     summary = dict(primary.summary)
+    # Backfill missing throughput/training-stat fields from history's last
+    # non-null row. wandb flushes summary AT RUN-END; if the trainer process
+    # ends in `failed` state mid-flight (host crash, OOM-kill, etc.), the
+    # auto-flushed summary is missing these fields → dashboard cards lose
+    # tr / MFU / EF / $/EF and the cost computer falls back to $0 because
+    # it can't infer hardware from `throughput/device_kind`. Sample the last
+    # history row for each missing key. (`primary.summary` always has the
+    # cron-written `cluster/*` and the basic wandb `_runtime`/`_step`/
+    # `_timestamp`, so those don't need backfilling.)
+    _BACKFILL_KEYS = (
+        "train/loss", "throughput/mfu", "throughput/p50_mfu",
+        "throughput/tokens_per_second", "throughput/duration",
+        "throughput/total_gflops", "throughput/device_kind",
+        "throughput/theoretical_flops_per_device", "throughput/theoretical_flops",
+        "throughput/flops_per_example", "num_devices",
+    )
+    last_row = history.get("last_row") if isinstance(history, dict) else None
+    if last_row:
+        for k in _BACKFILL_KEYS:
+            if k not in summary and last_row.get(k) is not None:
+                summary[k] = last_row[k]
     return {
         "schema_version": RUN_PARQUET_SCHEMA_VERSION,
         "synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),

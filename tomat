@@ -1117,6 +1117,29 @@ def runs_sync(substr: str, bucket: str, prefix: str, project: str | None, dry_ru
             if v is not None:
                 last_train_step = int(v)
                 break
+    # Backfill `summary` with the last non-null history value for the
+    # training-stat fields wandb auto-flushes only at clean exit. Bin5's
+    # trainer ended `failed` so the wandb-side summary lacks
+    # train/loss + throughput/* — without this, the dashboard card loses
+    # tr / MFU / EF and cost.json computes $0 (no device_kind to infer
+    # hardware). Mirror of `scripts/runs-sync.py:_build_manifest` (cron).
+    _BACKFILL_KEYS = (
+        "train/loss", "throughput/mfu", "throughput/p50_mfu",
+        "throughput/tokens_per_second", "throughput/duration",
+        "throughput/total_gflops", "throughput/device_kind",
+        "throughput/theoretical_flops_per_device", "throughput/theoretical_flops",
+        "throughput/flops_per_example", "num_devices",
+    )
+    if table.num_rows:
+        tail_n = min(table.num_rows, 200)
+        tail = table.slice(table.num_rows - tail_n, tail_n)
+        for col_name in _BACKFILL_KEYS:
+            if col_name in summary or col_name not in tail.schema.names:
+                continue
+            for v in reversed(tail.column(col_name).to_pylist()):
+                if v is not None:
+                    summary[col_name] = v
+                    break
     manifest = {
         "schema_version": _RUN_PARQUET_SCHEMA_VERSION,
         "synced_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
