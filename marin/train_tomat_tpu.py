@@ -831,11 +831,15 @@ def main():
         cache_dir = f"{BUCKET}/results/{results_label}/cache"
         print(f"[tomat-tpu] cache_dir=PER-RUN {cache_dir}")
     _assert_cache_local(cache_dir)
+    if len(label_parts_list) > 1:
+        # ConcatDatasetComponent: each child's cache_dir is the read target.
+        # Assert per-child so the same cross-region guard applies as for the
+        # single-label path.
+        for p in label_parts_list:
+            _assert_cache_local(f"{BUCKET}/cache/{p}/")
 
-    # `parquet_glob` is a list-of-globs (one per `_label_parts(label)`).
-    # Single-label case is just one glob; multi-label union passes all
-    # components → one Levanter cache spans the union.
-    source = UrlDatasetSourceConfig(train_urls=parquet_glob)
+    # Format is shared across all components (verified by the meta consistency
+    # check above).
     if f1_mode:
         # F1: carry both `input_ids` and `atom_xyz` through the cache.
         # `f1_data.F1PrebuiltLmDatasetFormat` registers itself under the
@@ -847,11 +851,35 @@ def main():
         print(f"[tomat-tpu] F1 mode ON: num_freqs={f1_num_freqs}")
     else:
         prebuilt = PrebuiltLmDatasetFormat(input_ids_key="input_ids")
-    component = DatasetComponent(
-        source=source,
-        cache_dir=cache_dir,
-        format=prebuilt,
-    )
+
+    # Single-label case: one DatasetComponent backed by the per-label cache,
+    # source set so Levanter auto-builds if missing (unchanged behavior).
+    # Multi-label case: one ConcatDatasetComponent whose children are the
+    # per-shard DatasetComponents. Each child points at its own pre-built
+    # per-shard cache (e.g. `<bucket>/cache/train-full-v3/`), so the
+    # ConcatDatasetComponent virtually concatenates them at train time
+    # without rebuilding. The downstream `BlockShuffleConfig` then walks
+    # the unified row index space — strict without-replacement mixing
+    # across the union. See marin Levanter PR (TODO link) for the API.
+    if len(label_parts_list) == 1:
+        source = UrlDatasetSourceConfig(train_urls=parquet_glob)
+        component = DatasetComponent(
+            source=source,
+            cache_dir=cache_dir,
+            format=prebuilt,
+        )
+    else:
+        from levanter.data.text import ConcatDatasetComponent
+        children: dict[str, DatasetComponent] = {}
+        for p, g in zip(label_parts_list, parquet_glob):
+            children[p] = DatasetComponent(
+                source=UrlDatasetSourceConfig(train_urls=[g]),
+                cache_dir=f"{BUCKET}/cache/{p}/",
+                format=prebuilt,
+            )
+        component = ConcatDatasetComponent(children=children)
+        print(f"[tomat-tpu] ConcatDatasetComponent: {len(children)} children — "
+              f"reusing per-shard caches under {BUCKET}/cache/<shard>/")
     # Shuffle config. Levanter's `LmDataConfig.shuffle` defaults to False —
     # batches read in cache order, which for tomat means consecutive patches
     # from the same material (M=32 or 64 sequences/mat): only ~BS/M unique
