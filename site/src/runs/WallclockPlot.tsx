@@ -690,12 +690,13 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         hoverLabel = `${name} · ${groupTitle} (${ancestor.name})`
       } else {
         traceColor = color
-        // Linear ramp anchored on the latest CURRENT-RUN segment: oldest
-        // current-run seg = 0.40, latest = 1.0. Floor at 0.40 (was 0.18) so
-        // older trajectories stay readable as individual lines.
+        // Current-run restart segments are sequential in x (step, wallclock,
+        // and epoch all monotonic across resumes), so they never visually
+        // overlap — a recency fade adds no information, only readability cost.
+        // The dashed gap-bridge between segments already shows where restarts
+        // happened.
+        opacity = 1
         const relIdx = segIdx - firstCurrentSeg
-        const lastRel = lastNonEmptyCurrent - firstCurrentSeg
-        opacity = lastRel <= 0 ? 1 : 0.40 + 0.60 * (relIdx / lastRel)
         legendGroup = lg
         groupTitle = 'losses (log)'
         showLegend = isLatest
@@ -775,12 +776,10 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       // Dotted bridge connecting each gap's endpoints. Same color/opacity/
       // legendgroup as the main line so a legend-toggle hides them with the
       // rest of the segment; `showlegend: false` so it doesn't add its own
-      // LI. We use `hoverinfo: 'none'` (NOT 'skip') intentionally: the
-      // `applyBandFade` callback above force-sets opacity on all
-      // `showlegend:false + hoverinfo:'skip'` traces (the eval / ±σ band
-      // edges) to either 1 or 0.3, which would flatten the older-segment
-      // opacity ramp on our bridges. `'none'` lets the configured opacity
-      // pass through while still suppressing the bridge's tooltip.
+      // LI. `hoverinfo: 'none'` (NOT 'skip') keeps `applyBandFade` from
+      // sweeping the bridge into its `showlegend:false + hoverinfo:'skip'`
+      // bucket (which force-sets opacity to 1 or 0.3 on every band edge);
+      // 'none' suppresses the bridge's tooltip without joining that bucket.
       const bridgeTrace: SmoothedTrace | null = bridgeX.length > 0 ? {
         x: bridgeX, y: bridgeY, name: segName,
         type: 'scatter', mode: 'lines',
