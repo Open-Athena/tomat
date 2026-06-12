@@ -1947,6 +1947,28 @@ def main():
                     "nemd": nemd,
                 })
                 _flush_results()
+                # Dump per-patch (pred, true) for ELvis diff viewing. The
+                # maskgit branch builds `rho_pred` (full grid) and `density`
+                # (full true grid); rebuild patch arrays from offsets here
+                # rather than threading another mutable accumulator through
+                # the K-iter inner loop. Cheap: n_patches × P³ floats per mat.
+                if dump_predictions:
+                    _iota_p = np.arange(P, dtype=np.int32)
+                    _di_p, _dj_p, _dk_p = np.meshgrid(_iota_p, _iota_p, _iota_p, indexing="ij")
+                    _gx_p = np.asarray(grid_shape, dtype=np.int32)
+                    _off_p = np.asarray(offsets, dtype=np.int32)
+                    _ix_p = (_off_p[:, 0, None, None, None] + _di_p) % _gx_p[0]
+                    _iy_p = (_off_p[:, 1, None, None, None] + _dj_p) % _gx_p[1]
+                    _iz_p = (_off_p[:, 2, None, None, None] + _dk_p) % _gx_p[2]
+                    _all_pred_mg = rho_pred[_ix_p, _iy_p, _iz_p].reshape(
+                        n_patches, P ** 3,
+                    ).astype(np.float32)
+                    _all_true_mg = density[_ix_p, _iy_p, _iz_p].reshape(
+                        n_patches, P ** 3,
+                    ).astype(np.float32)
+                    _dump_mat_predictions(
+                        mp_id, _all_pred_mg, _all_true_mg, _off_p,
+                    )
                 continue
 
             rho_pred = np.zeros(grid_shape, dtype=np.float32)
