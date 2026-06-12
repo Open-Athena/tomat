@@ -16,7 +16,7 @@ import { themedHoverlabel } from '../theme'
 import type { RunHistory } from './parquet'
 import { ancestorsOf } from './lineage'
 import { ALL_TAGS, cycleTagFilter, effectiveTagState, parseTagFiltersLegacyLs, runPassesTagFilters, tagsFor, TAG_FILTER_PARAM, type RunTag, type TagFilters } from './tags'
-import { stringParam, useUrlState, type Param } from 'use-prms'
+import { enumParam, stringParam, useUrlState, type Param } from 'use-prms'
 import { compileMultiTermFilter } from './filter'
 import {
   applySmoothing, bandsParam, DEFAULT_EMA_ALPHA, DEFAULT_ROLLING_WINDOW,
@@ -97,7 +97,22 @@ const X_MODES: { id: XMode; label: string; help: string }[] = [
   { id: 'loss', label: 'loss vs step', help: 'training-loss curves against step' },
   { id: 'flop', label: 'flop', help: 'training step vs cumulative FLOPs — normalizes across BS / hardware' },
 ]
+// Legacy localStorage key. We migrate it once on first read so existing
+// users keep their preferred view; afterwards `?x=…` in the URL is canonical.
 const X_MODE_KEY = 'tomat:runs-xmode'
+// URL-facing names for the x-mode. The internal `'rel'` reads as `elapsed`
+// in deep-link URLs (matches the per-run plot's same-named axis); other
+// modes pass through unchanged. The legacy localStorage values use the
+// internal names (`rel`, `clock`, …) — the migration in `useXModeUrlState`
+// translates on read.
+const URL_X_MODES = ['clock', 'elapsed', 'active', 'loss', 'flop'] as const
+type UrlXMode = (typeof URL_X_MODES)[number]
+const X_TO_URL: Record<XMode, UrlXMode> = {
+  clock: 'clock', rel: 'elapsed', active: 'active', loss: 'loss', flop: 'flop',
+}
+const URL_TO_X: Record<UrlXMode, XMode> = {
+  clock: 'clock', elapsed: 'rel', active: 'active', loss: 'loss', flop: 'flop',
+}
 const LEGEND_COLLAPSED_KEY = 'tomat:runs-legend-collapsed'
 const NAME_FILTER_KEY = 'tomat:runs-name-filter'
 export const TAG_FILTER_KEY = 'tomat:runs-tag-filter'
@@ -502,18 +517,37 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
     return next
   })
 
-  // x-axis mode also persists.
-  const [xMode, setXModeRaw] = useState<XMode>(() => {
-    try {
-      const v = localStorage.getItem(X_MODE_KEY)
-      if (v === 'clock' || v === 'rel' || v === 'active' || v === 'loss') return v
-    } catch { /* ignore */ }
-    return 'clock'
-  })
-  const setXMode = (m: XMode) => {
-    setXModeRaw(m)
-    try { localStorage.setItem(X_MODE_KEY, m) } catch { /* ignore */ }
-  }
+  // x-axis mode persists in `?x=…` so the URL is shareable (deep-link
+  // someone into your loss-vs-step or FLOP view). On first render we
+  // migrate the legacy `localStorage[X_MODE_KEY]` into the URL when no
+  // `?x=` is present, then drop the LS entry — matches the
+  // `useNameFilter` LS→URL migration pattern.
+  const [urlXMode, setUrlXMode] = useUrlState('x', enumParam<UrlXMode>('clock', URL_X_MODES))
+  const xMode: XMode = URL_TO_X[urlXMode]
+  const setXMode = (m: XMode) => setUrlXMode(X_TO_URL[m])
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    let lsVal: string | null = null
+    try { lsVal = localStorage.getItem(X_MODE_KEY) } catch { /* ignore */ }
+    if (!lsVal) return
+    // Only migrate if the URL hasn't already been set (default 'clock' means
+    // "nothing in URL"). Migrating after the user has touched the chip would
+    // overwrite their fresh choice.
+    if (urlXMode !== 'clock') {
+      // URL has a non-default x already → user expressed a preference this
+      // session; drop the LS entry without writing.
+      try { localStorage.removeItem(X_MODE_KEY) } catch { /* ignore */ }
+      return
+    }
+    const legalLs = ['clock', 'rel', 'active', 'loss', 'flop'] as const
+    if ((legalLs as readonly string[]).includes(lsVal)) {
+      setUrlXMode(X_TO_URL[lsVal as XMode])
+    }
+    try { localStorage.removeItem(X_MODE_KEY) } catch { /* ignore */ }
+    // Empty deps — fire once on mount. `setUrlXMode` is stable per the
+    // useUrlState contract; including it would just re-run on render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // Log-scale the loss axis (loss-vs-step mode only). Persisted.
   const [logY, setLogYRaw] = useState(() => {
