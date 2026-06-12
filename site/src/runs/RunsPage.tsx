@@ -8,7 +8,16 @@ import { concatHistories, fetchRunHistory, type RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
 import { RecentEvents } from './RecentEvents'
 import { EvalsPanel } from './EvalsPanel'
-import { MEvalTable } from './MEvalTable'
+import { MEvalTable, type MEvalMetric } from './MEvalTable'
+
+// Shared NMAE/NEMD toggle for the run-detail M-eval section — drives both
+// the MEvalTable cells AND the WallclockPlot's MT/MV panel + legend so the
+// user's choice affects both views at once. `?mevm=nmae|nemd` in the URL
+// (defaults to NMAE).
+const M_EVAL_METRICS = ['nmae', 'nemd'] as const
+function useMEvalMetric(): readonly [MEvalMetric, (m: MEvalMetric) => void] {
+  return useUrlState('mevm', enumParam<MEvalMetric>('nmae', M_EVAL_METRICS))
+}
 import { RunsTimelinePlot, colorForIndex, useNameFilter, useTagFilters, useAncestorsToggle, compileMultiTermFilter, runHaystack, shortLabel } from './RunsTimelinePlot'
 import { runPassesTagFilters, tagsFor } from './tags'
 import { ancestorsOf, lineageFor } from './lineage'
@@ -1269,6 +1278,9 @@ function RunDetail({ runId }: { runId: string }) {
   // this run's own segment. When the run has no recorded ancestors, the toggle
   // is hidden and we render this run's history directly (one query, no concat).
   const [lineageMode, setLineageMode] = useLineageMode()
+  // NMAE / NEMD toggle shared between MEvalTable (table cells) and
+  // WallclockPlot (MT/MV panel). URL-persisted via `?mevm=`.
+  const [mevalMetric, setMevalMetric] = useMEvalMetric()
   const ancestors = useMemo(() => ancestorsOf(runId), [runId])
   // `useQueries` returns a stable array indexed by ancestor; ancestors-first
   // (parent, grandparent, …) so concat below reverses to chronological order.
@@ -1488,10 +1500,16 @@ function RunDetail({ runId }: { runId: string }) {
       )}
       {/* Per-step m-eval table — compact summary of the eval.json points
           surfaced as `step | val_200 | train_200 | …-maskgit` with subtle
-          NMAE/NEMD colour-coding. Sits above the timeline so the most-
-          important quality numbers are immediately visible. Self-hides when
+          colour-coding. Sits above the timeline so the most-important
+          quality numbers are immediately visible. The NMAE/NEMD toggle on
+          the table also flips the MT/MV panel on the WallclockPlot below
+          (shared `?mevm` URL state, lifted here). Self-hides when
           `eval.json` returned nothing. */}
-      <MEvalTable evalSeries={evalQ.data ?? null} />
+      <MEvalTable
+        evalSeries={evalQ.data ?? null}
+        metric={mevalMetric}
+        setMetric={setMevalMetric}
+      />
       {!history && !err && <p>loading parquet…</p>}
       {history && (
         <WallclockPlot
@@ -1501,6 +1519,7 @@ function RunDetail({ runId }: { runId: string }) {
           attempts={attemptsQ.data ?? null}
           manifest={manifest}
           lineageInfo={lineageInfo}
+          mevalMetric={mevalMetric}
         />
       )}
       <EvalsPanel

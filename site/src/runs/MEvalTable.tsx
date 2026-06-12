@@ -19,7 +19,7 @@
 // already carries `per_mat[].mp_id`, so the elvis link-out is just a
 // (run_id, step, mp_id) tuple → an elvis URL.
 
-import type { ReactElement } from 'react'
+import type { CSSProperties, ReactElement } from 'react'
 import { useTheme } from 'pltly/react'
 import type { EvalPoint, RunEval } from './api'
 import {
@@ -30,8 +30,15 @@ import {
 export { nemdBucket, nmaeBucket, stepsDescOf } from './MEvalTable.helpers'
 export type { Bucket } from './MEvalTable.helpers'
 
+/** Metric the M-eval section displays — NMAE (default) or NEMD. Both the
+ *  plot (WallclockPlot's MT/MV panel) and this table read from the same
+ *  shared state in RunsPage so the toggle drives both at once. */
+export type MEvalMetric = 'nmae' | 'nemd'
+
 interface Props {
   evalSeries: RunEval | null
+  metric: MEvalMetric
+  setMetric: (m: MEvalMetric) => void
 }
 
 /** Column-key → display label. The four eval-set/mode combinations we
@@ -70,19 +77,22 @@ function fmtPct(v: number | null | undefined, digits = 2): string {
 interface SetCellProps {
   pt: EvalPoint
   isDark: boolean
+  metric: MEvalMetric
 }
 
-function SetCell({ pt, isDark }: SetCellProps): ReactElement {
+function SetCell({ pt, isDark, metric }: SetCellProps): ReactElement {
   const COLORS = isDark ? BUCKET_COLORS_DARK : BUCKET_COLORS_LIGHT
-  const nmaePct = typeof pt.nmae_mean === 'number' ? pt.nmae_mean * 100 : NaN
-  const nemdPct = typeof pt.nemd_mean === 'number' ? pt.nemd_mean * 100 : NaN
-  const nmaeColor = COLORS[nmaeBucket(nmaePct)]
-  const nemdColor = COLORS[nemdBucket(nemdPct)]
+  // Single active metric per cell — the section header tells the reader
+  // which it is, and the column labels stay short ("val_200 · K=1" rather
+  // than "val_200 · K=1 NMAE"). Bucket thresholds + display digits are
+  // metric-specific; everything else is symmetric.
+  const meanFrac = metric === 'nmae' ? pt.nmae_mean : pt.nemd_mean
+  const pct = typeof meanFrac === 'number' ? meanFrac * 100 : NaN
+  const bucket = metric === 'nmae' ? nmaeBucket(pct) : nemdBucket(pct)
+  const color = COLORS[bucket]
   return (
     <span>
-      <span style={{ color: nmaeColor }}>{fmtPct(pt.nmae_mean)}</span>
-      <span style={{ color: '#666' }}> / </span>
-      <span style={{ color: nemdColor }}>{fmtPct(pt.nemd_mean)}</span>
+      <span style={{ color }}>{fmtPct(meanFrac)}</span>
       {pt.n_mats != null && (
         <span style={{ color: '#777' }}> · n={pt.n_mats}</span>
       )}
@@ -90,7 +100,38 @@ function SetCell({ pt, isDark }: SetCellProps): ReactElement {
   )
 }
 
-export function MEvalTable({ evalSeries }: Props): ReactElement | null {
+/** Compact NMAE/NEMD segmented control — matches the x-axis chip rail at
+ *  the top of WallclockPlot (same border + active-state colors) so the two
+ *  controls read as siblings. */
+function MetricChips({
+  metric, setMetric, isDark,
+}: {
+  metric: MEvalMetric
+  setMetric: (m: MEvalMetric) => void
+  isDark: boolean
+}): ReactElement {
+  const btn = (m: MEvalMetric): CSSProperties => ({
+    fontSize: '0.75rem',
+    padding: '0.15rem 0.5rem',
+    borderRadius: 4,
+    border: `1px solid ${metric === m ? '#4a8aff' : (isDark ? '#444' : '#ccc')}`,
+    background: metric === m ? 'rgba(74,138,255,0.15)' : 'transparent',
+    color: 'inherit',
+    cursor: 'pointer',
+  })
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
+      <span style={{ fontSize: '0.75rem', color: '#888' }}>metric:</span>
+      {(['nmae', 'nemd'] as const).map((m) => (
+        <button key={m} type="button" onClick={() => setMetric(m)} style={btn(m)}>
+          {m.toUpperCase()}
+        </button>
+      ))}
+    </span>
+  )
+}
+
+export function MEvalTable({ evalSeries, metric, setMetric }: Props): ReactElement | null {
   const { isDark } = useTheme()
   const steps = stepsDescOf(evalSeries)
   if (steps.length === 0) return null
@@ -119,16 +160,20 @@ export function MEvalTable({ evalSeries }: Props): ReactElement | null {
 
   return (
     <div style={{ marginTop: '0.8rem', marginBottom: '1rem' }}>
-      <h2 style={{ fontSize: '0.95rem', marginBottom: '0.3rem' }}>
-        Per-step m-eval ({steps.length} step{steps.length === 1 ? '' : 's'})
-      </h2>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.8rem', marginBottom: '0.3rem' }}>
+        <h2 style={{ fontSize: '0.95rem', margin: 0 }}>
+          Per-step m-eval ({steps.length} step{steps.length === 1 ? '' : 's'}) ·{' '}
+          <span style={{ color: '#888', fontWeight: 'normal' }}>{metric.toUpperCase()}</span>
+        </h2>
+        <MetricChips metric={metric} setMetric={setMetric} isDark={isDark} />
+      </div>
       <table style={{ borderCollapse: 'collapse', fontSize: '0.8rem' }}>
         <thead>
           <tr>
             <th style={headerStyle}>step</th>
             {colsWithData.map((c) => (
               <th key={c.key} style={headerStyle}>
-                {c.label} <span style={{ color: '#555' }}>NMAE / NEMD</span>
+                {c.label}
               </th>
             ))}
           </tr>
@@ -141,7 +186,7 @@ export function MEvalTable({ evalSeries }: Props): ReactElement | null {
                 const pt = lookup.get(`${step}|${c.key}`)
                 return (
                   <td key={c.key} style={cellStyle}>
-                    {pt ? <SetCell pt={pt} isDark={isDark} /> : (
+                    {pt ? <SetCell pt={pt} isDark={isDark} metric={metric} /> : (
                       <span style={{ color: '#555' }}>–</span>
                     )}
                   </td>

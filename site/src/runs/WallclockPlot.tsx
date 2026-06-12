@@ -76,6 +76,10 @@ interface Props {
    *  ancestor renders in its own color (full opacity, no recency-ramp).
    *  The current run keeps the existing restart-segment opacity-ramp. */
   lineageInfo?: LineageAncestor[] | null
+  /** Which mat-eval metric to plot in the MT/MV panel. Shared with the
+   *  MEvalTable above via lifted state in RunsPage so the user's NMAE/NEMD
+   *  toggle drives both views at once. Defaults to NMAE. */
+  mevalMetric?: 'nmae' | 'nemd'
 }
 
 type XMode = 'time' | 'elapsed' | 'step' | 'epoch' | 'flop'
@@ -94,10 +98,16 @@ const URL_TO_X: Record<UrlXMode, XMode> = {
 
 const COLORS = {
   step: '#2196f3',
-  TL: '#ef5350',     // train/loss
-  VL: '#ffa726',     // eval/loss
-  nmae: '#43a047',   // mat-NMAE — green
-  nemd: '#00acc1',   // mat-NEMD — teal
+  TL: '#ef5350',     // train/loss — red (also used for MT below; train ↔ red)
+  VL: '#ffa726',     // eval/loss  — orange (also used for MV below; val ↔ orange)
+  // MT (mat_nmae/nemd on train_200) — red, matching TL so "train" reads the
+  // same color throughout the plot. MV (val_200) — orange, matching VL.
+  // K=1 (oneshot, the trainer's bare `val_200`/`train_200` setKey) renders
+  // DASHED; K=12 (full MaskGIT iterative decode, the `…-maskgit` setKey)
+  // renders SOLID. The cost/quality intuition: K=12 is the expensive, more
+  // honest decode, so it gets the visually heavier solid line.
+  MT: '#ef5350',     // mat-NMAE/NEMD · train_200 — red (matches TL)
+  MV: '#ffa726',     // mat-NMAE/NEMD · val_200   — orange (matches VL)
   start: '#ffa726',
   sigterm: '#bdbdbd',
   preempt: '#ba68c8',
@@ -134,7 +144,7 @@ const TZ_LABEL: string = (() => {
   }
 })()
 
-export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step', attempts, manifest = null, lineageInfo = null }: Props) {
+export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step', attempts, manifest = null, lineageInfo = null, mevalMetric = 'nmae' }: Props) {
   const { isDark } = useTheme()
   // Wrapper around <Plot> so we can DOM-walk to the `.js-plotly-plot` element
   // and call `Plotly.restyle` on the band traces directly. Bands have
@@ -977,12 +987,24 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   }
 
   // ── eval points from eval.json ──
-  // Per (set × metric): per-step median rendered as a `lines+markers` trace
-  // on the dedicated MT/MV panel (yaxis: 'y3'). Markers are size 6 so the
-  // typically-handful (~4) of timepoints are clearly visible (was: median +
-  // p25–p75 + p1–p99 bands, dropped — see header comment).
+  // Per setKey: per-step median rendered as a `lines+markers` trace on the
+  // dedicated MT/MV panel (yaxis: 'y3'). The active metric (NMAE or NEMD)
+  // is driven by `mevalMetric` (URL-shared with MEvalTable above).
+  //
+  // Visual encoding (matches MEvalTable's column labels):
+  //   • MT (train_200)  → red    (matches TL)
+  //   • MV (val_200)    → orange (matches VL)
+  //   • K=1  (oneshot, bare setKey)        → DASHED
+  //   • K=12 (full MaskGIT, `-maskgit`)    → SOLID
+  // Other modes (`-free`, `…`) keep dashed-K=1 styling for now (no K-shaped
+  // setKey suffix yet) but render in MT/MV's set color — spec 25 follow-up
+  // is the eventual per-mode color-coding.
+  //
+  // Markers are size 6 so the typically-handful (~4) of timepoints are clearly
+  // visible. ±p25-p75 / p1-p99 bands were dropped — see header comment.
   const evalMedianTrace = (
-    setKey: string, mvmt: string, dash: 'solid' | 'dash',
+    setKey: string, mvmt: 'MT' | 'MV', kLabel: string,
+    dash: 'solid' | 'dash',
     metric: 'nmae' | 'nemd',
   ) => {
     const pts = evalSeries?.sets[setKey] ?? []
@@ -999,8 +1021,8 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       customdata.push([pt.step, nMats ?? '?'])
       ys.push(typeof v === 'number' ? v * 100 : null)  // fraction → %
     }
-    const color = COLORS[metric]
-    const name = `${mvmt} ${metric.toUpperCase()}`
+    const color = COLORS[mvmt]  // MT → red, MV → orange (matches TL/VL).
+    const name = `${mvmt} · ${kLabel}`
     // Bypass smoothing for MT/MV — these are sparse eval-point traces (~5-30
     // timepoints per run, 1-10k steps between them). Applying a sample-index
     // rolling window of e.g. N=50 to a 5-point series collapses each output
@@ -1019,32 +1041,39 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       // once; per-trace click-to-toggle still works (plotly's default click
       // toggles the individual trace, not the whole legendgroup).
       legendgroup: 'mtmv',
-      legendgrouptitle: { text: 'MT/MV (mat-NMAE / mat-NEMD %)' },
+      legendgrouptitle: { text: `MT/MV (mat-${metric.toUpperCase()} %)` },
       customdata,
-      hovertemplate: `${name} %{y:.2f}%%<br>step %{customdata[0]} · n_mats %{customdata[1]}<extra></extra>`,
+      hovertemplate: `${name} %{y:.3f}%%<br>step %{customdata[0]} · n_mats %{customdata[1]}<extra></extra>`,
     }
   }
   const evalTraces = useMemo(() => {
     const out: Record<string, unknown>[] = []
-    // val/train_200 are the teacher-mode bare keys (cont33k-era eval.json);
-    // val/train_200-<mode> are non-teacher modes (maskgit, free) — same shape,
-    // same line style for now (spec 25 follow-up: color-code per mode).
+    // setKey conventions on eval.json:
+    //   val_200          → MV · K=1   (oneshot / teacher-mode bare key)
+    //   train_200        → MT · K=1
+    //   val_200-maskgit  → MV · K=12  (full MaskGIT iterative decode)
+    //   train_200-maskgit→ MT · K=12
+    //   …-<other-mode>   → MV/MT · <mode>  (e.g. `-free`; falls through as
+    //                       a dashed trace to keep the legend coherent)
     const setKeys = Object.keys(evalSeries?.sets ?? {})
-    const labelFor = (setKey: string): [string, 'solid' | 'dash'] => {
+    const labelFor = (setKey: string): {
+      mvmt: 'MT' | 'MV'; kLabel: string; dash: 'solid' | 'dash'
+    } => {
       const [base, mode] = setKey.split('-', 2) as [string, string | undefined]
-      const mvmt = base === 'val_200' ? 'MV' : 'MT'
-      const dash = base === 'val_200' ? 'solid' : 'dash'
-      return [mode ? `${mvmt}/${mode}` : mvmt, dash]
+      const mvmt: 'MT' | 'MV' = base === 'val_200' ? 'MV' : 'MT'
+      // K=12 (solid) only for the maskgit mode; bare keys + other modes stay
+      // K=1-style dashed. Treat unknown modes as their literal mode name.
+      const kLabel = mode == null ? 'K=1' : mode === 'maskgit' ? 'K=12' : mode
+      const dash: 'solid' | 'dash' = mode === 'maskgit' ? 'solid' : 'dash'
+      return { mvmt, kLabel, dash }
     }
     for (const setKey of setKeys) {
-      const [mvmt, dash] = labelFor(setKey)
-      for (const metric of ['nmae', 'nemd'] as const) {
-        out.push(evalMedianTrace(setKey, mvmt, dash, metric))
-      }
+      const { mvmt, kLabel, dash } = labelFor(setKey)
+      out.push(evalMedianTrace(setKey, mvmt, kLabel, dash, mevalMetric))
     }
     return out
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [evalSeries, xMode])
+  }, [evalSeries, xMode, mevalMetric])
   // Whether to render the third (MT/MV) panel: true iff the run has at least
   // one eval set with at least one point. Runs without eval.json (or with an
   // empty sets dict) fall back to the legacy 2-panel layout.
@@ -1546,8 +1575,9 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
           yaxis3: {
             // Linear scale: MT/MV values are typically 100-600% (< 6× range),
             // not orders of magnitude — log here compresses the range without
-            // adding information.
-            title: { text: 'mat-NMAE / NEMD %' },
+            // adding information. Title tracks the active metric (NMAE / NEMD)
+            // so the user always knows what the panel is showing.
+            title: { text: `mat-${mevalMetric.toUpperCase()} %` },
             type: 'linear',
             domain: evalDomain ?? [0.0, 0.01],
             gridcolor, zerolinecolor, linecolor: gridcolor,
