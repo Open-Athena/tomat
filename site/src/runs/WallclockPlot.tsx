@@ -388,24 +388,44 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   // Per-metric parquet series (TL/VL): xs, ys, gsteps (gstep for the tooltip).
   type Series = { xs: (string | number)[]; ys: number[]; gsteps: (number | null)[] }
 
-  // Restart-segment boundaries: indices into `ordered` keyed on
-  // `lifecycle/trainer_started` events (each one marks a new trainer
-  // process). Splitting at these boundaries lets us render older restart
-  // trajectories at low opacity so they don't deface the plot, while the
-  // latest segment stays fully visible.
+  // Restart-segment boundaries: row indices into the parquet (NOT into
+  // `ordered`) keyed on `lifecycle/trainer_started` events (each one marks
+  // a new trainer process). Splitting at these boundaries lets us render
+  // older restart trajectories at low opacity so they don't deface the plot,
+  // while the latest segment stays fully visible.
   //
-  // Per-row `global_step` regression OVER-segments — interleaved train/eval
-  // rows in async timestamp order can show gstep flipping back and forth
-  // within a single restart, especially when an eval log lands after the
-  // next train step. `lifecycle/trainer_started` is the unambiguous signal:
-  // one entry per trainer process boot.
+  // ## Why row-index, not `_timestamp`?
   //
-  // When the history is lineage-glued (`history.partRowCounts` from
-  // `concatHistories`), we ALSO split at every ancestor boundary so each
-  // ancestor's portion can render in its own color (full opacity, no
-  // recency-ramp). Each segment tracks which lineage part it belongs to
-  // (`partIdx`): 0..ancestors.length-1 → that ancestor, ancestors.length →
-  // current run.
+  // We previously walked `ordered` (ts-sorted) and placed seams when the
+  // running `_timestamp` cursor crossed each trainer_started's ts. That's
+  // a footgun on iris-TPU runs: Levanter's `BackgroundIterator` async-
+  // uploads metric batches in chunks, so wandb's server-side `_timestamp`
+  // (= upload time) drifts from the original client-side `log()` call time
+  // by minutes-to-hours. After a `trainer_started` event uploads at
+  // wall-time T_new, late-arriving rows from BEFORE the restart (whose
+  // logical step is e.g. 267) can still upload at wall-time > T_new and
+  // land inside the "post-restart" ts bucket — getting wrongly tagged as
+  // segment #2 by the ts-cursor walk. The plotted segment #2 trace then
+  // spans the full x range (because some of its members have gstep ≈ 267
+  // while others have gstep ≈ 34k), producing three full-x overlapping
+  // zigzags instead of three non-overlapping per-restart trajectories.
+  //
+  // The parquet's `_step` IS monotonic and uniquely identifies each row's
+  // logical position; `_timestamp` is upload-time noise. `scripts/runs-
+  // sync.py` writes rows in ascending `_step` order, so the natural row
+  // index 0..rowCount-1 already IS the correct seam space. Seams go at:
+  //   (1) row 0,
+  //   (2) every part boundary (lineage glue), and
+  //   (3) the row index of each `trainer_started == 1` row in the current
+  //       part, EXCLUDING the first one (it coincides with the current
+  //       run's start, already a seam from (1)/(2)).
+  //
+  // The proper upstream fix lives in iris task #219 (Levanter's
+  // BackgroundIterator ContextVars fix); this is the FE workaround for
+  // its consequences on parquets already in the wild.
+  //
+  // Each segment tracks which lineage part it belongs to (`partIdx`):
+  // 0..ancestors.length-1 → that ancestor, ancestors.length → current run.
   //
   // With one start and no lineage, this returns `[{ start: 0, partIdx: 0 }]`
   // and the whole run renders as a single trace as before.
@@ -417,74 +437,62 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     const partRowCounts = history.partRowCounts
     const numParts = partRowCounts?.length ?? 1
     const currentPartIdx = numParts - 1
+    // Precompute cumulative part boundaries so we can detect part transitions
+    // in a single O(rowCount) pass instead of paying the per-row scan cost.
+    const partBoundaries: number[] = []  // partBoundaries[p] = end-exclusive row index of part p
+    {
+      let acc = 0
+      for (let p = 0; p < numParts; p++) {
+        acc += partRowCounts?.[p] ?? history.rowCount
+        partBoundaries.push(acc)
+      }
+    }
     const partOfRaw = (rawIdx: number): number => {
       if (!partRowCounts || numParts === 1) return 0
-      let acc = 0
-      for (let p = 0; p < partRowCounts.length; p++) {
-        acc += partRowCounts[p]
-        if (rawIdx < acc) return p
+      for (let p = 0; p < numParts; p++) {
+        if (rawIdx < partBoundaries[p]) return p
       }
       return numParts - 1
     }
-    // Trainer_started timestamps from the CURRENT run's portion only —
-    // ancestor parts get one segment each (so they each get one solid color,
-    // no intra-ancestor restart-fade noise on top of the cross-part color
-    // story).
+    if (history.rowCount === 0) return [{ start: 0, partIdx: currentPartIdx }]
     const startedCol = cols.get('lifecycle/trainer_started') ?? []
-    const startTsCurrent: number[] = []
-    for (let i = 0; i < startedCol.length; i++) {
-      if (startedCol[i] === 1 && timestamps[i] != null) {
-        if (partOfRaw(i) === currentPartIdx) {
-          startTsCurrent.push(timestamps[i] as number)
-        }
-      }
-    }
-    startTsCurrent.sort((a, b) => a - b)
-    if (ordered.length === 0) return [{ start: 0, partIdx: currentPartIdx }]
-    // Walk `ordered` in ts order; insert seams at part-changes (for lineage
-    // glue) and at the first `ordered` index whose ts is ≥ each
-    // trainer_started ts within the current run's portion.
+    // Walk row indices in their natural (ascending-`_step`) order. Insert a
+    // seam at row 0, at each part boundary, and at each trainer_started row
+    // within the current part (skipping the first such row since it
+    // coincides with the current run's start).
     const out: SegMeta[] = []
-    let nextStartTsIdx = 0
+    let currentPartStartsSeen = 0
     let lastPartIdx = -1
-    for (let k = 0; k < ordered.length; k++) {
-      const { ts, i } = ordered[k]
+    for (let i = 0; i < history.rowCount; i++) {
       const p = partOfRaw(i)
-      // Advance the trainer_started pointer past any starts whose ts we've
-      // now caught up to. Each such advance marks "this k is the first row
-      // at-or-after the start". We push a seam for each pending start (after
-      // the first one — the very first start aligns with the first current-
-      // run row, which is already a seam from the part transition or from
-      // k===0).
-      let restartHere = false
-      while (nextStartTsIdx < startTsCurrent.length
-             && startTsCurrent[nextStartTsIdx] <= (ts as number)) {
-        // Skip the very first trainer_started — it coincides with the
-        // current run's start (already a seam via partChanged / k===0). Only
-        // 2nd+ starts indicate intra-run restarts.
-        if (nextStartTsIdx > 0) restartHere = true
-        nextStartTsIdx++
-      }
       const partChanged = p !== lastPartIdx
-      if (k === 0 || partChanged || restartHere) {
-        if (out.length === 0 || out[out.length - 1].start !== k) {
-          out.push({ start: k, partIdx: p })
+      let restartHere = false
+      if (startedCol[i] === 1 && p === currentPartIdx) {
+        // Skip the very first trainer_started in the current run — it
+        // coincides with the run's start (already a seam via partChanged /
+        // i===0). Only 2nd+ starts indicate intra-run restarts.
+        if (currentPartStartsSeen > 0) restartHere = true
+        currentPartStartsSeen++
+      }
+      if (i === 0 || partChanged || restartHere) {
+        if (out.length === 0 || out[out.length - 1].start !== i) {
+          out.push({ start: i, partIdx: p })
         }
       }
       lastPartIdx = p
     }
     return out
-  }, [ordered, cols, timestamps, history.partRowCounts])
+  }, [history.rowCount, history.partRowCounts, cols])
   const numSegments = segments.length
   const segmentStarts = useMemo(() => segments.map((s) => s.start), [segments])
 
-  // Segment index for a given index into `ordered`. Binary search over
-  // `segmentStarts` (monotonic).
-  function segmentOf(orderedIdx: number): number {
+  // Segment index for a given RAW ROW INDEX (NOT `ordered`-index). Binary
+  // search over `segmentStarts` (monotonic in row-index space).
+  function segmentOf(rowIdx: number): number {
     let lo = 0, hi = segmentStarts.length - 1, best = 0
     while (lo <= hi) {
       const mid = (lo + hi) >> 1
-      if (segmentStarts[mid] <= orderedIdx) { best = mid; lo = mid + 1 }
+      if (segmentStarts[mid] <= rowIdx) { best = mid; lo = mid + 1 }
       else hi = mid - 1
     }
     return best
@@ -499,17 +507,27 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
 
   // Returns one Series per restart segment. Empty segments are preserved at
   // their index so opacity / naming line up with `numSegments`.
+  //
+  // Walks raw row indices in natural (parquet / `_step`-ascending) order
+  // rather than `ordered` (ts-sorted): segment membership is in row-index
+  // space (see the `segments` useMemo for the rationale — `_timestamp` is
+  // upload-time noise on iris-TPU runs that async-upload metric batches).
+  // Within a segment, x=step picks up gstep-ascending naturally; x=wallclock/
+  // elapsed may carry tiny ts back-jumps where async-upload reordered rows,
+  // which read as noise on the line, not as the phantom "loop back to step 0"
+  // that the old ts-segmentation produced.
   function series(key: keyof RunHistoryRow): Series[] {
     const col = cols.get(key) ?? []
     const out: Series[] = Array.from({ length: numSegments },
       () => ({ xs: [], ys: [], gsteps: [] }))
-    for (let k = 0; k < ordered.length; k++) {
-      const { ts, i } = ordered[k]
+    for (let i = 0; i < history.rowCount; i++) {
+      const ts = timestamps[i]
+      if (ts === null) continue
       const v = col[i]
       if (v === null || v === undefined) continue
-      const seg = out[segmentOf(k)]
-      seg.gsteps.push(gstepAtTs(ts as number))
-      seg.xs.push(xOfTs(ts as number))
+      const seg = out[segmentOf(i)]
+      seg.gsteps.push(gstepAtTs(ts))
+      seg.xs.push(xOfTs(ts))
       seg.ys.push(v as number)
     }
     return out
