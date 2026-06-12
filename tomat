@@ -77,6 +77,7 @@ R2_RUNS_PREFIX = "tomat/runs"
 # source of truth shared with `scripts/runs-sync.py` (the cron). Aliased
 # as `_RUN_PARQUET_*` here for compat with existing call sites. Adding a
 # column or backfill field lands in one diff and reaches both writers.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 from tomat.run_history import (
     RUN_PARQUET_SCHEMA_VERSION as _RUN_PARQUET_SCHEMA_VERSION,
     RUN_PARQUET_KEYS as _RUN_PARQUET_KEYS,
