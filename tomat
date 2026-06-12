@@ -1057,7 +1057,16 @@ def runs_sync(substr: str, bucket: str, prefix: str, project: str | None, dry_ru
     # mid-training global_step) for an abandoned trajectory and drops
     # either the VL rows (when mtime sort puts them first) or all the
     # wandb rows (when mtime sort puts them last). Splice AFTER trim.
-    rows.sort(key=lambda d: (d.get("_timestamp") or 0, d.get("_step") or 0))
+    # Sort by `_step` ASCENDING — NOT `_timestamp`. wandb's `_timestamp` is
+    # the server-receive time (BackgroundIterator async-uploads metric batches)
+    # and late-uploaded early-step rows appear LATER in ts-order, making the
+    # `global_step` column read as if it had regressed. Trim then misfires and
+    # nukes 49,998 / 50,000 rows of good training (see bin5 incident
+    # 2026-06-12). `_step` is the dependable identity — it's wandb's per-row
+    # monotonic log counter. Cron (`scripts/runs-sync.py:_trim_to_latest_…`)
+    # already does this; this call site was the holdout. The FE WallclockPlot
+    # walks rows in `_step` order for the same reason (commit 95ee5de).
+    rows.sort(key=lambda d: d.get("_step") if d.get("_step") is not None else -1)
     rows = _trim_to_latest_trajectory(rows)
     # Splice in `eval/loss` from any VL backfill: prefer real held-out
     # `eval/vl/<ckpt_leaf>/step-*.json` (from `preamble_vl_modal.py
