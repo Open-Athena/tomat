@@ -1135,9 +1135,10 @@ def runs_sync(substr: str, bucket: str, prefix: str, project: str | None, dry_ru
     _BACKFILL_KEYS = (
         "train/loss", "throughput/mfu", "throughput/p50_mfu",
         "throughput/tokens_per_second", "throughput/duration",
-        "throughput/total_gflops", "throughput/device_kind",
-        "throughput/theoretical_flops_per_device", "throughput/theoretical_flops",
-        "throughput/flops_per_example", "num_devices",
+        "throughput/total_gflops", "throughput/total_tokens",
+        "throughput/device_kind", "throughput/theoretical_flops_per_device",
+        "throughput/theoretical_flops", "throughput/flops_per_example",
+        "num_devices", "parameter_count",
     )
     if table.num_rows:
         tail_n = min(table.num_rows, 200)

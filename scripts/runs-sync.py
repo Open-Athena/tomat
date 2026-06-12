@@ -320,9 +320,10 @@ def _build_manifest(primary, history: dict) -> dict:
     _BACKFILL_KEYS = (
         "train/loss", "throughput/mfu", "throughput/p50_mfu",
         "throughput/tokens_per_second", "throughput/duration",
-        "throughput/total_gflops", "throughput/device_kind",
-        "throughput/theoretical_flops_per_device", "throughput/theoretical_flops",
-        "throughput/flops_per_example", "num_devices",
+        "throughput/total_gflops", "throughput/total_tokens",
+        "throughput/device_kind", "throughput/theoretical_flops_per_device",
+        "throughput/theoretical_flops", "throughput/flops_per_example",
+        "num_devices", "parameter_count",
     )
     last_row = history.get("last_row") if isinstance(history, dict) else None
     if last_row:

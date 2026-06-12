@@ -1124,7 +1124,14 @@ export function RunHeaderRich({
   const epochBreakdown = stepsDoneRaw != null
     ? epochBreakdownAtStep(stepsDoneRaw, manifest)
     : null
-  const epochSegmented = stepsDoneRaw != null && epochBreakdown != null
+  // Prefer `epochOfStep(step, manifest)` whenever stepsDoneRaw is known,
+  // independent of whether the run has SEGMENTS declared in `lineage.ts`.
+  // `epochOfStep` falls back internally to the manifest's single-segment math
+  // (batchSize × step / epoch_seqs) — it doesn't require `total_tokens` in
+  // summary, unlike `nEpochsOf`. Avoids the chip disappearing for runs whose
+  // wandb summary lost its training-stat fields (state=failed → no auto-flush;
+  // bin5 was the recent example).
+  const epochSegmented = stepsDoneRaw != null
     ? epochOfStep(stepsDoneRaw, manifest)
     : null
   const nEpochs = epochSegmented ?? nEpochsOf(manifest)
@@ -1492,9 +1499,14 @@ export function RunHeaderRich({
             <Sparkline pts={sparkPts} color={freshnessColor(freshSec)} />
           </div>
         )}
-        {/* Step-rate over last 1m / 1h / 6h. Anchored to last log timestamp
-            (a run that died 2m ago shows steps in the 1m before that). */}
-        {(rate1m != null || rate1h != null || rate6h != null) && (
+        {/* Step-rate over last 1m / 1h / 6h. Only meaningful for runs that are
+            actively training; for finished/failed/killed runs the "rate" is
+            either zero (no recent steps) or pulled from post-run log artifacts
+            (e.g. cluster-monitor pings that confuse `stepsInWindow`'s segment
+            filter — bin5 showed "+34k/min" on a SUCCEEDED run because the
+            filter latched onto two stale post-completion log rows). */}
+        {manifest?.run?.state === 'running'
+          && (rate1m != null || rate1h != null || rate6h != null) && (
           <Tooltip content="steps in last 1m / 1h / 6h, ending at latest log">
             <div style={{ marginTop: 2, fontFamily: 'monospace', fontSize: '0.7rem',
                           color: '#aaa' }}>
