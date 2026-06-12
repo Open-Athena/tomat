@@ -906,9 +906,18 @@ function CostChip({ runId, summary }: {
   // `has_modal_pending` only fires now when a Modal segment ships with
   // null msrp_usd (the "no usable wallclock signal yet" placeholder),
   // which we keep separate from the `$X MSRP` chip's happy path.
+  //
+  // `msrp_usd === 0 && !is_complete` happens when `tomat cost compute`
+  // hasn't yet attributed any segments to this run — the iris-attempts
+  // sidecar or modal app match is missing or just hasn't been synced.
+  // Rendering as `$0.00 MSRP` is alarmingly wrong (a long-running job
+  // is NOT free); render `MSRP pending` instead so the user sees the
+  // missing-data state honestly.
   const label = summary.has_modal_pending && summary.msrp_usd === 0
     ? 'Modal MSRP TBD'
-    : `${formatMsrp(summary.msrp_usd)} MSRP`
+    : (summary.msrp_usd === 0 && !summary.is_complete
+      ? 'MSRP pending'
+      : `${formatMsrp(summary.msrp_usd)} MSRP`)
   return (
     <Tooltip content={
       <CostBreakdownTooltipBody cost={costQ.data ?? null} summary={summary} />
