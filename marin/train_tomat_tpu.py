@@ -373,21 +373,40 @@ _EPOCH_SEQUENCES = {
 }
 
 
+def _label_parts(label: str) -> list[str]:
+    """Split a comma-joined `TOMAT_LABEL` into its component data labels.
+
+    Single-label case (no comma) → `[label]`. Multi-label case (comma) →
+    `[p.strip() for p in label.split(',')]` with empties dropped. This is
+    the spec-`union of shards`-as-one-cache path: callers downstream pass
+    multiple parquet globs to Levanter's `UrlDatasetSourceConfig.train_urls`
+    so a single `BlockShuffleConfig` window can span all shards' epoch.
+    """
+    return [p.strip() for p in label.split(",") if p.strip()]
+
+
 def _epoch_window_blocks(label: str, io_block_size: int) -> int:
     """Block count covering one full epoch under the active io-block size.
 
-    Resolves the `TOMAT_SHUFFLE_WINDOW_BLOCKS=auto` default. Falls back to
-    a known-good large value (78125, matching the train-full-v3-shard1 epoch
-    we were running mid-2026-06) with a loud warning if the label is unknown
-    — better to over-shuffle than to silently land back at the 1024-block
-    sawtooth that bit kl-bin5-fs through step 34k.
+    Resolves the `TOMAT_SHUFFLE_WINDOW_BLOCKS=auto` default. For multi-label
+    unions (comma-joined `label`), sums component row counts so the shuffle
+    window mixes across ALL shards' rows, not just one shard's epoch (rows
+    land shard0→shard1→… in Levanter's cache; a too-small window would
+    never reach shard1 during shard0's first pass). Falls back to a known-
+    good large value (78125, matching the train-full-v3-shard1 epoch we
+    were running mid-2026-06) with a loud warning if any component is
+    unknown — better to over-shuffle than to silently land back at the
+    1024-block sawtooth that bit kl-bin5-fs through step 34k.
     """
-    seqs = _EPOCH_SEQUENCES.get(label)
-    if seqs is None:
+    parts = _label_parts(label)
+    if all(p in _EPOCH_SEQUENCES for p in parts):
+        seqs = sum(_EPOCH_SEQUENCES[p] for p in parts)
+    else:
+        missing = [p for p in parts if p not in _EPOCH_SEQUENCES]
         fallback = 78125
         print(f"[tomat-tpu] WARN: shuffle-window auto-default has no row count"
-              f" for label={label!r} (extend _EPOCH_SEQUENCES). Falling back"
-              f" to window_blocks={fallback}.")
+              f" for label={label!r} (missing components: {missing}; extend"
+              f" _EPOCH_SEQUENCES). Falling back to window_blocks={fallback}.")
         return fallback
     return -(-seqs // max(1, io_block_size))  # ceildiv
 
@@ -618,11 +637,43 @@ def main():
                     print(f"[tomat-tpu] bucket: {BUCKET} "
                           f"(env-pinned; x-reg rebase failed)", flush=True)
 
-    parquet_glob = f"{BUCKET}/tokenized/{label}/worker-*/*.parquet"
-    meta_url = f"{BUCKET}/tokenized/{label}/worker-00/meta.json"
+    # Multi-label union: `label` may be a comma-joined list (e.g.
+    # "train-full-v3,train-full-v3-shard1,…"). Build one parquet glob per
+    # component and let Levanter's `UrlDatasetSourceConfig.train_urls`
+    # flatten them into a single cache (`_mk_shard_name_mapping` ->
+    # `consolidate_shard_caches`). Single-label callers see no change
+    # (single-element list). Cross-component meta consistency
+    # (vocab/patch/codec/seq_len/packed) is verified up front — a
+    # silent mismatch would route training to the wrong tokenization.
+    label_parts_list = _label_parts(label)
+    parquet_glob = [f"{BUCKET}/tokenized/{p}/worker-*/*.parquet"
+                    for p in label_parts_list]
     import fsspec
-    with fsspec.open(meta_url, "r") as f:
-        meta = json.load(f)
+    metas: list[dict] = []
+    for p in label_parts_list:
+        with fsspec.open(f"{BUCKET}/tokenized/{p}/worker-00/meta.json", "r") as f:
+            metas.append(json.load(f))
+    meta = metas[0]
+    if len(metas) > 1:
+        _key_fns = {
+            "vocab_size":         lambda m: m["vocab"]["total_size"],
+            "patch_size":         lambda m: m["patch_size"],
+            "density_codec_name": lambda m: m["density_codec_name"],
+            "pad_to":             lambda m: m.get("pad_to"),
+            "packed":             lambda m: bool(m.get("packed", False)),
+        }
+        for key, fn in _key_fns.items():
+            base = fn(meta)
+            mismatches = [(p, fn(m)) for p, m in zip(label_parts_list, metas)
+                          if fn(m) != base]
+            if mismatches:
+                raise RuntimeError(
+                    f"[tomat-tpu] multi-label meta mismatch on {key!r}: "
+                    f"{label_parts_list[0]}={base!r}; "
+                    f"diverging: {mismatches}. All components must share "
+                    f"vocabulary, patch, codec, seq_len, packed mode.")
+        print(f"[tomat-tpu] union of {len(label_parts_list)} components: "
+              f"{label_parts_list} — meta consistency verified")
     vocab_size = meta["vocab"]["total_size"]
     # Sequence length is the dataset's pad_to (drives both model max_seq_len
     # and trainer train_seq_len). v3-p15 uses 4608 vs v3 baseline's 8192.
@@ -751,7 +802,10 @@ def main():
           f"patch={meta['patch_size']}, codec={meta['density_codec_name']}, "
           f"model={model_preset}, val_seqs={val_seqs}, seq_len={seq_len}")
 
-    results_label = results_label_env or f"{label}-tpu-{model_preset}-bs{batch_size}-seed{seed}"
+    # Sanitize comma-joined multi-label so derived GCS paths don't carry
+    # literal commas. Single-label labels are unchanged.
+    label_for_path = label.replace(",", "+")
+    results_label = results_label_env or f"{label_for_path}-tpu-{model_preset}-bs{batch_size}-seed{seed}"
     run_id = results_label
 
     # cache_dir resolution. Three modes, in priority order:
@@ -769,14 +823,19 @@ def main():
         print(f"[tomat-tpu] cache_dir=SHARED (explicit) {cache_dir}")
     elif os.environ.get("TOMAT_SHARE_CACHE") == "1":
         cache_bucket = _pick_cache_bucket(default=BUCKET)
-        cache_dir = f"{cache_bucket}/cache/{label}/"
+        # Multi-label unions get their own joined-label subdir so they don't
+        # collide with single-shard caches built from one component.
+        cache_dir = f"{cache_bucket}/cache/{label_for_path}/"
         print(f"[tomat-tpu] cache_dir=SHARED (zone-local) {cache_dir}")
     else:
         cache_dir = f"{BUCKET}/results/{results_label}/cache"
         print(f"[tomat-tpu] cache_dir=PER-RUN {cache_dir}")
     _assert_cache_local(cache_dir)
 
-    source = UrlDatasetSourceConfig(train_urls=[parquet_glob])
+    # `parquet_glob` is a list-of-globs (one per `_label_parts(label)`).
+    # Single-label case is just one glob; multi-label union passes all
+    # components → one Levanter cache spans the union.
+    source = UrlDatasetSourceConfig(train_urls=parquet_glob)
     if f1_mode:
         # F1: carry both `input_ids` and `atom_xyz` through the cache.
         # `f1_data.F1PrebuiltLmDatasetFormat` registers itself under the

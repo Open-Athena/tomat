@@ -3384,7 +3384,7 @@ def _write_submission_record(
 @click.option("--from-ckpt", "from_ckpt", default=None,
               help="gs:// path to a step-N ckpt dir to true-resume from under a NEW LABEL. Pre-copies the ckpt into the new run's output dir so Levanter auto-discovers it with optimizer state + step counter intact. Requires --resume.")
 @click.option("-D", "--data-label", default="train-full-v3",
-              help="TOMAT_LABEL (data subdir under tokenized/)")
+              help="TOMAT_LABEL (data subdir under tokenized/). Comma-separated values train on the UNION of components — one Levanter cache spans all shards' epoch via multi-URL `train_urls`; auto epoch-window sums component row counts; cache lands at `<bucket>/cache/<+-joined>/`.")
 @click.option("-m", "--model", default="200M", help="TOMAT_MODEL preset")
 @click.option("-T", "--tpu", default="v6e-16", help="iris --tpu")
 @click.option("--zone", default=None, help="iris --zone (e.g. europe-west4-a); pins the slice to one zone so it doesn't end up in a starved region. Repeatable via comma-separated list.")
@@ -3624,7 +3624,15 @@ def train(
                 import re as _re
                 m = _re.search(r"/cache/([^/]+)/?$", existing_cache.rstrip("/"))
                 existing_subdir = m.group(1) if m else ""
-                if existing_subdir and existing_subdir != data_label:
+                # Union-widening exception: if `data_label` is a comma-joined
+                # multi-label (TS0-3 union etc.) AND the existing single-label
+                # subdir is one of the new union's components, this is a
+                # deliberate curriculum change — let it through with a warning.
+                # (The trainer's per-component meta consistency check will
+                # still catch any actual t10n incompatibility.)
+                new_parts = [p.strip() for p in data_label.split(",") if p.strip()]
+                _union_widening = (len(new_parts) > 1 and existing_subdir in new_parts)
+                if existing_subdir and existing_subdir != data_label and not _union_widening:
                     err(f"[tomat train] resume {label!r}: --data-label mismatch.")
                     err(f"  existing wandb run ({existing.entity}/{existing.project}) "
                         f"cache_dir = {existing_cache!r}")
@@ -3634,6 +3642,11 @@ def train(
                         f"a different wandb project and train on incompatible t10n.")
                     err(f"  pass --data-label={existing_subdir}")
                     sys.exit(2)
+                if _union_widening:
+                    print(f"[tomat train] resume {label!r}: union widening — "
+                          f"existing subdir {existing_subdir!r} is part of "
+                          f"--data-label={data_label!r} ({len(new_parts)} components). "
+                          f"Cache will be rebuilt at /cache/{data_label.replace(',', '+')}/.")
                 print(f"[tomat train] resume target: {existing.entity}/{existing.project}/{label}")
                 print(f"[tomat train]   cache subdir verified: {existing_subdir} (existing: {existing_cache})")
                 if wandb_entity != "open-athena":
@@ -4009,7 +4022,7 @@ _CACHE_TARGETS = {
 
 
 @cache_grp.command("mirror")
-@click.option("-l", "--data-label", default="train-full-v3", help="data label whose cache to mirror")
+@click.option("-l", "--data-label", default="train-full-v3", help="data label whose cache to mirror. Comma-separated → mirrors the UNION cache at `<source>/cache/<+-joined>/` (commas in the flag value, `+` on disk).")
 @click.option("-s", "--source", default=_CACHE_SRC_DEFAULT, show_default=True, help="canonical source bucket")
 @click.option("-t", "--targets", default=None, help="comma-separated target bucket prefixes (default: all known regional targets)")
 @click.option("--splits", default="train,validation", show_default=True, help="comma-separated split names under the cache root")
@@ -4025,6 +4038,10 @@ def cache_mirror(data_label: str, source: str, targets: str | None, splits: str,
         if targets else list(_CACHE_TARGETS.keys())
     )
     split_list = [s.strip() for s in splits.split(",") if s.strip()]
+    # Multi-shard union labels (commas in `--data-label`) live at
+    # `cache/<a+b+c>/` on disk — same `+`-join as `train_tomat_tpu.py:
+    # _label_for_path` so all three (build/mirror/train) agree.
+    label_for_path = data_label.replace(",", "+")
     print(f"[cache mirror] data_label={data_label} source={source}")
     for tgt in tgt_list:
         note = _CACHE_TARGETS.get(tgt, ["(custom)"])
@@ -4033,7 +4050,7 @@ def cache_mirror(data_label: str, source: str, targets: str | None, splits: str,
 
     for tgt in tgt_list:
         for split in split_list:
-            src = f"{source}/cache/{data_label}/{split}/"
+            src = f"{source}/cache/{label_for_path}/{split}/"
             dst = f"{tgt}/cache/{data_label}/{split}/"
             cmd = ["gsutil", "-m", "rsync", "-r", src, dst]
             print()
@@ -4048,7 +4065,7 @@ def cache_mirror(data_label: str, source: str, targets: str | None, splits: str,
 
 
 @cache_grp.command("build")
-@click.option("-l", "--data-label", default="train-full-v3", help="data label whose cache to build")
+@click.option("-l", "--data-label", default="train-full-v3", help="data label whose cache to build. Comma-separated → builds the UNION cache at `<bucket>/cache/<+-joined>/` from all components' parquets.")
 @click.option("--bucket", default=None, help=f"bucket where the cache should land (default: {GCS_BUCKET})")
 @click.option("--lmq-path", default=None, help="TOMAT_LMQ_PATH (default = {bucket}/codecs/lmq-v2-16k.npz)")
 @click.option("--cpu", default=16, type=int, help="iris --cpu")
@@ -4081,7 +4098,11 @@ def cache_build(
     bucket = bucket or GCS_BUCKET
     lmq_path = lmq_path or f"{bucket}/codecs/lmq-v2-16k.npz"
     wandb_key = os.environ.get("WANDB_API_KEY", "<WANDB_API_KEY>")
-    job_name = f"cache-build-{data_label}-{bucket.rsplit('/', 1)[0].rsplit('-', 1)[-1]}"
+    # Comma-joined labels (multi-shard union) → `+`-joined for paths.
+    # `_label_for_path` mirrors `train_tomat_tpu.py:_label_for_path` so the
+    # cache lands at the SAME directory both ends would derive.
+    label_for_path = data_label.replace(",", "+")
+    job_name = f"cache-build-{label_for_path}-{bucket.rsplit('/', 1)[0].rsplit('-', 1)[-1]}"
 
     env_vars: list[tuple[str, str]] = [
         ("WANDB_API_KEY", wandb_key),
@@ -4101,7 +4122,7 @@ def cache_build(
         ("TOMAT_VAL_SEQS", "256"),
         ("TOMAT_PROFILE", "0"),
         ("TOMAT_GRADIENT_CHECKPOINTING", "1"),
-        ("TOMAT_CACHE_DIR", f"{bucket}/cache/{data_label}/"),
+        ("TOMAT_CACHE_DIR", f"{bucket}/cache/{label_for_path}/"),
         ("TOMAT_BUILD_CACHE_ONLY", "1"),
         ("MARIN_I_WILL_PAY_FOR_ALL_FEES", "1"),
     ]
@@ -4142,7 +4163,7 @@ def cache_build(
     if r.returncode != 0:
         err(f"[FAIL launch {job_name}] rc={r.returncode}\n{r.stderr[-1000:]}")
         sys.exit(r.returncode)
-    print(f"[launched cache-build {job_name} → {bucket}/cache/{data_label}/]")
+    print(f"[launched cache-build {job_name} → {bucket}/cache/{label_for_path}/]")
 
 
 @cli.group("ckpt")
