@@ -4070,6 +4070,7 @@ def cache_mirror(data_label: str, source: str, targets: str | None, splits: str,
 @click.option("--lmq-path", default=None, help="TOMAT_LMQ_PATH (default = {bucket}/codecs/lmq-v2-16k.npz)")
 @click.option("--cpu", default=16, type=int, help="iris --cpu")
 @click.option("--memory", default="64GB", show_default=True, help="iris --memory")
+@click.option("-n", "--job-name", default=None, help="iris --job-name override (default: `cache-build-<label>-<region>`; auto-shortened to `cache-build-<hash>-<region>` when the natural name exceeds 63 chars, the k8s DNS-label cap).")
 @click.option("--zone", default=None, help="iris --zone (e.g. europe-west4-a); pin to keep the build local to the cache region.")
 @click.option("--region", default=None, help="iris --region (e.g. europe-west4).")
 @click.option("-e", "--env", "extra_env", multiple=True, help="extra env var KEY=VAL")
@@ -4080,6 +4081,7 @@ def cache_build(
     lmq_path: str | None,
     cpu: int,
     memory: str,
+    job_name: str | None,
     zone: str | None,
     region: str | None,
     extra_env: tuple[str, ...],
@@ -4102,7 +4104,21 @@ def cache_build(
     # `_label_for_path` mirrors `train_tomat_tpu.py:_label_for_path` so the
     # cache lands at the SAME directory both ends would derive.
     label_for_path = data_label.replace(",", "+")
-    job_name = f"cache-build-{label_for_path}-{bucket.rsplit('/', 1)[0].rsplit('-', 1)[-1]}"
+    region_suffix = bucket.rsplit('/', 1)[0].rsplit('-', 1)[-1]
+    if job_name is None:
+        natural = f"cache-build-{label_for_path}-{region_suffix}"
+        # k8s DNS-label limit: 63 chars. Multi-shard unions exceed it
+        # (4 × `train-full-v3*` shards → ~99 chars). Auto-shorten by
+        # hashing the label and keeping the components count.
+        if len(natural) <= 63:
+            job_name = natural
+        else:
+            import hashlib
+            parts = [p for p in data_label.split(",") if p.strip()]
+            sha = hashlib.sha1(label_for_path.encode()).hexdigest()[:8]
+            job_name = f"cache-build-{len(parts)}x-{sha}-{region_suffix}"
+            print(f"[tomat cache build] natural job-name {natural!r} "
+                  f"({len(natural)}>63 chars); using {job_name!r}")
 
     env_vars: list[tuple[str, str]] = [
         ("WANDB_API_KEY", wandb_key),
