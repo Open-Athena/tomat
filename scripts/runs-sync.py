@@ -93,7 +93,12 @@ DEVICE_KIND_TO_VARIANT = {
 
 
 # Schema mirrors `tomat:76-92`. Bump version on incompatible changes.
-RUN_PARQUET_SCHEMA_VERSION = 1
+# v2 (2026-06-11): `throughput/total_gflops` column was added in v1 (commit
+# 0d0a993) without bumping the version, so existing manifests stayed
+# schema-compatible → incremental sync never re-fetched the full history
+# from wandb → the column landed in zero parquets. Bump forces a full
+# backfill on the next cron tick.
+RUN_PARQUET_SCHEMA_VERSION = 2
 RUN_PARQUET_KEYS = [
     "_step", "_timestamp", "_runtime",
     "global_step",
