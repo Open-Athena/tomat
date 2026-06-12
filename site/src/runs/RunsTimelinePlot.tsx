@@ -288,18 +288,47 @@ function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
     return { x: pts.map((p) => p.s), y: pts.map((p) => p.l) }
   }
 
-  // clock / rel / active / flop: running max of global_step along ascending
+  if (mode === 'flop') {
+    // `throughput/total_gflops` is cumulative across the whole run (continuous
+    // across trainer-restart boundaries), BUT the parquet rows are sorted by
+    // `_step` (logical training order) while their `_timestamp` (wandb upload
+    // time) can drift by minutes-to-hours: iris's `BackgroundIterator` async-
+    // uploads metric batches, so a row logged at logical step S can land in
+    // wandb later than a row logged at S+N. Walking in `_timestamp` order
+    // would then interleave rows from different upload batches and produce
+    // "horizontal bands" — y (running-max global_step) stays high while x
+    // (cumulative flops at the just-emerged-from-the-upload-queue old row)
+    // snaps back to a low value. Walk in row-index (= `_step`) order instead.
+    // Matches `WallclockPlot.tsx`'s `segments` useMemo rationale on `_step`-
+    // ordered segmentation. The cutoff filter still drops rows older than the
+    // wallclock window when one's set; the running-max + cumulative are
+    // computed over all rows that survive the filter, in row order.
+    const totalGflops = cols.get('throughput/total_gflops')
+    if (!totalGflops || totalGflops.length === 0) return { x: [], y: [] }
+    const x: number[] = []
+    const y: number[] = []
+    let runningMax = -Infinity
+    for (let i = 0; i < rowCount; i++) {
+      const ts = timestamps[i]
+      if (cutoffSec != null && (ts == null || ts < cutoffSec)) continue
+      const s = globalStep[i]
+      const g = totalGflops[i]
+      if (s == null || g == null) continue
+      runningMax = Math.max(runningMax, s)
+      x.push((g as number) * 1e9)  // GFLOPs → FLOPs (so formatFlops scales right)
+      y.push(runningMax)
+    }
+    return { x, y }
+  }
+
+  // clock / rel / active: running max of global_step along ascending
   // _timestamp. `active` accumulates only the intervals in which the step
   // advanced — idle / preempt stretches (the flat segments) collapse to zero,
-  // so the x-axis measures time the run was actually training. `flop` uses
-  // the parquet's cumulative `throughput/total_gflops` column instead of a
-  // wallclock function — when absent, the point is skipped (per the spec,
-  // older runs that don't carry the column gracefully drop from the plot).
+  // so the x-axis measures time the run was actually training.
   const ordered = timestamps
     .map((ts, i) => ({ ts, i }))
     .filter((r) => r.ts !== null && (cutoffSec == null || (r.ts as number) >= cutoffSec))
     .sort((a, b) => (a.ts as number) - (b.ts as number))
-  const totalGflops = mode === 'flop' ? cols.get('throughput/total_gflops') : null
   const t0 = ordered.length ? (ordered[0].ts as number) : 0
   const x: number[] = []
   const y: number[] = []
@@ -323,13 +352,6 @@ function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
     runningMax = Math.max(runningMax, s)
     if (mode === 'clock') x.push(tsec * 1000)        // ms since epoch
     else if (mode === 'rel') x.push((tsec - t0) / 3600)
-    else if (mode === 'flop') {
-      // Skip rows missing the column (older parquets, or pre-warm rows that
-      // log before the first throughput stats land).
-      const g = totalGflops?.[i]
-      if (g == null) continue
-      x.push((g as number) * 1e9)  // GFLOPs → FLOPs (so formatFlops scales right)
-    }
     else x.push(activeCum / 3600)
     y.push(runningMax)
     prevTs = tsec

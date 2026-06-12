@@ -300,20 +300,54 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
 
   // (ts, flops) pairs from every row carrying `throughput/total_gflops`.
   // The wandb column logs cumulative GFLOPs; we store raw FLOPs (×1e9) so
-  // `formatFlops(x, unit)` lands a value in the unit the user chose. Sorted by
-  // ts (matches `ordered`). Drives `flopAtTs` for the `flop` x-axis mode.
-  // Empty for parquets logged before the column was added to the schema —
-  // the `flop` button is hidden in that case.
+  // `formatFlops(x, unit)` lands a value in the unit the user chose. Drives
+  // `flopAtTs` for the `flop` x-axis mode. Empty for parquets logged before
+  // the column was added to the schema — the `flop` button is hidden in that
+  // case.
+  //
+  // The cumulative IS continuous across trainer-restart boundaries (Levanter
+  // re-loads the prior cumulative from the checkpoint after resume), but
+  // `_timestamp` is upload-time noise on iris-TPU runs that async-upload
+  // metric batches: rows can land in wandb with their ts hours late relative
+  // to log time. The flop value paired with a "late" ts is its OLD logical-
+  // order cumulative, which is much smaller than the cumulative the run
+  // had actually reached by that wallclock — so a naive ts→flop binary
+  // search would snap back to a stale value and produce "horizontal
+  // slashes" (the running-max step stays high while x snaps low).
+  //
+  // Walk row-index (= `_step`) order — which preserves the (cumulative,
+  // step) pairing — and store the RUNNING MAX cumulative at each ts so
+  // `flopAtTs(ts)` always returns "the highest cumulative the run had
+  // reached by ts". Then sort by ts so the binary search still works.
+  // Same rationale + fix as the `segments` useMemo below (`_step` is
+  // monotonic and authoritative; `_timestamp` is upload noise).
   const tsFlop = useMemo(() => {
     const totalGflops = cols.get('throughput/total_gflops') ?? []
+    if (totalGflops.length === 0) return []
     const pairs: { ts: number; flop: number }[] = []
-    for (const { ts, i } of ordered) {
+    let runningMaxFlop = 0
+    for (let i = 0; i < history.rowCount; i++) {
       const g = totalGflops[i]
-      if (g === null || g === undefined) continue
-      pairs.push({ ts: ts as number, flop: (g as number) * 1e9 })
+      if (g == null) continue
+      const ts = timestamps[i]
+      if (ts == null) continue
+      // The parquet IS `_step`-ascending; cumulative is monotonic in `_step`,
+      // so this `Math.max` is a no-op for in-order runs and ONLY clamps the
+      // pathological async-upload disorder. Kept explicit so a future
+      // schema change can't silently regress the contract.
+      runningMaxFlop = Math.max(runningMaxFlop, (g as number) * 1e9)
+      pairs.push({ ts: ts as number, flop: runningMaxFlop })
     }
+    // ts-sort, but also enforce monotone flop within ties / out-of-order ts:
+    // after sort, if pair[i].ts < pair[i-1].ts due to wandb upload noise,
+    // pair[i].flop (from an EARLIER `_step`) can be smaller than pair[i-1].flop.
+    // Running-max-after-sort returns to the same monotone semantics ("highest
+    // flop the run had reached by ts").
+    pairs.sort((a, b) => a.ts - b.ts)
+    let m = 0
+    for (const p of pairs) { m = Math.max(m, p.flop); p.flop = m }
     return pairs
-  }, [ordered, cols])
+  }, [history.rowCount, timestamps, cols])
   const flopAvailable = tsFlop.length > 0
 
   /** gstep of the latest logged row at or before `ts`. */
@@ -368,6 +402,24 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     if (xMode === 'flop') return flopAtTs(ts)
     if (xMode === 'elapsed') return (ts - t0) / 3600
     return toLocal(ts)
+  }
+
+  /** x-coordinate for the parquet row at index `i`. Used by traces that walk
+   *  rows in `_step` (row-index) order — `stepTrace`, `series` — so the
+   *  cumulative pairs strictly with the row's own logical step. In FLOP mode
+   *  this reads the row's own `throughput/total_gflops` directly instead of
+   *  routing through `flopAtTs(ts)`: the ts-keyed binary search would land on
+   *  the wrong cumulative when wandb's `_timestamp` is upload-time noise
+   *  (iris async-uploads metric batches), producing back-and-forth jitter on
+   *  what should be a monotonic loss-vs-FLOP trace. For other axes, the row's
+   *  ts is the right `xOfTs` input. */
+  function xOfRow(i: number, ts: number): string | number {
+    if (xMode === 'flop') {
+      const totalGflops = cols.get('throughput/total_gflops')
+      const g = totalGflops?.[i]
+      return g == null ? NaN : (g as number) * 1e9
+    }
+    return xOfTs(ts)
   }
 
   /** x-coordinate for an eval point at checkpoint `step`. */
@@ -525,30 +577,57 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       if (ts === null) continue
       const v = col[i]
       if (v === null || v === undefined) continue
+      const x = xOfRow(i, ts as number)
+      // In FLOP mode the row may not carry the cumulative column (older
+      // pre-warm rows, ancestor parquets that predate the schema bump);
+      // drop those points so the trace doesn't render `NaN` gaps mid-line.
+      if (typeof x === 'number' && !Number.isFinite(x)) continue
       const seg = out[segmentOf(i)]
       seg.gsteps.push(gstepAtTs(ts))
-      seg.xs.push(xOfTs(ts))
+      seg.xs.push(x)
       seg.ys.push(v as number)
     }
     return out
   }
 
   // Step (top-panel) trace: running-max of global_step.
+  //
+  // In FLOP mode, walk row-index order (`_step`-ascending in the parquet) so
+  // x = cumulative_at_row_i pairs strictly with the row's own logical step
+  // — `xOfRow` reads `throughput/total_gflops[i]` directly. Other modes still
+  // walk ts-sorted (`ordered`) because the running-max-step + x-of-ts pairing
+  // is correct there and the ts-sort gives natural ascending x on the time
+  // axes.
   const stepTrace = useMemo(() => {
     const globalStep = cols.get('global_step') ?? []
     const xs: (string | number)[] = []
     const ys: number[] = []
     let runningMax = -Infinity
-    for (const { ts, i } of ordered) {
-      const s = globalStep[i]
-      if (s === null) continue
-      runningMax = Math.max(runningMax, s)
-      xs.push(xOfTs(ts as number))
-      ys.push(runningMax)
+    if (xMode === 'flop') {
+      const totalGflops = cols.get('throughput/total_gflops') ?? []
+      for (let i = 0; i < history.rowCount; i++) {
+        const ts = timestamps[i]
+        if (ts === null) continue
+        const s = globalStep[i]
+        if (s === null) continue
+        const g = totalGflops[i]
+        if (g == null) continue
+        runningMax = Math.max(runningMax, s)
+        xs.push((g as number) * 1e9)
+        ys.push(runningMax)
+      }
+    } else {
+      for (const { ts, i } of ordered) {
+        const s = globalStep[i]
+        if (s === null) continue
+        runningMax = Math.max(runningMax, s)
+        xs.push(xOfTs(ts as number))
+        ys.push(runningMax)
+      }
     }
     return { xs, ys }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ordered, cols, xMode])
+  }, [ordered, cols, xMode, history.rowCount, timestamps])
 
   const customGsteps = (s: Series) => s.gsteps.map((g) => (g === null ? '?' : g))
 
