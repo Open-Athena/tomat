@@ -1,5 +1,12 @@
 #!/usr/bin/env python
-"""Mat-level teacher-forced NMAE eval — comparable to electrAI/charg3net numbers.
+"""Mat-level NMAE eval — comparable to electrAI/charg3net numbers.
+
+Default mode is "one-shot" (`TOMAT_EVAL_MODE=oneshot`; alias `teacher`):
+one forward pass over the full grid per patch. For AR-trained models this
+is teacher-forced (GT density at each position, predict next); for
+MaskGIT-trained models it masks ALL density positions and runs a single
+bidirectional forward. (`--mode free` and `--mode maskgit` toggle the
+other paths — see `TOMAT_EVAL_MODE` below.)
 
 For each held-out material:
   1. Load raw Zarr from gs://.../tomat/rho_gga_raw/<split>/<mp_id>.zarr
@@ -7,7 +14,7 @@ For each held-out material:
   3. For each patch:
        - Build preamble + true-density input_ids using the same PatchTokenizer
          logic the training corpus used
-       - Teacher-forced forward pass: logits[Pos, Vocab]
+       - One-shot forward pass: logits[Pos, Vocab]
        - Argmax at density-target positions → predicted density tokens
        - Decode each predicted token → float via LMQ codec
   4. Write predicted floats into the full (nx, ny, nz) grid
@@ -24,11 +31,15 @@ Env vars:
     TOMAT_EVAL_DECODER      "median" (default; L_1-optimal point estimator),
                             "argmax" (mode), or "mean" (E[ρ], L_2-optimal).
     TOMAT_ZARR_BASE         gs:// prefix for raw Zarrs (default rho_gga_raw/validation)
-    TOMAT_EVAL_MODE         "teacher" (default; one forward, true density fed
-                            in) or "free" (autoregressive — the model's own
+    TOMAT_EVAL_MODE         "oneshot" (default; alias "teacher" — one forward
+                            pass over the full grid. AR-trained models:
+                            teacher-forced (GT density at each position,
+                            predict next). MaskGIT-trained models: ALL
+                            density positions masked, single bidir forward.)
+                            Or "free" (autoregressive — the model's own
                             predictions feed back; v3-only). See specs/25 §1.
                             Free mode covers the whole grid (every patch),
-                            same disjoint tiling as teacher-forced.
+                            same disjoint tiling as one-shot.
     TOMAT_EVAL_FREE_BATCH   (free mode) patches per forward — an HBM knob, not
                             a coverage cap (default 32). Free-running is ~P^3
                             sequential forwards/patch; cap cost via the mat
@@ -664,10 +675,19 @@ def main():
         "TOMAT_ZARR_BASE", f"{BUCKET}/rho_gga_raw/{split}"
     )
     seed = int(os.environ.get("TOMAT_SEED", "42"))
-    # Eval mode: teacher-forced (default), free-running AR, or MaskGIT iterative.
-    eval_mode = os.environ.get("TOMAT_EVAL_MODE", "teacher").strip()
+    # Eval mode: one-shot (default; AR=teacher-forced, MG=all-masked bidir),
+    # free-running AR, or MaskGIT iterative. `oneshot` is the canonical name;
+    # `teacher` is a legacy alias. Normalize to `teacher` so the downstream
+    # output-path / JSON-`mode`-field / R2-record-key layout stays unchanged
+    # (the dashboard, sync, backfill, and historical results all key off the
+    # `teacher` label + bare-`<set>/` GCS path).
+    eval_mode = os.environ.get("TOMAT_EVAL_MODE", "oneshot").strip()
+    if eval_mode == "oneshot":
+        eval_mode = "teacher"
     if eval_mode not in ("teacher", "free", "maskgit"):
-        raise ValueError(f"TOMAT_EVAL_MODE must be teacher/free/maskgit, got {eval_mode!r}")
+        raise ValueError(
+            f"TOMAT_EVAL_MODE must be oneshot/teacher/free/maskgit, got {eval_mode!r}"
+        )
     free_batch = int(os.environ.get("TOMAT_EVAL_FREE_BATCH", "32"))
     # Free-running decode path:
     #   TOMAT_EVAL_FREE_LEGACY=1 → recompute the full prefix every step (the
@@ -702,11 +722,14 @@ def main():
     # In MaskGIT mode the model was trained with a +1 vocab (MASK token at end).
     # Bump vocab_size to match the checkpoint's embedding table.
     #
-    # `--mode maskgit` always bumps. For `--mode teacher` against a model
-    # trained with MaskGIT (e.g. `train-mg-modal-h200x8-tz-v4-epochwin-*`
-    # evaluated TF-style), the ckpt has +1 vocab and Haliax raises an axis-
-    # size mismatch. Detect MG-trained models from the ckpt path / run name
-    # so the right MASK_ID lands without needing an extra env-var.
+    # `--mode maskgit` always bumps. For `--mode oneshot` (alias `teacher`)
+    # against a model trained with MaskGIT (e.g.
+    # `train-mg-modal-h200x8-tz-v4-epochwin-*` evaluated in one-shot mode —
+    # which for an MG model means "all density positions masked, one bidir
+    # forward", NOT teacher-forcing in the AR sense), the ckpt has +1 vocab
+    # and Haliax raises an axis-size mismatch. Detect MG-trained models from
+    # the ckpt path / run name so the right MASK_ID lands without needing an
+    # extra env-var.
     MASK_ID: int | None = None
     # MaskGIT-trained models have +1 vocab (MASK token at end of embedding table).
     # Eval-side detection: name/path substring sniff. Generic loss-name prefixes

@@ -2342,7 +2342,7 @@ def evals():
 @click.option("-d", "--dry-run", is_flag=True, help="print iris commands without executing")
 @click.option("-D", "--debug-dump-mat", default="", help="dump per-voxel rho_pred/rho_true (and per-patch flat arrays in free mode) to GCS for this mp_id; overrides n_mats")
 @click.option("-f", "--free-batch", default=32, type=int, help="(--mode free) patches per forward — HBM knob, not a coverage cap")
-@click.option("--mode", default="teacher", type=click.Choice(["teacher", "free", "maskgit"]), help="teacher-forced (default), free-running AR, or MaskGIT iterative-refinement eval")
+@click.option("--mode", default="oneshot", type=click.Choice(["oneshot", "teacher", "free", "maskgit"]), help="One forward pass over the full grid (default; AR: teacher-forced, GT at each position predict-next. MG: all density positions masked, single bidir forward). `teacher` is a back-compat alias for `oneshot`. `free` = autoregressive (AR only). `maskgit` = K-step iterative MG refinement.")
 @click.option("--mg-k-steps", default=12, type=int, help="(--mode maskgit) number of iterative-refinement steps (TOMAT_EVAL_MG_K_STEPS)")
 @click.option("--mg-partial-ratios", default="", help="(--mode maskgit) diagnostic: comma-sep mask ratios (e.g. 0.1,0.5,0.9,1.0). When set, skip K-iter loop; mask R fraction at random, ONE forward, report NMAE on masked positions only. Tests whether model has learned at any mask ratio.")
 @click.option("--bucket", "bucket_override", default=None, help=f"GCS bucket where the run's ckpts live (default: {GCS_BUCKET}). Use when the run was trained with --bucket override (e.g. v5p in us-east5 → gs://marin-us-east5/tomat).")
@@ -2378,13 +2378,17 @@ def evals_fire(
 ):
     """Fire mat-NMAE eval jobs against a run's GCS checkpoints.
 
-    Teacher-forced (default) pre-populates the watchdog FIRED files so a
-    subsequent `tomat evals harvest <run>` picks the numbers up. Free-running
-    (`--mode free`) covers the whole grid (every patch) but is ~P^3 sequential
-    forwards/patch — cap cost with `-n` (mat count, e.g. 1), not coverage;
-    results land in GCS `<set>-free/`. MaskGIT iterative-refinement
-    (`--mode maskgit`) runs K bidirectional forwards per patch (confidence-
-    sorted cosine schedule); results land in GCS `<set>-maskgit/`.
+    One-shot (default; `--mode oneshot`, alias `--mode teacher`) does a
+    single forward over the full grid — AR runs are teacher-forced (GT at
+    each position, predict next); MG runs mask ALL density positions and do
+    one bidir forward. Pre-populates the watchdog FIRED files so a
+    subsequent `tomat evals harvest <run>` picks the numbers up; results
+    land in GCS `<set>/` (bare). Free-running (`--mode free`) covers the
+    whole grid (every patch) but is ~P^3 sequential forwards/patch — cap
+    cost with `-n` (mat count, e.g. 1), not coverage; results land in GCS
+    `<set>-free/`. MaskGIT iterative-refinement (`--mode maskgit`) runs K
+    bidirectional forwards per patch (confidence-sorted cosine schedule);
+    results land in GCS `<set>-maskgit/`.
 
     `--backend modal` routes each (step, set, task) to an 8×H200 Modal call
     via `scripts/eval_modal.py::eval_checkpoint_h200x8` (sidesteps the iris
@@ -2394,6 +2398,14 @@ def evals_fire(
 
     Use --dry-run to print iris commands without executing (iris backend only).
     """
+    # `oneshot` is the canonical name for "one forward pass"; `teacher` is the
+    # legacy alias kept for back-compat with prior ad-hoc fires + watchdogs.
+    # Normalize to `teacher` internally so all downstream code (FIRED files,
+    # output paths, JSON `mode` fields, R2 record keys) keeps its existing
+    # on-disk layout. See `_BACKFILL_MODES` + `_backfill_discover_dirs` —
+    # path layout MUST stay `<set>/` (bare) for the one-forward mode.
+    if mode == "oneshot":
+        mode = "teacher"
     # Resolve `-s` against actual GCS ckpts. Two recurring foot-guns this
     # avoids: (1) the Levanter `num_train_steps=N` → final ckpt named
     # `step-(N-1)` OBO that's bitten us in mg-1 / cont33k / cont7k-ext /
@@ -2450,8 +2462,9 @@ def evals_fire(
             err(f"unknown mat-set {s!r}; known: {sorted(SPLITS)}")
             sys.exit(1)
 
-    # Teacher-forced evals seed the harvest watchdog via FIRED files; the
-    # free-running and maskgit harvest paths read GCS directly.
+    # One-shot evals seed the harvest watchdog via FIRED files; the
+    # free-running and maskgit harvest paths read GCS directly. (`teacher`
+    # is the canonical internal name post-normalization — see flag handling.)
     if not dry_run and mode == "teacher":
         TMP_DIR.mkdir(exist_ok=True)
         for s in set_list:
@@ -2696,12 +2709,13 @@ def evals_sync(substr: str | None, bucket: str, dry_run: bool, prefix: str):
                  "nemd_mean", "nemd_median", "nemd_p99")
     for run in run_dirs:
         sets: dict[str, list[dict]] = {}
-        # Discover every `<set>(-<mode>)/` subdir (teacher, free, maskgit, ...)
-        # — shares `_backfill_discover_dirs` so sync + backfill stay in lockstep
-        # on the on-GCS layout. Teacher-mode subdirs map back to the bare
-        # `<set>` key (back-compat with cont33k-era eval.json's); other modes
-        # land under `<set>-<mode>` (the dashboard's WallclockPlot iterates
-        # both flavors).
+        # Discover every `<set>(-<mode>)/` subdir (teacher/oneshot, free,
+        # maskgit, ...) — shares `_backfill_discover_dirs` so sync + backfill
+        # stay in lockstep on the on-GCS layout. One-shot (`mode=="teacher"`
+        # internally; `--mode oneshot` from the CLI normalizes to it) subdirs
+        # map back to the bare `<set>` key (back-compat with cont33k-era
+        # eval.json's); other modes land under `<set>-<mode>` (the
+        # dashboard's WallclockPlot iterates both flavors).
         for subdir, mat_set, mode in _backfill_discover_dirs(fs, results_base, run):
             sets_key = mat_set if mode == "teacher" else f"{mat_set}-{mode}"
             paths = [
@@ -2771,8 +2785,11 @@ def evals_sync(substr: str | None, bucket: str, dry_run: bool, prefix: str):
 # ──────────────────────────────────────────────────────────────────────
 
 # Set names whose results land directly under `eval/results/<dir>/<set>/`
-# (teacher mode) or `eval/results/<dir>/<set>-<mode>/` (free, maskgit, ...).
-# We scan for both flavors per known set.
+# (one-shot / teacher mode — bare set name, no `-<mode>` suffix) or under
+# `eval/results/<dir>/<set>-<mode>/` (free, maskgit, ...). We scan for both
+# flavors per known set. The internal `mode="teacher"` label is preserved
+# (vs renaming to `"oneshot"`) so existing R2 record keys / `mode` JSON
+# fields stay back-compatible.
 _BACKFILL_SETS = ("val_200", "train_200")
 _BACKFILL_MODES = ("teacher", "free", "maskgit")
 

@@ -198,7 +198,7 @@ def eval_checkpoint(
     batch: int = 16,
     debug_dump_mat: str = "",
     run_label: str | None = None,
-    mode: str = "teacher",
+    mode: str = "oneshot",
     mg_k_steps: int = 12,
     eval_skip: int = 0,
     output_suffix: str = "",
@@ -219,7 +219,7 @@ def eval_checkpoint(
     gpu="H200:8",
     secrets=[gcp_secret],
     volumes={"/vol": train_volume},
-    timeout=14400,  # 4h cap; a TF eval on H200×8 finishes in 5-15 min.
+    timeout=14400,  # 4h cap; a one-shot eval on H200×8 finishes in 5-15 min.
 )
 def eval_checkpoint_h200x8(
     checkpoint: str,
@@ -232,15 +232,15 @@ def eval_checkpoint_h200x8(
     batch: int = 32,
     debug_dump_mat: str = "",
     run_label: str | None = None,
-    mode: str = "teacher",
+    mode: str = "oneshot",
     mg_k_steps: int = 12,
     eval_skip: int = 0,
     output_suffix: str = "",
     dump_predictions: bool = False,
 ) -> dict:
     """H200×8 backend used by `tomat evals fire --backend modal`. Same body
-    as `eval_checkpoint`, just bigger GPU pool — TF eval @ n_mats=200 on
-    200M should finish in ~5-15 min vs ~2h on a single A100.
+    as `eval_checkpoint`, just bigger GPU pool — one-shot eval @ n_mats=200
+    on 200M should finish in ~5-15 min vs ~2h on a single A100.
     """
     return _setup_env_and_run(
         checkpoint=checkpoint, mat_set=mat_set, label=label, lmq_path=lmq_path,
@@ -263,7 +263,7 @@ def main(
     decoder: str = "median",
     debug_dump_mat: str = "",
     run_label: str = "",
-    mode: str = "teacher",
+    mode: str = "oneshot",
 ):
     """Eval `checkpoint` on `mat_set` (val_200 | train_200 | both).
 
@@ -306,7 +306,7 @@ def main_h200x8(
     n_mats: int = 200,
     decoder: str = "median",
     run_label: str = "",
-    mode: str = "teacher",
+    mode: str = "oneshot",
     mg_k_steps: int = 12,
 ):
     """H200×8 entrypoint. Sets-fanout same as `main`, GPU larger."""
