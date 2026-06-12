@@ -36,3 +36,33 @@ export function formatFlops(value: number, unit: FlopUnit = 'EF'): string {
   // render strings into the DOM. No-op for values <1000.
   return `${rounded.toLocaleString('en-US')} ${unit}`
 }
+
+/** Scale factor that takes raw FLOPs to the user-chosen unit. For `sci`
+ *  (legacy scientific-notation display) the scale stays 1 so axis ticks read
+ *  in raw FLOPs (`.2e` formatted). For EF/PF/TF, divide by 10^{18,15,12} so
+ *  plotly's tick labels read in human-friendly numbers. Drives the plotly
+ *  trace x arrays in both `RunsTimelinePlot` and `WallclockPlot` so the
+ *  axis ticks read in the unit chosen via the `FlopUnitChips` chip rail
+ *  (bug 1 fix — was hardcoded `.2e` regardless of unit). */
+export function flopUnitScale(unit: FlopUnit): number {
+  if (unit === 'sci') return 1
+  return 10 ** UNIT_EXP[unit]
+}
+
+/** Per-unit plotly `tickformat` for the FLOP-axis ticks. Pairs with
+ *  `flopUnitScale` — the x values arrive in the chosen unit, so the format
+ *  string is chosen to render those scaled magnitudes legibly:
+ *  - `EF` lands in 0.1-1000 → fixed point with trailing-zero suppression
+ *    (`.2~f` → "0.5" / "240")
+ *  - `PF` goes into the thousands / hundreds-of-thousands → grouped fixed
+ *    (`,.0f` → "240,000")
+ *  - `TF` goes to hundreds-of-millions+ → scientific
+ *  - `sci` always scientific (legacy display) */
+export function flopTickformat(unit: FlopUnit): string {
+  switch (unit) {
+    case 'EF': return '.2~f'
+    case 'PF': return ',.0f'
+    case 'TF': return '.2e'
+    case 'sci': return '.2e'
+  }
+}

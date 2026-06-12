@@ -19,7 +19,7 @@ import type { Param } from 'use-prms'
 import { enumParam, useUrlState } from 'use-prms'
 import { Tooltip } from '../Tooltip'
 
-export { FLOP_UNITS, formatFlops } from './flops.format'
+export { FLOP_UNITS, formatFlops, flopUnitScale, flopTickformat } from './flops.format'
 export type { FlopUnit } from './flops.format'
 import type { FlopUnit } from './flops.format'
 import { FLOP_UNITS } from './flops.format'

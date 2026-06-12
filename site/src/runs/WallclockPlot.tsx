@@ -38,7 +38,7 @@ import { SmoothingChips, useBandsToggle, useSmoothMode } from './RunsTimelinePlo
 import { epochOfStep } from './runMeta'
 import { annotationsFor, type RunAnnotation } from './annotations'
 import { computeSmoothedSeries } from './smoothing'
-import { FlopUnitChips, formatFlops, useFlopUnit } from './flops'
+import { FlopUnitChips, flopTickformat, flopUnitScale, formatFlops, useFlopUnit } from './flops'
 import { ancestorRelation } from './lineage'
 
 /** Ancestor metadata for a lineage-glued history. Each entry corresponds to
@@ -233,6 +233,14 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   )
   const setXMode = (m: XMode) => setUrlXMode(X_TO_URL[m])
 
+  // FLOP-unit display preference (`?fopu=`). Hoisted to the top of the
+  // component so `xOfRow` / `xOfTs` / `xOfStep` / `stepTrace` (declared
+  // below) can divide raw FLOPs by `flopXScale` to land x in the user-chosen
+  // unit. `formatFlops` callers (hovertemplates) still receive RAW flops
+  // because that helper does its own unit-aware scaling.
+  const [flopUnit, setFlopUnit] = useFlopUnit()
+  const flopXScale = flopUnitScale(flopUnit)
+
   // User-set x-range captured from box-zoom (`plotly_relayout`). Persists
   // across smoothing-chip clicks and poll-driven re-renders that would
   // otherwise reset the axis to autorange. `null` = no user range; render
@@ -399,7 +407,10 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       const ep = epochOfStep(s, manifest)
       return ep ?? NaN
     }
-    if (xMode === 'flop') return flopAtTs(ts)
+    if (xMode === 'flop') {
+      const f = flopAtTs(ts)
+      return Number.isFinite(f) ? f / flopXScale : NaN
+    }
     if (xMode === 'elapsed') return (ts - t0) / 3600
     return toLocal(ts)
   }
@@ -412,12 +423,15 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
    *  the wrong cumulative when wandb's `_timestamp` is upload-time noise
    *  (iris async-uploads metric batches), producing back-and-forth jitter on
    *  what should be a monotonic loss-vs-FLOP trace. For other axes, the row's
-   *  ts is the right `xOfTs` input. */
+   *  ts is the right `xOfTs` input. The FLOP value is divided by
+   *  `flopXScale` so plotly's axis ticks read in the user-chosen unit
+   *  (EF/PF/TF/sci) — keep `formatFlops` callers feeding RAW flops since
+   *  that helper does its own unit scaling. */
   function xOfRow(i: number, ts: number): string | number {
     if (xMode === 'flop') {
       const totalGflops = cols.get('throughput/total_gflops')
       const g = totalGflops?.[i]
-      return g == null ? NaN : (g as number) * 1e9
+      return g == null ? NaN : ((g as number) * 1e9) / flopXScale
     }
     return xOfTs(ts)
   }
@@ -430,7 +444,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       const ts = tsAtGstep(step)
       if (ts === null) return null
       const f = flopAtTs(ts)
-      return Number.isFinite(f) ? f : null
+      return Number.isFinite(f) ? f / flopXScale : null
     }
     const ts = tsAtGstep(step)
     if (ts === null) return null
@@ -642,7 +656,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         const g = totalGflops[i]
         if (g == null) continue
         runningMax = Math.max(runningMax, s)
-        xs.push((g as number) * 1e9)
+        xs.push(((g as number) * 1e9) / flopXScale)
         ys.push(runningMax)
       }
     } else {
@@ -656,7 +670,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     }
     return { xs, ys }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ordered, cols, xMode, history.rowCount, timestamps])
+  }, [ordered, cols, xMode, history.rowCount, timestamps, flopXScale])
 
   const customGsteps = (s: Series) => s.gsteps.map((g) => (g === null ? '?' : g))
 
@@ -683,9 +697,9 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   // `WallclockPlot.test.ts` for the contract.
   const [smooth, setSmooth] = useSmoothMode()
   const [bandsOn, setBandsOn] = useBandsToggle()
-  // FLOP-unit display preference (`?fopu=`). Drives the axis title + tooltip
-  // formatting whenever the user is in `?x=flop` mode.
-  const [flopUnit, setFlopUnit] = useFlopUnit()
+  // (FLOP-unit hook hoisted to the top of the component so the x-coordinate
+  // helpers — `xOfRow`, `xOfTs`, `xOfStep`, `stepTrace` — can scale raw
+  // flops by `flopXScale` to land x in the user-chosen unit.)
 
   // Gap detection in wallclock / elapsed modes: when a run is paused
   // (e.g. a Modal-side respawn between two real data points without an
@@ -1492,12 +1506,12 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
             title: { text: xTitle },
             type: xMode === 'time' ? 'date' : 'linear',
             ...(xMode === 'time' ? { tickformat: '%-m/%-d %H:%M' } : {}),
-            // FLOP mode: scientific notation for the axis ticks
-            // (`tickformat: '~e'` → 2e20, not "240 EF") so the axis itself
-            // stays compact. The unit-formatted display lives in the title +
-            // tooltip (`hovertemplate` below). FLOP values span 6+ OOM across
-            // runs so SI suffixes (`~s` → "240E") would be ambiguous.
-            ...(xMode === 'flop' ? { tickformat: '.2e' } : {}),
+            // FLOP mode: x values are scaled by `flopXScale` upstream so the
+            // axis ticks read in the user-chosen unit (EF / PF / TF / sci).
+            // Tickformat varies with the unit since EF lands in 0.1-1000,
+            // PF in the thousands, and TF / sci span enough magnitude that
+            // scientific notation reads better than grouped fixed-point.
+            ...(xMode === 'flop' ? { tickformat: flopTickformat(flopUnit) } : {}),
             gridcolor, zerolinecolor, linecolor: gridcolor,
             // Anchor to the bottom-most y-axis so tick labels render BELOW
             // the bottom panel (MT/MV when present, TL/VL when not), instead

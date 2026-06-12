@@ -22,7 +22,7 @@ import {
   applySmoothing, bandsParam, DEFAULT_EMA_ALPHA, DEFAULT_ROLLING_WINDOW,
   smoothKey, smoothParam, type SmoothMode,
 } from './smoothing'
-import { FlopUnitChips, useFlopUnit } from './flops'
+import { FlopUnitChips, flopTickformat, flopUnitScale, useFlopUnit } from './flops'
 // Re-export so RunsPage can `import { ... } from './RunsTimelinePlot'` —
 // keeps callers off the helper module's internal path.
 export { compileMultiTermFilter, runHaystack, FILTER_EXAMPLES } from './filter'
@@ -265,13 +265,15 @@ function quantile(sorted: number[], q: number): number {
 /** One run's (x, y) series for the given x-axis mode.
  *  clock/rel:  y = running-max `global_step` (flats = idle/preempt).
  *  loss:       y = `train/loss` vs `global_step`.
- *  flop:       y = running-max `global_step` vs cumulative FLOPs
- *              (`throughput/total_gflops * 1e9`). Skipped (empty result) for
- *              runs whose parquet doesn't carry the column.
+ *  flop:       y = running-max `global_step` vs cumulative FLOPs scaled by
+ *              `flopXScale` so plotly axis ticks land in the user-chosen
+ *              unit (EF / PF / TF / sci). Skipped (empty result) for runs
+ *              whose parquet doesn't carry `throughput/total_gflops`.
  *  `x` is ALWAYS numeric: ms-since-epoch for `clock`, hours for `rel`/`active`,
- *  step for `loss`, raw FLOPs for `flop`. Date strings (when needed for the
- *  Plotly date axis) are built downstream from the ms values via `localDateStr`. */
-function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
+ *  step for `loss`, FLOPs/flopXScale for `flop`. Date strings (when needed for
+ *  the Plotly date axis) are built downstream from the ms values via
+ *  `localDateStr`. */
+function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null, flopXScale: number): {
   x: number[]; y: number[]
 } {
   const { timestamps, cols, rowCount } = history
@@ -315,7 +317,7 @@ function traceFor(history: RunHistory, mode: XMode, cutoffSec: number | null): {
       const g = totalGflops[i]
       if (s == null || g == null) continue
       runningMax = Math.max(runningMax, s)
-      x.push((g as number) * 1e9)  // GFLOPs → FLOPs (so formatFlops scales right)
+      x.push(((g as number) * 1e9) / flopXScale)  // GFLOPs → display unit
       y.push(runningMax)
     }
     return { x, y }
@@ -532,6 +534,7 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
   // plot's hovertext + tooltips and — via the same URL state — every per-card
   // pill in the list below.
   const [flopUnit, setFlopUnit] = useFlopUnit()
+  const flopXScale = flopUnitScale(flopUnit)
 
   // Regex filter on run name. Persisted + cross-component-synced (RunsPage
   // reads the same hook to sort matching cards to top + fade non-matches).
@@ -640,7 +643,7 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
     }
     const out = new Map<string, Cached>()
     for (const r of plotted) {
-      const { x, y } = traceFor(r.history, xMode, cutoffSec)
+      const { x, y } = traceFor(r.history, xMode, cutoffSec, flopXScale)
       if (x.length === 0) continue
       const yRaw: (number | null)[] = y as (number | null)[]
       if (smooth.kind === 'rolling') {
@@ -675,7 +678,7 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
     // key on the run-id join + smoothing/x-mode/cutoff. Same idiom used by
     // `labelToId` in RunsPage.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [plotted.map((r) => r.id).join('|'), smoothK, bandsOn, xMode, cutoffSec])
+  }, [plotted.map((r) => r.id).join('|'), smoothK, bandsOn, xMode, cutoffSec, flopXScale])
 
   // Fade non-highlighted traces to a true neutral grey (pltly's built-in fade
   // only desaturates partway / keeps a tint); the highlighted run keeps full
@@ -941,10 +944,11 @@ export function RunsTimelinePlot({ runs, hoursBack, highlight, runHaystacks, onP
           : xMode === 'flop' ? `FLOP (${flopUnit})`
           : 'step',
       },
-      // FLOP values span 6+ OOM across runs; use scientific notation on the
-      // axis ticks so the labels stay readable. The unit-formatted display is
-      // in the title.
-      ...(xMode === 'flop' ? { tickformat: '.2e' } : {}),
+      // FLOP mode: x is scaled by `flopXScale` upstream so axis ticks read
+      // in the user-chosen unit (EF / PF / TF / sci). Per-unit tickformat —
+      // EF lands in 0.1-1000, PF in thousands, TF / sci span enough OOM
+      // that scientific notation reads better than grouped fixed-point.
+      ...(xMode === 'flop' ? { tickformat: flopTickformat(flopUnit) } : {}),
       gridcolor, zerolinecolor, linecolor: gridcolor,
     }
   const xaxis = userXRange
