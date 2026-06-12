@@ -73,32 +73,16 @@ R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 R2_BUCKET = "openathena"
 R2_RUNS_PREFIX = "tomat/runs"
 
-# History-sync schema (see `specs/23-runs-dashboard.md`). Bump
-# `_RUN_PARQUET_SCHEMA_VERSION` on incompatible parquet changes. Keep in
-# lockstep with `scripts/runs-sync.py:RUN_PARQUET_SCHEMA_VERSION` — both
-# write the same parquet, so a drift between them silently invalidates
-# manifests on every cross-tool pass.
-_RUN_PARQUET_SCHEMA_VERSION = 2
-_RUN_PARQUET_KEYS = [
-    "_step", "_timestamp", "_runtime",
-    "global_step",   # Levanter's training step (true progress) — separate
-                     # from `_step` which is wandb's log-call counter and can
-                     # leap during restart churn.
-    "train/loss", "eval/loss",
-    "throughput/mfu", "throughput/tokens_per_second", "throughput/duration",
-    # Cumulative GFLOPs since training started — monotonic. Drives the
-    # FLOP x-axis option (`?x=flop`) on the dashboard plots. Mirror this
-    # in scripts/runs-sync.py's WANT_COLS so the cron + CLI agree.
-    "throughput/total_gflops",
-    "eval/mat_nmae/val_200/mean", "eval/mat_nmae/val_200/median", "eval/mat_nmae/val_200/p99",
-    "eval/mat_nmae/train_200/mean", "eval/mat_nmae/train_200/median", "eval/mat_nmae/train_200/p99",
-    "eval/mat_nemd/val_200/mean", "eval/mat_nemd/val_200/median", "eval/mat_nemd/val_200/p99",
-    "eval/mat_nemd/train_200/mean", "eval/mat_nemd/train_200/median", "eval/mat_nemd/train_200/p99",
-    "lifecycle/trainer_started", "lifecycle/sigterm_received", "lifecycle/trainer_finished",
-    "cluster/preemptions", "cluster/failures",
-    "cluster/preempts_delta", "cluster/failures_delta",
-    "cluster/preempts_per_hour", "cluster/elapsed_min",
-]
+# Parquet schema + backfill keys live in `tomat.run_history` — single
+# source of truth shared with `scripts/runs-sync.py` (the cron). Aliased
+# as `_RUN_PARQUET_*` here for compat with existing call sites. Adding a
+# column or backfill field lands in one diff and reaches both writers.
+from tomat.run_history import (
+    RUN_PARQUET_SCHEMA_VERSION as _RUN_PARQUET_SCHEMA_VERSION,
+    RUN_PARQUET_KEYS as _RUN_PARQUET_KEYS,
+    BACKFILL_KEYS as _BACKFILL_KEYS,
+    arrow_schema as _arrow_schema,
+)
 IRIS_USER = "ryan"
 GCS_BUCKET = "gs://marin-eu-west4/tomat"
 LMQ_PATH = f"{GCS_BUCKET}/codecs/lmq-v2-16k.npz"
@@ -879,44 +863,10 @@ def _vl_backfill_rows(
     return [merged[s] for s in sorted(merged)]
 
 
-def _run_parquet_arrow_schema():
-    """Lazy-build the per-run history parquet schema (pyarrow). Mirrors
-    `_RUN_PARQUET_KEYS` order. `_step` is non-null; everything else nullable."""
-    import pyarrow as pa
-    return pa.schema([
-        ("_step",                            pa.int64()),
-        ("_timestamp",                       pa.float64()),
-        ("_runtime",                         pa.float64()),
-        ("global_step",                      pa.int64()),
-        ("train/loss",                       pa.float32()),
-        ("eval/loss",                        pa.float32()),
-        ("throughput/mfu",                   pa.float32()),
-        ("throughput/tokens_per_second",     pa.float32()),
-        ("throughput/duration",              pa.float32()),
-        # Cumulative — needs float64 to avoid losing precision at 1e10+ GF totals.
-        ("throughput/total_gflops",          pa.float64()),
-        ("eval/mat_nmae/val_200/mean",       pa.float32()),
-        ("eval/mat_nmae/val_200/median",     pa.float32()),
-        ("eval/mat_nmae/val_200/p99",        pa.float32()),
-        ("eval/mat_nmae/train_200/mean",     pa.float32()),
-        ("eval/mat_nmae/train_200/median",   pa.float32()),
-        ("eval/mat_nmae/train_200/p99",      pa.float32()),
-        ("eval/mat_nemd/val_200/mean",       pa.float32()),
-        ("eval/mat_nemd/val_200/median",     pa.float32()),
-        ("eval/mat_nemd/val_200/p99",        pa.float32()),
-        ("eval/mat_nemd/train_200/mean",     pa.float32()),
-        ("eval/mat_nemd/train_200/median",   pa.float32()),
-        ("eval/mat_nemd/train_200/p99",      pa.float32()),
-        ("lifecycle/trainer_started",        pa.int8()),
-        ("lifecycle/sigterm_received",       pa.int8()),
-        ("lifecycle/trainer_finished",       pa.int8()),
-        ("cluster/preemptions",              pa.int32()),
-        ("cluster/failures",                 pa.int32()),
-        ("cluster/preempts_delta",           pa.int32()),
-        ("cluster/failures_delta",           pa.int32()),
-        ("cluster/preempts_per_hour",        pa.float32()),
-        ("cluster/elapsed_min",              pa.float32()),
-    ])
+# Schema definition is in `tomat.run_history.arrow_schema` (imported at
+# module top as `_arrow_schema`). Wrapper kept here so existing callers
+# don't have to change.
+_run_parquet_arrow_schema = _arrow_schema
 
 
 def _r2_put_bytes(
@@ -1139,15 +1089,8 @@ def runs_sync(substr: str, bucket: str, prefix: str, project: str | None, dry_ru
     # trainer ended `failed` so the wandb-side summary lacks
     # train/loss + throughput/* — without this, the dashboard card loses
     # tr / MFU / EF and cost.json computes $0 (no device_kind to infer
-    # hardware). Mirror of `scripts/runs-sync.py:_build_manifest` (cron).
-    _BACKFILL_KEYS = (
-        "train/loss", "throughput/mfu", "throughput/p50_mfu",
-        "throughput/tokens_per_second", "throughput/duration",
-        "throughput/total_gflops", "throughput/total_tokens",
-        "throughput/device_kind", "throughput/theoretical_flops_per_device",
-        "throughput/theoretical_flops", "throughput/flops_per_example",
-        "num_devices", "parameter_count",
-    )
+    # hardware). Key set is shared with `scripts/runs-sync.py` via
+    # `tomat.run_history.BACKFILL_KEYS`.
     if table.num_rows:
         tail_n = min(table.num_rows, 200)
         tail = table.slice(table.num_rows - tail_n, tail_n)

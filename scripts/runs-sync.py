@@ -30,8 +30,20 @@ import sys
 import time
 from pathlib import Path
 
+# Make `src/` importable when the cron's venv doesn't have the `tomat`
+# package pip-installed. Spec 55 clones the repo to `~/tomat` on the VM.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
 import boto3
 from botocore.exceptions import ClientError
+
+from tomat.run_history import (
+    RUN_PARQUET_SCHEMA_VERSION,
+    RUN_PARQUET_KEYS,
+    BACKFILL_KEYS,
+    arrow_schema,
+)
 
 HOME = Path.home()
 AWS_CREDS = HOME / ".aws/credentials"
@@ -92,31 +104,12 @@ DEVICE_KIND_TO_VARIANT = {
 }
 
 
-# Schema mirrors `tomat:76-92`. Bump version on incompatible changes.
-# v2 (2026-06-11): `throughput/total_gflops` column was added in v1 (commit
-# 0d0a993) without bumping the version, so existing manifests stayed
-# schema-compatible → incremental sync never re-fetched the full history
-# from wandb → the column landed in zero parquets. Bump forces a full
-# backfill on the next cron tick.
-RUN_PARQUET_SCHEMA_VERSION = 2
-RUN_PARQUET_KEYS = [
-    "_step", "_timestamp", "_runtime",
-    "global_step",
-    "train/loss", "eval/loss",
-    "throughput/mfu", "throughput/tokens_per_second", "throughput/duration",
-    # Cumulative GFLOPs since training started — monotonic, drives the FLOP
-    # x-axis option in the dashboard. Added 2026-06-07; older parquets won't
-    # have it (older runs would need a forced full re-sync).
-    "throughput/total_gflops",
-    "eval/mat_nmae/val_200/mean", "eval/mat_nmae/val_200/median", "eval/mat_nmae/val_200/p99",
-    "eval/mat_nmae/train_200/mean", "eval/mat_nmae/train_200/median", "eval/mat_nmae/train_200/p99",
-    "eval/mat_nemd/val_200/mean", "eval/mat_nemd/val_200/median", "eval/mat_nemd/val_200/p99",
-    "eval/mat_nemd/train_200/mean", "eval/mat_nemd/train_200/median", "eval/mat_nemd/train_200/p99",
-    "lifecycle/trainer_started", "lifecycle/sigterm_received", "lifecycle/trainer_finished",
-    "cluster/preemptions", "cluster/failures",
-    "cluster/preempts_delta", "cluster/failures_delta",
-    "cluster/preempts_per_hour", "cluster/elapsed_min",
-]
+# `RUN_PARQUET_SCHEMA_VERSION`, `RUN_PARQUET_KEYS`, `BACKFILL_KEYS`, and
+# `arrow_schema()` are imported from `tomat.run_history` above. That module
+# is the single source of truth, shared with `./tomat`'s `runs sync`
+# subcommand. Don't redefine here — drift between writers silently
+# invalidates each other's manifests on every cross-tool pass (a02cda7
+# already paid that tax). See spec 56.
 
 
 def err(*a, **k):
@@ -134,44 +127,10 @@ def setup_wandb_creds():
     sys.exit(1)
 
 
-def run_parquet_schema():
-    """pyarrow schema for the merged history table — matches `tomat:486`."""
-    import pyarrow as pa
-    return pa.schema([
-        ("_step",                            pa.int64()),
-        ("_timestamp",                       pa.float64()),
-        ("_runtime",                         pa.float64()),
-        ("global_step",                      pa.int64()),
-        ("train/loss",                       pa.float32()),
-        ("eval/loss",                        pa.float32()),
-        ("throughput/mfu",                   pa.float32()),
-        ("throughput/tokens_per_second",     pa.float32()),
-        ("throughput/duration",              pa.float32()),
-        # Cumulative GFLOPs since training started — monotonic, drives the
-        # FLOP x-axis option in the dashboard. Added 2026-06-07.
-        ("throughput/total_gflops",          pa.float64()),
-        ("eval/mat_nmae/val_200/mean",       pa.float32()),
-        ("eval/mat_nmae/val_200/median",     pa.float32()),
-        ("eval/mat_nmae/val_200/p99",        pa.float32()),
-        ("eval/mat_nmae/train_200/mean",     pa.float32()),
-        ("eval/mat_nmae/train_200/median",   pa.float32()),
-        ("eval/mat_nmae/train_200/p99",      pa.float32()),
-        ("eval/mat_nemd/val_200/mean",       pa.float32()),
-        ("eval/mat_nemd/val_200/median",     pa.float32()),
-        ("eval/mat_nemd/val_200/p99",        pa.float32()),
-        ("eval/mat_nemd/train_200/mean",     pa.float32()),
-        ("eval/mat_nemd/train_200/median",   pa.float32()),
-        ("eval/mat_nemd/train_200/p99",      pa.float32()),
-        ("lifecycle/trainer_started",        pa.int8()),
-        ("lifecycle/sigterm_received",       pa.int8()),
-        ("lifecycle/trainer_finished",       pa.int8()),
-        ("cluster/preemptions",              pa.int32()),
-        ("cluster/failures",                 pa.int32()),
-        ("cluster/preempts_delta",           pa.int32()),
-        ("cluster/failures_delta",           pa.int32()),
-        ("cluster/preempts_per_hour",        pa.float32()),
-        ("cluster/elapsed_min",              pa.float32()),
-    ])
+# Parquet schema lives in `tomat.run_history.arrow_schema()` (imported
+# above). Kept here as a module-level alias for `pq.write_table` calls
+# below — same identity, just shorter name.
+run_parquet_schema = arrow_schema
 
 
 def collect_active_runs(api):
@@ -317,17 +276,11 @@ def _build_manifest(primary, history: dict) -> dict:
     # history row for each missing key. (`primary.summary` always has the
     # cron-written `cluster/*` and the basic wandb `_runtime`/`_step`/
     # `_timestamp`, so those don't need backfilling.)
-    _BACKFILL_KEYS = (
-        "train/loss", "throughput/mfu", "throughput/p50_mfu",
-        "throughput/tokens_per_second", "throughput/duration",
-        "throughput/total_gflops", "throughput/total_tokens",
-        "throughput/device_kind", "throughput/theoretical_flops_per_device",
-        "throughput/theoretical_flops", "throughput/flops_per_example",
-        "num_devices", "parameter_count",
-    )
+    # `BACKFILL_KEYS` is imported from `tomat.run_history` (shared with the
+    # CLI's `runs sync` subcommand — same source of truth, no drift).
     last_row = history.get("last_row") if isinstance(history, dict) else None
     if last_row:
-        for k in _BACKFILL_KEYS:
+        for k in BACKFILL_KEYS:
             if k not in summary and last_row.get(k) is not None:
                 summary[k] = last_row[k]
     return {
