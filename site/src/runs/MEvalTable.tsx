@@ -36,11 +36,17 @@ interface Props {
 
 /** Column-key → display label. The four eval-set/mode combinations we
  *  surface in the table. Order is also the column display order. */
+// Eval-mode labels (`K=1` / `K=12`) are renamed from the underlying setKey
+// for honesty: `oneshot` is the K=1 limit of MaskGIT iterative decode (one
+// bidir forward, no top-k schedule), `maskgit` is the K=12 schedule. The
+// numeric labels make the cost/quality tradeoff explicit (K=12 is 12× per
+// mat). Underlying setKeys stay `val_200`/`val_200-maskgit` so JSON
+// reads + dump paths don't migrate.
 const COLUMNS: { key: string; label: string }[] = [
-  { key: 'val_200',         label: 'val_200' },
-  { key: 'train_200',       label: 'train_200' },
-  { key: 'val_200-maskgit', label: 'val_200 · maskgit' },
-  { key: 'train_200-maskgit', label: 'train_200 · maskgit' },
+  { key: 'val_200',         label: 'val_200 · K=1' },
+  { key: 'train_200',       label: 'train_200 · K=1' },
+  { key: 'val_200-maskgit', label: 'val_200 · K=12' },
+  { key: 'train_200-maskgit', label: 'train_200 · K=12' },
 ]
 
 const BUCKET_COLORS_LIGHT: Record<Bucket, string> = {
