@@ -564,10 +564,13 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   // rather than `ordered` (ts-sorted): segment membership is in row-index
   // space (see the `segments` useMemo for the rationale — `_timestamp` is
   // upload-time noise on iris-TPU runs that async-upload metric batches).
-  // Within a segment, x=step picks up gstep-ascending naturally; x=wallclock/
-  // elapsed may carry tiny ts back-jumps where async-upload reordered rows,
-  // which read as noise on the line, not as the phantom "loop back to step 0"
-  // that the old ts-segmentation produced.
+  // Within a segment, x=step / epoch / flop picks up monotonically in row
+  // order naturally (gstep / epoch-of-gstep / cumulative-flop are all
+  // monotone in `_step`); x=wallclock/elapsed instead carry tiny ts
+  // back-jumps where async-upload reordered rows — we post-sort each
+  // segment's xs/ys/gsteps in those modes so downstream gap detection
+  // (`findGapEndIndices`) doesn't trip on the jitter and emit hundreds of
+  // phantom dotted bridge segments.
   function series(key: keyof RunHistoryRow): Series[] {
     const col = cols.get(key) ?? []
     const out: Series[] = Array.from({ length: numSegments },
@@ -586,6 +589,32 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       seg.gsteps.push(gstepAtTs(ts))
       seg.xs.push(x)
       seg.ys.push(v as number)
+    }
+    // Sort wallclock/elapsed segments by x. The row-index walk above doesn't
+    // guarantee ts-monotonicity (Levanter `BackgroundIterator` async-uploads
+    // metric batches → wandb `_timestamp` can drift minutes-to-hours from
+    // log time, putting an "earlier" row's ts after a "later" row's). The
+    // resulting non-monotone xs trip both rendering (zigzag) and gap
+    // detection (`findGapEndIndices`'s median-delta threshold flags every
+    // tiny back-jump as a gap, producing hundreds of phantom dotted bridge
+    // segments — `train-mg-kl-bin5-fs-tpu` exhibited ~700 false gaps in
+    // seg #1 alone). step/epoch/flop xs are monotone in row order already;
+    // skip the sort there.
+    if (xMode === 'time' || xMode === 'elapsed') {
+      for (const seg of out) {
+        if (seg.xs.length < 2) continue
+        const indices = seg.xs.map((_, k) => k)
+        indices.sort((a, b) => {
+          const xa = seg.xs[a], xb = seg.xs[b]
+          if (typeof xa === 'number' && typeof xb === 'number') return xa - xb
+          // wallclock: xs are `YYYY-MM-DD HH:MM:SS` strings, where lex order
+          // matches chronological order. localeCompare is overkill but safe.
+          return String(xa).localeCompare(String(xb))
+        })
+        seg.xs = indices.map((k) => seg.xs[k])
+        seg.ys = indices.map((k) => seg.ys[k])
+        seg.gsteps = indices.map((k) => seg.gsteps[k])
+      }
     }
     return out
   }
@@ -663,41 +692,49 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   // intervening `lifecycle/trainer_started`), the parquet rows that bookend
   // the pause would otherwise be connected by a solid line indistinguishable
   // from a normal training step — especially misleading once rolling
-  // smoothing is on. Detect "gaps" as consecutive-x deltas ≥ `GAP_THRESHOLD`
-  // × the segment's median delta, split the main line at those points (insert
-  // `null` y to break it), and emit a separate dotted bridge trace (same
-  // color/legendgroup/opacity, `showlegend: false`) covering only the gap
-  // span. Step-mode is exempt: restart-segment splitting already breaks at
-  // step regressions and intra-segment step deltas are unit-1 monotone.
-  const GAP_THRESHOLD = 10
-  // Numeric distance between consecutive xs. `NaN` if either is null/mixed.
-  // For date-typed `wallclock` xs (ISO strings) → ms; for `elapsed` xs
-  // (hours, numbers) → hours. Units are irrelevant for the median-based
-  // threshold — only the ratio matters.
-  function xDelta(prev: string | number, curr: string | number): number {
-    if (typeof prev === 'number' && typeof curr === 'number') return curr - prev
+  // smoothing is on. Detect "gaps" as consecutive-x deltas ≥ both
+  // `GAP_THRESHOLD_RATIO` × the segment's median delta AND `GAP_MIN_SECONDS`
+  // absolute. Both gates have to fire so we don't flag (a) wandb async-upload
+  // jitter at the ~minute scale (~100× median but only ~1 min absolute —
+  // training resumes fine, no real pause) or (b) a long-cadence eval column
+  // whose median is already minutes (a 10-min gap there is normal). Real
+  // Modal-respawn pauses are 5+ min AND many-× the median; the AND-gate
+  // catches them and nothing else. Step-mode is exempt: restart-segment
+  // splitting already breaks at step regressions and intra-segment step
+  // deltas are unit-1 monotone.
+  const GAP_THRESHOLD_RATIO = 10
+  const GAP_MIN_SECONDS = 300  // 5 minutes
+  // Numeric distance between consecutive xs, in SECONDS. `NaN` if either is
+  // null/mixed. Wallclock xs are `YYYY-MM-DD HH:MM:SS` strings (parse via
+  // `Date.parse` → ms → / 1000); `elapsed` xs are hours (× 3600).
+  function xDeltaSec(prev: string | number, curr: string | number): number {
+    if (typeof prev === 'number' && typeof curr === 'number') {
+      // elapsed: hours
+      return (curr - prev) * 3600
+    }
     if (typeof prev === 'string' && typeof curr === 'string') {
-      return new Date(curr).getTime() - new Date(prev).getTime()
+      // wallclock: date strings → ms → s
+      return (new Date(curr).getTime() - new Date(prev).getTime()) / 1000
     }
     return NaN
   }
-  // Indices `i` such that `xs[i-1] → xs[i]` is a gap (delta ≥ threshold ×
-  // median). Empty in step-mode (caller short-circuits) and for short series.
+  // Indices `i` such that `xs[i-1] → xs[i]` is a gap. Empty in step-mode
+  // (caller short-circuits) and for short series.
   function findGapEndIndices(xs: (string | number)[]): number[] {
     if (xMode === 'step' || xs.length < 3) return []
     const deltas: number[] = []
     for (let i = 1; i < xs.length; i++) {
-      const d = xDelta(xs[i - 1], xs[i])
+      const d = xDeltaSec(xs[i - 1], xs[i])
       if (Number.isFinite(d) && d > 0) deltas.push(d)
     }
     if (deltas.length === 0) return []
     const sorted = [...deltas].sort((a, b) => a - b)
     const median = sorted[Math.floor(sorted.length / 2)]
     if (!(median > 0)) return []
-    const cutoff = median * GAP_THRESHOLD
+    const cutoff = Math.max(median * GAP_THRESHOLD_RATIO, GAP_MIN_SECONDS)
     const out: number[] = []
     for (let i = 1; i < xs.length; i++) {
-      const d = xDelta(xs[i - 1], xs[i])
+      const d = xDeltaSec(xs[i - 1], xs[i])
       if (Number.isFinite(d) && d > cutoff) out.push(i)
     }
     return out
