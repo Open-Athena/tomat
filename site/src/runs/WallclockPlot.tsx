@@ -1389,7 +1389,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
 
   const xTitle = xMode === 'time' ? TZ_LABEL
     : xMode === 'elapsed' ? 'elapsed (h)'
-    : xMode === 'epoch' ? 'epoch (fractional)'
+    : xMode === 'epoch' ? 'epoch'
     : xMode === 'flop' ? `FLOP (${flopUnit})`
     : 'global_step'
 
