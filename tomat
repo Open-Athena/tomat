@@ -2339,6 +2339,7 @@ def evals():
 @click.option("-T", "--num-tasks", default=1, type=int, help="Fan out the mat set across N iris jobs. Each job gets a contiguous slice of size ~n_mats/N via the eval script's existing TOMAT_EVAL_SKIP+TOMAT_EVAL_N_MATS env vars. Per-task results land at `<set>-<mode>/step-<N>-task-<i>.json`; `tomat evals sync` aggregates them. Use when free-running eval at n_mats=200 is too slow on a single task (see specs/38).")
 @click.option("-b", "--eval-batch", default=32, type=int)
 @click.option("-t", "--tpu", default="v6e-8")
+@click.option("--memory", "iris_memory", default="64GB", show_default=True, help="iris container --memory. Bump for maskgit + dump-predictions evals where K iterations × full-vocab logits + npz buffer writes can spill past 64GB (kl-bin5 maskgit OOM'd at 64GB on v6e-8; 128GB fits).")
 @click.option("--zone", default=None, help="iris --zone (e.g. europe-west4-a); pin eval slice to the ckpt-bucket region to avoid x-reg ckpt-read egress. Repeatable via comma-sep list.")
 @click.option("--region", default=None, help="iris --region (e.g. europe-west4); broader pin than --zone.")
 @click.option("--decoder", default="median")
@@ -2364,6 +2365,7 @@ def evals_fire(
     num_tasks: int,
     eval_batch: int,
     tpu: str,
+    iris_memory: str,
     decoder: str,
     dry_run: bool,
     debug_dump_mat: str,
@@ -2552,7 +2554,7 @@ def evals_fire(
                 cmd = [
                     IRIS_BIN, "--cluster=marin", "job", "run",
                     "--tpu", tpu, "--enable-extra-resources", "--priority", "interactive",
-                    "--cpu", "32", "--memory", "64GB",
+                    "--cpu", "32", "--memory", iris_memory,
                 ]
                 if zone:
                     for z in zone.split(","):
