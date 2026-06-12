@@ -740,11 +740,19 @@ def runs_links(substr: str | None, limit: int, md: bool):
 def _trim_to_latest_trajectory(rows: list[dict]) -> list[dict]:
     """Drop rows from abandoned trajectories before a `global_step` reset.
 
-    `rows` must already be sorted by `_timestamp` (the call site does this).
-    Walk in time-order, find the LAST index where `global_step` decreased
-    vs the previous non-null `global_step` row — that's the start of a fresh
-    training trajectory (caused by `--force`, a wandb-resume that reset, etc.).
-    Keep only rows from that index onward.
+    `rows` must already be sorted by `_step` ascending (the call site does
+    this; commit `33c688d` after the bin5 incident — wandb's `_timestamp`
+    is server-receive time on iris-TPU runs that async-upload metric
+    batches, so a ts-sorted walk would see `global_step` regress and
+    mis-trim. `_step` is the dependable monotonic key).
+
+    Walk in `_step` order, find the LAST index where `global_step`
+    decreased vs the previous non-null `global_step` row — that's the
+    start of a fresh training trajectory (caused by `--force`, a
+    wandb-resume that reset, etc.). Keep only rows from that index onward.
+
+    Mirror of `scripts/runs-sync.py:_trim_to_latest_trajectory`. Spec 56
+    (C1) plans to factor them into one shared helper.
 
     No reset detected → no change. Single trajectory → no change.
     """
