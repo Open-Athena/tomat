@@ -74,8 +74,11 @@ R2_BUCKET = "openathena"
 R2_RUNS_PREFIX = "tomat/runs"
 
 # History-sync schema (see `specs/23-runs-dashboard.md`). Bump
-# `_RUN_PARQUET_SCHEMA_VERSION` on incompatible parquet changes.
-_RUN_PARQUET_SCHEMA_VERSION = 1
+# `_RUN_PARQUET_SCHEMA_VERSION` on incompatible parquet changes. Keep in
+# lockstep with `scripts/runs-sync.py:RUN_PARQUET_SCHEMA_VERSION` — both
+# write the same parquet, so a drift between them silently invalidates
+# manifests on every cross-tool pass.
+_RUN_PARQUET_SCHEMA_VERSION = 2
 _RUN_PARQUET_KEYS = [
     "_step", "_timestamp", "_runtime",
     "global_step",   # Levanter's training step (true progress) — separate
