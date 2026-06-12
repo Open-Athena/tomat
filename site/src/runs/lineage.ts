@@ -107,6 +107,26 @@ export function lineageFor(runName: string): RunLineage | null {
   return RUN_LINEAGE[runName] ?? null
 }
 
+/** Short relationship label for an ancestor at `partIdx` in a `lineageInfo`
+ *  of length `numAncestors`. `lineageInfo` is root→parent; the LAST entry
+ *  is the immediate parent. Depth-from-current = `numAncestors - partIdx`:
+ *  depth 1 → `'parent'`, 2 → `'grandparent'`, 3 → `'great-grandparent'`,
+ *  ≥4 → `'ancestor #N'` (avoids piling on "great-"s past 3).
+ *
+ *  Used for the WallclockPlot legend's per-ancestor group title — the
+ *  previous `ancestor: <full-name>` group title dominated plot width on
+ *  multi-ancestor runs. The full ancestor name lives on hover (the trace's
+ *  hovertemplate appends `· <relation> (<full-name>)`).
+ */
+export function ancestorRelation(partIdx: number, numAncestors: number): string {
+  const depth = numAncestors - partIdx  // 1 = immediate parent, 2 = grandparent, …
+  if (depth <= 0) return 'ancestor'
+  if (depth === 1) return 'parent'
+  if (depth === 2) return 'grandparent'
+  if (depth === 3) return 'great-grandparent'
+  return `ancestor #${depth}`
+}
+
 // ── Run segments (data-label / batch-size cutovers within one run) ──────────
 //
 // A "segment" is a half-open `[startStep, endStep)` slice of a run during

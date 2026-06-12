@@ -39,6 +39,7 @@ import { epochOfStep } from './runMeta'
 import { annotationsFor, type RunAnnotation } from './annotations'
 import { computeSmoothedSeries } from './smoothing'
 import { FlopUnitChips, formatFlops, useFlopUnit } from './flops'
+import { ancestorRelation } from './lineage'
 
 /** Ancestor metadata for a lineage-glued history. Each entry corresponds to
  *  one part of the concatenated `history` (root → parent order, the order
@@ -660,6 +661,11 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       let groupTitle: string
       let showLegend: boolean
       let segName: string
+      // Full descriptive label used in the per-trace hovertemplate (the legend
+      // text itself stays short — `name` or `${name} #k/N`). For ancestor
+      // segments, this surfaces the full ancestor name on hover so the
+      // discoverability cost of the short group title is paid back.
+      let hoverLabel: string
       if (ancestor) {
         traceColor = ancestor.color
         opacity = 1
@@ -667,9 +673,21 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         // legend-toggle isolate the ancestor's metric stack from the
         // current run's `losses` group. Group key is unique per ancestor.
         legendGroup = `lineage:${ancestor.name}`
-        groupTitle = `ancestor: ${ancestor.name}`
+        // Short relationship label (parent / grandparent / great-grandparent
+        // / ancestor #N) — the previous full-name group title `ancestor:
+        // <full-name>` dominated the plot width on multi-ancestor runs.
+        // Full name lives on hover (see `hoverLabel`). `lineageInfo` is
+        // non-null here because `ancestor` is.
+        groupTitle = ancestorRelation(segMeta.partIdx, lineageInfo!.length)
         showLegend = true  // one row per ancestor per metric
-        segName = `${name} · ${ancestor.name}`
+        // Trace name matches the current-run's `name` (e.g. `TL (train/loss)`)
+        // — the legend group title disambiguates which ancestor it is, and
+        // color further distinguishes. Same-name traces still work for the
+        // band-fade logic: ancestor segments don't draw ±σ bands (see
+        // `isLatest` gate below), so the only `name`-matched band edges are
+        // the current run's, which fade together with their parent line.
+        segName = name
+        hoverLabel = `${name} · ${groupTitle} (${ancestor.name})`
       } else {
         traceColor = color
         // Linear ramp anchored on the latest CURRENT-RUN segment: oldest
@@ -687,6 +705,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         // instead of three identical "TL (train/loss)" rows.
         segName = numCurrentSegs > 1 && !isLatest
           ? `${name} #${relIdx + 1}/${numCurrentSegs}` : name
+        hoverLabel = segName
       }
       // Bypass smoothing for sparse traces — VL on a long run carries ~5-20
       // points across 10k+ steps, and sample-index rolling with window >
@@ -751,7 +770,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         legendgrouptitle: { text: groupTitle },
         showlegend: showLegend,
         customdata: lineG,
-        hovertemplate: `${segName} %{y:.3f}<br>gstep %{customdata}<extra></extra>`,
+        hovertemplate: `${hoverLabel} %{y:.3f}<br>gstep %{customdata}<extra></extra>`,
       }
       // Dotted bridge connecting each gap's endpoints. Same color/opacity/
       // legendgroup as the main line so a legend-toggle hides them with the

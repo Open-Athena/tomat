@@ -13,6 +13,7 @@
 import { strict as assert } from 'node:assert'
 import { describe, it } from 'node:test'
 import { computeSmoothedSeries, type SmoothMode } from './smoothing.ts'
+import { ancestorRelation } from './lineage.ts'
 
 const RAW: SmoothMode = { kind: 'raw' }
 const ema = (alpha: number): SmoothMode => ({ kind: 'ema', alpha })
@@ -172,5 +173,50 @@ describe('computeSmoothedSeries', () => {
         assert.ok(close(m, globalMean, 1e-9))
       }
     })
+  })
+})
+
+describe('ancestorRelation (legend group-title label)', () => {
+  // `lineageInfo` is root → parent, so the LAST entry is the immediate
+  // parent. `partIdx` indexes into it; depth-from-current = numAncestors -
+  // partIdx (depth 1 = parent, 2 = grandparent, …).
+
+  it('single-ancestor: only entry is the immediate parent', () => {
+    assert.equal(ancestorRelation(0, 1), 'parent')
+  })
+
+  it('two-ancestor chain: root → parent', () => {
+    // lineageInfo = [grandparent, parent]
+    assert.equal(ancestorRelation(0, 2), 'grandparent')
+    assert.equal(ancestorRelation(1, 2), 'parent')
+  })
+
+  it('three-ancestor chain (e.g. SS run): great-grandparent → grandparent → parent', () => {
+    // lineageInfo = [great-grandparent, grandparent, parent] — this is the
+    // `train-ss-cont80k-emax025-1` case: cont7k → cont7k-ext → cont33k → SS.
+    assert.equal(ancestorRelation(0, 3), 'great-grandparent')
+    assert.equal(ancestorRelation(1, 3), 'grandparent')
+    assert.equal(ancestorRelation(2, 3), 'parent')
+  })
+
+  it('deeper-than-3 chains use indexed "ancestor #N" instead of stacking "great-"s', () => {
+    // 4-ancestor chain: depths 4, 3, 2, 1 → labels for partIdx 0..3
+    assert.deepEqual(
+      [0, 1, 2, 3].map((i) => ancestorRelation(i, 4)),
+      ['ancestor #4', 'great-grandparent', 'grandparent', 'parent'],
+    )
+    // 6-ancestor chain: the two deepest become indexed
+    assert.deepEqual(
+      [0, 1, 2, 3, 4, 5].map((i) => ancestorRelation(i, 6)),
+      ['ancestor #6', 'ancestor #5', 'ancestor #4', 'great-grandparent', 'grandparent', 'parent'],
+    )
+  })
+
+  it('out-of-range partIdx (defensive — should never happen in practice)', () => {
+    // depth <= 0 (partIdx >= numAncestors) — defensive default; the caller
+    // never passes this in the real flow (the current run goes through the
+    // non-ancestor branch in `smoothedSeriesTraces`).
+    assert.equal(ancestorRelation(1, 1), 'ancestor')
+    assert.equal(ancestorRelation(3, 2), 'ancestor')
   })
 })
