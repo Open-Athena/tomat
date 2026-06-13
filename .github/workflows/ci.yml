@@ -52,3 +52,35 @@ jobs:
             echo "::error::DVX-tracked artifacts are stale vs their .dvc provenance. Re-run the producing command and commit."
             exit 1
           fi
+
+  site-e2e:
+    # Playwright e2e suite against the built site. Gates `deploy.yml` —
+    # `deploy.yml` does NOT depend on this job at the GHA workflow level,
+    # but the deploy-on-push semantics mean a failed e2e run blocks the
+    # merge (and thus the push that triggers deploy) when this job is
+    # required in branch protection. Hits R2 + workers.dev for run
+    # manifests, so network egress in the CI runner matters; runs in
+    # ~3-5 min as of bin5 baseline.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: site/pnpm-lock.yaml
+      - run: pnpm --dir site install --frozen-lockfile
+      - name: Install Playwright browsers
+        run: pnpm --dir site exec playwright install --with-deps chromium
+      - name: Run Playwright e2e
+        run: pnpm --dir site exec playwright test --reporter=line
+      - name: Upload trace + screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-failures
+          path: site/test-results/
+          retention-days: 7
