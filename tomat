@@ -3633,15 +3633,23 @@ def train(
                 # still catch any actual t10n incompatibility.)
                 new_parts = [p.strip() for p in data_label.split(",") if p.strip()]
                 _union_widening = (len(new_parts) > 1 and existing_subdir in new_parts)
-                if existing_subdir and existing_subdir != data_label and not _union_widening:
+                # Cache subdir uses `+`-join (per `train_tomat_tpu.py:label_for_path
+                # = label.replace(",", "+")`), but `--data-label` is the comma-joined
+                # form the trainer's `_label_parts(...)` expects. Normalize both to
+                # `+`-form before comparing so the validator doesn't false-positive
+                # on cosmetic separator-mismatch (and so passing `+`-form here
+                # doesn't accidentally pass through to TOMAT_LABEL — which would
+                # break `_label_parts` and FileNotFound on a single combined dir).
+                expected_subdir = data_label.replace(",", "+")
+                if existing_subdir and existing_subdir != expected_subdir and not _union_widening:
                     err(f"[tomat train] resume {label!r}: --data-label mismatch.")
                     err(f"  existing wandb run ({existing.entity}/{existing.project}) "
                         f"cache_dir = {existing_cache!r}")
-                    err(f"  --data-label={data_label!r} (subdir {data_label!r}) "
+                    err(f"  --data-label={data_label!r} (subdir {expected_subdir!r}) "
                         f"!= existing subdir {existing_subdir!r}")
                     err(f"  resuming with a mismatched cache would silently re-route to "
                         f"a different wandb project and train on incompatible t10n.")
-                    err(f"  pass --data-label={existing_subdir}")
+                    err(f"  pass --data-label={existing_subdir.replace('+', ',')}")
                     sys.exit(2)
                 if _union_widening:
                     print(f"[tomat train] resume {label!r}: union widening — "
