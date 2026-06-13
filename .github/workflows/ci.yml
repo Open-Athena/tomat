@@ -62,7 +62,14 @@ jobs:
     # points pytest at `tests/` with `PYTHONPATH=src` so `tomat.*` imports
     # resolve. ~3-5 min on a cold CI runner (one-time wheel download +
     # JAX/HAX init).
+    #
+    # `VIRTUAL_ENV` is force-set to `marin/.venv` in every step because
+    # `setup-uv@v5` exports `VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv` early,
+    # which would route `uv sync` + `uv pip install` into the ROOT venv
+    # (no ML deps) instead of `marin/.venv` (the one we want).
     runs-on: ubuntu-latest
+    env:
+      VIRTUAL_ENV: ${{ github.workspace }}/marin/.venv
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v5
