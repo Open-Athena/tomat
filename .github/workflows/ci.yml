@@ -53,6 +53,32 @@ jobs:
             exit 1
           fi
 
+  test-ml:
+    # Run the jax/levanter-dependent tests inside the marin subproject's
+    # venv (already pins the full ML stack via [tool.uv.sources] git+SHA).
+    # The root `test` job skips these tests via `pytest.importorskip("jax")`
+    # because the root pyproject deliberately defers the heavy ML install;
+    # this job picks them up using `tomat/marin/` as the venv root and
+    # points pytest at `tests/` with `PYTHONPATH=src` so `tomat.*` imports
+    # resolve. ~3-5 min on a cold CI runner (one-time wheel download +
+    # JAX/HAX init).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - name: Install marin ML stack
+        working-directory: marin
+        run: |
+          uv sync
+          uv pip install pytest
+      - name: Run jax-dependent tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+        working-directory: marin
+        run: uv run --no-sync pytest ../tests/
+
   site-e2e:
     # Playwright e2e suite against the built site. Gates `deploy.yml` —
     # `deploy.yml` does NOT depend on this job at the GHA workflow level,

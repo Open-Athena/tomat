@@ -10,11 +10,17 @@ Plan from `specs/39-fr-eval-paged-kv.md` (Path B). Reference:
 `/Users/ryan/c/oa/levanter/tests/inference/test_paged_attention.py:303-384`
 for the prefill-then-chunked-decode pattern.
 """
-import jax
+import pytest
+# Heavy ML deps — CI's lightweight `uv sync` doesn't install them. Skip
+# the whole module in environments without `jax`/`haliax`/Levanter (this
+# smoke is a real-hardware bf16-equivalence A/B; CI never runs it green).
+jax = pytest.importorskip("jax")
+hax = pytest.importorskip("haliax")
+pytest.importorskip("levanter")
+
 import jax.random as jrandom
 import jax.numpy as jnp
 import numpy as np
-import haliax as hax
 from haliax import Axis
 
 from levanter.models.qwen import Qwen3Config, Qwen3LMHeadModel

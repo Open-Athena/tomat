@@ -18,11 +18,17 @@ to 3+ decimal places — has to run on real hardware; that's a wall-clock
 A/B once the paths are wired into the eval driver (`tomat evals fire`
 on a real ckpt with `TOMAT_EVAL_FREE_LEGACY=1` vs unset).
 """
+import pytest
+# Heavy ML deps — CI's lightweight `uv sync` doesn't install them. Skip
+# the whole module in environments without `jax`/`haliax`/Levanter (this
+# test is a real-hardware A/B; CI never runs it green).
+jax = pytest.importorskip("jax")
+hax = pytest.importorskip("haliax")
+pytest.importorskip("levanter")
+
 import numpy as np
-import jax
 import jax.random as jrandom
 import jax.numpy as jnp
-import haliax as hax
 from haliax import Axis
 
 from levanter.models.qwen import Qwen3Config, Qwen3LMHeadModel
