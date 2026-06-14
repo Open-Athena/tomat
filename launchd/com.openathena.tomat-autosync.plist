@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd plist for tomat autosync (#280).
+
+  Install:
+    cp launchd/com.openathena.tomat-autosync.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.openathena.tomat-autosync.plist
+    launchctl kickstart -k gui/$(id -u)/com.openathena.tomat-autosync   # smoke
+
+  Uninstall:
+    launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.openathena.tomat-autosync.plist
+    rm ~/Library/LaunchAgents/com.openathena.tomat-autosync.plist
+
+  Logs: /tmp/tomat-autosync.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.openathena.tomat-autosync</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/ryan/c/oa/tomat/scripts/autosync.sh</string>
+  </array>
+
+  <!-- Every 15 minutes. Tune up/down based on tolerance for dashboard
+       staleness vs the per-run cost-compute cost (~secs/run × ~30 runs). -->
+  <key>StartInterval</key>
+  <integer>900</integer>
+
+  <!-- Don't run more than once at a time. -->
+  <key>AbandonProcessGroup</key>
+  <false/>
+
+  <!-- Don't run while the Mac is sleeping; the script will catch up on
+       the next interval after wake. -->
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/tomat-autosync.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/tomat-autosync.stderr.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/ryan/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/ryan</string>
+  </dict>
+</dict>
+</plist>
