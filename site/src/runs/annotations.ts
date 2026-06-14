@@ -41,6 +41,17 @@ export const RUN_ANNOTATIONS: Record<string, RunAnnotation[]> = {
       label: 'TS0→TS1, BS 128→256, LR 3e-5→4e-5',
     },
   ],
+  // bin5 (r=1 absorbing-prior MaskGIT, KL-Gauss σ=5 bin). Started on
+  // `train-full-v3-shard1` only (sawtooth-prone per-shard epoch boundaries);
+  // resumed at step-67000 onto the 4-shard `TS0+TS1+TS2+TS3` union (epoch
+  // width ~4× wider → TL trajectory smooths out). The same fire also
+  // bumped `TOMAT_SHUFFLE_WINDOW_BLOCKS` 1024 → auto/78125 (epochwin).
+  'train-mg-kl-bin5-fs-tpu': [
+    {
+      step: 67000,
+      label: 'shard1 → TS0+TS1+TS2+TS3 union; shuffle 1024 → epochwin',
+    },
+  ],
   // 4-way LF ablation, KL-Gauss(σ=0.5) arm. Three consecutive resumes, each
   // re-extending num_train_steps → cosine schedule recomputed over the new
   // horizon. First two are pure "stretch the cosine"; the third (9k) also
