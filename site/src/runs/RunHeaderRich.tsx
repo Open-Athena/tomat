@@ -634,13 +634,23 @@ function EvalChip({ jobs }: { jobs: EvalJob[] }) {
     else done++
   }
   if (flight === 0 && failed === 0) return null
+  // Hide the chip entirely once `done` ≥ `failed` AND no flight: a few
+  // bad apples among many successes is information, not an actionable
+  // alarm. The MT/MV numbers on the page are the actual signal. The
+  // failed count is still surfaced (in the tooltip / status dots).
+  if (flight === 0 && done >= failed) return null
   const label = flight > 0
     ? `⏳ ${flight} m-eval${flight > 1 ? 's' : ''}`
     : `⚠ ${failed} m-eval${failed > 1 ? 's' : ''} failed`
+  // Color: yellow when there's progress (flight or some done); red only
+  // when every fired job failed (failed > 0 ∧ done = 0 ∧ flight = 0).
+  const bg = flight > 0 ? '#d4a017'
+    : done > 0 ? '#a16207'
+    : '#cb2431'
   return (
     <Tooltip content={`${jobs.length} m-eval job(s): ${flight} in flight · ${done} done · ${failed} failed`}>
       <span style={{
-        backgroundColor: flight > 0 ? '#d4a017' : '#cb2431', color: '#fff',
+        backgroundColor: bg, color: '#fff',
         padding: '1px 6px', borderRadius: 3,
         fontSize: '0.75rem', fontFamily: 'monospace',
       }}>
