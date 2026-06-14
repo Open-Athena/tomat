@@ -168,6 +168,17 @@ export const SEGMENTS: Record<string, RunSegment[]> = {
     { startStep: 0,     endStep: 76186,    dataLabel: 'train-full-v3',        batchSize: 128 },
     { startStep: 76186, endStep: Infinity, dataLabel: 'train-full-v3-shard1', batchSize: 256 },
   ],
+  // bin5 (r=1 absorbing-prior MaskGIT). Started on shard1 only through
+  // step 67000, then resumed onto the 4-shard `train-full-v3 + shard1+2+3`
+  // union for the rest. BS=128 throughout.
+  'train-mg-kl-bin5-fs-tpu': [
+    { startStep: 0,     endStep: 67000,    dataLabel: 'train-full-v3-shard1', batchSize: 128 },
+    {
+      startStep: 67000, endStep: Infinity,
+      dataLabel: 'train-full-v3+train-full-v3-shard1+train-full-v3-shard2+train-full-v3-shard3',
+      batchSize: 128,
+    },
+  ],
 }
 
 /** Segments for `runName`, or `null` if none are declared. */

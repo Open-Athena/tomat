@@ -213,6 +213,10 @@ export const EPOCH_SEQUENCES: Record<string, number> = {
   'train-full-v3-shard1': 4964352,
   'train-full-v3-shard2': 4964352,
   'train-full-v3-shard3': 4964352,
+  // ConcatDatasetComponent union of the 4 shards (bin5's resume target).
+  // Total = train-full-v3 (4,954,176) + 3 × shard{1,2,3} (4,964,352).
+  // Same `+`-joined name as `train_tomat_tpu.py:label_for_path`.
+  'train-full-v3+train-full-v3-shard1+train-full-v3-shard2+train-full-v3-shard3': 19847232,
 }
 
 /** Data label (tokenization) of a run.
