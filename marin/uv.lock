@@ -1552,7 +1552,7 @@ wheels = [
 [[package]]
 name = "marin-core"
 version = "0.2.0"
-source = { git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Fmarin&rev=e9ca2074376916e69daf37b8d278d45ca2c6990b#e9ca2074376916e69daf37b8d278d45ca2c6990b" }
+source = { git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Fmarin&rev=b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5#b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5" }
 dependencies = [
     { name = "backports-zstd", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "braceexpand", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1599,7 +1599,7 @@ dependencies = [
 [[package]]
 name = "marin-finelog"
 version = "0.2.0"
-source = { git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Ffinelog&rev=e9ca2074376916e69daf37b8d278d45ca2c6990b#e9ca2074376916e69daf37b8d278d45ca2c6990b" }
+source = { git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Ffinelog&rev=b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5#b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5" }
 dependencies = [
     { name = "click", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "connect-python", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1619,7 +1619,7 @@ dependencies = [
 [[package]]
 name = "marin-fray"
 version = "0.2.0"
-source = { git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Ffray&rev=e9ca2074376916e69daf37b8d278d45ca2c6990b#e9ca2074376916e69daf37b8d278d45ca2c6990b" }
+source = { git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Ffray&rev=b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5#b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5" }
 dependencies = [
     { name = "click", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "cloudpickle", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1641,7 +1641,7 @@ dependencies = [
 [[package]]
 name = "marin-haliax"
 version = "0.2.0"
-source = { git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Fhaliax&rev=e9ca2074376916e69daf37b8d278d45ca2c6990b#e9ca2074376916e69daf37b8d278d45ca2c6990b" }
+source = { git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Fhaliax&rev=b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5#b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5" }
 dependencies = [
     { name = "aqtp", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "equinox", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1654,7 +1654,7 @@ dependencies = [
 [[package]]
 name = "marin-iris"
 version = "0.2.0"
-source = { git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Firis&rev=e9ca2074376916e69daf37b8d278d45ca2c6990b#e9ca2074376916e69daf37b8d278d45ca2c6990b" }
+source = { git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Firis&rev=b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5#b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5" }
 dependencies = [
     { name = "click", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "cloudpickle", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1683,7 +1683,7 @@ dependencies = [
 [[package]]
 name = "marin-levanter"
 version = "0.2.0"
-source = { git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Flevanter&rev=e9ca2074376916e69daf37b8d278d45ca2c6990b#e9ca2074376916e69daf37b8d278d45ca2c6990b" }
+source = { git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Flevanter&rev=b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5#b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5" }
 dependencies = [
     { name = "async-lru", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "braceexpand", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1734,7 +1734,7 @@ serve = [
 [[package]]
 name = "marin-rigging"
 version = "0.2.0"
-source = { git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Frigging&rev=e9ca2074376916e69daf37b8d278d45ca2c6990b#e9ca2074376916e69daf37b8d278d45ca2c6990b" }
+source = { git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Frigging&rev=b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5#b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5" }
 dependencies = [
     { name = "connect-python", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "fsspec", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1745,7 +1745,7 @@ dependencies = [
 [[package]]
 name = "marin-zephyr"
 version = "0.2.0"
-source = { git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Fzephyr&rev=e9ca2074376916e69daf37b8d278d45ca2c6990b#e9ca2074376916e69daf37b8d278d45ca2c6990b" }
+source = { git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Fzephyr&rev=b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5#b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5" }
 dependencies = [
     { name = "braceexpand", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "click", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -3391,11 +3391,11 @@ requires-dist = [
     { name = "gcsfs" },
     { name = "jax", extras = ["tpu"], marker = "sys_platform == 'linux'", specifier = ">=0.9.2" },
     { name = "jax", extras = ["tpu"], marker = "sys_platform == 'linux' and extra == 'tpu'", specifier = ">=0.9.2" },
-    { name = "marin-core", git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Fmarin&rev=e9ca2074376916e69daf37b8d278d45ca2c6990b" },
-    { name = "marin-iris", git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Firis&rev=e9ca2074376916e69daf37b8d278d45ca2c6990b" },
-    { name = "marin-levanter", git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Flevanter&rev=e9ca2074376916e69daf37b8d278d45ca2c6990b" },
-    { name = "marin-rigging", git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Frigging&rev=e9ca2074376916e69daf37b8d278d45ca2c6990b" },
-    { name = "marin-zephyr", git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Fzephyr&rev=e9ca2074376916e69daf37b8d278d45ca2c6990b" },
+    { name = "marin-core", git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Fmarin&rev=b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5" },
+    { name = "marin-iris", git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Firis&rev=b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5" },
+    { name = "marin-levanter", git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Flevanter&rev=b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5" },
+    { name = "marin-rigging", git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Frigging&rev=b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5" },
+    { name = "marin-zephyr", git = "https://github.com/Open-Athena/marin?subdirectory=lib%2Fzephyr&rev=b52ab82dfe2a3dcae2fe1e02a0d681eae55062b5" },
     { name = "py-spy" },
     { name = "pymatgen" },
     { name = "torch", marker = "sys_platform == 'linux' and extra == 'tpu'", specifier = "==2.9.0" },
