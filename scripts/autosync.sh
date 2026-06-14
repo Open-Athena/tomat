@@ -36,6 +36,18 @@ trap 'rm -f "$LOCK"' EXIT
   echo "[$(date -u +%FT%TZ)] tomat cost compute --all"
   "$TOMAT" cost compute --all 2>&1 || echo "  cost compute exit=$?"
 
+  # Phase A.2: m-eval results aggregation. Per-step JSONs on GCS
+  # (`gs://marin-eu-west4/tomat/eval/results/<run>/<set>/step-N.json`)
+  # → per-run `eval.json` on R2. Without this, the dashboard's MEvalTable
+  # shows stale rows: the iris jobs finish, the JSONs land on GCS, but
+  # `eval.json` on R2 doesn't auto-rebuild. Bin5's "13 done · 1 dot
+  # rendered" symptom on 2026-06-14 traced to this.
+  echo "[$(date -u +%FT%TZ)] tomat evals sync (all recently-synced runs)"
+  # `evals sync` takes a SUBSTR. Empty string = match all → walk every
+  # run that has a parquet sidecar. Each run takes ~1s of GCS scans;
+  # the dominant cost is the eu-west4 bucket walk.
+  "$TOMAT" evals sync 2>&1 || echo "  evals sync exit=$?"
+
   # Phase B: segments + annotations from submissions.jsonl. Stub until
   # next pass. The CLI would read ~/.tomat/submissions.jsonl, group by
   # run label, detect consecutive fires whose TOMAT_LABEL or
