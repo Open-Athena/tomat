@@ -1477,7 +1477,20 @@ export function RunHeaderRich({
                   : 'fractional passes over the training set, computed from total_tokens / (epoch_sequences × train_seq_len)'
               }>
                 <div style={{ marginTop: 3, fontSize: '0.78rem' }}>
-                  epoch <b>{nEpochs.toFixed(2)}</b>
+                  {/* For segmented runs (different data label / BS across
+                      segments), display each segment's epochs as a `+`-joined
+                      expression rather than the numeric sum — the operands are
+                      over different training distributions, so the sum is a
+                      misleading single-number summary. The tooltip above
+                      still shows the per-segment breakdown + a `total:` row
+                      for callers who want the scalar. */}
+                  epoch <b>{
+                    epochBreakdown && epochBreakdown.length > 1
+                      ? epochBreakdown
+                          .map(({ epochs }) => Number.isFinite(epochs) ? epochs.toFixed(2) : '?')
+                          .join(' + ')
+                      : nEpochs.toFixed(2)
+                  }</b>
                 </div>
               </Tooltip>
             )}
