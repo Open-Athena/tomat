@@ -612,11 +612,30 @@ def main():
                 if _jax.process_index() == 0:
                     print(f"[tomat-tpu] cross-region ckpt rebase: rsync "
                           f"{_src} → {_dst} …", flush=True)
-                    _rc = _sp.run(
+                    # Try `gcloud storage` first (modern, ships in marin's
+                    # worker image), fall back to `gsutil`. `subprocess.run`
+                    # with `check=False` still raises FileNotFoundError when
+                    # the binary itself is missing, so we wrap in try/except
+                    # and skip the rebase entirely if neither is on PATH —
+                    # better to take the cross-region-write hit than crash.
+                    _rc = None
+                    for _cmd in (
+                        ["gcloud", "storage", "rsync", "-r", _src, _dst],
                         ["gsutil", "-m", "rsync", "-r", _src, _dst],
-                        check=False,
-                    )
-                    if _rc.returncode != 0:
+                    ):
+                        try:
+                            _rc = _sp.run(_cmd, check=False)
+                            break
+                        except FileNotFoundError:
+                            print(f"[tomat-tpu] {_cmd[0]!r} not on PATH; "
+                                  f"trying next rsync backend…", flush=True)
+                    if _rc is None:
+                        print(f"[tomat-tpu] WARN: no rsync backend "
+                              f"(gcloud/gsutil) on PATH; falling back to "
+                              f"env-pinned bucket {_env_bucket} (will incur "
+                              f"cross-region writes)", flush=True)
+                        _ok = False
+                    elif _rc.returncode != 0:
                         print(f"[tomat-tpu] WARN: rsync rc={_rc.returncode}; "
                               f"falling back to env-pinned bucket "
                               f"{_env_bucket} (will incur cross-region "
