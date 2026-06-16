@@ -10,7 +10,7 @@ in the tomat training project. Subcommands:
   tomat runs links [<substr>]        markdown table: state, step, mfu, NMAE/NEMD,
                                      wandb + iris dashboard URLs (slack-paste-ready)
 
-  tomat iris ls                      list /ryan/* iris jobs (filtered)
+  tomat iris ls                      list known runners' iris jobs (filtered)
   tomat iris kill <substr>           kill matching running jobs
   tomat iris logs <substr>           tail logs for a job
   tomat iris summary <substr>        per-task summary
@@ -86,7 +86,22 @@ from tomat.run_history import (
     BACKFILL_KEYS as _BACKFILL_KEYS,
     arrow_schema as _arrow_schema,
 )
-IRIS_USER = "ryan"
+# Iris namespaces jobs as `/<user>/<job-name>`, where <user> defaults to the
+# submitting machine's local username (`getpass.getuser()` — see iris's
+# `resolve_job_user`). So runs fired from your laptop land under /<you>/, not
+# /ryan/. IRIS_USER is the *submitting* user for this invocation (override:
+# TOMAT_IRIS_USER). IRIS_USERS is every runner whose jobs the list / sync /
+# lookup commands fan across — all pre-2026-06 runs live under /ryan/
+# (override: TOMAT_IRIS_USERS, comma-separated).
+IRIS_USER = os.environ.get("TOMAT_IRIS_USER") or getpass.getuser()
+IRIS_KNOWN_USERS = ("ryan", "betsy")
+IRIS_USERS = tuple(dict.fromkeys(
+    u.strip()
+    for u in os.environ.get(
+        "TOMAT_IRIS_USERS", ",".join((*IRIS_KNOWN_USERS, IRIS_USER))
+    ).split(",")
+    if u.strip()
+))
 GCS_BUCKET = "gs://marin-eu-west4/tomat"
 LMQ_PATH = f"{GCS_BUCKET}/codecs/lmq-v2-16k.npz"
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -238,8 +253,14 @@ def strip_iris_log(text: str) -> str:
 
 
 # iris requires --prefix to be `/<user>/<jobname>` (2+ segments). We fan
-# out across the conventional job-name prefixes used in tomat work.
-DEFAULT_IRIS_PREFIXES = ("/ryan/tomat", "/ryan/train", "/ryan/eval")
+# out across the conventional job-name prefixes used in tomat work, for
+# every known runner (jobs land under the submitting user's namespace).
+# `kl` catches loss-name-prefixed labels (e.g. `kl-s05-tpu-cont-v3`); see
+# the note on TRAINING_JOB_RE.
+IRIS_JOB_PREFIXES = ("tomat", "train", "eval", "kl")
+DEFAULT_IRIS_PREFIXES = tuple(
+    f"/{u}/{p}" for u in IRIS_USERS for p in IRIS_JOB_PREFIXES
+)
 
 
 def iris_list_lines(prefixes: tuple[str, ...] = DEFAULT_IRIS_PREFIXES, state: str | None = None) -> list[str]:
@@ -652,10 +673,36 @@ def _wandb_url(run_name: str, entity: str | None = None, project: str | None = N
     return f"{WANDB_BASE}/{WANDB_PROJECT}/runs/{run_name}"
 
 
+_iris_owner_cache: dict[str, str] | None = None
+
+
+def _iris_job_user(run_name: str) -> str:
+    """Best-effort owner (user namespace) for an iris job label.
+
+    Sources the R2 iris-state snapshot (cron-synced every minute across all
+    IRIS_USERS prefixes; one HTTP GET, memoized). Falls back to "ryan" —
+    where all pre-2026-06 runs live — when the snapshot is unavailable or
+    the label is unknown (e.g. a just-fired run the cron hasn't synced yet).
+    """
+    global _iris_owner_cache
+    if _iris_owner_cache is None:
+        owners: dict[str, str] = {}
+        try:
+            state = _r2_get_json(R2_BUCKET, "tomat/iris-state.json")
+        except Exception:
+            state = None
+        for jid in ((state or {}).get("jobs") or {}):
+            parts = jid.split("/", 2)  # "/user/label" → ["", user, label]
+            if len(parts) == 3 and parts[2]:
+                owners.setdefault(parts[2], parts[1])
+        _iris_owner_cache = owners
+    return _iris_owner_cache.get(run_name, "ryan")
+
+
 def _iris_url(run_name: str) -> str:
     """Iris dashboard URL — path-encodes the leading / and any others."""
     from urllib.parse import quote
-    return f"{IRIS_DASHBOARD}/#/job/{quote(f'/{IRIS_USER}/{run_name}', safe='')}"
+    return f"{IRIS_DASHBOARD}/#/job/{quote(f'/{_iris_job_user(run_name)}/{run_name}', safe='')}"
 
 
 def _latest_metric(r, key: str) -> tuple[int | None, float | None]:
@@ -1520,7 +1567,7 @@ def _iris_job_list_json(prefix: str, timeout: int = 60) -> list[dict]:
 # Used by `iris sync` to decide which parent jobs warrant a per-label
 # attempts sidecar (training runs only — not the m-eval / tomat-eval
 # sidecar jobs, which would just bloat the snapshot).
-TRAINING_JOB_RE = re.compile(r"^/[^/]+/(train-[^/]+)$")
+TRAINING_JOB_RE = re.compile(r"^/[^/]+/(train-[^/]+|kl-[^/]+)$")
 
 
 @iris_grp.command("attempts")
@@ -1534,14 +1581,22 @@ def iris_attempts(label: str, out: str | None, tail: int):
     """Dump per-attempt history for an iris job, as JSON.
 
     LABEL is either a full job id (`/ryan/train-mg-tz-11`) or just the
-    trailing label (`train-mg-tz-11`, expanded to `/ryan/train-mg-tz-11`).
+    trailing label (`train-mg-tz-11`, tried under each IRIS_USERS namespace
+    until one matches).
 
     Output shape mirrors iris's `AttemptReport` dataclass, with epoch_ms
     fields added for direct JS consumption. See `scripts/iris_attempts_dump.py`
     for the schema.
     """
-    job_id = label if label.startswith("/") else f"/{IRIS_USER}/{label}"
-    payload = _iris_attempts_dump(job_id, tail=tail)
+    candidates = (
+        [label] if label.startswith("/")
+        else [f"/{u}/{label}" for u in IRIS_USERS]
+    )
+    payload = job_id = None
+    for job_id in candidates:
+        payload = _iris_attempts_dump(job_id, tail=tail)
+        if payload is not None:
+            break
     if payload is None:
         sys.exit(1)
     data = json.dumps(payload, indent=1)
@@ -1565,14 +1620,15 @@ def iris_attempts(label: str, out: str | None, tail: int):
               "own controller tunnel; keep modest to spare the controller)")
 def iris_sync(bucket: str, key: str, dry_run: bool,
               no_attempts: bool, attempts_prefix: str, attempts_workers: int):
-    """Snapshot iris job state for /ryan/{tomat,train,eval}/* parent jobs → R2.
+    """Snapshot iris job state for /<user>/{tomat,train,eval}/* parent jobs → R2,
+    across all IRIS_USERS namespaces.
 
     Powers the iris-state column on tomat.oa.dev/runs. Uses `iris job list
     --json` over RPC per prefix — SAFE to run on a cadence (e.g. cron every
     minute). The prior SQL-based version was banned for controller load.
 
     Also writes one `tomat/iris-attempts/<label>.json` sidecar per training
-    job (`/ryan/train-*`), with per-attempt death timestamps + causes from
+    job (`/<user>/train-*`), with per-attempt death timestamps + causes from
     iris's bug-report machinery. Skipped by `--no-attempts` (useful when
     iterating only the state index).
     """
@@ -1584,7 +1640,7 @@ def iris_sync(bucket: str, key: str, dry_run: bool,
                 pass
             jid = row["job_id"]
             if jid.count("/") > 2:
-                # Skip task rows (`/ryan/<job>/<task>`); we want parents.
+                # Skip task rows (`/<user>/<job>/<task>`); we want parents.
                 continue
             state_full = row.get("state", "")  # e.g. "JOB_STATE_RUNNING"
             state = state_full.removeprefix("JOB_STATE_") if state_full else "UNKNOWN"
@@ -1626,7 +1682,7 @@ def iris_sync(bucket: str, key: str, dry_run: bool,
     if no_attempts:
         return
 
-    # Per-label attempts sidecars. Only training runs (`/ryan/train-*`); the
+    # Per-label attempts sidecars. Only training runs (`/<user>/train-*`); the
     # `tomat-eval-*` and other sidecar jobs aren't shown on the runs dashboard
     # so per-attempt detail for them would just waste R2 + controller cycles.
     training_jids = sorted(j for j in jobs if TRAINING_JOB_RE.match(j))
@@ -1644,7 +1700,8 @@ def iris_sync(bucket: str, key: str, dry_run: bool,
             if payload is None:
                 n_fail += 1
                 continue
-            label = payload.get("label") or jid.removeprefix(f"/{IRIS_USER}/")
+            # jid is "/user/label" for any IRIS_USERS user — strip namespace.
+            label = payload.get("label") or jid.split("/", 2)[-1]
             key_i = f"{attempts_prefix}/{label}.json"
             data_i = json.dumps(payload, indent=1).encode("utf-8")
             if dry_run:
@@ -1660,10 +1717,11 @@ def iris_sync(bucket: str, key: str, dry_run: bool,
 @click.option("-s", "--state", default=None, help="filter by state (running, failed, ...)")
 @click.option("--all", "show_all", is_flag=True, help="include child task lines (default: parents only)")
 def iris_ls(filter_re: str | None, state: str | None, show_all: bool):
-    """List tomat-relevant /ryan/* iris jobs (parents only by default).
+    """List tomat-relevant iris jobs for all IRIS_USERS (parents only by default).
 
-    Fans across `/ryan/{tomat,train,eval}` prefixes — iris requires --prefix
-    to be a `/<user>/<jobname>` form, not a bare `/<user>`.
+    Fans across `/<user>/{tomat,train,eval}` prefixes per known runner —
+    iris requires --prefix to be a `/<user>/<jobname>` form, not a bare
+    `/<user>`.
     """
     pat = re.compile(filter_re) if filter_re else None
     lines = iris_list_lines(state=state)
@@ -4663,7 +4721,7 @@ def preempts_watch(substr: str, interval: int, max_iters: int):
         err(f"expected 1 iris match for {substr!r}, got {len(iris_matches)}: {iris_matches}")
         sys.exit(1)
     jid = iris_matches[0]
-    # Run name == iris job name (without /ryan/ prefix).
+    # Run name == iris job name (without the /<user>/ prefix).
     run_name = jid.split("/", 2)[-1]
 
     api = wandb.Api()
@@ -7862,37 +7920,42 @@ def cost_grp():
 
 
 @cost_grp.command("summary")
-@click.option("-p", "--prefix", default="/ryan", help="iris job prefix to inspect")
+@click.option("-p", "--prefix", default=None,
+              help="iris job prefix to inspect (default: /<user> per known runner)")
 @click.option("-f", "--filter", "filter_re", default="tomat|train-full|train-cont", help="regex on job name")
-def cost_summary(prefix: str, filter_re: str):
+def cost_summary(prefix: str | None, filter_re: str):
     """Estimate MSRP-equivalent compute spend across matching iris jobs.
 
     Sums chip-hours (TPU × duration) across visible parent jobs and prints
     preempt-rate and on-demand-rate equivalents. Public-rate, not actual.
     """
-    # Parent jobs only — children inherit their parent's slice, would double-count.
-    res = iris_run("list", "--prefix", prefix)
-    out = strip_iris_log(res.stdout)
+    prefixes = (prefix,) if prefix else tuple(f"/{u}" for u in IRIS_USERS)
     pat = re.compile(filter_re)
     rows = []
-    for line in out.split("\n"):
-        if not line.strip() or "JOB ID" in line:
-            continue
-        jid = line.split()[0]
-        if not jid.startswith("/") or jid.count("/") > 2:
-            continue
-        if not pat.search(jid):
-            continue
-        # Pull TPU + duration from the line — parsing is fragile, so summary
-        # call would be more robust; defer until we build a json list option.
-        m = re.search(r"v6e-(\d+)", line)
-        chips = int(m.group(1)) if m else 0
-        rows.append((jid, chips, line))
+    seen: set[str] = set()
+    for pfx in prefixes:
+        # Parent jobs only — children inherit their parent's slice, would double-count.
+        res = iris_run("list", "--prefix", pfx)
+        out = strip_iris_log(res.stdout)
+        for line in out.split("\n"):
+            if not line.strip() or "JOB ID" in line:
+                continue
+            jid = line.split()[0]
+            if not jid.startswith("/") or jid.count("/") > 2 or jid in seen:
+                continue
+            if not pat.search(jid):
+                continue
+            seen.add(jid)
+            # Pull TPU + duration from the line — parsing is fragile, so summary
+            # call would be more robust; defer until we build a json list option.
+            m = re.search(r"v6e-(\d+)", line)
+            chips = int(m.group(1)) if m else 0
+            rows.append((jid, chips, line))
     if not rows:
-        err(f"no matching jobs under {prefix!r}")
+        err(f"no matching jobs under {', '.join(repr(p) for p in prefixes)}")
         sys.exit(0)
 
-    print(f"# Jobs (prefix={prefix}, filter={filter_re}):")
+    print(f"# Jobs (prefixes={','.join(prefixes)}, filter={filter_re}):")
     print(f"  found {len(rows)} parent jobs (chip-hour estimates require `iris job summary` per-job)")
     for jid, chips, _ in rows:
         print(f"  v6e-{chips:<3d}  {jid}")
@@ -8043,10 +8106,14 @@ def _compute_one_cost(
     # Attempts sidecar (TPU runs only). 404 is fine — we'll fall back to
     # iris-state for the full window.
     attempts = _r2_get_json(bucket, f"{attempts_prefix}/{run_label}.json")
-    # Iris job (parent) entry from the snapshot.
+    # Iris job (parent) entry from the snapshot — the run may have been
+    # fired by any known runner, so scan each user namespace.
     job: dict | None = None
     if iris_state is not None:
-        job = iris_state.get("jobs", {}).get(f"/{IRIS_USER}/{run_label}")
+        for u in IRIS_USERS:
+            job = iris_state.get("jobs", {}).get(f"/{u}/{run_label}")
+            if job is not None:
+                break
     # Manifest — lazily fetched. Required for Modal runs (we read
     # `history.ts_min/max` for wallclock). Caller may pass it in to avoid
     # a redundant R2 round-trip when we just wrote it (see `runs_sync`).

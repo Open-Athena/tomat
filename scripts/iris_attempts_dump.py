@@ -200,7 +200,8 @@ def attempts_dump(ctx, tail: int, job_id: str):
     # Build the flat payload. We KEEP the iso strings (human-readable in dev /
     # `jq` walks) and ADD epoch_ms for the JS dashboard. The frontend doesn't
     # need worker/log details, just attempt timing + state + error.
-    label = report.job_id.removeprefix("/ryan/")
+    # job_id is "/<user>/<label>" for any runner — strip the user namespace.
+    label = report.job_id.split("/", 2)[-1]
     tasks_out: list[dict] = []
     # `attempts_summary`: flat per-attempt-per-task records ordered by
     # `started_at_ms`. The dashboard groups by `attempt_id` to render

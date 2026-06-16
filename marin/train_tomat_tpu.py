@@ -44,17 +44,16 @@ Env-var knobs:
 
 Prereqs:
 - `gs://marin-eu-west4/tomat/tokenized/<label>/worker-*/*.parquet` populated
-- ADC refreshed for `ryan.williams@openathena.ai` on hai-gcp-models.
+- ADC refreshed for your `@openathena.ai` account on hai-gcp-models
+  (`gcloud auth application-default login`).
 """
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
 import sys
 from datetime import timedelta
-from pathlib import Path
 
 # Multihost-capable JAX init. Historically we called `jax.distributed.initialize()`
 # up-front here because Levanter's `WandbConfig.init` would call
@@ -546,7 +545,7 @@ def _assert_cache_local(cache_dir: str) -> None:
     or `TOMAT_ALLOW_XREG_CACHE=1` is set.
     """
     if os.environ.get("TOMAT_ALLOW_XREG_CACHE") == "1":
-        print(f"[tomat-tpu] TOMAT_ALLOW_XREG_CACHE=1 → skipping x-reg check", flush=True)
+        print("[tomat-tpu] TOMAT_ALLOW_XREG_CACHE=1 → skipping x-reg check", flush=True)
         return
     cache_region = _bucket_region(cache_dir)
     worker_region = _detect_gce_region()
@@ -1046,7 +1045,7 @@ def main():
               f"window_blocks={shuffle_window_blocks})")
     else:
         shuffle_cfg = False
-        print(f"[tomat-tpu] shuffle: OFF (TOMAT_SHUFFLE_WINDOW_BLOCKS=0)")
+        print("[tomat-tpu] shuffle: OFF (TOMAT_SHUFFLE_WINDOW_BLOCKS=0)")
 
     # `data_cfg_cls` selects between standard `LmDataConfig` and the F1
     # subclass that routes `F1PrebuiltLmDatasetFormat` components through
