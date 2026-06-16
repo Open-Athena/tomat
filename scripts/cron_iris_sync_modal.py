@@ -82,18 +82,32 @@ image = (
     # complete here.
     .pip_install(
         "boto3",
-        "click>=8.3.1", "cloudpickle>=3.1.2", "connect-python>=0.9.0",
+        "click>=8.3.1",
+        "cloudpickle>=3.1.2",
+        "connect-python>=0.9.0",
         # fsspec/gcsfs/s3fs pin to matching minor versions — keep all three
         # in sync (mirror what the laptop venv has).
-        "fsspec==2025.3.0", "gcsfs==2025.3.0", "google-auth>=2.0",
-        "google-cloud-tpu>=1.18.0", "grpcio>=1.76.0", "httpx>=0.28.1",
-        "humanfriendly>=10.0", "pydantic>=2.0", "pyjwt>=2.12.0",
-        "pyyaml>=6.0", "s3fs>=2024.0.0", "starlette>=0.50.0",
-        "tabulate>=0.9.0", "typing-extensions>=4.0",
-        "uvicorn[standard]>=0.23.0", "zstandard>=0.22.0",
+        "fsspec==2025.3.0",
+        "gcsfs==2025.3.0",
+        "google-auth>=2.0",
+        "google-cloud-tpu>=1.18.0",
+        "grpcio>=1.76.0",
+        "httpx>=0.28.1",
+        "humanfriendly>=10.0",
+        "pydantic>=2.0",
+        "pyjwt>=2.12.0",
+        "pyyaml>=6.0",
+        "s3fs>=2024.0.0",
+        "starlette>=0.50.0",
+        "tabulate>=0.9.0",
+        "typing-extensions>=4.0",
+        "uvicorn[standard]>=0.23.0",
+        "zstandard>=0.22.0",
         "s3fs==2025.3.0",
         # marin-finelog's deps not yet covered above:
-        "duckdb>=1.0.0", "protobuf>=5.0", "pyarrow>=19.0.0",
+        "duckdb>=1.0.0",
+        "protobuf>=5.0",
+        "pyarrow>=19.0.0",
         # finelog/store/log_namespace.py imports numpy at module level:
         "numpy>=1.26",
     )
@@ -126,6 +140,7 @@ def _materialize_adc() -> str:
     created the secret (`GOOGLE_APPLICATION_CREDENTIALS_JSON`).
     """
     import os
+
     raw = os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"]
     path = "/tmp/adc.json"
     with open(path, "w") as f:
@@ -144,16 +159,17 @@ def _iris_job_list_json(prefix: str, timeout: int = 60) -> list[dict]:
     import sys
     import time
 
-    cmd = ["iris", "--cluster=marin", "job", "list",
-           "--prefix", prefix, "--json"]
+    cmd = ["iris", "--cluster=marin", "job", "list", "--prefix", prefix, "--json"]
     t0 = time.monotonic()
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     tag = "SLOW" if elapsed_ms > 10_000 else ""
     print(f"[iris-rpc {prefix} {elapsed_ms}ms] {tag}", file=sys.stderr)
     if r.returncode != 0:
-        print(f"iris job list failed: rc={r.returncode}\n{r.stderr[-500:]}",
-              file=sys.stderr)
+        print(
+            f"iris job list failed: rc={r.returncode}\n{r.stderr[-500:]}",
+            file=sys.stderr,
+        )
         return []
     # Iris CLI emits log lines before the JSON; find the JSON array start.
     out = r.stdout
@@ -170,6 +186,7 @@ def _build_payload(rows_by_prefix: dict[str, list[dict]]) -> dict:
     crash-loops as healthy RUNNING jobs.
     """
     import datetime
+
     jobs: dict[str, dict] = {}
     for rows in rows_by_prefix.values():
         for row in rows:
@@ -192,15 +209,24 @@ def _build_payload(rows_by_prefix: dict[str, list[dict]]) -> dict:
                 "failures": int(row.get("failure_count") or 0),
                 "error": row.get("error") or None,
                 "exit_code": row.get("exit_code"),
-                "submitted_at_ms": int((row.get("submitted_at") or {}).get("epoch_ms") or 0) or None,
-                "started_at_ms": int((row.get("started_at") or {}).get("epoch_ms") or 0) or None,
-                "finished_at_ms": int((row.get("finished_at") or {}).get("epoch_ms") or 0) or None,
+                "submitted_at_ms": int(
+                    (row.get("submitted_at") or {}).get("epoch_ms") or 0
+                )
+                or None,
+                "started_at_ms": int((row.get("started_at") or {}).get("epoch_ms") or 0)
+                or None,
+                "finished_at_ms": int(
+                    (row.get("finished_at") or {}).get("epoch_ms") or 0
+                )
+                or None,
                 "num_tasks": int(row.get("task_count") or 0),
                 "task_state_counts": tsc,
             }
     return {
         "schema_version": 1,
-        "synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat(
+            timespec="seconds"
+        ),
         "count": len(jobs),
         "jobs": jobs,
     }
@@ -210,6 +236,7 @@ def _r2_put_json(payload: dict) -> int:
     import json
     import os
     import boto3
+
     data = json.dumps(payload, indent=1).encode("utf-8")
     s3 = boto3.client(
         "s3",
@@ -218,14 +245,16 @@ def _r2_put_json(payload: dict) -> int:
         aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
         region_name="auto",
     )
-    s3.put_object(Bucket=R2_BUCKET, Key=R2_KEY, Body=data,
-                  ContentType="application/json")
+    s3.put_object(
+        Bucket=R2_BUCKET, Key=R2_KEY, Body=data, ContentType="application/json"
+    )
     return len(data)
 
 
 def _sync() -> dict:
     """The actual work — runs in both the cron and one-shot entrypoints."""
     import sys
+
     _materialize_adc()
     rows_by_prefix = {p: _iris_job_list_json(p) for p in PREFIXES}
     payload = _build_payload(rows_by_prefix)
@@ -233,12 +262,18 @@ def _sync() -> dict:
     # auth failure should NOT clobber the existing R2 snapshot — let the
     # dashboard keep showing the last-good state until we fix the cron.
     if payload["count"] == 0:
-        print("[iris sync] 0 jobs across all prefixes — refusing to "
-              "overwrite R2 (likely iris/auth failure)", file=sys.stderr)
+        print(
+            "[iris sync] 0 jobs across all prefixes — refusing to "
+            "overwrite R2 (likely iris/auth failure)",
+            file=sys.stderr,
+        )
         return {"jobs": 0, "bytes": 0, "skipped": True}
     n_bytes = _r2_put_json(payload)
-    print(f"[iris sync] {payload['count']} jobs → "
-          f"s3://{R2_BUCKET}/{R2_KEY} ({n_bytes} bytes)", file=sys.stderr)
+    print(
+        f"[iris sync] {payload['count']} jobs → "
+        f"s3://{R2_BUCKET}/{R2_KEY} ({n_bytes} bytes)",
+        file=sys.stderr,
+    )
     return {"jobs": payload["count"], "bytes": n_bytes}
 
 
