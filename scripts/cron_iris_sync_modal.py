@@ -130,6 +130,11 @@ app = modal.App("tomat-iris-sync-cron", image=image)
 USERS = ["ryan", "betsy"]
 PREFIXES = [f"/{u}/{p}" for u in USERS for p in ("tomat", "train", "eval", "kl")]
 
+# Bound on simultaneous iris RPCs (each opens its own tunnel to the
+# controller). The cron fires every minute, so fan the per-prefix RPCs out
+# concurrently rather than sequentially (8×~60s would overrun the interval).
+MAX_SYNC_WORKERS = 4
+
 R2_ACCOUNT_ID = "43a6f2d588b1483733189d39418ec5be"
 R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 R2_BUCKET = "openathena"
@@ -257,9 +262,13 @@ def _r2_put_json(payload: dict) -> int:
 def _sync() -> dict:
     """The actual work — runs in both the cron and one-shot entrypoints."""
     import sys
+    from concurrent.futures import ThreadPoolExecutor
 
     _materialize_adc()
-    rows_by_prefix = {p: _iris_job_list_json(p) for p in PREFIXES}
+    # Concurrent fan-out (bounded) — sequential per-prefix RPCs would overrun
+    # the 1-min cron. ex.map preserves input order, so zip pairs cleanly.
+    with ThreadPoolExecutor(max_workers=MAX_SYNC_WORKERS) as ex:
+        rows_by_prefix = dict(zip(PREFIXES, ex.map(_iris_job_list_json, PREFIXES)))
     payload = _build_payload(rows_by_prefix)
     # Safety: never upload an empty state. A broken iris CLI / missing dep /
     # auth failure should NOT clobber the existing R2 snapshot — let the
