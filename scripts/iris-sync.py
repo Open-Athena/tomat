@@ -11,6 +11,7 @@ R2 creds: pulled from `~/.aws/credentials [cfo]` (so we don't depend on
 cron's stripped env).
 GCP creds: `~/.config/gcloud/application_default_credentials.json` (ADC).
 """
+
 from __future__ import annotations
 
 import configparser
@@ -47,11 +48,21 @@ def iris_job_list_json(prefix: str, timeout: int = 240) -> list[dict]:
     # typical, can spike to 200s). Cron runs every 5min (3 prefixes × ~60s
     # = ~180s typical), so a slow call just skips the upload — the safety
     # guard in main() keeps the last-good R2 snapshot.
-    cmd = [str(IRIS_BIN), "--cluster=marin", "job", "list", "--prefix", prefix, "--json"]
+    cmd = [
+        str(IRIS_BIN),
+        "--cluster=marin",
+        "job",
+        "list",
+        "--prefix",
+        prefix,
+        "--json",
+    ]
     t0 = time.monotonic()
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     elapsed_ms = int((time.monotonic() - t0) * 1000)
-    err(f"[iris-rpc {prefix} {elapsed_ms}ms]" + (" SLOW" if elapsed_ms > 10_000 else ""))
+    err(
+        f"[iris-rpc {prefix} {elapsed_ms}ms]" + (" SLOW" if elapsed_ms > 10_000 else "")
+    )
     if r.returncode != 0:
         err(f"iris job list failed: rc={r.returncode}\n{r.stderr[-500:]}")
         return []
@@ -86,15 +97,24 @@ def build_payload(rows_by_prefix: dict[str, list[dict]]) -> dict:
                 "failures": int(row.get("failure_count") or 0),
                 "error": row.get("error") or None,
                 "exit_code": row.get("exit_code"),
-                "submitted_at_ms": int((row.get("submitted_at") or {}).get("epoch_ms") or 0) or None,
-                "started_at_ms": int((row.get("started_at") or {}).get("epoch_ms") or 0) or None,
-                "finished_at_ms": int((row.get("finished_at") or {}).get("epoch_ms") or 0) or None,
+                "submitted_at_ms": int(
+                    (row.get("submitted_at") or {}).get("epoch_ms") or 0
+                )
+                or None,
+                "started_at_ms": int((row.get("started_at") or {}).get("epoch_ms") or 0)
+                or None,
+                "finished_at_ms": int(
+                    (row.get("finished_at") or {}).get("epoch_ms") or 0
+                )
+                or None,
                 "num_tasks": int(row.get("task_count") or 0),
                 "task_state_counts": tsc,
             }
     return {
         "schema_version": 1,
-        "synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat(
+            timespec="seconds"
+        ),
         "count": len(jobs),
         "jobs": jobs,
     }
@@ -111,7 +131,9 @@ def r2_put_json(payload: dict) -> int:
         aws_secret_access_key=cp.get("cfo", "aws_secret_access_key"),
         region_name="auto",
     )
-    s3.put_object(Bucket=R2_BUCKET, Key=R2_KEY, Body=data, ContentType="application/json")
+    s3.put_object(
+        Bucket=R2_BUCKET, Key=R2_KEY, Body=data, ContentType="application/json"
+    )
     return len(data)
 
 
@@ -122,11 +144,15 @@ def main():
     # Safety: a broken iris CLI or auth failure would zero out the R2 snapshot;
     # the dashboard should keep showing last-good state until the cron is fixed.
     if payload["count"] == 0:
-        err("[iris sync] 0 jobs across all prefixes — refusing R2 upload (probable iris/auth failure)")
+        err(
+            "[iris sync] 0 jobs across all prefixes — refusing R2 upload (probable iris/auth failure)"
+        )
         sys.exit(1)
     n_bytes = r2_put_json(payload)
-    print(f"[iris sync] {datetime.datetime.now().isoformat(timespec='seconds')} "
-          f"{payload['count']} jobs → s3://{R2_BUCKET}/{R2_KEY} ({n_bytes} bytes)")
+    print(
+        f"[iris sync] {datetime.datetime.now().isoformat(timespec='seconds')} "
+        f"{payload['count']} jobs → s3://{R2_BUCKET}/{R2_KEY} ({n_bytes} bytes)"
+    )
 
 
 if __name__ == "__main__":

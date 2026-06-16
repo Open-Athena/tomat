@@ -47,13 +47,12 @@ Output:
       ]
     }
 """
+
 from __future__ import annotations
 
 import datetime
 import json
 import re
-import sys
-from dataclasses import asdict
 
 import click
 
@@ -88,35 +87,40 @@ from iris.cluster.types import JobName  # noqa: E402
 _ERROR_CLASSIFIERS: list[tuple[re.Pattern[str], str]] = [
     # tz-11 post-fix: JAX-mesh ValueError when the eval data-loader's bg
     # producer thread runs jit'd stack_tree without a mesh ContextVar.
-    (re.compile(r"Received incompatible devices for jitted computation", re.I),
-     "JAX mesh ValueError (eval boundary)"),
+    (
+        re.compile(r"Received incompatible devices for jitted computation", re.I),
+        "JAX mesh ValueError (eval boundary)",
+    ),
     # tz-11 pre-fix: jax.distributed.initialize() called too late / not at
     # all (PJRT_DEVICE wasn't TPU at JAX-import time).
-    (re.compile(r"jax\.distributed\.initialize\(\) must be called before any JAX calls", re.I),
-     "jax.distributed not initialised"),
+    (
+        re.compile(
+            r"jax\.distributed\.initialize\(\) must be called before any JAX calls",
+            re.I,
+        ),
+        "jax.distributed not initialised",
+    ),
     # tz-10 mode: asyncio socket teardown during worker bootstrap.
-    (re.compile(r"asyncio socket\.send\(\) raised exception", re.I),
-     "asyncio socket teardown (worker startup)"),
-    (re.compile(r"\b(?:OOM|OutOfMemory|Resource exhausted|RESOURCE_EXHAUSTED)\b"),
-     "OOM"),
-    (re.compile(r"Coscheduled sibling", re.I),
-     "cascade (sibling died)"),
-    (re.compile(r"\bSIGTERM\b|Terminated by signal 15"),
-     "SIGTERM"),
-    (re.compile(r"\bSIGKILL\b|Killed by signal 9"),
-     "SIGKILL"),
-    (re.compile(r"XLA compilation failed|HLO module", re.I),
-     "XLA compile failure"),
+    (
+        re.compile(r"asyncio socket\.send\(\) raised exception", re.I),
+        "asyncio socket teardown (worker startup)",
+    ),
+    (
+        re.compile(r"\b(?:OOM|OutOfMemory|Resource exhausted|RESOURCE_EXHAUSTED)\b"),
+        "OOM",
+    ),
+    (re.compile(r"Coscheduled sibling", re.I), "cascade (sibling died)"),
+    (re.compile(r"\bSIGTERM\b|Terminated by signal 15"), "SIGTERM"),
+    (re.compile(r"\bSIGKILL\b|Killed by signal 9"), "SIGKILL"),
+    (re.compile(r"XLA compilation failed|HLO module", re.I), "XLA compile failure"),
     # iris worker bounce — controller lost heartbeat from the worker.
     # Common during TPU preempt cleanup; conceptually a worker-loss
     # cascade trigger.
-    (re.compile(r"worker ping threshold exceeded", re.I),
-     "worker ping timeout"),
+    (re.compile(r"worker ping threshold exceeded", re.I), "worker ping timeout"),
     # Tokenizer / vocab-size mismatches at eval restart (e.g. a checkpoint
     # vocab=18570 vs config vocab=18571). Frequent on tomat-eval-* jobs
     # against in-flight training checkpoints.
-    (re.compile(r"Axis vocab has different sizes", re.I),
-     "vocab-size mismatch"),
+    (re.compile(r"Axis vocab has different sizes", re.I), "vocab-size mismatch"),
 ]
 
 _EXIT_CODE_PREFIX = re.compile(r"^Exit code:\s*\d+\.\s*stderr:\s*")
@@ -172,16 +176,26 @@ def _iso_to_epoch_ms(iso: str) -> int | None:
 
 
 @iris.command("attempts-dump", hidden=True)
-@click.option("--tail", type=int, default=0,
-              help="Recent log lines per task (0 = skip log fetch, what we want)")
+@click.option(
+    "--tail",
+    type=int,
+    default=0,
+    help="Recent log lines per task (0 = skip log fetch, what we want)",
+)
 @click.argument("job_id")
 @click.pass_context
 def attempts_dump(ctx, tail: int, job_id: str):
     """Internal: gather per-attempt history for JOB_ID, emit JSON to stdout."""
     controller_url = require_controller_url(ctx)
     token_provider = ctx.obj.get("token_provider")
-    name = JobName.from_string(job_id) if not job_id.startswith("/") else JobName.from_wire(job_id)
-    report = gather_bug_report(controller_url, name, tail=tail, token_provider=token_provider)
+    name = (
+        JobName.from_string(job_id)
+        if not job_id.startswith("/")
+        else JobName.from_wire(job_id)
+    )
+    report = gather_bug_report(
+        controller_url, name, tail=tail, token_provider=token_provider
+    )
 
     # Build the flat payload. We KEEP the iso strings (human-readable in dev /
     # `jq` walks) and ADD epoch_ms for the JS dashboard. The frontend doesn't
@@ -214,35 +228,43 @@ def attempts_dump(ctx, tail: int, job_id: str):
                 "finished_at_ms": _iso_to_epoch_ms(a.finished_at),
             }
             atts_out.append(att_rec)
-            summary_records.append({
+            summary_records.append(
+                {
+                    "task_id": t.task_id,
+                    "attempt_id": a.attempt_id,
+                    "trainer_started_ts_ms": _iso_to_epoch_ms(a.started_at),
+                    "ended_ts_ms": _iso_to_epoch_ms(a.finished_at),
+                    "state": a.state,
+                    "exit_code": a.exit_code,
+                    "error_first_line": err_first,
+                    "error_classification": err_class,
+                }
+            )
+        tasks_out.append(
+            {
                 "task_id": t.task_id,
-                "attempt_id": a.attempt_id,
-                "trainer_started_ts_ms": _iso_to_epoch_ms(a.started_at),
-                "ended_ts_ms": _iso_to_epoch_ms(a.finished_at),
-                "state": a.state,
-                "exit_code": a.exit_code,
-                "error_first_line": err_first,
-                "error_classification": err_class,
-            })
-        tasks_out.append({
-            "task_id": t.task_id,
-            "state": t.state,
-            "started_at": t.started_at,
-            "started_at_ms": _iso_to_epoch_ms(t.started_at),
-            "finished_at": t.finished_at,
-            "finished_at_ms": _iso_to_epoch_ms(t.finished_at),
-            "exit_code": t.exit_code,
-            "error": t.error,
-            "attempts": atts_out,
-        })
+                "state": t.state,
+                "started_at": t.started_at,
+                "started_at_ms": _iso_to_epoch_ms(t.started_at),
+                "finished_at": t.finished_at,
+                "finished_at_ms": _iso_to_epoch_ms(t.finished_at),
+                "exit_code": t.exit_code,
+                "error": t.error,
+                "attempts": atts_out,
+            }
+        )
 
-    summary_records.sort(key=lambda r: (r.get("trainer_started_ts_ms") or 0, r["task_id"]))
+    summary_records.sort(
+        key=lambda r: (r.get("trainer_started_ts_ms") or 0, r["task_id"])
+    )
 
     payload = {
         "schema_version": 2,
         "label": label,
         "job_id": report.job_id,
-        "synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat(
+            timespec="seconds"
+        ),
         "job_state": report.state_name,
         "job_failure_count": report.failure_count,
         "job_preemption_count": report.preemption_count,
