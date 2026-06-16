@@ -35,6 +35,11 @@ IRIS_BIN = HOME / "iris-sync-venv/bin/iris"  # populated by setup-iris-cron-vm.s
 USERS = ["ryan", "betsy"]
 PREFIXES = [f"/{u}/{p}" for u in USERS for p in ("tomat", "train", "eval", "kl")]
 
+# Bound on simultaneous iris RPCs (each opens its own IAP tunnel to the
+# controller). Caps connection spikes while still cutting the every-minute
+# cron's wall-clock from len(PREFIXES)×~60s to ~ceil(len/MAX)×~60s.
+MAX_SYNC_WORKERS = 4
+
 R2_ACCOUNT_ID = "43a6f2d588b1483733189d39418ec5be"
 R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 R2_BUCKET = "openathena"
@@ -48,9 +53,11 @@ def err(*a):
 def iris_job_list_json(prefix: str, timeout: int = 240) -> list[dict]:
     # 240s ceiling: each `iris` invocation re-establishes its own IAP tunnel
     # to Marin's controller (laptop: 5-6s warm; e2-micro fresh tunnel: ~60s
-    # typical, can spike to 200s). Cron runs every 5min (3 prefixes × ~60s
-    # = ~180s typical), so a slow call just skips the upload — the safety
-    # guard in main() keeps the last-good R2 snapshot.
+    # typical, can spike to 200s). The crontab fires every minute and we fan
+    # across len(PREFIXES) namespaces, so main() runs these concurrently (see
+    # MAX_SYNC_WORKERS) to keep wall-clock under the interval; a slow call just
+    # skips the upload — the safety guard in main() keeps the last-good R2
+    # snapshot.
     cmd = [
         str(IRIS_BIN),
         "--cluster=marin",
@@ -142,7 +149,10 @@ def r2_put_json(payload: dict) -> int:
 
 def main():
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(ADC_PATH)
-    rows_by_prefix = {p: iris_job_list_json(p) for p in PREFIXES}
+    # Concurrent fan-out (bounded) — sequential 8×~60s would blow the 1-min
+    # cron interval. ex.map preserves input order, so zip pairs cleanly.
+    with ThreadPoolExecutor(max_workers=MAX_SYNC_WORKERS) as ex:
+        rows_by_prefix = dict(zip(PREFIXES, ex.map(iris_job_list_json, PREFIXES)))
     payload = build_payload(rows_by_prefix)
     # Safety: a broken iris CLI or auth failure would zero out the R2 snapshot;
     # the dashboard should keep showing last-good state until the cron is fixed.

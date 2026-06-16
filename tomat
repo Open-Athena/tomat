@@ -86,19 +86,19 @@ from tomat.run_history import (
     BACKFILL_KEYS as _BACKFILL_KEYS,
     arrow_schema as _arrow_schema,
 )
-# Iris namespaces jobs as `/<user>/<job-name>`, where <user> defaults to the
-# submitting machine's local username (`getpass.getuser()` — see iris's
-# `resolve_job_user`). So runs fired from your laptop land under /<you>/, not
-# /ryan/. IRIS_USER is the *submitting* user for this invocation (override:
-# TOMAT_IRIS_USER). IRIS_USERS is every runner whose jobs the list / sync /
-# lookup commands fan across — all pre-2026-06 runs live under /ryan/
-# (override: TOMAT_IRIS_USERS, comma-separated).
-IRIS_USER = os.environ.get("TOMAT_IRIS_USER") or getpass.getuser()
+# Iris namespaces jobs as `/<user>/<job-name>`, where <user> is the submitting
+# machine's local username (`getpass.getuser()` — see iris's `resolve_job_user`,
+# which tomat does NOT override). So runs fired from your laptop land under
+# /<you>/, not /ryan/. IRIS_USERS is every runner whose jobs the list / sync /
+# lookup commands fan across: the known roster plus your own local user (all
+# pre-2026-06 runs live under /ryan/). Override with TOMAT_IRIS_USERS
+# (comma-separated) — note this only affects *lookup*, never where your jobs
+# land, which iris alone decides from the OS user.
 IRIS_KNOWN_USERS = ("ryan", "betsy")
 IRIS_USERS = tuple(dict.fromkeys(
     u.strip()
     for u in os.environ.get(
-        "TOMAT_IRIS_USERS", ",".join((*IRIS_KNOWN_USERS, IRIS_USER))
+        "TOMAT_IRIS_USERS", ",".join((*IRIS_KNOWN_USERS, getpass.getuser()))
     ).split(",")
     if u.strip()
 ))
