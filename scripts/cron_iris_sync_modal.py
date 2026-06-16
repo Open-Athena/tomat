@@ -124,8 +124,11 @@ r2_secret = modal.Secret.from_name("oa-r2-write")  # AWS_ACCESS_KEY_ID/SECRET
 
 app = modal.App("tomat-iris-sync-cron", image=image)
 
-# Same prefix set as `tomat iris sync` uses on the laptop.
-PREFIXES = ["/ryan/tomat", "/ryan/train", "/ryan/eval"]
+# Same prefix set as `tomat iris sync` uses on the laptop: every known
+# runner's namespace × the conventional job-name prefixes. Keep in sync
+# with IRIS_KNOWN_USERS in the `tomat` CLI.
+USERS = ["ryan", "betsy"]
+PREFIXES = [f"/{u}/{p}" for u in USERS for p in ("tomat", "train", "eval", "kl")]
 
 R2_ACCOUNT_ID = "43a6f2d588b1483733189d39418ec5be"
 R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"

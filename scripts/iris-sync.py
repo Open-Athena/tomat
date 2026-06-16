@@ -30,7 +30,10 @@ ADC_PATH = HOME / ".config/gcloud/application_default_credentials.json"
 AWS_CREDS = HOME / ".aws/credentials"
 IRIS_BIN = HOME / "iris-sync-venv/bin/iris"  # populated by setup-iris-cron-vm.sh
 
-PREFIXES = ["/ryan/tomat", "/ryan/train", "/ryan/eval"]
+# Fan across every known runner's namespace (jobs land under the submitting
+# user). Keep in sync with IRIS_KNOWN_USERS in the `tomat` CLI.
+USERS = ["ryan", "betsy"]
+PREFIXES = [f"/{u}/{p}" for u in USERS for p in ("tomat", "train", "eval", "kl")]
 
 R2_ACCOUNT_ID = "43a6f2d588b1483733189d39418ec5be"
 R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
