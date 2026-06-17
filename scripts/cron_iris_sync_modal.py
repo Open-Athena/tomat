@@ -117,6 +117,9 @@ image = (
         f"marin-rigging @ git+{MARIN_REPO}@{MARIN_SHA}#subdirectory=lib/rigging",
         extra_options="--no-deps",
     )
+    # Ship the canonical runner roster (scripts/iris_runners.py) into the
+    # image so `_sync` can import it at runtime (it isn't a pip dep).
+    .add_local_python_source("iris_runners")
 )
 
 adc_secret = modal.Secret.from_name("marin-iris-adc")  # GCP ADC for iris RPC
@@ -124,11 +127,8 @@ r2_secret = modal.Secret.from_name("oa-r2-write")  # AWS_ACCESS_KEY_ID/SECRET
 
 app = modal.App("tomat-iris-sync-cron", image=image)
 
-# Same prefix set as `tomat iris sync` uses on the laptop: every known
-# runner's namespace × the conventional job-name prefixes. Keep in sync
-# with IRIS_KNOWN_USERS in the `tomat` CLI.
-USERS = ["ryan", "betsy"]
-PREFIXES = [f"/{u}/{p}" for u in USERS for p in ("tomat", "train", "eval", "kl")]
+# The runner roster / prefix set comes from scripts/iris_runners.py (shipped
+# into the image above); `_sync` builds the prefixes from it at runtime.
 
 # Bound on simultaneous iris RPCs (each opens its own tunnel to the
 # controller). The cron fires every minute, so fan the per-prefix RPCs out
@@ -264,11 +264,14 @@ def _sync() -> dict:
     import sys
     from concurrent.futures import ThreadPoolExecutor
 
+    from iris_runners import iris_prefixes  # shipped via add_local_python_source
+
     _materialize_adc()
+    prefixes = iris_prefixes()
     # Concurrent fan-out (bounded) — sequential per-prefix RPCs would overrun
     # the 1-min cron. ex.map preserves input order, so zip pairs cleanly.
     with ThreadPoolExecutor(max_workers=MAX_SYNC_WORKERS) as ex:
-        rows_by_prefix = dict(zip(PREFIXES, ex.map(_iris_job_list_json, PREFIXES)))
+        rows_by_prefix = dict(zip(prefixes, ex.map(_iris_job_list_json, prefixes)))
     payload = _build_payload(rows_by_prefix)
     # Safety: never upload an empty state. A broken iris CLI / missing dep /
     # auth failure should NOT clobber the existing R2 snapshot — let the

@@ -86,6 +86,15 @@ from tomat.run_history import (
     BACKFILL_KEYS as _BACKFILL_KEYS,
     arrow_schema as _arrow_schema,
 )
+# The runner roster (KNOWN_USERS / JOB_PREFIXES) lives in
+# scripts/iris_runners.py — the single source of truth shared with the
+# iris-state sync crons. Add a new runner THERE, not here.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+from iris_runners import (
+    KNOWN_USERS as IRIS_KNOWN_USERS,
+    JOB_PREFIXES as IRIS_JOB_PREFIXES,
+)
+
 # Iris namespaces jobs as `/<user>/<job-name>`, where <user> is the submitting
 # machine's local username (`getpass.getuser()` — see iris's `resolve_job_user`,
 # which tomat does NOT override). So runs fired from your laptop land under
@@ -94,7 +103,6 @@ from tomat.run_history import (
 # pre-2026-06 runs live under /ryan/). Override with TOMAT_IRIS_USERS
 # (comma-separated) — note this only affects *lookup*, never where your jobs
 # land, which iris alone decides from the OS user.
-IRIS_KNOWN_USERS = ("ryan", "betsy")
 IRIS_USERS = tuple(dict.fromkeys(
     u.strip()
     for u in os.environ.get(
@@ -252,12 +260,9 @@ def strip_iris_log(text: str) -> str:
     return "\n".join(l for l in text.split("\n") if not l.startswith("I20"))
 
 
-# iris requires --prefix to be `/<user>/<jobname>` (2+ segments). We fan
-# out across the conventional job-name prefixes used in tomat work, for
-# every known runner (jobs land under the submitting user's namespace).
-# `kl` catches loss-name-prefixed labels (e.g. `kl-s05-tpu-cont-v3`); see
-# the note on TRAINING_JOB_RE.
-IRIS_JOB_PREFIXES = ("tomat", "train", "eval", "kl")
+# iris requires --prefix to be `/<user>/<jobname>` (2+ segments). Fan
+# IRIS_USERS (known roster + local user) across the shared job-name prefixes
+# (IRIS_JOB_PREFIXES, from scripts/iris_runners.py).
 DEFAULT_IRIS_PREFIXES = tuple(
     f"/{u}/{p}" for u in IRIS_USERS for p in IRIS_JOB_PREFIXES
 )
