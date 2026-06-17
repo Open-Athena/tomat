@@ -21,19 +21,22 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import boto3
+
+from iris_runners import iris_prefixes
 
 HOME = Path.home()
 ADC_PATH = HOME / ".config/gcloud/application_default_credentials.json"
 AWS_CREDS = HOME / ".aws/credentials"
 IRIS_BIN = HOME / "iris-sync-venv/bin/iris"  # populated by setup-iris-cron-vm.sh
 
-# Fan across every known runner's namespace (jobs land under the submitting
-# user). Keep in sync with IRIS_KNOWN_USERS in the `tomat` CLI.
-USERS = ["ryan", "betsy"]
-PREFIXES = [f"/{u}/{p}" for u in USERS for p in ("tomat", "train", "eval", "kl")]
+# Canonical runner roster (scripts/iris_runners.py), shared with the `tomat`
+# CLI and the Modal cron. Imported as a sibling module (top of file), so run
+# this from the repo checkout (`~/tomat/scripts/`), not as a bare scp'd file.
+PREFIXES = iris_prefixes()
 
 # Bound on simultaneous iris RPCs (each opens its own IAP tunnel to the
 # controller). Caps connection spikes while still cutting the every-minute
