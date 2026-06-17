@@ -85,13 +85,13 @@ resiliparse = { index = "marin-resiliparse" }
 # `uv lock` against the find-links registries fails. The 20260428 wheels are
 # also unreachable (rotated out of marin-*-latest). Pin until upstream is
 # healthy again.
-marin-core      = { git = "https://github.com/Open-Athena/marin", rev = "51f17e5fa22bb41ace6c7a18f5775cb572518a4e", subdirectory = "lib/marin" }
-marin-haliax    = { git = "https://github.com/Open-Athena/marin", rev = "51f17e5fa22bb41ace6c7a18f5775cb572518a4e", subdirectory = "lib/haliax" }
-marin-levanter  = { git = "https://github.com/Open-Athena/marin", rev = "51f17e5fa22bb41ace6c7a18f5775cb572518a4e", subdirectory = "lib/levanter" }
-marin-iris      = { git = "https://github.com/Open-Athena/marin", rev = "51f17e5fa22bb41ace6c7a18f5775cb572518a4e", subdirectory = "lib/iris" }
-marin-zephyr    = { git = "https://github.com/Open-Athena/marin", rev = "51f17e5fa22bb41ace6c7a18f5775cb572518a4e", subdirectory = "lib/zephyr" }
-marin-rigging   = { git = "https://github.com/Open-Athena/marin", rev = "51f17e5fa22bb41ace6c7a18f5775cb572518a4e", subdirectory = "lib/rigging" }
-marin-fray      = { git = "https://github.com/Open-Athena/marin", rev = "51f17e5fa22bb41ace6c7a18f5775cb572518a4e", subdirectory = "lib/fray" }
+marin-core      = { git = "https://github.com/Open-Athena/marin", rev = "dc0edbbee2445c76c7159abb99fd03712dbde7d4", subdirectory = "lib/marin" }
+marin-haliax    = { git = "https://github.com/Open-Athena/marin", rev = "dc0edbbee2445c76c7159abb99fd03712dbde7d4", subdirectory = "lib/haliax" }
+marin-levanter  = { git = "https://github.com/Open-Athena/marin", rev = "dc0edbbee2445c76c7159abb99fd03712dbde7d4", subdirectory = "lib/levanter" }
+marin-iris      = { git = "https://github.com/Open-Athena/marin", rev = "dc0edbbee2445c76c7159abb99fd03712dbde7d4", subdirectory = "lib/iris" }
+marin-zephyr    = { git = "https://github.com/Open-Athena/marin", rev = "dc0edbbee2445c76c7159abb99fd03712dbde7d4", subdirectory = "lib/zephyr" }
+marin-rigging   = { git = "https://github.com/Open-Athena/marin", rev = "dc0edbbee2445c76c7159abb99fd03712dbde7d4", subdirectory = "lib/rigging" }
+marin-fray      = { git = "https://github.com/Open-Athena/marin", rev = "dc0edbbee2445c76c7159abb99fd03712dbde7d4", subdirectory = "lib/fray" }
 [tool.hatch.metadata]
 allow-direct-references = true
 
