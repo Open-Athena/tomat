@@ -3,7 +3,8 @@ import { csvParse } from 'd3-dsv'
 import { Plot, useTheme, usePinnedLegend } from 'pltly/react'
 import { themedHoverlabel } from './theme'
 
-interface LossRow { step: number; loss: number }
+// 0-indexed Levanter info.step from the checkpoint name; see `docs/step-conventions.md`.
+interface LossRow { step_idx: number; loss: number }
 interface RunSpec {
   file: string
   name: string
@@ -46,7 +47,7 @@ export function ScalingLossPlot({ baseUrl }: { baseUrl: string }) {
         .then(r => r.ok ? r.text() : Promise.reject(new Error(`fetch ${run.file}: ${r.status}`)))
         .then(text => {
           const parsed = csvParse(text, d => ({
-            step: Number(d.step),
+            step_idx: Number(d.step),
             loss: Number(d.train_loss),
           }))
           return [run.file, parsed as LossRow[]] as const
@@ -61,7 +62,7 @@ export function ScalingLossPlot({ baseUrl }: { baseUrl: string }) {
     return RUNS.map(run => {
       const rows = data[run.file] ?? []
       return {
-        x: rows.map(r => r.step),
+        x: rows.map(r => r.step_idx),
         y: rows.map(r => r.loss),
         type: 'scatter' as const,
         mode: 'lines' as const,

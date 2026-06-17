@@ -1336,6 +1336,13 @@ def main():
     profile_num_steps = int(os.environ.get("TOMAT_PROFILE_NUM_STEPS", "25"))
     print(f"[tomat-tpu] profiler: enabled={profile_enabled} start_step={profile_start} num_steps={profile_num_steps}")
 
+    # We pass `num_train_steps=N` and let Levanter run exactly N steps.
+    # Periodic ckpts land at clean `step-1000`, `step-2000`, … (Levanter
+    # tests `info.step % save_interval == 0`, where `info.step = state.step
+    # - 1` is 0-indexed); the final force-save lands at `step-(N-1)`
+    # (e.g. a 50000-step run's final disk ckpt is `step-49999`). UI snaps
+    # near-round values back to the round form (`snap_step` /
+    # `snapStep`; see `marin/run_names.py` and `site/src/lib/runNames.ts`).
     trainer = TrainerConfig(
         id=run_id,
         seed=seed,

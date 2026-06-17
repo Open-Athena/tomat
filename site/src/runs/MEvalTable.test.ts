@@ -9,7 +9,7 @@
 import { strict as assert } from 'node:assert'
 import { describe, it } from 'node:test'
 import {
-  nemdBucket, nmaeBucket, stepsDescOf, type Bucket,
+  nemdBucket, nmaeBucket, parseEvalJobId, stepsDescOf, type Bucket,
 } from './MEvalTable.helpers.ts'
 
 const point = (step: number) => ({
@@ -118,5 +118,53 @@ describe('nemdBucket', () => {
 
   it('NaN → none', () => {
     assert.equal(nemdBucket(NaN), 'none')
+  })
+})
+
+describe('parseEvalJobId', () => {
+  it('splits the mode infix out of the run label (oneshot / maskgit / free)', () => {
+    // Oneshot: no mode infix, bare `tomat-eval-<run>-…`.
+    assert.deepEqual(
+      parseEvalJobId('/ryan/tomat-eval-train-mg-foo-val_200-step-40000'),
+      { mode: 'oneshot', runLabel: 'train-mg-foo', matSet: 'val_200', step: 40000, taskIdx: null },
+    )
+    // K=12: `tomat-eval-maskgit-<run>-…`. The pre-fix regex used a greedy
+    // `(.+)` and bound runLabel to `maskgit-train-mg-foo`, never matching
+    // any actual run on the dashboard.
+    assert.deepEqual(
+      parseEvalJobId('/ryan/tomat-eval-maskgit-train-mg-foo-val_200-step-40000'),
+      { mode: 'maskgit', runLabel: 'train-mg-foo', matSet: 'val_200', step: 40000, taskIdx: null },
+    )
+    // Free: `tomat-eval-free-<run>-…`.
+    assert.deepEqual(
+      parseEvalJobId('/ryan/tomat-eval-free-train-mg-foo-train_200-step-1000'),
+      { mode: 'free', runLabel: 'train-mg-foo', matSet: 'train_200', step: 1000, taskIdx: null },
+    )
+  })
+
+  it('captures the `-task<i>` fan-out suffix', () => {
+    assert.deepEqual(
+      parseEvalJobId('/ryan/tomat-eval-maskgit-train-foo-val_200-step-50000-task0'),
+      { mode: 'maskgit', runLabel: 'train-foo', matSet: 'val_200', step: 50000, taskIdx: 0 },
+    )
+    assert.deepEqual(
+      parseEvalJobId('/ryan/tomat-eval-train-foo-train_200-step-12345-task7'),
+      { mode: 'oneshot', runLabel: 'train-foo', matSet: 'train_200', step: 12345, taskIdx: 7 },
+    )
+  })
+
+  it('does not match training jobs (regex anchored to tomat-eval-)', () => {
+    assert.equal(parseEvalJobId('/ryan/train-mg-foo'), null)
+    assert.equal(parseEvalJobId('/ryan/tomat-train-smoke'), null)
+    assert.equal(parseEvalJobId('not-an-iris-job-id'), null)
+  })
+
+  it('does not match other -<thing>- infixes (only maskgit / free)', () => {
+    // `tomat-eval-junk-train-foo-…` → `junk` isn't a mode infix, so the
+    // optional group bypasses → runLabel = `junk-train-foo`, mode = oneshot.
+    const r = parseEvalJobId('/ryan/tomat-eval-junk-train-foo-val_200-step-100')
+    assert.deepEqual(r, {
+      mode: 'oneshot', runLabel: 'junk-train-foo', matSet: 'val_200', step: 100, taskIdx: null,
+    })
   })
 })

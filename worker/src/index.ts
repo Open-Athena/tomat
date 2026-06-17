@@ -14,9 +14,12 @@
  *   GET  /api/iris-attempts/:label.json  — per-task per-attempt history (death events) for one training run
  *   GET  /api/voxel-corr/:label.json     — voxel-position corr-matrix sidecar (int8 scale, 1D curve, blob_format)
  *   GET  /api/voxel-corr/:label.bin.gzip — gzipped int8 corr-matrix blob (upper-triangle)
+ *   GET  /api/mp/:mp_id/grids            — per-mat grid index (spec 58 Phase A; R2-stub until #111 D1 lands)
  *   GET  /api/modal-state.json           — Modal app + function-call snapshot (synced by tomat modal sync)
  *   GET  /api/pending-fires.json         — Modal-spawned training fires not yet wandb-manifested (synced by tomat modal pending-fire add)
  *   GET  /api/cron-heartbeat.json        — GCE-VM cron last-fired timestamp (written by gce/sync/runs-sync-active.sh)
+ *   POST /api/eval/fire                  — append a pending eval-fire request to R2 (processed out-of-band by autosync.sh)
+ *   GET  /api/eval/fire-requests         — list pending eval-fire-request keys (for autosync.sh + the dashboard)
  *   GET  /api/files/list?prefix=&cursor= — generic R2 list (under FILES_PREFIX allow-list)
  *   GET  /api/files/get?path=…           — generic R2 get with Range support
  *   GET  /health
@@ -46,9 +49,132 @@ export interface Env {
 function corsHeaders(env: Env): HeadersInit {
 	return {
 		'Access-Control-Allow-Origin': env.CORS_ORIGIN,
-		'Access-Control-Allow-Methods': 'GET, OPTIONS',
+		'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+		'Access-Control-Allow-Headers': 'Content-Type',
 		'Access-Control-Max-Age': '86400',
 	};
+}
+
+// Prefix on R2 where eval-fire requests land. `scripts/autosync.sh` lists
+// this prefix every cron pass, dispatches `tomat evals fire` for each
+// request, then deletes the consumed request.
+const EVAL_FIRE_REQUESTS_PREFIX = 'tomat/eval-fire-requests';
+
+/** Eval-fire request payload accepted by `POST /api/eval/fire`. Keep the
+ *  schema narrow: only fields autosync.sh actually consumes. */
+interface EvalFireRequest {
+	run_id: string;
+	step: number;
+	mat_set: 'val_200' | 'train_200';
+	mode: 'oneshot' | 'maskgit' | 'free';
+	eval_label?: string;
+	reason?: string;
+}
+
+/** Validate + normalize a raw POST body. Returns the canonical
+ *  EvalFireRequest on success, or an error string. Defensive: the endpoint
+ *  is unauthenticated, so we reject anything unexpected. */
+function validateFireRequest(body: unknown): EvalFireRequest | string {
+	if (!body || typeof body !== 'object') return 'body must be a JSON object';
+	const b = body as Record<string, unknown>;
+	const run_id = b.run_id;
+	if (typeof run_id !== 'string' || !run_id) return '`run_id` required (string)';
+	// Defensive: run_id is going into an R2 key + an iris job name. Restrict
+	// to the chars our run names actually use.
+	if (!/^[A-Za-z0-9_-]+$/.test(run_id)) return '`run_id` must match [A-Za-z0-9_-]+';
+	if (run_id.length > 200) return '`run_id` too long';
+	const step = b.step;
+	if (typeof step !== 'number' || !Number.isFinite(step) || step < 0 || step > 10_000_000) {
+		return '`step` must be a non-negative finite number';
+	}
+	if (!Number.isInteger(step)) return '`step` must be an integer';
+	const mat_set = b.mat_set;
+	if (mat_set !== 'val_200' && mat_set !== 'train_200') {
+		return '`mat_set` must be one of val_200, train_200';
+	}
+	const mode = b.mode;
+	if (mode !== 'oneshot' && mode !== 'maskgit' && mode !== 'free') {
+		return '`mode` must be one of oneshot, maskgit, free';
+	}
+	const out: EvalFireRequest = { run_id, step, mat_set, mode };
+	if (typeof b.eval_label === 'string') {
+		if (!/^[A-Za-z0-9._-]+$/.test(b.eval_label) || b.eval_label.length > 100) {
+			return '`eval_label` must match [A-Za-z0-9._-]+ and be <= 100 chars';
+		}
+		out.eval_label = b.eval_label;
+	}
+	if (typeof b.reason === 'string') {
+		// Reason is free-form audit text; clip to keep keys/blobs small.
+		out.reason = b.reason.slice(0, 200);
+	}
+	return out;
+}
+
+async function handleEvalFire(req: Request, env: Env): Promise<Response> {
+	let raw: unknown;
+	try {
+		raw = await req.json();
+	} catch {
+		return jsonResponse({ ok: false, error: 'invalid JSON body' }, env, { status: 400 });
+	}
+	const validated = validateFireRequest(raw);
+	if (typeof validated === 'string') {
+		return jsonResponse({ ok: false, error: validated }, env, { status: 400 });
+	}
+	// Per-request key: `<run_id>/<step>-<mat_set>-<mode>-<iso>.json`. The
+	// `<run_id>/` prefix groups requests per run so `autosync.sh` can list
+	// them in batches; the trailing ISO timestamp keeps re-fires from the
+	// same cell distinguishable (and is sortable).
+	const now = new Date();
+	const iso = now.toISOString().replace(/[:.]/g, '-');
+	const key = `${EVAL_FIRE_REQUESTS_PREFIX}/${validated.run_id}/`
+		+ `${validated.step}-${validated.mat_set}-${validated.mode}-${iso}.json`;
+	// Best-effort dedupe: if a request for this exact (run, step, set, mode)
+	// is already pending in R2 — i.e. an earlier file with the same prefix
+	// is still there — drop the new one. This stops a double-click on the
+	// fire button from queueing two iris jobs for the same cell.
+	const dedupePrefix = `${EVAL_FIRE_REQUESTS_PREFIX}/${validated.run_id}/`
+		+ `${validated.step}-${validated.mat_set}-${validated.mode}-`;
+	const existing = await env.R2.list({ prefix: dedupePrefix, limit: 1 });
+	if (existing.objects.length > 0) {
+		return jsonResponse({
+			ok: true,
+			request_id: existing.objects[0].key,
+			deduped: true,
+		}, env);
+	}
+	const body = {
+		schema_version: 1,
+		fired_at: now.toISOString(),
+		...validated,
+	};
+	await env.R2.put(key, JSON.stringify(body, null, 2), {
+		httpMetadata: { contentType: 'application/json' },
+	});
+	return jsonResponse({ ok: true, request_id: key }, env);
+}
+
+async function handleEvalFireList(env: Env): Promise<Response> {
+	// List all pending eval-fire requests across all runs. Used by
+	// `autosync.sh`'s consumer to know what to process this pass.
+	const out: { key: string; fired_at: string; uploaded: string }[] = [];
+	let cursor: string | undefined;
+	for (let i = 0; i < 5; i++) {
+		const listing = await env.R2.list({
+			prefix: `${EVAL_FIRE_REQUESTS_PREFIX}/`,
+			...(cursor ? { cursor } : {}),
+		});
+		for (const o of listing.objects) {
+			out.push({
+				key: o.key,
+				fired_at: o.uploaded.toISOString(),
+				uploaded: o.uploaded.toISOString(),
+			});
+		}
+		if (!listing.truncated) break;
+		cursor = listing.cursor;
+	}
+	return jsonResponse({ requests: out, count: out.length }, env);
 }
 
 function jsonResponse(data: unknown, env: Env, init?: ResponseInit): Response {
@@ -396,10 +522,12 @@ async function refreshSnapshotCache(cache: Cache, cacheKey: Request, env: Env): 
 function isFilesPrefixAllowed(env: Env, keyOrPrefix: string): boolean {
 	const root = env.FILES_PREFIX;
 	if (!root) return false;
-	// Both empty prefix → "root listing" — allow, the lister will scope to
-	// the root prefix anyway.
-	if (keyOrPrefix === '' || keyOrPrefix === root) return true;
-	return keyOrPrefix.startsWith(root);
+	// `FILES_PREFIX` may be a comma-separated list of allowed roots
+	// (e.g. `tomat/,electrai/`) — supports cross-corpus serving without
+	// committing to whole-bucket open access.
+	const roots = root.split(',').map(s => s.trim()).filter(Boolean);
+	if (keyOrPrefix === '' || roots.includes(keyOrPrefix)) return true;
+	return roots.some(r => keyOrPrefix.startsWith(r));
 }
 
 interface FilesEntry {
@@ -508,6 +636,142 @@ function contentTypeForKey(key: string): string {
 	}
 }
 
+/** Per-mat grid index row (spec 58 §"Data model"). Phase A R2-stub: we don't
+ *  yet have a D1 binding, so we synthesize rows by walking R2 prefixes for
+ *  GT (`tomat/rho_gga_v3mr/{validation,train}/<mp>.zarr/zarr.json`) and preds
+ *  (`tomat/eval/predictions/<run>/<setmode>/step-<N>/<mp>.zarr/zarr.json`).
+ *  `nmae` is null here; #289 follow-up wires it from eval.json. */
+interface GridRow {
+	mp_id: string;
+	role: 'gt' | 'pred';
+	run_id: string | null;
+	set: string | null;     // e.g. 'val_200-maskgit', 'train_200-maskgit' (Phase A: pass-through)
+	step: number | null;    // 0-indexed Levanter step from the `step-<N>/` path segment
+	r2_key: string;         // points at the `.zarr/zarr.json` group (caller appends multiscale level)
+	size_bytes: number;     // size of the zarr.json metadata blob (cheap proxy; full-zarr size = LIST cost)
+	written_at: string;     // ISO-8601, from R2 object `uploaded`
+	nmae: number | null;    // always null in Phase A stub
+}
+
+/** List immediate sub-prefixes under `prefix` (one R2 LIST with delimiter='/').
+ *  Returns just the trailing segment names (not the full prefix). Bounded
+ *  loops — a mat's pred prefix is at most a few hundred entries. */
+async function listSubdirNames(env: Env, prefix: string): Promise<string[]> {
+	const out: string[] = [];
+	let cursor: string | undefined;
+	for (let i = 0; i < 10; i++) {
+		const listing = await env.R2.list({ prefix, delimiter: '/', ...(cursor ? { cursor } : {}) });
+		for (const p of listing.delimitedPrefixes ?? []) {
+			// p = `<prefix><name>/` — strip both ends.
+			const name = p.slice(prefix.length).replace(/\/$/, '');
+			if (name) out.push(name);
+		}
+		if (!listing.truncated) break;
+		cursor = listing.cursor;
+	}
+	return out;
+}
+
+/** Probe one `<key>.zarr/zarr.json` via R2.head(). Returns the row or null if
+ *  the object doesn't exist (mat not present at this step / set). */
+async function probeGrid(
+	env: Env,
+	mp_id: string,
+	role: 'gt' | 'pred',
+	zarrPrefix: string,
+	run_id: string | null,
+	set: string | null,
+	step: number | null,
+): Promise<GridRow | null> {
+	const key = `${zarrPrefix}/zarr.json`;
+	const obj = await env.R2.head(key);
+	if (!obj) return null;
+	return {
+		mp_id,
+		role,
+		run_id,
+		set,
+		step,
+		r2_key: zarrPrefix,
+		size_bytes: obj.size,
+		written_at: obj.uploaded.toISOString(),
+		nmae: null,
+	};
+}
+
+/** GET /api/mp/:mp_id/grids — flat JSON array of grids known for `mp_id`.
+ *
+ *  Phase A stub per spec 58: walks the R2 prefixes that `tomat zarr mirror-r2`
+ *  + `tomat evals mirror-mat` already populate. Replaced by a one-shot D1
+ *  query once #111 lands the binding. NMAE is null here; the eval.json join
+ *  is #289's follow-up.
+ *
+ *  Cost: O(2 + R × S × C) R2 HEADs, where R=#runs (currently 1), S=#setmodes
+ *  (currently 2: val/train), C=#steps (currently ~7). One mat → ~16 reads
+ *  + 3-4 LISTs. Well inside the 50-subrequest soft cap. */
+async function handleMpGrids(env: Env, mp_id: string): Promise<Response> {
+	// Defensive: mp_id flows into R2 keys; reject anything that could escape.
+	if (!/^mp-[0-9]+$/.test(mp_id)) {
+		return jsonResponse({ error: '`mp_id` must match `mp-<digits>`' }, env, { status: 400 });
+	}
+
+	const out: GridRow[] = [];
+
+	// 1. GT: validation + train splits. The `elvis.role` attr inside says
+	//    "input" (it's the DFT charge density that's the model's target), but
+	//    from tomat's perspective it's the ground-truth we score preds against,
+	//    hence `role: 'gt'` in our index.
+	const gtProbes = [
+		probeGrid(env, mp_id, 'gt', `tomat/rho_gga_v3mr/validation/${mp_id}.zarr`, null, 'validation', null),
+		probeGrid(env, mp_id, 'gt', `tomat/rho_gga_v3mr/train/${mp_id}.zarr`, null, 'train', null),
+	];
+
+	// 2. Preds: walk runs × setmodes × steps. Each level is a delimited LIST;
+	//    leaves are probed with HEAD. We do all the HEADs in parallel.
+	const predProbes: Promise<GridRow | null>[] = [];
+	const runs = await listSubdirNames(env, 'tomat/eval/predictions/');
+	const runSetmodes = await Promise.all(
+		runs.map(async (run) => {
+			const setmodes = await listSubdirNames(env, `tomat/eval/predictions/${run}/`);
+			return { run, setmodes };
+		}),
+	);
+	const stepListJobs: { run: string; setmode: string; }[] = [];
+	for (const { run, setmodes } of runSetmodes) {
+		for (const setmode of setmodes) stepListJobs.push({ run, setmode });
+	}
+	const stepLists = await Promise.all(
+		stepListJobs.map(async ({ run, setmode }) => {
+			const stepDirs = await listSubdirNames(env, `tomat/eval/predictions/${run}/${setmode}/`);
+			return { run, setmode, stepDirs };
+		}),
+	);
+	for (const { run, setmode, stepDirs } of stepLists) {
+		for (const stepDir of stepDirs) {
+			const m = stepDir.match(/^step-(\d+)$/);
+			if (!m) continue;
+			const step = parseInt(m[1], 10);
+			const zarrPrefix = `tomat/eval/predictions/${run}/${setmode}/${stepDir}/${mp_id}.zarr`;
+			predProbes.push(probeGrid(env, mp_id, 'pred', zarrPrefix, run, setmode, step));
+		}
+	}
+
+	const results = await Promise.all([...gtProbes, ...predProbes]);
+	for (const r of results) {
+		if (r) out.push(r);
+	}
+
+	// Sort: gt first (by set asc), then pred (by run asc, setmode asc, step asc).
+	out.sort((a, b) => {
+		if (a.role !== b.role) return a.role === 'gt' ? -1 : 1;
+		if ((a.run_id ?? '') !== (b.run_id ?? '')) return (a.run_id ?? '').localeCompare(b.run_id ?? '');
+		if ((a.set ?? '') !== (b.set ?? '')) return (a.set ?? '').localeCompare(b.set ?? '');
+		return (a.step ?? 0) - (b.step ?? 0);
+	});
+
+	return jsonResponse(out, env);
+}
+
 /** Serve an R2 object under the FILES_PREFIX allow-list. Like
  *  `serveR2Object`, but uses extension-derived content-type when R2 has no
  *  stored `httpMetadata.contentType`, and applies cache-control tuned for
@@ -565,6 +829,22 @@ export default {
 		if (req.method === 'OPTIONS') {
 			return new Response(null, { status: 204, headers: corsHeaders(env) });
 		}
+
+		const url = new URL(req.url);
+		const path = url.pathname;
+
+		// Single mutating endpoint: POST /api/eval/fire. Everything else
+		// is read-only, so we 405 non-GET/HEAD requests against any other
+		// path.
+		if (req.method === 'POST') {
+			if (path === '/api/eval/fire') {
+				return handleEvalFire(req, env);
+			}
+			return new Response('Method not allowed', {
+				status: 405,
+				headers: corsHeaders(env),
+			});
+		}
 		if (req.method !== 'GET' && req.method !== 'HEAD') {
 			return new Response('Method not allowed', {
 				status: 405,
@@ -572,11 +852,12 @@ export default {
 			});
 		}
 
-		const url = new URL(req.url);
-		const path = url.pathname;
-
 		if (path === '/health' || path === '/api/health') {
 			return jsonResponse({ ok: true }, env);
+		}
+
+		if (path === '/api/eval/fire-requests') {
+			return handleEvalFireList(env);
 		}
 
 		if (path === '/api/runs-snapshot.json') {
@@ -674,6 +955,13 @@ export default {
 			return serveR2Object(req, env, r2Key);
 		}
 
+		// /api/mp/<mp_id>/grids — spec 58 Phase A grid index (R2-stub).
+		const mpGridsMatch = path.match(/^\/api\/mp\/([^/]+)\/grids$/);
+		if (mpGridsMatch) {
+			const [, mp_id] = mpGridsMatch;
+			return handleMpGrids(env, mp_id);
+		}
+
 		if (path === '/api/files/list') {
 			return handleFilesList(req, env);
 		}
@@ -682,6 +970,26 @@ export default {
 			const key = url.searchParams.get('path') ?? '';
 			if (!key) {
 				return new Response('path required', { status: 400, headers: corsHeaders(env) });
+			}
+			if (!isFilesPrefixAllowed(env, key)) {
+				return new Response('Forbidden: path outside FILES_PREFIX', {
+					status: 403,
+					headers: corsHeaders(env),
+				});
+			}
+			return serveR2FilesObject(req, env, key);
+		}
+
+		// Hierarchical alias for /api/files/get?path=… — needed for libraries
+		// like zarrita whose FetchStore appends keys to the base URL pathname
+		// (`<base>/zarr.json`, `<base>/c/0/0/0`). With ?path= the key would
+		// land in the query string and zarrita's appending would break
+		// resolution. With /api/files/raw/<key> appending works natively.
+		// See `~/c/oa/elvis/specs/zarr-v3-multires-support.md`.
+		if (path.startsWith('/api/files/raw/')) {
+			const key = path.slice('/api/files/raw/'.length);
+			if (!key) {
+				return new Response('key required', { status: 400, headers: corsHeaders(env) });
 			}
 			if (!isFilesPrefixAllowed(env, key)) {
 				return new Response('Forbidden: path outside FILES_PREFIX', {

@@ -3,7 +3,8 @@ import { csvParse } from 'd3-dsv'
 import { Plot, useTheme } from 'pltly/react'
 import { themedHoverlabel } from './theme'
 
-interface LossRow { step: number; loss: number }
+// 0-indexed Levanter info.step from the checkpoint name; see `docs/step-conventions.md`.
+interface LossRow { step_idx: number; loss: number }
 
 export function SmokeLossPlot({ url }: { url: string }) {
   const [rows, setRows] = useState<LossRow[] | null>(null)
@@ -15,7 +16,7 @@ export function SmokeLossPlot({ url }: { url: string }) {
       .then(r => r.ok ? r.text() : Promise.reject(new Error(`fetch ${url}: ${r.status}`)))
       .then(text => {
         const parsed = csvParse(text, d => ({
-          step: Number(d.step),
+          step_idx: Number(d.step),
           loss: Number(d.train_loss),
         }))
         setRows(parsed as LossRow[])
@@ -33,7 +34,7 @@ export function SmokeLossPlot({ url }: { url: string }) {
       <Plot
         data={[
           {
-            x: rows.map(r => r.step),
+            x: rows.map(r => r.step_idx),
             y: rows.map(r => r.loss),
             type: 'scatter',
             mode: 'lines',
@@ -42,7 +43,7 @@ export function SmokeLossPlot({ url }: { url: string }) {
             hovertemplate: 'step %{x}<br>loss %{y:.3f}<extra></extra>',
           },
           {
-            x: [0, rows[rows.length - 1]?.step ?? 99],
+            x: [0, rows[rows.length - 1]?.step_idx ?? 99],
             y: [baseline, baseline],
             type: 'scatter',
             mode: 'lines',

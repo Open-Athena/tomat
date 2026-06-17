@@ -14,6 +14,7 @@
     "@rdub/file-tree": "https://github.com/runsascoded/file-tree#0ca64f4a22f3aff962f8d64dbd2438d30277dc22",
     "@tanstack/react-query": "^5.100.11",
     "d3-dsv": "^3.0.1",
+    "fzstd": "^0.1.1",
     "highlight.js": "^11.11.1",
     "hyparquet": "^1.25.8",
     "katex": "^0.17.0",

@@ -1506,7 +1506,9 @@ function RunDetail({ runId }: { runId: string }) {
           (shared `?mevm` URL state, lifted here). Self-hides when
           `eval.json` returned nothing. */}
       <MEvalTable
+        runId={runId}
         evalSeries={evalQ.data ?? null}
+        evalJobs={evalJobs}
         metric={mevalMetric}
         setMetric={setMevalMetric}
       />

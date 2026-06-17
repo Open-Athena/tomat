@@ -14,7 +14,14 @@
 
 set -euo pipefail
 
-TOMAT="${TOMAT:-/Users/ryan/c/oa/tomat/tomat}"
+# Use the project venv's python so deps (`click`, `fsspec`, …) are in
+# scope. `./tomat`'s shebang `#!/usr/bin/env python3` resolves to the
+# system python under launchd's PATH (no `direnv` activation), which
+# doesn't have project deps → autosync silently no-op'd for days until
+# noticed (MSRP chip stayed $0).
+TOMAT_PY="${TOMAT_PY:-/Users/ryan/c/oa/tomat/.venv/bin/python}"
+TOMAT_SCRIPT="${TOMAT_SCRIPT:-/Users/ryan/c/oa/tomat/tomat}"
+TOMAT="$TOMAT_PY $TOMAT_SCRIPT"
 LOG="/tmp/tomat-autosync.log"
 LOCK="/tmp/tomat-autosync.lock"
 
@@ -34,7 +41,7 @@ trap 'rm -f "$LOCK"' EXIT
   # Phase A: MSRP. Idempotent; rewrites every run's cost.json from
   # iris-state.json + per-run parquet history.
   echo "[$(date -u +%FT%TZ)] tomat cost compute --all"
-  "$TOMAT" cost compute --all 2>&1 || echo "  cost compute exit=$?"
+  $TOMAT cost compute --all 2>&1 || echo "  cost compute exit=$?"
 
   # Phase A.2: m-eval results aggregation. Per-step JSONs on GCS
   # (`gs://marin-eu-west4/tomat/eval/results/<run>/<set>/step-N.json`)
@@ -46,7 +53,7 @@ trap 'rm -f "$LOCK"' EXIT
   # `evals sync` takes a SUBSTR. Empty string = match all → walk every
   # run that has a parquet sidecar. Each run takes ~1s of GCS scans;
   # the dominant cost is the eu-west4 bucket walk.
-  "$TOMAT" evals sync 2>&1 || echo "  evals sync exit=$?"
+  $TOMAT evals sync 2>&1 || echo "  evals sync exit=$?"
 
   # Phase B: segments + annotations from submissions.jsonl. Stub until
   # next pass. The CLI would read ~/.tomat/submissions.jsonl, group by
@@ -54,14 +61,24 @@ trap 'rm -f "$LOCK"' EXIT
   # TOMAT_BATCH_SIZE changed, and write `runs/<label>/segments.json` +
   # `runs/<label>/annotations.json` on R2.
   # TODO:
-  #   "$TOMAT" runs build-segments --all
-  #   "$TOMAT" runs build-annotations --all
+  #   $TOMAT runs build-segments --all
+  #   $TOMAT runs build-annotations --all
 
   # Phase C: m-eval auto-fire. Stub. Would walk each running/finished
   # run's ckpts and fire missing (val_200|train_200) × (K=1|K=12) evals.
   # TODO:
-  #   "$TOMAT" evals auto-fire --all --modes oneshot,maskgit \
+  #   $TOMAT evals auto-fire --all --modes oneshot,maskgit \
   #            --sets val_200,train_200
+
+  # Phase D: process pending eval-fire requests posted from the dashboard.
+  # FE → CFW (`POST /api/eval/fire`) writes a small JSON request to R2 at
+  # `tomat/eval-fire-requests/<run>/<step>-<set>-<mode>-<iso>.json`. We list
+  # those, dispatch `tomat evals fire` for each, then delete the consumed
+  # request blob so the dashboard's "queued" cell flips back to "missing" /
+  # "in-flight" on the next snapshot cycle. The whole pass is idempotent — a
+  # failed `tomat evals fire` leaves the request in R2 to retry next pass.
+  echo "[$(date -u +%FT%TZ) eval-fire-requests] processing pending fires"
+  $TOMAT evals process-fire-requests 2>&1 || echo "  process-fire-requests exit=$?"
 
   echo "==== $(date -u +%FT%TZ) autosync done ===="
 } >> "$LOG" 2>&1

@@ -11,9 +11,12 @@
 import { useEffect, useState } from 'react'
 import { Plot, useTheme } from 'pltly/react'
 import { themedHoverlabel } from './theme'
+import { formatStepDetail } from './lib/runNames'
 
 interface SplitSeries {
-  steps: number[]
+  /** 0-based Levanter `info.step` values from per-step ckpt names.
+   *  See `docs/step-conventions.md`. */
+  step_indices: number[]
   nmae: (number | null)[]
   nemd: (number | null)[]
   nmae_p99: (number | null)[]
@@ -37,13 +40,17 @@ interface TrajectoryData {
 const TAB10 = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
                '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
 
+/** Returns the (step, value%) pair with the minimum value of `key` across
+ *  the SplitSeries, or null if every entry is null. The returned `step`
+ *  field is a 0-based `step_idx` (Levanter `info.step` value — see
+ *  `docs/step-conventions.md`). */
 function bestStep(s: SplitSeries, key: 'nmae' | 'nemd'): { step: number; value: number } | null {
   let best: { step: number; value: number } | null = null
-  for (let i = 0; i < s.steps.length; i++) {
+  for (let i = 0; i < s.step_indices.length; i++) {
     const v = s[key][i]
     if (v == null) continue
     const pct = v * 100
-    if (best === null || pct < best.value) best = { step: s.steps[i], value: pct }
+    if (best === null || pct < best.value) best = { step: s.step_indices[i], value: pct }
   }
   return best
 }
@@ -78,7 +85,7 @@ export function TrajectoryPlot({ url }: Props) {
         const ys = s[metric].map((v) => (v == null ? null : v * 100))
         if (ys.every((v) => v == null)) continue
         traces.push({
-          x: s.steps,
+          x: s.step_indices,
           y: ys as number[],
           name: `${r.label} ${split}`,
           legendgroup: `${r.label}-${split}`,
@@ -106,7 +113,10 @@ export function TrajectoryPlot({ url }: Props) {
         mode: 'text+markers',
         type: 'scatter',
         marker: { symbol: 'star', size: 16, color, line: { color: '#000', width: 0.7 } },
-        text: [`step-${best.step}<br>${best.value.toFixed(2)}%`],
+        // `≈90k` for final-of-segment ckpts (Levanter saves `step-(N-1)`),
+        // plain `50k` for clean periodic ckpts. Plotly hover is off
+        // (`hoverinfo: 'skip'`), so no tooltip wiring possible here.
+        text: [`${formatStepDetail(best.step).display}<br>${best.value.toFixed(2)}%`],
         textposition: 'top right',
         textfont: { color, size: 10 },
         yaxis: axis,

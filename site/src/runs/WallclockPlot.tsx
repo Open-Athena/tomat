@@ -40,6 +40,7 @@ import { annotationsFor, type RunAnnotation } from './annotations'
 import { computeSmoothedSeries } from './smoothing'
 import { FlopUnitChips, flopTickformat, flopUnitScale, formatFlops, useFlopUnit } from './flops'
 import { ancestorRelation } from './lineage'
+import { formatStepDetail } from '../lib/runNames'
 
 /** Ancestor metadata for a lineage-glued history. Each entry corresponds to
  *  one part of the concatenated `history` (root → parent order, the order
@@ -1622,14 +1623,27 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
           }}
         >
           <Tooltip
-            content={(
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-                <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>
-                  step {ann.step.toLocaleString()}
+            content={(() => {
+              // Inline the snap explanation when the annotation step was
+              // snapped — we're already inside a Tooltip, so nesting another
+              // would be janky.
+              const sd = formatStepDetail(ann.step)
+              return (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                  <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>
+                    step {sd.display}
+                  </div>
+                  <div style={{ whiteSpace: 'pre-wrap' }}>{ann.label}</div>
+                  {sd.isSnapped && (
+                    <div style={{ fontSize: '0.65rem', opacity: 0.55,
+                                  borderTop: '1px solid rgba(255,255,255,0.1)',
+                                  paddingTop: 3, marginTop: 2 }}>
+                      {sd.tooltip}
+                    </div>
+                  )}
                 </div>
-                <div style={{ whiteSpace: 'pre-wrap' }}>{ann.label}</div>
-              </div>
-            )}
+              )
+            })()}
           >
             <span
               style={{

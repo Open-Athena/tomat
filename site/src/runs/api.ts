@@ -137,6 +137,8 @@ export function parquetUrl(runId: string): string {
  *  1.17%) — ×100 for display. (Note: distinct from the manifest summary's
  *  `eval/mat_nmae/...` values, which the watchdog logs already as percentages.) */
 export interface EvalPoint {
+  /** 0-based `step_idx` (Levanter `info.step`) from the per-step ckpt name.
+   *  See `docs/step-conventions.md`. */
   step: number
   n_mats: number | null
   nmae_mean: number | null
@@ -195,6 +197,7 @@ export type EvalRecordState = 'pending' | 'running' | 'succeeded' | 'failed' | '
 export interface EvalRecord {
   run_label: string
   ckpt_leaf: string | null
+  /** 0-based `step_idx` (Levanter `info.step`). See `docs/step-conventions.md`. */
   step: number
   set: string                 // 'val_200' | 'train_200' | ...
   mode: string                // 'teacher' | 'free' | 'maskgit'
@@ -434,19 +437,48 @@ export function irisJobIdForRun(runName: string): string {
 
 /**
  * An m-eval (mat-NMAE) job — an iris job that evaluates one checkpoint of one
- * run against one mat-set. `tomat evals fire` names them
- * `tomat-eval-<run_label>-<mat_set>-step-<N>`, so the name fully encodes which
- * run + checkpoint + split the job evaluates.
+ * run against one mat-set + mode. `tomat evals fire` names them
+ *   `tomat-eval-<run_label>-<mat_set>-step-<N>`              (oneshot/teacher; K=1)
+ *   `tomat-eval-maskgit-<run_label>-<mat_set>-step-<N>`      (K=12 schedule)
+ *   `tomat-eval-free-<run_label>-<mat_set>-step-<N>`         (free-running)
+ *   `…-task<i>` suffix for fan-out across multiple iris tasks.
+ *
+ * The previous regex collapsed the mode infix into `runLabel` (so a
+ * `tomat-eval-maskgit-train-…` job's runLabel parsed as
+ * `maskgit-train-…`, never matching any actual run). Now we split out the
+ * `mode` infix explicitly so the MEvalTable can join in-flight jobs to
+ * the correct (run, step, set, mode) cell.
  */
+export type EvalMode = 'oneshot' | 'maskgit' | 'free'
+
 export interface EvalJob {
   runLabel: string
   matSet: string  // 'val_200' | 'train_200'
+  mode: EvalMode
+  /** 0-based `step_idx` parsed from the iris job name (`…-step-{step_idx}`).
+   *  See `docs/step-conventions.md`. */
   step: number
+  taskIdx: number | null
   jobId: string
   job: IrisJob
 }
 
-const EVAL_JOB_RE = /^\/ryan\/tomat-eval-(.+)-(val_200|train_200)-step-(\d+)$/
+// Capture the optional mode infix (`maskgit-` or `free-`), then runLabel,
+// then matSet, step, and optional `-taskN` suffix. NB: lazy `(.+?)` on
+// runLabel so the suffix groups bind correctly. Source string is exported
+// from `./MEvalTable.helpers` so node-test can exercise the same regex
+// without dragging the `api.ts` `import.meta.env` evaluation in.
+import { EVAL_JOB_RE_SRC } from './MEvalTable.helpers'
+
+const EVAL_JOB_RE = new RegExp(EVAL_JOB_RE_SRC)
+
+/** Map the iris job name's mode infix to the column-set key the eval.json
+ *  / MEvalTable uses. `oneshot`/`teacher` shares the bare set key
+ *  (`val_200`), `maskgit` appends `-maskgit`, `free` appends `-free`. */
+export function evalSetKey(matSet: string, mode: EvalMode): string {
+  if (mode === 'oneshot') return matSet
+  return `${matSet}-${mode}`
+}
 
 /** Group the iris snapshot's m-eval jobs by the run they evaluate. */
 export function evalJobsByRun(iris: IrisState | undefined): Map<string, EvalJob[]> {
@@ -455,15 +487,66 @@ export function evalJobsByRun(iris: IrisState | undefined): Map<string, EvalJob[
   for (const [jobId, job] of Object.entries(iris.jobs)) {
     const m = EVAL_JOB_RE.exec(jobId)
     if (!m) continue
-    const [, runLabel, matSet, stepStr] = m
+    const [, modeInfix, runLabel, matSet, stepStr, taskStr] = m
+    const mode: EvalMode = modeInfix === 'maskgit' ? 'maskgit'
+      : modeInfix === 'free' ? 'free'
+      : 'oneshot'
     const arr = byRun.get(runLabel) ?? []
-    arr.push({ runLabel, matSet, step: Number(stepStr), jobId, job })
+    arr.push({
+      runLabel, matSet, mode, step: Number(stepStr),
+      taskIdx: taskStr != null ? Number(taskStr) : null,
+      jobId, job,
+    })
     byRun.set(runLabel, arr)
   }
   for (const arr of byRun.values()) {
-    arr.sort((a, b) => a.step - b.step || a.matSet.localeCompare(b.matSet))
+    arr.sort((a, b) => a.step - b.step || a.matSet.localeCompare(b.matSet)
+      || a.mode.localeCompare(b.mode))
   }
   return byRun
+}
+
+// ── eval-fire request (FE → CFW → R2 → autosync.sh) ─────────────────────────
+// FE POSTs a small request blob to the runs API; the worker appends it to
+// `tomat/eval-fire-requests/<ts>-<rand>.json` on R2; the GCE-VM cron
+// (`scripts/autosync.sh`) lists the prefix and calls `tomat evals fire` for
+// each pending entry. This avoids a public live `tomat evals fire` endpoint
+// (TPU spend) while still giving the dashboard a one-click "fire this cell"
+// affordance.
+
+export interface EvalFireRequest {
+  run_id: string
+  /** 0-based `step_idx` (Levanter `info.step`). Matches the GCS ckpt
+   *  `step-{step_idx}` directory. See `docs/step-conventions.md`. */
+  step: number
+  mat_set: string         // 'val_200' | 'train_200'
+  mode: EvalMode          // 'oneshot' | 'maskgit' | 'free'
+  /** Optional override of the eval-fire `--eval-label`; the autosync runner
+   *  picks a sensible default per-run if missing. */
+  eval_label?: string
+  /** Free-form reason for audit (logged with the fire request). */
+  reason?: string
+}
+
+export interface EvalFireResponse {
+  ok: boolean
+  request_id?: string
+  error?: string
+}
+
+/** Submit an eval-fire request. Returns the response from the CFW endpoint
+ *  (which only writes the request to R2 — actual firing happens out-of-band
+ *  via the GCE-VM autosync cron). */
+export async function fireEval(req: EvalFireRequest): Promise<EvalFireResponse> {
+  const r = await fetch(`${API_BASE}/api/eval/fire`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  let body: EvalFireResponse
+  try { body = await r.json() } catch { body = { ok: false, error: `non-JSON response (${r.status})` } }
+  if (!r.ok && body.ok !== false) body.ok = false
+  return body
 }
 
 export type EvalPhase = 'flight' | 'done' | 'failed'

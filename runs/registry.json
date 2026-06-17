@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "runs": [
+    {
+      "short": "bin5",
+      "canonical": "train-mg-kl-bin5-fs-tpu",
+      "notes": "MaskGIT KL-Gaussian bin5 absorbing-prior; from-scratch TPU."
+    },
+    {
+      "short": "tz-v4-epochwin",
+      "canonical": "train-mg-modal-h200x8-tz-v4-epochwin-bs128-seed42",
+      "notes": "MaskGIT tz v4 with segment-aware epoch window; Modal H200x8."
+    },
+    {
+      "short": "cont7k-ext",
+      "canonical": "train-full-v3-200M-bs128-emd-do-8k-tpu16-shuf1k-cont7k-ext",
+      "notes": "AR continuation +10k constant-LR from earlier cont7k branch."
+    },
+    {
+      "short": "mg-4-cos-ce",
+      "canonical": "train-mg-4-cos-ce",
+      "notes": "First real MG+CE run (cosine mask prior + cross-entropy)."
+    },
+    {
+      "short": "cont33k",
+      "canonical": "train-full-v3-200M-bs128-emd-do-80k-v6e16-shuf1k-cont33k",
+      "notes": "AR cont33k 80k-step extension off cont7k-ext step-33000."
+    },
+    {
+      "short": "tz-v4",
+      "canonical": "train-mg-modal-h200x8-tz-v4-bs128-seed42",
+      "notes": "MaskGIT tz v4 baseline (Modal H200x8, BS128)."
+    },
+    {
+      "short": "tz-v4-epochwin-bs256",
+      "canonical": "train-mg-modal-h200x8-tz-v4-epochwin-bs256-seed42",
+      "notes": "tz v4 epochwin BS256 ablation."
+    },
+    {
+      "short": "kl-s05-modal",
+      "canonical": "train-mg-modal-h200x8-tz-fs-kl-s05-ts1-bs128-seed42",
+      "notes": "MaskGIT KL-Gauss sigma=0.5 from-scratch Modal H200x8."
+    },
+    {
+      "short": "kl-s05-tpu-cont",
+      "canonical": "kl-s05-tpu-cont-v3",
+      "notes": "TPU resume of KL-Gauss sigma=0.5 Modal run at step-20000."
+    },
+    {
+      "short": "tz-11",
+      "canonical": "train-mg-tz-11",
+      "notes": "MaskGIT tz-11 baseline."
+    },
+    {
+      "short": "tz-11-bs256",
+      "canonical": "train-mg-tz-11-bs256",
+      "notes": "tz-11 BS=256 ablation forked at step-20000."
+    },
+    {
+      "short": "mg-4-r1-ext",
+      "canonical": "train-mg-4-r1-ext",
+      "notes": "mg-4-cos-ce extension; r=1 sampling fine-tune."
+    },
+    {
+      "short": "mg-4-cos-ext",
+      "canonical": "train-mg-4-cos-ext",
+      "notes": "mg-4-cos-ce cosine-prior extension."
+    },
+    {
+      "short": "mg-1",
+      "canonical": "train-mg-1",
+      "notes": "MG-1 (mode-collapsed cos-EMD run; see memory)."
+    }
+  ]
+}

@@ -2244,6 +2244,8 @@ def _evals_fire_modal(
     mg_k_steps: int,
     debug_dump_mat: str,
     dump_predictions: bool = False,
+    voxel_zarrs: bool = False,
+    resume_eval: bool = False,
 ) -> int:
     """Modal-backend eval fire: spawn one 8×H200 call per (step, set, task).
 
@@ -2293,6 +2295,8 @@ def _evals_fire_modal(
                                 eval_skip=task_skip,
                                 output_suffix=out_suffix,
                                 dump_predictions=dump_predictions,
+                                voxel_zarrs=voxel_zarrs,
+                                resume_eval=resume_eval,
                             )
                         except Exception as e:
                             err(f"[FAIL spawn step={step} set={s} task={task_i}] {e}")
@@ -2339,6 +2343,8 @@ def evals():
 @click.option("--ckpt-leaf", "ckpt_leaf", default=None, help="Override the leaf dir under `<bucket>/results/<run_label>/checkpoints/` (default: run_label). Use for Modal training runs whose ckpt path is `results/<results_label>/checkpoints/<results_label>-bs<bs>-seed<seed>/step-*` — pass `--ckpt-leaf <results_label>-bs<bs>-seed<seed>`.")
 @click.option("--backend", default="iris", type=click.Choice(["iris", "modal"]), help="Submission backend. `iris` (default): submit one iris/TPU job per (step, set, task). `modal`: spawn each combo as an 8×H200 Modal `eval_checkpoint_h200x8` call. The modal path sidesteps marin-iris's 14-day client-freshness gate + marin-*-latest wheel rotation (see memories `iris-build-date-empty-bug`, `marin-dev-wheel-rotation`). Result JSONs land at the same GCS path either way (eval/results/<ckpt_leaf or run_label>/<set>/step-N.json); modal forces `<ckpt_leaf>` via TOMAT_EVAL_RUN_LABEL so RL ≠ leaf runs (Modal-trained) get the leaf-based output dir.")
 @click.option("-P", "--dump-predictions", "dump_predictions", is_flag=True, help="Sets TOMAT_EVAL_DUMP_PREDICTIONS=1. Each completed mat dumps a (n_patches, P^3) pred/true .npz sibling to the result JSON, for the voxel-position corr-matrix diagnostic (spec 41).")
+@click.option("-V", "--voxel-zarrs", "voxel_zarrs", is_flag=True, help="Sets TOMAT_EVAL_DUMP_VOXEL_ZARRS=1. Each completed mat writes a per-mat voxel-space fp16 zarr at `<bucket>/eval/predictions/<run>/<set>{-mode}/step-N/<mp_id>.zarr/` (schema mirrors `rho_gga_raw`). Enables elvis diff-mode viz of GT vs prediction (spec 51 Layer 1). R2 mirror happens in `tomat evals sync`.")
+@click.option("-r", "--resume", "resume_eval", is_flag=True, help="Sets TOMAT_EVAL_RESUME=1. Load existing per-mat results from `<bucket>/eval/results/<run>/<set>{-mode}/step-N.json` and skip those mp_ids. Lets a killed/timed-out fire pick up where it left off. Per_pos_* in the resumed summary reflects only newly-computed mats. task #228.")
 @click.argument("run_label")
 def evals_fire(
     run_label: str,
@@ -2365,6 +2371,8 @@ def evals_fire(
     ckpt_leaf: str | None,
     backend: str,
     dump_predictions: bool,
+    voxel_zarrs: bool,
+    resume_eval: bool,
 ):
     """Fire mat-NMAE eval jobs against a run's GCS checkpoints.
 
@@ -2502,6 +2510,8 @@ def evals_fire(
             mg_k_steps=mg_k_steps,
             debug_dump_mat=debug_dump_mat,
             dump_predictions=dump_predictions,
+            voxel_zarrs=voxel_zarrs,
+            resume_eval=resume_eval,
         )
         print(f"\n[done firing {fired_total}/{len(step_list)*len(set_list)*num_tasks} modal jobs]")
         # FIRED file seeding still useful so a downstream `tomat evals harvest`
@@ -2590,6 +2600,14 @@ def evals_fire(
                 if dump_predictions:
                     cmd += [
                         "--env-vars", "TOMAT_EVAL_DUMP_PREDICTIONS", "1",
+                    ]
+                if voxel_zarrs:
+                    cmd += [
+                        "--env-vars", "TOMAT_EVAL_DUMP_VOXEL_ZARRS", "1",
+                    ]
+                if resume_eval:
+                    cmd += [
+                        "--env-vars", "TOMAT_EVAL_RESUME", "1",
                     ]
                 cmd += [
                     "--no-wait", "--no-terminate-on-exit",
@@ -2767,6 +2785,388 @@ def evals_sync(substr: str | None, bucket: str, dry_run: bool, prefix: str):
         else:
             _r2_put_bytes(bucket, key, data, "application/json")
             err(f"[evals sync] {run}: {n_pts} pts → {R2_ENDPOINT}/{bucket}/{key}")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Spec 51 — eval prediction zarrs: GCS → R2 mirror helpers.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _mirror_gcs_dir_to_r2(
+    gcs_prefix: str,
+    bucket: str,
+    r2_prefix: str,
+    *,
+    content_type: str = "application/octet-stream",
+    skip_existing: bool = True,
+) -> tuple[int, int]:
+    """Mirror every file under `gcs_prefix` (no leading `gs://`, no trailing `/`)
+    to `s3://<bucket>/<r2_prefix>/` via `aws s3 cp` (cfo profile).
+
+    Returns (n_uploaded, n_skipped). Uses `aws s3 sync` for batched parallel
+    upload — preserves the relative directory structure (zarr groups need
+    `<key>/zarr.json`, `<key>/c/0/0/0`, etc. all at parallel paths).
+    """
+    import fsspec
+    import subprocess
+    import tempfile
+    import shutil
+    fs = fsspec.filesystem("gcs")
+    if not fs.exists(gcs_prefix):
+        return (0, 0)
+    files = [p for p in fs.find(gcs_prefix) if not p.endswith("/")]
+    if not files:
+        return (0, 0)
+    if skip_existing:
+        # Cheap dedup: skip if the marker file (zarr.json or .zarray) already
+        # exists on R2. Not perfect — partial uploads still slip through — but
+        # avoids re-uploading complete zarrs on every sync pass.
+        marker_candidates = (f"{gcs_prefix}/zarr.json", f"{gcs_prefix}/.zarray")
+        if any(m in files for m in marker_candidates):
+            check_key = f"{r2_prefix}/zarr.json"
+            r = subprocess.run(
+                ["aws", "--profile", "cfo", "--endpoint-url", R2_ENDPOINT,
+                 "s3api", "head-object", "--bucket", bucket, "--key", check_key],
+                capture_output=True, text=True,
+            )
+            if r.returncode == 0:
+                return (0, len(files))
+    # Stage to local tmp + aws sync (parallel uploads, retries, content-type).
+    tmpdir = tempfile.mkdtemp(prefix="tomat-r2-mirror-")
+    try:
+        for f in files:
+            rel = f[len(gcs_prefix):].lstrip("/")
+            local_path = f"{tmpdir}/{rel}"
+            os.makedirs(os.path.dirname(local_path) or tmpdir, exist_ok=True)
+            with open(local_path, "wb") as out:
+                out.write(fs.cat_file(f))
+        r = subprocess.run(
+            ["aws", "--profile", "cfo", "--endpoint-url", R2_ENDPOINT,
+             "s3", "sync", tmpdir, f"s3://{bucket}/{r2_prefix}",
+             "--content-type", content_type, "--no-progress"],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            err(f"[mirror] aws s3 sync failed: {r.stderr[:400]}")
+            return (0, len(files))
+        return (len(files), 0)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@evals.command("mirror-mat")
+@click.option("-r", "--run", "run_label", required=True, help="run label (e.g. train-mg-kl-bin5-fs-tpu)")
+@click.option("-m", "--mp-id", "mp_id", required=True, help="material id (e.g. mp-1921473)")
+@click.option("-s", "--set", "set_name", default="val_200", show_default=True, help="mat set (val_200 / train_200)")
+@click.option("--mode", default="maskgit", show_default=True, help="eval mode (oneshot|maskgit|free); 'oneshot' / 'teacher' use bare set name")
+@click.option("--step", default=None, type=int, help="ckpt step (required if --pred is set)")
+@click.option("--gt/--no-gt", default=True, show_default=True, help="mirror the GT charge density zarr")
+@click.option("--pred/--no-pred", default=True, show_default=True, help="mirror the prediction zarr (requires --step)")
+@click.option("--gcs-bucket", default="marin-eu-west4", show_default=True, help="source GCS bucket (no gs:// prefix)")
+@click.option("-b", "--bucket", default=R2_BUCKET, show_default=True, help="dest R2 bucket")
+@click.option("--split", default=None, help="zarr split (validation|train); auto-detects from set name if unset")
+@click.option("-n", "--dry-run", is_flag=True)
+def evals_mirror_mat(
+    run_label: str, mp_id: str, set_name: str, mode: str,
+    step: int | None, gt: bool, pred: bool,
+    gcs_bucket: str, bucket: str, split: str | None, dry_run: bool,
+):
+    """Mirror one mat's GT and/or prediction zarr from GCS → R2 for elvis viz.
+
+    GT path  : gs://<gcs_bucket>/tomat/rho_gga_raw/<split>/<mp_id>.zarr
+              → s3://<bucket>/tomat/rho_gga_raw/<split>/<mp_id>.zarr
+    Pred path: gs://<gcs_bucket>/tomat/eval/predictions/<run>/<set>{-mode}/<step>/<mp_id>.zarr
+              → s3://<bucket>/tomat/eval/<run>/predictions/<set>{-mode}/<step>/<mp_id>.zarr
+
+    `tomat evals fire -V` writes pred zarrs; this then makes them viewable in
+    elvis. ELVis URL:
+      https://elvis.oa.dev/?v0=https://<r2.../tomat/rho_gga_raw/<split>/<mp_id>.zarr>&v1=https://<r2.../tomat/eval/<run>/predictions/<setmode>/<step>/<mp_id>.zarr>&src=diff
+    """
+    if pred and step is None:
+        err("--pred requires --step")
+        sys.exit(2)
+    if not gt and not pred:
+        err("nothing to mirror (pass --gt or --pred)")
+        sys.exit(2)
+    if split is None:
+        split = "validation" if set_name.startswith("val") else "train"
+    setmode = set_name if mode in ("oneshot", "teacher") else f"{set_name}-{mode}"
+
+    out: list[str] = []
+    if gt:
+        gcs = f"{gcs_bucket}/tomat/rho_gga_raw/{split}/{mp_id}.zarr"
+        r2_key = f"tomat/rho_gga_raw/{split}/{mp_id}.zarr"
+        if dry_run:
+            err(f"[mirror-mat] GT: gs://{gcs} → s3://{bucket}/{r2_key} (dry-run)")
+        else:
+            up, sk = _mirror_gcs_dir_to_r2(gcs, bucket, r2_key)
+            err(f"[mirror-mat] GT mp={mp_id}: uploaded={up} skipped={sk}")
+        out.append(f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com/{bucket}/{r2_key}")
+    if pred:
+        gcs = (f"{gcs_bucket}/tomat/eval/predictions/{run_label}/"
+               f"{setmode}/step-{step}/{mp_id}.zarr")
+        r2_key = (f"tomat/eval/{run_label}/predictions/"
+                  f"{setmode}/step-{step}/{mp_id}.zarr")
+        if dry_run:
+            err(f"[mirror-mat] PRED: gs://{gcs} → s3://{bucket}/{r2_key} (dry-run)")
+        else:
+            up, sk = _mirror_gcs_dir_to_r2(gcs, bucket, r2_key)
+            err(f"[mirror-mat] PRED mp={mp_id} step={step}: uploaded={up} skipped={sk}")
+        out.append(f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com/{bucket}/{r2_key}")
+    # Helper: print ELVis URL when both were mirrored.
+    if gt and pred and not dry_run:
+        v0, v1 = out[0], out[1]
+        print(f"\nelvis url:\n  https://elvis.oa.dev/?v0={v0}&v1={v1}&src=diff")
+
+
+@cli.group()
+def zarr():
+    """Voxel-zarr utilities — bulk GT mirror to R2, future converters."""
+
+
+@zarr.command("mirror-r2")
+@click.option("-s", "--src", default="gs://marin-eu-west4/tomat/rho_gga_v3mr",
+              show_default=True,
+              help="GCS source prefix containing `<split>/<mp>.zarr/` subdirs")
+@click.option("-d", "--dst-prefix", default="tomat/rho_gga_v3mr",
+              show_default=True,
+              help="R2 key prefix (under --bucket)")
+@click.option("-b", "--bucket", default=R2_BUCKET, show_default=True)
+@click.option("--split", default=None,
+              help="restrict to one split (validation|train|test); default = all subdirs")
+@click.option("--limit", default=0, type=int,
+              help="stop after N zarrs (smoke; 0 = unlimited)")
+@click.option("-j", "--workers", default=20, type=int, show_default=True,
+              help="ThreadPoolExecutor size for per-zarr mirror parallelism. "
+                   "Each worker holds one tmpdir + a `aws s3 sync` subprocess.")
+@click.option("-n", "--dry-run", is_flag=True)
+def zarr_mirror_r2(
+    src: str, dst_prefix: str, bucket: str,
+    split: str | None, limit: int, workers: int, dry_run: bool,
+):
+    """Bulk-mirror every <split>/<mp>.zarr/ under SRC from GCS to R2.
+
+    SRC defaults to the GT pyramid prefix written by `convert_zarrs_modal.py`.
+    R2 layout mirrors the GCS layout 1:1 at <bucket>/<dst-prefix>/<split>/<mp>.zarr/.
+    Uses `aws s3 sync` per-zarr (the same path the eval-pred mirror uses) so
+    elvis sees the right Content-Type + CORS headers.
+    """
+    import fsspec
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+    fs = fsspec.filesystem("gs")
+    src_clean = src.rstrip("/")
+    src_gcs = src_clean.removeprefix("gs://")
+    # Enumerate `<split>/` subdirs unless one was pinned.
+    if split:
+        splits = [split]
+    else:
+        try:
+            children = [p.rsplit("/", 1)[-1] for p in fs.ls(src_gcs)]
+            splits = sorted(c for c in children if c)
+        except Exception as e:
+            err(f"[zarr mirror-r2] failed to list {src}: {e}")
+            sys.exit(1)
+    err(f"[zarr mirror-r2] splits: {splits}  workers={workers}")
+
+    # Flatten across splits so the threadpool has a uniform work list.
+    tasks: list[tuple[str, str, str, str]] = []  # (sp, leaf, gcs, r2_key)
+    for sp in splits:
+        try:
+            zarrs = [
+                p.rsplit("/", 1)[-1]
+                for p in fs.ls(f"{src_gcs}/{sp}")
+                if p.endswith(".zarr") or p.endswith(".zarr/")
+            ]
+        except Exception as e:
+            err(f"[zarr mirror-r2] split {sp}: skip ({e})")
+            continue
+        zarrs.sort()
+        err(f"[zarr mirror-r2] {sp}: {len(zarrs)} zarrs queued")
+        for leaf in zarrs:
+            gcs = f"{src_gcs}/{sp}/{leaf}"
+            r2_key = f"{dst_prefix}/{sp}/{leaf}"
+            tasks.append((sp, leaf, gcs, r2_key))
+    if limit > 0:
+        tasks = tasks[:limit]
+    if dry_run:
+        for sp, leaf, gcs, r2_key in tasks:
+            err(f"  {leaf.removesuffix('.zarr')}: gs://{gcs} → s3://{bucket}/{r2_key} (dry-run)")
+        return
+
+    n_ok = n_skipped = n_err = 0
+    counter_lock = threading.Lock()
+    t0 = time.time()
+
+    def _one(sp_leaf_gcs_r2):
+        sp, leaf, gcs, r2_key = sp_leaf_gcs_r2
+        try:
+            up, sk = _mirror_gcs_dir_to_r2(gcs, bucket, r2_key)
+            return ("skip" if (up == 0 and sk > 0) else ("ok" if up > 0 else "err"))
+        except Exception as e:
+            return f"err:{type(e).__name__}"
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_one, t) for t in tasks]
+        for i, fut in enumerate(as_completed(futures)):
+            r = fut.result()
+            with counter_lock:
+                if r == "ok":
+                    n_ok += 1
+                elif r == "skip":
+                    n_skipped += 1
+                else:
+                    n_err += 1
+                done = n_ok + n_skipped + n_err
+            if done % 50 == 0 or done == len(tasks):
+                rate = done / max(time.time() - t0, 1e-3)
+                err(f"  {done}/{len(tasks)} ok={n_ok} skip={n_skipped} err={n_err} "
+                    f"({rate:.1f}/s)")
+    err(f"[zarr mirror-r2] done in {time.time() - t0:.0f}s: "
+        f"ok={n_ok} skipped={n_skipped} err={n_err}")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# tomat evals process-fire-requests — drain dashboard eval-fire requests.
+# ──────────────────────────────────────────────────────────────────────
+
+
+EVAL_FIRE_REQUESTS_PREFIX = "tomat/eval-fire-requests"
+
+
+def _eval_label_for_run(run_label: str) -> str:
+    """Pick a sensible TOMAT_LABEL for an eval fire against a given run.
+    P14/v2 runs use `val-full-lmq-v2`; P19/v3 runs use `val-full-v3`.
+    Heuristic: name match on the run label. Returns `val-full-v3` by default.
+    """
+    # P14/v2 era runs had `-v2` somewhere in the name (e.g. `cont7k-ext`, …).
+    # Default to v3 for everything else — matches the `tomat evals fire`
+    # default + memory `v2-t10n-contamination`.
+    if "-v2" in run_label and "-v3" not in run_label:
+        return "val-full-lmq-v2"
+    return "val-full-v3"
+
+
+@evals.command("process-fire-requests")
+@click.option("-b", "--bucket", default=R2_BUCKET, help="R2 bucket")
+@click.option("-p", "--prefix", default=EVAL_FIRE_REQUESTS_PREFIX,
+              help="R2 key prefix where the CFW writes pending fire-requests")
+@click.option("-n", "--dry-run", is_flag=True,
+              help="show what would be fired (and what would be deleted) without invoking iris or deleting requests")
+@click.option("-T", "--tpu", default="v6e-8", show_default=True, help="--tpu for iris evals (default v6e-8)")
+@click.option("-l", "--limit", default=20, type=int, show_default=True,
+              help="max number of requests to process this pass (defensive — bursty FE can spam)")
+def evals_process_fire_requests(
+    bucket: str, prefix: str, dry_run: bool, tpu: str, limit: int,
+):
+    """Drain pending eval-fire-requests from R2 (one `tomat evals fire` per
+    request, then delete the consumed request).
+
+    Each request looks like:
+        {"run_id": "train-mg-…", "step": 40000, "mat_set": "val_200",
+         "mode": "maskgit", "eval_label": "val-full-v3", "fired_at": "...",
+         "reason": "single-from-dashboard"}
+
+    Behaviour:
+      - lists every object under `<prefix>/`
+      - for each, parses + fires via `tomat evals fire ... <run_id>`
+      - on success, deletes the R2 object so the dashboard's "queued" cell
+        flips back to "in-flight" (or "succeeded") on the next snapshot
+      - on failure, leaves the request in place — autosync.sh's next pass
+        retries (idempotent; iris's de-dup is the backstop).
+
+    See `scripts/autosync.sh` Phase D and `worker/src/index.ts handleEvalFire`.
+    """
+    keys = _r2_list_keys(bucket, f"{prefix}/")
+    keys = [k for k in keys if k.endswith(".json")]
+    if not keys:
+        err(f"[evals process-fire-requests] no pending requests under s3://{bucket}/{prefix}/")
+        return
+    if len(keys) > limit:
+        err(f"[evals process-fire-requests] {len(keys)} pending; capping at --limit={limit}")
+        keys = keys[:limit]
+
+    n_ok = n_fail = n_dropped = 0
+    for key in keys:
+        # `_r2_get_json` returns dict|list|None — we always wrote a dict.
+        body = _r2_get_json(bucket, key)
+        if not isinstance(body, dict):
+            err(f"[fire-req] {key}: not a JSON object; skipping")
+            n_dropped += 1
+            continue
+        run_id = body.get("run_id")
+        step = body.get("step")
+        mat_set = body.get("mat_set")
+        mode = body.get("mode")
+        eval_label = body.get("eval_label") or _eval_label_for_run(str(run_id))
+        if (
+            not isinstance(run_id, str)
+            or not isinstance(step, int)
+            or mat_set not in ("val_200", "train_200")
+            or mode not in ("oneshot", "maskgit", "free")
+        ):
+            err(f"[fire-req] {key}: malformed body, deleting: {body}")
+            if not dry_run:
+                _r2_delete_key(bucket, key)
+            n_dropped += 1
+            continue
+        # Best-effort: skip if the eval result JSON already exists on GCS
+        # (e.g. autosync.sh saw the request after the user already manually
+        # fired it). Cheap GCS stat keeps us from re-queuing a finished cell.
+        try:
+            import fsspec
+            fs = fsspec.filesystem("gcs")
+            sub = mat_set if mode in ("oneshot", "teacher") else f"{mat_set}-{mode}"
+            result_path = (
+                f"marin-eu-west4/tomat/eval/results/{run_id}/{sub}/step-{step}.json"
+            )
+            if fs.exists(result_path):
+                err(f"[fire-req] {key}: result JSON already on GCS at "
+                    f"gs://{result_path}; deleting request")
+                if not dry_run:
+                    _r2_delete_key(bucket, key)
+                n_dropped += 1
+                continue
+        except Exception as e:
+            # Don't let a transient GCS issue block firing — just log + proceed.
+            err(f"[fire-req] {key}: GCS pre-check failed ({e}); proceeding with fire")
+
+        # Dispatch `tomat evals fire`. We invoke the running CLI as a
+        # subprocess so we don't have to refactor `evals_fire` to be
+        # importable; that also gives us a clean stdout/stderr separation.
+        cmd = [
+            sys.argv[0], "evals", "fire",
+            "-s", str(step),
+            "-S", mat_set,
+            "-l", eval_label,
+            "-T", tpu,
+            "--mode", mode,
+            run_id,
+        ]
+        if dry_run:
+            err(f"[fire-req] (dry-run) would fire: {' '.join(cmd)}")
+            err(f"[fire-req] (dry-run) would delete: s3://{bucket}/{key}")
+            n_ok += 1
+            continue
+        err(f"[fire-req] dispatching: {' '.join(cmd)}")
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            err(f"[fire-req] {key}: `tomat evals fire` rc={r.returncode}")
+            err(r.stdout[-1500:])
+            err(r.stderr[-1500:])
+            n_fail += 1
+            continue
+        # Fire succeeded → drop the request from R2 so the next snapshot
+        # pass sees the iris job (RUNNING) instead of the "queued" cell.
+        if _r2_delete_key(bucket, key):
+            err(f"[fire-req] {key}: fired + deleted request")
+            n_ok += 1
+        else:
+            err(f"[fire-req] {key}: fired but failed to delete (will retry next pass)")
+            n_ok += 1
+    err(f"[evals process-fire-requests] done: {n_ok} fired, {n_fail} failed, "
+        f"{n_dropped} dropped (out of {len(keys)})")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -3297,14 +3697,17 @@ def _gcs_ls(path: str) -> list[str]:
 
 
 def _latest_ckpt_step(run_label: str, bucket: str = GCS_BUCKET) -> int | None:
-    """Return the latest step-N under the run's checkpoint dir, or None."""
+    """Return the latest `step_idx` under the run's checkpoint dir, or None.
+
+    `step_idx` is 0-based (Levanter `info.step`); see `docs/step-conventions.md`.
+    """
     base = f"{bucket}/results/{run_label}/checkpoints/{run_label}"
-    steps = []
+    step_indices = []
     for line in _gcs_ls(f"{base}/"):
         m = re.search(r"/step-(\d+)/?$", line)
         if m:
-            steps.append(int(m.group(1)))
-    return max(steps) if steps else None
+            step_indices.append(int(m.group(1)))
+    return max(step_indices) if step_indices else None
 
 
 SUBMISSIONS_PATH = Path.home() / ".tomat" / "submissions.jsonl"
@@ -4525,6 +4928,409 @@ def wb_gql(query: str, var: tuple[str, ...]):
     print(json.dumps(out, indent=2))
 
 
+# ──────────────────────────────────────────────────────────────────────
+# tomat viz
+# ──────────────────────────────────────────────────────────────────────
+
+
+@cli.group("viz")
+def viz_grp():
+    """Voxel-level visualization primitives (joint hists, per-mat plots)."""
+
+
+_GCS_BUCKET_DEFAULT = "gs://marin-eu-west4/tomat"
+
+
+def _viz_parse_source(spec: str, bucket: str) -> tuple[str, str, str]:
+    """Parse a `--x` / `--y` source spec into (label, gcs_prefix, kind).
+
+    `gcs_prefix` is everything up to (but not including) the `<mp>.zarr/`
+    suffix; per-mat URLs are built as `f"{gcs_prefix}/{mp}.zarr"`.
+
+    Grammar:
+      gt:<split>                            → rho_gga_v3mr/<split>/
+      pred:<run>:<setmode>:<step>           → eval/predictions/<run>/<setmode>/step-<step>/
+    """
+    parts = spec.split(":")
+    if not parts:
+        raise click.BadParameter(f"empty source spec: {spec!r}")
+    kind = parts[0]
+    if kind == "gt":
+        if len(parts) != 2:
+            raise click.BadParameter(
+                f"gt source must be `gt:<split>` (e.g. `gt:val`, `gt:train`); got {spec!r}")
+        split = parts[1]
+        # accept short aliases
+        split_map = {"val": "validation", "validation": "validation",
+                     "train": "train", "training": "train"}
+        if split not in split_map:
+            raise click.BadParameter(
+                f"unknown gt split {split!r}; expected one of {sorted(split_map)}")
+        full = split_map[split]
+        return (f"gt:{split}", f"{bucket}/rho_gga_v3mr/{full}", "gt")
+    if kind == "pred":
+        if len(parts) != 4:
+            raise click.BadParameter(
+                f"pred source must be `pred:<run>:<setmode>:<step>`; got {spec!r}")
+        _, run, setmode, step = parts
+        try:
+            step_i = int(step)
+        except ValueError:
+            raise click.BadParameter(f"pred step must be an int; got {step!r}")
+        label = f"pred:{run}:{setmode}:{step_i}"
+        prefix = f"{bucket}/eval/predictions/{run}/{setmode}/step-{step_i}"
+        return (label, prefix, "pred")
+    raise click.BadParameter(
+        f"unknown source kind {kind!r} in {spec!r}; expected `gt` or `pred`")
+
+
+# Short-name extraction now delegates to `marin.run_names`, which loads the
+# vetted registry at `runs/registry.json` and falls back to a regex (mirrors
+# the prior inline regex here) for uncurated runs. Local regex helpers stay
+# below as a last-resort fallback if the marin module fails to import.
+_VIZ_RUN_SHORTNAME_RE = re.compile(r"train-mg-(?:kl-)?([a-z0-9]+(?:-[a-z0-9]+)?)-")
+
+
+def _viz_short_step(step_idx: int) -> str:
+    """Format a 0-based `step_idx` compactly: 30000→`30k`, 89999→`90k`, 1500000→`1.5M`.
+
+    `step_idx` is a Levanter `info.step` value (lifted from a GCS
+    `step-{step_idx}` checkpoint name). See `docs/step-conventions.md`.
+    """
+    try:
+        from marin.run_names import shorten_step
+        return shorten_step(step_idx)
+    except Exception:
+        pass
+    if step_idx >= 10**6:
+        v = step_idx / 1e6
+        return f"{v:.1f}M" if v < 10 else f"{round(v)}M"
+    if step_idx >= 1000:
+        return f"{round(step_idx / 1000)}k"
+    return str(step_idx)
+
+
+def _viz_short_run(run: str) -> str:
+    """Extract a short label for a run name (e.g. `train-mg-kl-bin5-fs-tpu` → `bin5`).
+
+    Consults `marin.run_names.shorten_run`, which checks the curated registry
+    first and falls back to the same regex used here as a final layer of
+    safety for uncurated runs.
+    """
+    try:
+        from marin.run_names import shorten_run
+        return shorten_run(run)
+    except Exception:
+        pass
+    m = _VIZ_RUN_SHORTNAME_RE.match(run)
+    if m:
+        return m.group(1)
+    # generic mg-* style fallback: `train-mg-<tag>-…` or `train-<tag>-…`
+    m = re.match(r"train-(?:mg-)?([a-z0-9]+(?:-[a-z0-9]+)?)-", run)
+    if m:
+        return m.group(1)
+    return run
+
+
+def _viz_setmode_split(setmode: str) -> str | None:
+    """Return `val` or `train` (or None if unknown) given a setmode like `val_200-maskgit`."""
+    s = setmode.lower()
+    if s.startswith("val"):
+        return "val"
+    if s.startswith("train"):
+        return "train"
+    return None
+
+
+def _viz_short_name(spec: str) -> tuple[str, str | None]:
+    """Map a source spec to (short_label, split) where split ∈ {`val`,`train`,None}."""
+    parts = spec.split(":")
+    if not parts:
+        return spec, None
+    if parts[0] == "gt" and len(parts) == 2:
+        split = parts[1]
+        s = "val" if split.startswith("val") else ("train" if split.startswith("train") else split)
+        return f"GT ({s})", s
+    if parts[0] == "pred" and len(parts) == 4:
+        _, run, setmode, step = parts
+        # `step` is a stringified 0-based `step_idx` (Levanter `info.step`);
+        # see `docs/step-conventions.md`.
+        try:
+            step_idx = int(step)
+        except ValueError:
+            step_idx = 0
+        return f"{_viz_short_run(run)} @ {_viz_short_step(step_idx)}", _viz_setmode_split(setmode)
+    return spec, None
+
+
+def _viz_load_l0(gs_url: str) -> "np.ndarray":
+    """Load the level-0 (full-res) array from a v3 multires zarr at `gs_url`.
+
+    `gs_url` is the zarr root (`.../<mp>.zarr`). Returns a 3D float32 array.
+    """
+    import numpy as np
+    import zarr
+    store = zarr.storage.FsspecStore.from_url(gs_url, read_only=True)
+    g = zarr.open_group(store=store, mode="r", use_consolidated=False)
+    return np.asarray(g["0"][:]).astype(np.float32, copy=False)
+
+
+def _viz_fetch_mat_pair(
+    mp: str,
+    x_prefix: str,
+    y_prefix: str,
+) -> tuple[str, "np.ndarray | None", "np.ndarray | None", str | None]:
+    """Fetch (x, y) voxel arrays for `mp`. Returns (mp, x, y, err)."""
+    try:
+        x = _viz_load_l0(f"{x_prefix}/{mp}.zarr")
+    except Exception as e:
+        return mp, None, None, f"x: {type(e).__name__}: {e}"
+    try:
+        y = _viz_load_l0(f"{y_prefix}/{mp}.zarr")
+    except Exception as e:
+        return mp, x, None, f"y: {type(e).__name__}: {e}"
+    if x.shape != y.shape:
+        return mp, x, y, f"shape mismatch: x={x.shape} y={y.shape}"
+    return mp, x, y, None
+
+
+@viz_grp.command("joint-hist")
+@click.option("--mat", "mat_one", default=None,
+              help="single MP id (e.g. `mp-1797712`). Mutually exclusive with --mats.")
+@click.option("--mats", "mats_csv", default=None,
+              help="comma-sep list of MP ids. Mutually exclusive with --mat.")
+@click.option("-x", "--x", "x_spec", required=True,
+              help="x-axis source: `gt:val`, `gt:train`, or `pred:<run>:<setmode>:<step>`")
+@click.option("-y", "--y", "y_spec", required=True,
+              help="y-axis source: same grammar as --x")
+@click.option("-n", "--bins", type=int, default=1024, show_default=True,
+              help="number of bins per axis (square histogram)")
+@click.option("--bin-scale", type=click.Choice(["log", "linear"]), default="log",
+              show_default=True,
+              help="bin edge spacing in density-space")
+@click.option("--vmin", type=float, default=None,
+              help="density-range lower clip (default: auto from data; log-scale clips at max(p0.1, 1e-3))")
+@click.option("--vmax", type=float, default=None,
+              help="density-range upper clip (default: auto from data — p99.99)")
+@click.option("-D", "--no-diagonal", "no_diagonal", is_flag=True,
+              help="skip drawing the y=x line")
+@click.option("-t", "--title", default=None, help="override auto-generated plot title")
+@click.option("--tol", type=float, default=0.10, show_default=True,
+              help="on-diagonal tolerance for the title summary stat (|y/x - 1| <= tol)")
+@click.option("-w", "--workers", type=int, default=8, show_default=True,
+              help="ThreadPoolExecutor worker count for parallel mat fetches")
+@click.option("--bucket", default=_GCS_BUCKET_DEFAULT, show_default=True,
+              help="GCS bucket prefix (use `gs://marin-us-east5/tomat` for runs in that region)")
+@click.option("-o", "--out", default=None,
+              help="output PNG path (default: `tmp/joint-hist-<sha8>.png`, deterministic in args)")
+def viz_joint_hist(
+    mat_one: str | None,
+    mats_csv: str | None,
+    x_spec: str,
+    y_spec: str,
+    bins: int,
+    bin_scale: str,
+    vmin: float | None,
+    vmax: float | None,
+    no_diagonal: bool,
+    title: str | None,
+    tol: float,
+    workers: int,
+    bucket: str,
+    out: str | None,
+):
+    """2D joint-histogram heatmap of (x-source, y-source) voxel densities.
+
+    \b
+    Examples:
+      tomat viz joint-hist --mat mp-1797712 \\
+          -x gt:val \\
+          -y pred:train-mg-kl-bin5-fs-tpu:val_200-maskgit:30000
+
+      tomat viz joint-hist --mats mp-1,mp-2,mp-3 \\
+          -x pred:RUN:val_200-maskgit:30000 \\
+          -y pred:RUN:val_200-maskgit:89999
+
+    Both axes can be `pred` sources for pred-vs-pred analysis; the
+    diagonal (y=x) is drawn by default so perfect agreement is on it.
+    """
+    import hashlib
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+
+    if (mat_one is None) == (mats_csv is None):
+        raise click.UsageError("exactly one of --mat or --mats must be set")
+    if mat_one is not None:
+        mats = [mat_one]
+    else:
+        mats = [m.strip() for m in mats_csv.split(",") if m.strip()]
+    if not mats:
+        raise click.UsageError("no MP ids parsed from --mats")
+
+    x_label, x_prefix, x_kind = _viz_parse_source(x_spec, bucket)
+    y_label, y_prefix, y_kind = _viz_parse_source(y_spec, bucket)
+    x_short, x_split = _viz_short_name(x_spec)
+    y_short, y_split = _viz_short_name(y_spec)
+
+    if out is None:
+        sig = "|".join([
+            ",".join(sorted(mats)), x_spec, y_spec, str(bins), bin_scale,
+            f"{vmin}", f"{vmax}", str(no_diagonal), f"{tol}", bucket,
+        ])
+        sha8 = hashlib.sha256(sig.encode()).hexdigest()[:8]
+        out = f"tmp/joint-hist-{sha8}.png"
+    out_path = Path(out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    err(f"[joint-hist] mats={len(mats)}, x={x_label}, y={y_label}, bins={bins}, "
+        f"bin-scale={bin_scale}, out={out_path}")
+
+    xs: list[np.ndarray] = []
+    ys: list[np.ndarray] = []
+    fetched: list[str] = []
+    failed: list[tuple[str, str]] = []
+    shapes: list[tuple[int, ...]] = []
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        futs = [ex.submit(_viz_fetch_mat_pair, mp, x_prefix, y_prefix) for mp in mats]
+        for f in as_completed(futs):
+            mp, x, y, e = f.result()
+            if e is not None:
+                err(f"[joint-hist] {mp}: FAIL ({e})")
+                failed.append((mp, e))
+                continue
+            xs.append(x.ravel())
+            ys.append(y.ravel())
+            fetched.append(mp)
+            shapes.append(tuple(x.shape))
+            err(f"[joint-hist] {mp}: shape={x.shape} "
+                f"x:[{x.min():.3g},{x.max():.3g}] y:[{y.min():.3g},{y.max():.3g}]")
+    if not xs:
+        raise click.ClickException(f"no mats loaded successfully; failures: {failed}")
+
+    x_all = np.concatenate(xs)
+    y_all = np.concatenate(ys)
+    del xs, ys
+    err(f"[joint-hist] stacked: {x_all.size:,} voxels across {len(fetched)} mats")
+
+    # Auto bin range from the union of x and y, with sensible log-scale floor.
+    combined = np.concatenate([x_all, y_all])
+    if vmin is None:
+        if bin_scale == "log":
+            p_lo = float(np.percentile(combined, 0.1))
+            vmin = max(p_lo, 1e-3)
+        else:
+            vmin = float(combined.min())
+    if vmax is None:
+        vmax = float(np.percentile(combined, 99.99))
+    if not (vmax > vmin):
+        raise click.ClickException(f"degenerate range: vmin={vmin}, vmax={vmax}")
+    del combined
+
+    if bin_scale == "log":
+        edges = np.logspace(np.log10(vmin), np.log10(vmax), bins + 1)
+        x_clip = np.clip(x_all, vmin, vmax)
+        y_clip = np.clip(y_all, vmin, vmax)
+    else:
+        edges = np.linspace(vmin, vmax, bins + 1)
+        x_clip = np.clip(x_all, vmin, vmax)
+        y_clip = np.clip(y_all, vmin, vmax)
+
+    H, xe, ye = np.histogram2d(x_clip, y_clip, bins=[edges, edges])
+    # Mass-on-diagonal stat: |y/x - 1| <= tol, on the unclipped data
+    # (avoid divide-by-zero by masking tiny x).
+    eps = max(vmin, 1e-9)
+    safe = x_all > eps
+    ratio = np.full(x_all.shape, np.nan, dtype=np.float32)
+    ratio[safe] = y_all[safe] / np.maximum(x_all[safe], eps)
+    on_diag_frac = float(np.mean(np.abs(ratio[safe] - 1.0) <= tol)) if safe.any() else float("nan")
+
+    # Marginal PDFs (density-normalized so x/y are comparable irrespective of voxel
+    # count). Same bin edges as the main hist → axes line up exactly.
+    H_x, _ = np.histogram(x_clip, bins=edges, density=True)
+    H_y, _ = np.histogram(y_clip, bins=edges, density=True)
+
+    # gridspec: main heatmap (bottom-left), top x-marginal, right y-marginal,
+    # plus a colorbar slot in the top-right corner.
+    fig = plt.figure(figsize=(9, 8))
+    gs = fig.add_gridspec(
+        2, 3,
+        width_ratios=[5, 1, 0.18],
+        height_ratios=[1, 5],
+        wspace=0.05, hspace=0.05,
+    )
+    ax = fig.add_subplot(gs[1, 0])
+    ax_top = fig.add_subplot(gs[0, 0], sharex=ax)
+    ax_right = fig.add_subplot(gs[1, 1], sharey=ax)
+    cax = fig.add_subplot(gs[1, 2])
+
+    H_plot = H.T  # rows=y, cols=x for pcolormesh
+    # LogNorm needs vmin >= 1; clip empty cells.
+    pos_min = H_plot[H_plot > 0].min() if (H_plot > 0).any() else 1.0
+    norm = LogNorm(vmin=max(1.0, float(pos_min)), vmax=max(float(H_plot.max()), 1.0))
+    # pcolormesh respects irregular (log-spaced) bin edges natively — this is the
+    # fix for the imshow-extent-vs-logscale-mismatch bug that previously placed
+    # bin N at linear position N before log-stretching the axis.
+    pm = ax.pcolormesh(xe, ye, H_plot, norm=norm, cmap="viridis", shading="flat")
+    if bin_scale == "log":
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax_top.set_xscale("log")
+        ax_right.set_yscale("log")
+    ax.set_xlabel(f"x: {x_short}")
+    ax.set_ylabel(f"y: {y_short}")
+    if not no_diagonal:
+        diag = np.array([vmin, vmax])
+        ax.plot(diag, diag, color="white", linewidth=0.8, alpha=0.6, linestyle="--")
+        ax.plot(diag, diag, color="black", linewidth=0.4, alpha=0.7, linestyle="--")
+
+    # Marginal PDFs via stairs (one step per bin edge) — matches the histogram cells.
+    ax_top.stairs(H_x, edges, fill=True, color="steelblue", alpha=0.6, linewidth=0.5)
+    ax_right.stairs(H_y, edges, fill=True, color="steelblue", alpha=0.6, linewidth=0.5,
+                    orientation="horizontal")
+    ax_top.tick_params(axis="x", labelbottom=False)
+    ax_right.tick_params(axis="y", labelleft=False)
+    ax_top.set_ylabel("PDF", fontsize=8)
+    ax_right.set_xlabel("PDF", fontsize=8)
+    for a in (ax_top, ax_right):
+        a.tick_params(labelsize=8)
+        a.grid(True, alpha=0.3, linewidth=0.4)
+
+    fig.colorbar(pm, cax=cax, label="voxel count")
+    if title is None:
+        if len(mats) == 1 and shapes:
+            sh = shapes[0]
+            shape_part = "×".join(str(d) for d in sh) + " voxels"
+        else:
+            shape_part = f"{x_all.size:,} voxels"
+        splits = {s for s in (x_split, y_split) if s}
+        if len(splits) == 1:
+            set_tag = next(iter(splits))
+            mats_part = (
+                f"{mats[0]} ({set_tag})" if len(mats) == 1
+                else f"{len(mats)} mats ({set_tag})"
+            )
+        else:
+            mats_part = mats[0] if len(mats) == 1 else f"{len(mats)} mats"
+        title = (
+            f"{mats_part} — {shape_part}, {x_short} vs {y_short}\n"
+            f"on-diag (|y/x-1|≤{tol:.0%}): {100*on_diag_frac:.1f}%"
+        )
+    # Anchor title across the whole figure so the top-marginal doesn't shove it.
+    fig.suptitle(title, fontsize=10)
+    ax.set_xlim(edges[0], edges[-1])
+    ax.set_ylim(edges[0], edges[-1])
+    fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    size = out_path.stat().st_size
+    err(f"[joint-hist] on-diag(|y/x-1|≤{tol:.0%}) = {100*on_diag_frac:.2f}%  "
+        f"(n_loaded={len(fetched)}, n_failed={len(failed)})")
+    err(f"[joint-hist] wrote {out_path} ({size:,} bytes)")
+    print(out_path)
+
+
 @cli.group("analyze")
 def analyze_grp():
     """Offline analysis subcommands (corr matrices, post-hoc diagnostics)."""
@@ -4796,6 +5602,42 @@ def _r2_get_json(bucket: str, key: str, timeout: int = 60) -> dict | list | None
             return None
     finally:
         Path(path).unlink(missing_ok=True)
+
+
+def _r2_list_keys(bucket: str, prefix: str) -> list[str]:
+    """Return every R2 key under `s3://<bucket>/<prefix>` (no delimiter)."""
+    r = subprocess.run(
+        ["aws", "--profile", "cfo", "--endpoint-url", R2_ENDPOINT,
+         "s3api", "list-objects-v2",
+         "--bucket", bucket,
+         "--prefix", prefix,
+         "--query", "Contents[].Key",
+         "--output", "text"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if r.returncode != 0:
+        err(f"[r2 list-keys] failed: rc={r.returncode} stderr={r.stderr[-300:]}")
+        return []
+    keys: list[str] = []
+    for tok in (r.stdout or "").replace("\t", "\n").split("\n"):
+        tok = tok.strip()
+        if not tok or tok == "None":
+            continue
+        keys.append(tok)
+    return sorted(keys)
+
+
+def _r2_delete_key(bucket: str, key: str) -> bool:
+    """Delete one R2 object. Returns True on success."""
+    r = subprocess.run(
+        ["aws", "--profile", "cfo", "--endpoint-url", R2_ENDPOINT,
+         "s3", "rm", f"s3://{bucket}/{key}"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if r.returncode != 0:
+        err(f"[r2 rm] s3://{bucket}/{key} failed: rc={r.returncode} stderr={r.stderr[-300:]}")
+        return False
+    return True
 
 
 def _r2_list_synced_runs(bucket: str, prefix: str) -> list[str]:

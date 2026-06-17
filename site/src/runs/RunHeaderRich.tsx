@@ -49,6 +49,7 @@ import {
 import { formatFlops, useFlopUnit } from './flops'
 import type { FlopUnit } from './flops.format'
 import { tagsFor, type RunTag } from './tags'
+import { formatStep, formatStepDetail, snapStep } from '../lib/runNames'
 
 // ── small SVG sparkline (no plotly) ─────────────────────────────────────────
 export function Sparkline({
@@ -694,13 +695,20 @@ function ParentChip({
 }) {
   const lin = lineageFor(runId)
   if (!lin) return null
-  const stepTail = lin.parent_step != null ? ` @ step-${lin.parent_step}` : ''
+  // Surface legacy 0-based-final step values (e.g. `step-49999`) as `≈50k` so
+  // the chip is transparent about the snap; the tooltip narrates the raw
+  // value + Levanter's `info.step = state.step − 1` final-of-segment
+  // convention. Periodic ckpts (clean N) get plain `50k`.
+  const stepDetail = lin.parent_step != null ? formatStepDetail(lin.parent_step) : null
+  const stepTail = stepDetail != null ? ` @ ${stepDetail.display}` : ''
   const tipBase = `resumed from ${defaultShortLabel(lin.parent)}${stepTail}`
-  const tip = onScrollToParent
+  const snapNote = stepDetail?.isSnapped ? `${stepDetail.tooltip}\n\n` : ''
+  const tipBody = onScrollToParent
     ? (parentWandbUrl
         ? `${tipBase}. Click to scroll to the parent's card (or open its wandb).`
         : `${tipBase}. Click to scroll to the parent's card.`)
     : `${tipBase}. Click to open the parent's detail page.`
+  const tip = `${snapNote}${tipBody}`
   // On the detail page (no scroll target), the chip becomes a real link to the
   // parent's detail page — middle/cmd-click then opens it in a new tab.
   const href = onScrollToParent
@@ -1470,7 +1478,7 @@ export function RunHeaderRich({
                   ? (
                     <div style={{ fontFamily: 'monospace', fontSize: '0.72rem' }}>
                       <div style={{ marginBottom: 4 }}>
-                        epochs at step {stepsDoneRaw?.toLocaleString()}, by segment:
+                        epochs at step {stepsDoneRaw != null ? formatStep(stepsDoneRaw) : '?'}, by segment:
                       </div>
                       {epochBreakdown.map(({ segment, endStep, epochs }, i) => (
                         <div key={i}>
@@ -1566,8 +1574,8 @@ export function RunHeaderRich({
           {nTokens != null && (
             <Tooltip content={
               segmentContributions != null && segmentContributions.length > 1
-                ? `tokens trained at step ${stepsDoneRaw?.toLocaleString()}: sum of per-segment (Δstep · bs · seq_len)`
-                : `tokens trained at step ${stepsDoneRaw?.toLocaleString()} = step · bs · seq_len`
+                ? `tokens trained at step ${stepsDoneRaw != null ? formatStep(stepsDoneRaw) : '?'}: sum of per-segment (Δstep · bs · seq_len)`
+                : `tokens trained at step ${stepsDoneRaw != null ? formatStep(stepsDoneRaw) : '?'} = step · bs · seq_len`
             }>
               <span> · {formatTokens(nTokens)} tok</span>
             </Tooltip>

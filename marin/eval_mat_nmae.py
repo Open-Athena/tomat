@@ -1191,6 +1191,30 @@ def main():
         _results_path = f"{BUCKET}/eval/results/{_run_label}/{_ms}/{_ckpt_tail}{_out_suffix}.json"
         _predictions_dir = f"{BUCKET}/eval/results/{_run_label}/{_ms}/predictions"
 
+        # `TOMAT_EVAL_RESUME=1`: load existing per-mat results from
+        # `_results_path` and skip those mp_ids. Lets a killed/timed-out
+        # fire pick up where it left off (the summary is already streamed
+        # per-mat). Caveat: per_pos_* accumulators aren't reconstructed
+        # (per-position data isn't stored per-mat), so per_pos_* in the
+        # resumed summary reflects only newly-computed mats. task #228.
+        resume = bool(int(os.environ.get("TOMAT_EVAL_RESUME", "0")))
+        resumed_ids: set[str] = set()
+        if resume and not debug_dump_mat:
+            try:
+                with fsspec.open(_results_path, "r") as f:
+                    _existing = json.load(f)
+                _existing_per_mat = _existing.get("per_mat", []) or []
+                resumed_ids = {r["mp_id"] for r in _existing_per_mat if "mp_id" in r}
+                per_mat_results = list(_existing_per_mat)
+                err(f"[eval-mat] resume: loaded {len(resumed_ids)} done mats "
+                    f"from {_results_path}")
+            except (FileNotFoundError, OSError):
+                err(f"[eval-mat] resume: no prior results at {_results_path}; "
+                    f"starting fresh")
+            except Exception as e:
+                err(f"[eval-mat] resume: WARN failed to load {_results_path} "
+                    f"({e}); starting fresh")
+
         def _bootstrap_ci(xs: np.ndarray, n_boot: int = 1000, alpha: float = 0.05):
             """(lo, hi) bootstrap CI for the mean. Fixed seed so successive
             intermediate writes are comparable (CI tightens as mats land).
@@ -1263,7 +1287,60 @@ def main():
             except Exception as e:
                 err(f"[eval-mat] WARN: failed to dump predictions for {mp_id}: {e}")
 
+        # `TOMAT_EVAL_DUMP_VOXEL_ZARRS=1` → per-mat voxel-space prediction
+        # zarr for elvis diff-mode rendering (spec 51 Layer 1). Schema mirrors
+        # `rho_gga_raw/<mp_id>.zarr` so elvis treats GT and pred zarrs
+        # interchangeably: `charge_density_total` fp16 (Nx, Ny, Nz) + attrs
+        # `mp_id` and `grid_shape`. R2 mirror happens in `tomat evals sync`
+        # (Layer 2). fp16 halves storage with no visible loss for diff-mode
+        # viz (ρ-range is ~1e-6 to ~1e3; fp16 has plenty of precision here).
+        dump_voxel_zarrs = bool(int(os.environ.get("TOMAT_EVAL_DUMP_VOXEL_ZARRS", "0")))
+        _voxel_zarrs_dir = (
+            f"{BUCKET}/eval/predictions/{_run_label}/{_ms}/{_ckpt_tail}"
+        )
+
+        def _dump_voxel_zarr(
+            mp_id: str, rho_pred: np.ndarray, grid_shape: tuple,
+            structure_json: str | None = None,
+        ):
+            """Save per-mat voxel-space prediction as a multi-res zarr v3
+            pyramid + NGFF multiscales + elvis-block for diff-mode viz
+            (spec 51 Layer 1). Schema matches GT side at
+            `gs://marin-eu-west4/tomat/rho_gga_v3mr/`. Skipped unless
+            TOMAT_EVAL_DUMP_VOXEL_ZARRS=1.
+            """
+            if not dump_voxel_zarrs or debug_dump_mat:
+                return
+            url = f"{_voxel_zarrs_dir}/{mp_id}{_out_suffix}.zarr"
+            try:
+                # Lazy import — only loaded when the flag is on. Keeps the
+                # eval startup path minimal for runs that don't dump voxels.
+                # On iris workers the bundle flattens `marin/` into `/app/`
+                # so the module sits at top level; locally it's a package.
+                try:
+                    from voxel_zarr import write_voxel_zarr, build_elvis_attr
+                except ImportError:
+                    from marin.voxel_zarr import write_voxel_zarr, build_elvis_attr
+                P0, P1, P2 = (int(d) for d in grid_shape)
+                elvis_block = build_elvis_attr(
+                    rho=rho_pred,
+                    material_id=mp_id,
+                    role="label",  # pred = "label" (v1) per ELVis convention
+                    structure_json=structure_json,
+                )
+                n_levels = write_voxel_zarr(
+                    url, rho_pred,
+                    extra_attrs={"grid_shape": [P0, P1, P2]},
+                    elvis_block=elvis_block,
+                )
+                err(f"[eval-mat] voxel-zarr {mp_id}: {n_levels} levels → {url}")
+            except Exception as e:
+                err(f"[eval-mat] WARN: failed to dump voxel-zarr for {mp_id}: {e}")
+
         for mp_id in mp_ids:
+            if mp_id in resumed_ids:
+                err(f"[eval-mat] resume: skipping {mp_id} (already in {_results_path})")
+                continue
             # Load raw Zarr — download from GCS to local /tmp first to dodge
             # the gcsfs/aiohttp async-event-loop conflict with JAX's runtime.
             # fsspec.download works synchronously even when the underlying
@@ -1284,6 +1361,10 @@ def main():
             density = np.asarray(group["charge_density_total"][:]).astype(np.float32)
             grid_shape = tuple(density.shape)
             Zs, frac, lattice_params = load_structure_from_zarr_attrs(group)
+            # Raw pymatgen Structure JSON — forwarded into the prediction
+            # zarr's elvis-block so the viewer has atoms+lattice for the diff
+            # render. Optional: if missing, build_elvis_attr handles None.
+            _src_structure_json = dict(group.attrs).get("structure")
             err(f"[eval-mat] mat={mp_id}: grid={grid_shape}, atoms={len(Zs)}, "
                 f"lattice=({lattice_params[0]:.2f},{lattice_params[1]:.2f},"
                 f"{lattice_params[2]:.2f}) Å α,β,γ=("
@@ -1537,6 +1618,7 @@ def main():
                         _f.write(_buf.getvalue())
                     err(f"[eval-mat] DEBUG: dumped per-voxel free-run "
                         f"grids → {_dump}")
+                _dump_voxel_zarr(mp_id, rho_pred, grid_shape, structure_json=_src_structure_json)
                 per_mat_results.append({
                     "mp_id": mp_id,
                     "grid_shape": list(grid_shape),
@@ -1933,6 +2015,7 @@ def main():
                 err(f"  rho_true        mean={t_mean:.3e}  p99={t_p99:.3e}")
                 err(f"  rho_pred(reforw) mean={rf_mean:.3e}  p50={rf_p50:.3e}  p99={rf_p99:.3e}")
                 err(f"  rho_pred(filled) mean={pf_mean:.3e}  p50={pf_p50:.3e}  p99={pf_p99:.3e}")
+                _dump_voxel_zarr(mp_id, rho_pred, grid_shape, structure_json=_src_structure_json)
                 per_mat_results.append({
                     "mp_id": mp_id,
                     "grid_shape": list(grid_shape),
@@ -2101,6 +2184,7 @@ def main():
                 with fsspec.open(_dump, "wb") as _f:
                     _f.write(_buf.getvalue())
                 err(f"[eval-mat] DEBUG: dumped per-voxel grids → {_dump}")
+            _dump_voxel_zarr(mp_id, rho_pred, grid_shape, structure_json=_src_structure_json)
             per_mat_results.append({
                 "mp_id": mp_id,
                 "grid_shape": list(grid_shape),

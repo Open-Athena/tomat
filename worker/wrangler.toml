@@ -10,4 +10,4 @@ bucket_name = "openathena"
 [vars]
 CORS_ORIGIN = "*"
 R2_RUNS_PREFIX = "tomat/runs"
-FILES_PREFIX = "tomat/"
+FILES_PREFIX = "tomat/,electrai/"

@@ -56,7 +56,11 @@ def load_run(short_label: str) -> dict:
 
 
 def _best_step(d: dict, key: str) -> tuple[int, float] | None:
-    """(step, value%) of min `key` across steps in `d`, or None."""
+    """(step_idx, value%) of min `key` across steps in `d`, or None.
+
+    Keys of `d` are 0-based `step_idx` values (Levanter `info.step`); see
+    `docs/step-conventions.md`.
+    """
     pts = [(s, d[s][key] * 100) for s in d if d[s][key] is not None]
     if not pts:
         return None
@@ -87,12 +91,14 @@ def main(out: str | None, json_out: str | None, title: str | None, annotate_best
             entry: dict = {"label": r["label"], "full": r["full"], "splits": {}}
             for split in ("val", "train"):
                 d = r[split]
-                steps = sorted(d.keys())
+                # `d.keys()` are 0-based `step_idx` values (Levanter `info.step`
+                # from per-step ckpt names). See `docs/step-conventions.md`.
+                step_indices = sorted(d.keys())
                 entry["splits"][split] = {
-                    "steps": steps,
-                    "nmae": [d[s]["nmae"] for s in steps],
-                    "nemd": [d[s]["nemd"] for s in steps],
-                    "nmae_p99": [d[s].get("nmae_p99") for s in steps],
+                    "step_indices": step_indices,
+                    "nmae": [d[s]["nmae"] for s in step_indices],
+                    "nemd": [d[s]["nemd"] for s in step_indices],
+                    "nmae_p99": [d[s].get("nmae_p99") for s in step_indices],
                 }
             out_data["runs"].append(entry)
         Path(json_out).parent.mkdir(parents=True, exist_ok=True)

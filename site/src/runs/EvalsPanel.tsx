@@ -18,6 +18,8 @@ import { useQueries } from '@tanstack/react-query'
 import { useMemo } from 'react'
 import { fetchEvalRecord } from './api'
 import type { EvalIndexEntry, EvalRecord, EvalRecordState } from './api'
+import { formatStepDetail } from '../lib/runNames'
+import { Tooltip } from '../Tooltip'
 
 const STATE_COLOR: Record<EvalRecordState, string> = {
   pending:   '#facc15', // yellow
@@ -193,7 +195,19 @@ export function EvalsPanel({ runId, evalsIndex }: {
         <tbody>
           {steps.map((step) => (
             <tr key={step}>
-              <td style={cellStyle}>{step.toLocaleString()}</td>
+              <td style={cellStyle}>
+                {(() => {
+                  // `≈Nk` prefix marks Levanter's final-of-segment ckpts
+                  // (saved at `step-(N-1)` because `info.step` is 0-indexed);
+                  // the tooltip explains the raw value + naming convention.
+                  const d = formatStepDetail(step)
+                  return d.isSnapped ? (
+                    <Tooltip content={d.tooltip}>
+                      <span>{d.display}</span>
+                    </Tooltip>
+                  ) : d.display
+                })()}
+              </td>
               {columns.map((c) => {
                 const cell = byCell.get(`${step}|${c.id}`)
                 if (!cell) {

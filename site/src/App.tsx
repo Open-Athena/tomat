@@ -3,9 +3,11 @@ import { DeckPage } from './DeckPage'
 import { FilesPage } from './files/FilesPage'
 import { HomePage } from './HomePage'
 import { KbdShell } from './KbdSetup'
+import { MpPage } from './mp/MpPage'
 import { PostsPage } from './posts/PostsPage'
 import { RunsPage } from './runs/RunsPage'
 import { VoxelCorrPage } from './voxel-corr/VoxelCorrPage'
+import { JointHistPage } from './viz/JointHistPage'
 import { parseHash, useHash } from './useHash'
 
 // Use the fork's `lib/index-basic.js` src-mode entry: bar + pie + calendars on
@@ -15,10 +17,21 @@ import { parseHash, useHash } from './useHash'
 // hccs/household-vehicles); produces a ~1 MB plotly chunk vs ~3.5 MB full.
 // `.then(m => m.default ?? m)` unwraps the ESM default export so
 // pltly's `<Plot>` sees `P.react`, `P.purge`, etc. directly.
-const plotlyLoader = () =>
-  import('plotly.js/lib/index-basic.js').then(
-    (m) => ((m as { default?: unknown }).default ?? m) as typeof import('plotly.js')
-  )
+//
+// `heatmap` is registered on top so the joint-hist viz (spec 59) can render
+// 2-D density images. Adds ~150 KB minified.
+const plotlyLoader = async () => {
+  const [Pmod, hmMod] = await Promise.all([
+    import('plotly.js/lib/index-basic.js'),
+    import('plotly.js/lib/heatmap.js'),
+  ])
+  const P = ((Pmod as { default?: unknown }).default ?? Pmod) as typeof import('plotly.js')
+  const heatmap = (hmMod as { default?: unknown }).default ?? hmMod
+  // `register` is idempotent — calling more than once with the same trace
+  // is a no-op. Safe across HMR re-loads.
+  ;(P as { register: (mods: unknown[]) => void }).register([heatmap])
+  return P
+}
 
 export function App() {
   const hash = useHash()
@@ -38,6 +51,10 @@ export function App() {
           <PostsPage parts={parts.slice(1)} />
         ) : route === 'voxel-corr' ? (
           <VoxelCorrPage parts={parts.slice(1)} />
+        ) : route === 'viz' && parts[1] === 'joint-hist' ? (
+          <JointHistPage />
+        ) : route === 'mp' && parts[1] ? (
+          <MpPage mpId={parts[1]} />
         ) : (
           <HomePage />
         )}
