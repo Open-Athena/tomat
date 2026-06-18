@@ -20,7 +20,7 @@
     "katex": "^0.17.0",
     "oa-react-slides": "file:../oa-react-slides",
     "plotly.js": "https://github.com/runsascoded/plotly.js#3b2b20213bccfb38ca8e526fb78a2d2836a45eb2",
-    "pltly": "https://gitlab.com/runsascoded/js/pltly/-/archive/9c64c11de2aa3656c308dfdad56eafbc5c2fb32e/pltly-9c64c11de2aa3656c308dfdad56eafbc5c2fb32e.tar.gz",
+    "pltly": "workspace:*",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-markdown": "^10.1.0",
