@@ -866,7 +866,7 @@ def _vl_backfill_rows(
     # training region per zone-local writes), older runs live in eu-west4.
     # Later sources win on per-step overlap (sorted scan + dict merge).
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
-    from tomat.vl_backfill import CANONICAL_BUCKETS as _CANON_BUCKETS
+    from tomat.buckets import CANONICAL_BUCKETS as _CANON_BUCKETS
     buckets = [bucket] if bucket else list(_CANON_BUCKETS)
     old: dict[int, dict] = {}
     new: dict[int, dict] = {}

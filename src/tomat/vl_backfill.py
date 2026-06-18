@@ -104,29 +104,11 @@ train_volume = modal.Volume.from_name(VOL_NAME)
 # ──────────────────────────────────────────────────────────────────────
 
 
-CANONICAL_BUCKETS = (
-    "gs://marin-eu-west4/tomat",
-    "gs://marin-us-east5/tomat",
-    "gs://marin-us-central1/tomat",
-    "gs://marin-us-east1/tomat",
-)
-
-
-def resolve_run_bucket(run_label: str, ckpt_leaf: str | None = None) -> str | None:
-    """Find which canonical GCS bucket a run's ckpts live in. Mirrors the
-    `_resolve_run_bucket` helper in the `tomat` CLI; duplicated here so the
-    library is importable without depending on the top-level script.
-    """
-    leaf = ckpt_leaf or run_label
-    for bkt in CANONICAL_BUCKETS:
-        path = f"{bkt}/results/{run_label}/checkpoints/{leaf}/"
-        r = subprocess.run(
-            ["gcloud", "storage", "ls", path],
-            capture_output=True, text=True, timeout=30,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            return bkt
-    return None
+# `CANONICAL_BUCKETS` + `resolve_run_bucket` moved to `tomat.buckets` so the
+# bucket list can be imported by `tomat runs sync` (cron VM) without pulling
+# in `modal`. Re-exported here so existing callers of
+# `from tomat.vl_backfill import CANONICAL_BUCKETS` keep working.
+from tomat.buckets import CANONICAL_BUCKETS, resolve_run_bucket  # noqa: F401
 
 
 def discover_ckpts(
