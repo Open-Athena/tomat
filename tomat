@@ -771,7 +771,7 @@ def _trim_to_latest_trajectory(rows: list[dict]) -> list[dict]:
 
 def _vl_backfill_rows(
     ckpt_leaf: str,
-    bucket: str = GCS_BUCKET,
+    bucket: str | None = None,
 ) -> list[dict]:
     """List per-step VL JSONs and emit history-style rows that `runs_sync`
     can splice into the wandb history before parquet build.
@@ -861,8 +861,18 @@ def _vl_backfill_rows(
             }
         return rows
 
-    old = _read_dir(f"{bucket}/eval/vl-backfill/{ckpt_leaf}", "vl-backfill")
-    new = _read_dir(f"{bucket}/eval/vl/{ckpt_leaf}", "vl")
+    # Buckets to scan. Until `bucket` is passed explicitly per-run, scan ALL
+    # canonical region buckets — bin5's VL backfill lands in us-east5 (its
+    # training region per zone-local writes), older runs live in eu-west4.
+    # Later sources win on per-step overlap (sorted scan + dict merge).
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
+    from tomat.vl_backfill import CANONICAL_BUCKETS as _CANON_BUCKETS
+    buckets = [bucket] if bucket else list(_CANON_BUCKETS)
+    old: dict[int, dict] = {}
+    new: dict[int, dict] = {}
+    for b in buckets:
+        old.update(_read_dir(f"{b}/eval/vl-backfill/{ckpt_leaf}", "vl-backfill"))
+        new.update(_read_dir(f"{b}/eval/vl/{ckpt_leaf}", "vl"))
     # `new` wins on overlap — held-out val supersedes train-tail.
     merged = {**old, **new}
     if not merged:

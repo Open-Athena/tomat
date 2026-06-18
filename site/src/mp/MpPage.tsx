@@ -15,7 +15,7 @@
 
 import { useQuery } from '@tanstack/react-query'
 import { API_BASE } from '../runs/api'
-import { shortenRun, shortenStep, snapStep } from '../lib/runNames'
+import { shortenRun, formatStep } from '../lib/runNames'
 import { ThemeToggle } from '../theme'
 
 /** One row of the grid index — mirrors the CFW's `GridRow` shape. */
@@ -58,11 +58,16 @@ function r2RawUrl(r2_key: string): string {
   return `${API_BASE}/api/files/raw/${r2_key}`
 }
 
-/** Open-in-ELVis URL for a single grid (Phase A): drops the user into the
- *  single-grid render, keyed by the row's `r2_key`. Phase B will switch to
- *  the 2-way diff URL (`?v0=<a>&v1=<b>`) once the column-A/B selectors land. */
-function elvisUrlFor(mp_id: string, r2_key: string): string {
+/** Open-in-ELVis URL. When `gt_key` is passed, builds the 2-way diff URL
+ *  (`?s=d&v0=<gt>&v1=<pred>`) so the viewer renders a side-by-side / overlay
+ *  of GT vs. this row's prediction. Without `gt_key` (e.g. on the GT row
+ *  itself), falls back to the single-grid render. */
+function elvisUrlFor(mp_id: string, r2_key: string, gt_key?: string | null): string {
   const v1 = encodeURIComponent(r2RawUrl(r2_key))
+  if (gt_key && gt_key !== r2_key) {
+    const v0 = encodeURIComponent(r2RawUrl(gt_key))
+    return `${ELVIS_BASE}/?m=${encodeURIComponent(mp_id)}&s=d&v0=${v0}&v1=${v1}`
+  }
   return `${ELVIS_BASE}/?m=${encodeURIComponent(mp_id)}&v1=${v1}`
 }
 
@@ -126,13 +131,12 @@ function shortenRunCell(run_id: string | null): string {
   return shortenRun(run_id)
 }
 
-/** Short label for the step column: `shortenStep` with the project's
- *  snap-to-round-Nk convention (50000 → '50k', 89999 → '≈90k'). */
+/** Short label for the step column. `formatStep` handles the legacy OBO
+ *  translation (`step-89999` → `90k` no asterisk = exactly 90k completed)
+ *  and the legacy-periodic case (`step-90000` → `90k*` = 90,001 completed). */
 function shortenStepCell(step: number | null): string {
   if (step == null) return '—'
-  // Show the on-disk raw value as a tooltip so the snap is transparent.
-  const snapped = snapStep(step)
-  return snapped === step ? shortenStep(step) : shortenStep(step)
+  return formatStep(step)
 }
 
 export function MpPage({ mpId }: { mpId: string }) {
@@ -228,6 +232,11 @@ function GridTable({ mpId, rows }: { mpId: string; rows: GridRow[] }) {
   if (rows.length === 0) {
     return <p className="meta">No grids found for {mpId}.</p>
   }
+  // The GT row is the diff anchor — pred rows link as `v0=<gt>&v1=<pred>&s=d`.
+  // Prefer the validation GT (matches val_200 m-evals); fall back to any gt.
+  const gtRow = rows.find((r) => r.role === 'gt' && r.set === 'validation')
+    ?? rows.find((r) => r.role === 'gt')
+  const gtKey = gtRow?.r2_key ?? null
   return (
     <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: '0.9rem' }}>
       <thead>
@@ -278,7 +287,11 @@ function GridTable({ mpId, rows }: { mpId: string; rows: GridRow[] }) {
               {row.nmae == null ? '—' : `${(row.nmae * 100).toFixed(2)}%`}
             </td>
             <td style={{ padding: '0.3rem 0.6rem' }}>
-              <a href={elvisUrlFor(mpId, row.r2_key)} target="_blank" rel="noreferrer">
+              <a
+                href={elvisUrlFor(mpId, row.r2_key, row.role === 'pred' ? gtKey : null)}
+                target="_blank"
+                rel="noreferrer"
+              >
                 Open in ELVis ↗
               </a>
             </td>

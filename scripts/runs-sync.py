@@ -214,6 +214,72 @@ def _trim_to_latest_trajectory(rows: list[dict]) -> list[dict]:
     return rows[last_restart:]
 
 
+# Region buckets to scan for VL backfill JSONs. Kept in sync with
+# `tomat:src/tomat/vl_backfill.py::CANONICAL_BUCKETS`. The cron VM has GCS
+# access via its compute service-account identity (no explicit creds needed).
+CANONICAL_BUCKETS = (
+    "gs://marin-eu-west4/tomat",
+    "gs://marin-us-east5/tomat",
+    "gs://marin-us-central1/tomat",
+    "gs://marin-us-east1/tomat",
+)
+
+
+def _vl_backfill_rows(run_name: str) -> list[dict]:
+    """List per-step VL-backfill JSONs across all canonical region buckets
+    and emit history-style rows. Mirrors `tomat:_vl_backfill_rows` but
+    standalone (cron VM doesn't have `tomat` CLI installed). Returns `[]` on
+    any error or when no JSONs exist."""
+    import fsspec
+    old: dict[int, dict] = {}
+    new: dict[int, dict] = {}
+    for bkt in CANONICAL_BUCKETS:
+        for sub, dest in (("eval/vl-backfill", old), ("eval/vl", new)):
+            base = f"{bkt}/{sub}/{run_name}"
+            try:
+                fs, _ = fsspec.core.url_to_fs(base)
+                if not fs.exists(base):
+                    continue
+                paths = [p for p in fs.ls(base) if p.endswith(".json")]
+            except Exception:
+                continue
+            for p in sorted(paths):
+                try:
+                    with fs.open(p, "r") as f:
+                        d = json.load(f)
+                    if "step" in d and "eval_loss" in d:
+                        step = int(d["step"])
+                        ev = float(d["eval_loss"])
+                    else:
+                        m = re.search(r"step-(\d+)\.json$", p)
+                        if not m:
+                            continue
+                        step = int(m.group(1))
+                        ev = float(d["results"]["baseline"]["mean"])
+                except Exception:
+                    continue
+                try:
+                    info = fs.info(p)
+                    mt = info.get("mtime") or info.get("updated")
+                    if hasattr(mt, "timestamp"):
+                        mtime = float(mt.timestamp())
+                    elif isinstance(mt, str):
+                        s = mt[:-1] + "+00:00" if mt.endswith("Z") else mt
+                        mtime = float(datetime.datetime.fromisoformat(s).timestamp())
+                    else:
+                        mtime = float(mt) if mt else 0.0
+                except Exception:
+                    mtime = 0.0
+                dest[step] = {
+                    "_step": step,
+                    "_timestamp": mtime,
+                    "global_step": step,
+                    "eval/loss": ev,
+                }
+    merged = {**old, **new}
+    return [merged[s] for s in sorted(merged)] if merged else []
+
+
 def _history_block(table) -> dict:
     """The `history` sub-dict of a manifest, derived from the parquet table.
 
@@ -377,6 +443,36 @@ def sync_one_run(s3, run_name: str, copies: list) -> tuple[str, int, int]:
         for row in new_rows:
             by_step[row.get("_step")] = row
         rows = list(by_step.values())
+
+    # Merge VL-backfill JSONs from GCS. Runs that didn't carve out a val
+    # split during training (or whose `steps_per_eval` was too sparse) get
+    # their eval/loss curve filled in by `tomat evals vl-backfill -m iris`,
+    # which writes per-step JSONs to `gs://<bucket>/tomat/eval/vl-backfill/
+    # <run>/step-N.json`. These rows look like wandb history entries but
+    # carry only `eval/loss` (+ `_step`, `_timestamp`, `global_step`); the
+    # parquet's nullable schema handles the missing train-side cols. New
+    # rows win on per-step overlap. Skips silently when no JSONs exist.
+    try:
+        vl_rows = _vl_backfill_rows(run_name)
+    except Exception as e:
+        err(f"  [{run_name}] vl-backfill merge failed (non-fatal): "
+            f"{type(e).__name__}: {e}")
+        vl_rows = []
+    if vl_rows:
+        by_step = {r.get("_step"): r for r in rows}
+        for r in vl_rows:
+            s = r.get("_step")
+            if s in by_step:
+                # Wandb-history row exists at this step; merge fields the
+                # backfill provides into it (don't overwrite native eval/loss
+                # if both are set — the in-train one is canonical).
+                for k, v in r.items():
+                    if by_step[s].get(k) is None:
+                        by_step[s][k] = v
+            else:
+                by_step[s] = r
+        rows = list(by_step.values())
+        err(f"  [{run_name}] merged {len(vl_rows)} vl-backfill row(s)")
 
     rows.sort(key=lambda d: d.get("_step") if d.get("_step") is not None else -1)
     rows = _trim_to_latest_trajectory(rows)

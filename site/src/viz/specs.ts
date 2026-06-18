@@ -10,7 +10,7 @@
 // run names (`train-mg-kl-<arm>-fs-tpu` ± `step-N`).
 
 import { API_BASE } from '../runs/api'
-import { shortenStep } from '../lib/runNames'
+import { formatStep } from '../lib/runNames'
 
 export type SourceSpec =
   | { kind: 'gt'; set: 'val' | 'train' }
@@ -52,9 +52,13 @@ export function shortenSpec(spec: string): string {
   const armRaw = parsed.run
     .replace(/^train-mg-([a-z0-9-]+?)-fs-tpu$/, '$1')
     .replace(/^kl-/, '')
-  // Delegate to `shortenStep` so the `≈` prefix flows through to axis
-  // labels when a legacy 0-based-final value (e.g. 89999) was snapped.
-  return `${armRaw} @ ${shortenStep(parsed.step_idx)}`
+  // `formatStep` handles both the legacy OBO translation (`step-89999` →
+  // exactly `90k` no asterisk, because it was a force-save of "90k steps
+  // completed") AND the post-fix periodic stamping (where a `*` flags
+  // the `N+1` actual-completed-steps case). `shortenStep` has inverted
+  // semantics that pre-date the formatter rewrite — avoid for axis
+  // titles.
+  return `${armRaw} @ ${formatStep(parsed.step_idx)}`
 }
 
 /** Expand a shorthand like `bin5@30k` → `pred:train-mg-kl-bin5-fs-tpu:val_200-maskgit:30000`.
