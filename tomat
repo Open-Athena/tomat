@@ -96,6 +96,15 @@ MARIN_DIR = PROJECT_ROOT / "marin"
 # because of direnv-set VIRTUAL_ENV in the parent shell. See memory
 # `iris-build-date-empty-bug` for context.
 IRIS_BIN = str(MARIN_DIR / ".venv" / "bin" / "iris")
+# Above constant is broken on this machine: MARIN_DIR/.venv resolves via
+# symlink to tomat/.venv (no iris bin). Real iris lives in the OA marin
+# fork's venv ($c/oa/marin/.venv). Override here so `tomat evals fire`
+# and friends don't FileNotFoundError. Long-term: refactor MARIN_DIR
+# vs. the marin-clone path.
+if not Path(IRIS_BIN).exists():
+    _fork_iris = "/Users/ryan/c/oa/marin/.venv/bin/iris"
+    if Path(_fork_iris).exists():
+        IRIS_BIN = _fork_iris
 TMP_DIR = PROJECT_ROOT / "tmp"
 
 SPLITS = {
@@ -2643,6 +2652,317 @@ def evals_fire(
 
     suffix = " (dry-run)" if dry_run else ""
     print(f"\n[done firing {fired_total}/{len(step_list)*len(set_list)*num_tasks} jobs{suffix}]")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# tomat evals vl-backfill — Modal-based eval/loss backfill for runs
+# whose training never logged it (no val carve-out). See
+# `src/tomat/vl_backfill.py` for the Modal app + function body.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _vl_backfill_autodetect_loss(run_label: str) -> tuple[str, float | None, str]:
+    """Heuristic mapping from run-label substrings to (loss_type, kl_sigma, kl_sigma_unit).
+
+    Conservative: defaults to ce/None. Recognised tags:
+      `kl-bin<N>` / `bin<N>` → kl_gauss, sigma=N, unit=bin
+    """
+    m = re.search(r"(?:^|-)(?:kl-)?bin(\d+)(?:-|$)", run_label)
+    if m:
+        sigma = float(m.group(1))
+        return ("kl_gauss", sigma, "bin")
+    return ("ce", None, "bin")
+
+
+def _vl_backfill_autodetect_parquet(run_label: str) -> str:
+    """Heuristic mapping from run-label to parquet label on the Modal volume.
+
+    `bin5` was the only shard1-only run; everything else defaults to v3
+    (the 4-shard union). Pass `--parquet-label` to override.
+    """
+    if "bin5" in run_label or "shard1" in run_label:
+        return "train-full-v3-shard1"
+    return "train-full-v3"
+
+
+@evals.command("vl-backfill")
+@click.option("--mode", default="iris", show_default=True, type=click.Choice(["iris", "modal"]), help="iris+TPU eval-only (default; uses TOMAT_EVAL_ONLY=1 short-circuit in train_tomat_tpu.py) vs modal H100/H200×8 (legacy; reconstructs val carve-out config manually — risk of drift on multi-shard runs).")
+@click.option("-s", "--steps", default=None, help="comma-sep step list (e.g. `10000,20000`). Mutually exclusive with --every. Default: --every 1000.")
+@click.option("--every", default=None, type=int, help="filter discovered ckpts to multiples of N. Default 1000 if neither -s nor --every passed.")
+@click.option("--smoke", is_flag=True, help="alias for `--every 10000` — every 10k step for smoke-testing the pipeline before firing every-1k.")
+@click.option("-G", "--gpu", default="H100:8", show_default=True, type=click.Choice(["H100:8", "H200:8"]), help="(modal-only) GPU kind. H100×8 ≈ half the price of H200×8; both fit 256-seq bidir forward.")
+@click.option("-T", "--tpu", default="v6e-8", show_default=True, help="(iris-only) TPU variant. v6e-8 boots in ~30s + ~10s eval per ckpt.")
+@click.option("--zone", default="us-east5-b", show_default=True, help="(iris-only) iris zone pin. Should match the bin5 region in --bucket.")
+@click.option("--data-label", "data_label_override", default=None, help="(iris-only) TOMAT_LABEL comma-separated multi-shard data label. Autodetected from run name if omitted (bin5 → 4-shard v3 union).")
+@click.option("-b", "--batch-size", default=64, type=int, help="eval batch size (passed to TrainerConfig).")
+@click.option("-S", "--val-seqs", default=256, type=int, help="size of val carve-out (last N seqs after PRNGKey(0) feistel shuffle).")
+@click.option("-M", "--model-preset", default="200M", help="model preset (must match trained ckpt).")
+@click.option("--bucket", "bucket_override", default=None, help="GCS bucket where the run lives (autodetected from canonical buckets if omitted).")
+@click.option("--ckpt-leaf", default=None, help="Override ckpt subdir under `results/<run>/checkpoints/` (default: <run>).")
+@click.option("--parquet-label", default=None, help="(modal-only) parquet dir under /vol/tokenized/. Autodetect: bin5/shard1 → train-full-v3-shard1, else train-full-v3.")
+@click.option("--loss-type", default=None, type=click.Choice(["ce", "kl_gauss", "emd"]), help="MaskGIT loss type (autodetected from run-label `bin<N>` token if omitted).")
+@click.option("-k", "--kl-sigma", default=None, type=float, help="MaskGIT kl_gauss sigma (autodetected from `bin<N>`).")
+@click.option("--kl-sigma-unit", default="bin", show_default=True, help="MaskGIT kl_gauss sigma unit (`bin` or `density`).")
+@click.option("--mask-prior", default="absorbing", show_default=True, help="MaskGIT mask prior.")
+@click.option("--cache-dir", "cache_dir_override", default=None, help="(modal-only) Override levanter cache dir (default: `/vol/vl-backfill-cache/<parquet_label>`).")
+@click.option("--long-timeout", "long_timeout", is_flag=True, help="(modal-only) use 3600s Modal timeout. Default 600s caps cost/fire at ~$5 (H100×8).")
+@click.option("-n", "--dry-run", is_flag=True, help="list steps + planned fires, don't spawn.")
+@click.option("-F", "--force", is_flag=True, help="re-fire even if `step-N.json` already exists for the run.")
+@click.argument("run_label")
+def evals_vl_backfill(
+    run_label: str,
+    mode: str,
+    steps: str | None,
+    every: int | None,
+    smoke: bool,
+    gpu: str,
+    tpu: str,
+    zone: str,
+    data_label_override: str | None,
+    batch_size: int,
+    val_seqs: int,
+    model_preset: str,
+    bucket_override: str | None,
+    ckpt_leaf: str | None,
+    parquet_label: str | None,
+    loss_type: str | None,
+    kl_sigma: float | None,
+    kl_sigma_unit: str,
+    mask_prior: str,
+    cache_dir_override: str | None,
+    long_timeout: bool,
+    dry_run: bool,
+    force: bool,
+):
+    """Backfill `eval/loss` for a run's GCS checkpoints via H100/H200×8 Modal.
+
+    Runs the same MaskGIT loss computation the trainer would have logged, but
+    after the fact — one Modal call per ckpt against a `val_seqs`-sized
+    held-out carve-out of the training parquet (PRNGKey(0) feistel shuffle,
+    last N seqs). Per-step JSONs land at
+    `gs://<bucket>/tomat/eval/vl-backfill/<ckpt_leaf>/step-N.json` and are
+    auto-picked-up by `tomat runs sync` (see `_vl_backfill_rows`).
+
+    `--steps` is mutually exclusive with `--every` / `--smoke`. With no
+    selector flag, defaults to `--every 1000`.
+
+    `--smoke` is shorthand for `--every 10000` — sparse cadence for
+    smoke-testing the pipeline before firing every-1k.
+
+    Loss config (loss_type / kl_sigma) is autodetected from the run label
+    when omitted (`bin<N>` → kl_gauss + sigma=N).
+
+    Skip-if-exists is on by default; pass `-F` to re-fire steps that already
+    have a step-N.json.
+    """
+    # Reconcile selectors.
+    if steps and (every is not None or smoke):
+        raise click.UsageError("--steps is mutually exclusive with --every / --smoke")
+    if smoke:
+        every = 10000
+    if not steps and every is None:
+        every = 1000
+
+    # Resolve bucket.
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
+    from tomat.vl_backfill import (
+        resolve_run_bucket,
+        select_steps,
+        existing_results,
+        get_fn,
+        app as vl_app,
+    )
+
+    bucket = bucket_override or resolve_run_bucket(run_label, ckpt_leaf=ckpt_leaf)
+    if bucket is None:
+        err(f"[vl-backfill] could not find {run_label!r} in any canonical bucket; pass --bucket")
+        sys.exit(1)
+    leaf = ckpt_leaf or run_label
+    err(f"[vl-backfill] bucket={bucket} run={run_label} leaf={leaf}")
+
+    # Autodetect loss + parquet from run label.
+    if loss_type is None:
+        loss_type, sigma_auto, unit_auto = _vl_backfill_autodetect_loss(run_label)
+        if kl_sigma is None:
+            kl_sigma = sigma_auto
+        kl_sigma_unit = unit_auto if loss_type == "kl_gauss" else kl_sigma_unit
+        err(f"[vl-backfill] loss autodetect: type={loss_type} "
+            f"sigma={kl_sigma} unit={kl_sigma_unit}")
+    if loss_type == "kl_gauss" and kl_sigma is None:
+        raise click.UsageError("--kl-sigma required when --loss-type=kl_gauss (autodetect failed)")
+
+    if parquet_label is None:
+        parquet_label = _vl_backfill_autodetect_parquet(run_label)
+        err(f"[vl-backfill] parquet autodetect: {parquet_label}")
+
+    # Resolve steps against on-GCS ckpts.
+    step_list = select_steps(
+        run_label, bucket, explicit=steps, every=every, ckpt_leaf=ckpt_leaf,
+    )
+    if not step_list:
+        err(f"[vl-backfill] no matching ckpts on GCS; aborting")
+        sys.exit(1)
+
+    # Skip already-done unless --force.
+    done = existing_results(leaf, bucket)
+    if done:
+        err(f"[vl-backfill] {len(done)} step(s) already have results: "
+            f"{sorted(done)[:5]}{'…' if len(done) > 5 else ''}")
+    if not force:
+        before = len(step_list)
+        step_list = [s for s in step_list if s not in done]
+        skipped = before - len(step_list)
+        if skipped:
+            err(f"[vl-backfill] skipping {skipped} already-completed step(s); pass -F to re-fire")
+    if not step_list:
+        err(f"[vl-backfill] nothing to fire (all selected steps already have results)")
+        return
+
+    err(f"[vl-backfill] mode={mode} {len(step_list)} fires planned: steps={step_list}")
+
+    # Iris fork: per-ckpt iris job using TOMAT_EVAL_ONLY=1 short-circuit in
+    # marin/train_tomat_tpu.py. Reuses 100% of in-train semantics → VL
+    # bit-identical (modulo TPU non-determinism) to what an in-train eval
+    # would have logged. ~$1.50/fire on v6e-8 priority interactive.
+    if mode == "iris":
+        # Autodetect data label. bin5 trains on 4-shard v3 union per
+        # ConcatDatasetComponent switch at step 67000 (commit a11dcf9).
+        # `--data-label` overrides this; otherwise we apply heuristics.
+        if data_label_override:
+            data_label = data_label_override
+        elif "bin5" in run_label:
+            data_label = "train-full-v3,train-full-v3-shard1,train-full-v3-shard2,train-full-v3-shard3"
+        else:
+            # Fallback to whatever parquet autodetect picked (or v3 union)
+            data_label = parquet_label or "train-full-v3"
+        err(f"[vl-backfill] iris data_label: {data_label}")
+
+        # Cost estimate: ~$1.50/fire on v6e-8 priority interactive.
+        per_fire_cost = 1.50
+        err(f"[vl-backfill] tpu={tpu} zone={zone} "
+            f"est-per-fire=${per_fire_cost:.2f} → est-total=${per_fire_cost * len(step_list):.2f}")
+        if dry_run:
+            err(f"[vl-backfill] dry-run; not spawning")
+            print()
+            for st in step_list:
+                print(f"  step={st}  out={bucket}/eval/vl-backfill/{leaf}/step-{st}.json")
+            return
+
+        lmq_path = f"{bucket}/codecs/lmq-v2-16k.npz"
+        env_pairs_base = [
+            ("TOMAT_LABEL", data_label),
+            ("TOMAT_RESULTS_LABEL", run_label),
+            ("TOMAT_BUCKET", bucket),
+            ("TOMAT_PIN_BUCKET", "1"),
+            ("TOMAT_BATCH_SIZE", "256"),
+            ("TOMAT_MODEL", model_preset),
+            ("TOMAT_SEED", "42"),
+            ("TOMAT_VAL_SEQS", str(val_seqs)),
+            ("TOMAT_STEPS", "1"),
+            ("TOMAT_STEPS_PER_EVAL", "1"),
+            ("TOMAT_LMQ_PATH", lmq_path),
+            ("TOMAT_MG_MODE", "1"),
+            ("TOMAT_MG_LOSS_TYPE", loss_type),
+            ("TOMAT_MG_KL_SIGMA", str(kl_sigma) if kl_sigma is not None else ""),
+            ("TOMAT_MG_KL_SIGMA_UNIT", kl_sigma_unit),
+            ("TOMAT_MG_MASK_PRIOR", mask_prior),
+            ("TOMAT_EVAL_ONLY", "1"),
+        ]
+
+        fires: list[tuple[int, str]] = []
+        for st in step_list:
+            out_uri = f"{bucket}/eval/vl-backfill/{leaf}/step-{st}.json"
+            job_name = f"vl-bf-{leaf[:20]}-step{st}"
+            env_pairs = env_pairs_base + [
+                ("TOMAT_EVAL_CKPT_STEP", str(st)),
+                ("TOMAT_EVAL_OUT_URI", out_uri),
+            ]
+            # IRIS_BIN constant points to a non-existent path on this machine
+            # (symlink chain tomat/marin/.venv → tomat/.venv → no iris bin);
+            # the OA marin fork lives at $c/oa/marin and has the real iris
+            # binary in its venv. Use that directly. (TODO: fix IRIS_BIN
+            # constant if existing call sites are all broken too.)
+            _iris_bin = "/Users/ryan/c/oa/marin/.venv/bin/iris"
+            cmd = [
+                _iris_bin, "--cluster=marin", "job", "run",
+                "--tpu", tpu, "--enable-extra-resources", "--priority", "interactive",
+                "--cpu", "96", "--memory", "128G",
+                "--max-retries", "0",
+                "--zone", zone,
+            ]
+            for k, v in env_pairs:
+                cmd += ["--env-vars", k, v]
+            cmd += ["--no-wait", "--no-terminate-on-exit",
+                    "--job-name", job_name, "--", "python", "train_tomat_tpu.py"]
+            try:
+                r = subprocess.run(cmd, cwd=str(MARIN_DIR), capture_output=True, text=True)
+            except Exception as e:
+                err(f"[FAIL fire step={st}] {type(e).__name__}: {e}")
+                continue
+            if r.returncode != 0:
+                err(f"[FAIL fire step={st}] rc={r.returncode}\n{r.stderr[-300:]}")
+                continue
+            # iris submit prints `/ryan/<job_name>` as the last stdout line.
+            job_path = (r.stdout or "").strip().splitlines()[-1].strip() or f"/ryan/{job_name}"
+            fires.append((st, job_path))
+            err(f"[vl-backfill fired] step={st} {job_path}")
+
+        err(f"[vl-backfill] {len(fires)}/{len(step_list)} iris job(s) fired.")
+        print("\n[iris job IDs]")
+        for st, jp in sorted(fires):
+            print(f"  step={st:<6}  {jp}  out=https://iris.oa.dev/#/job/{jp.replace('/','%2F')}")
+        if not fires:
+            sys.exit(1)
+        return
+
+    # Modal fork: existing path (kept for v4/single-shard runs).
+    per_hr = 30.0 if gpu == "H100:8" else 40.0
+    timeout = 3600 if long_timeout else 600
+    max_cost_per_call = per_hr * (timeout / 3600.0)
+    err(f"[vl-backfill] gpu={gpu} timeout={timeout}s "
+        f"max-per-call=${max_cost_per_call:.2f} → max-total=${max_cost_per_call * len(step_list):.2f}")
+    if dry_run:
+        err(f"[vl-backfill] dry-run; not spawning")
+        return
+
+    fn = get_fn(gpu, long=long_timeout)
+
+    import modal as _modal
+    err(f"[vl-backfill] deploying app {vl_app.name!r}…")
+    vl_app.deploy()
+    err(f"[vl-backfill] deployed; spawning {len(step_list)} call(s)…")
+
+    lmq_path = f"{bucket}/codecs/lmq-v2-16k.npz"
+    calls: list[tuple[int, str]] = []
+    for st in step_list:
+        try:
+            call = fn.spawn(
+                run_label=run_label,
+                ckpt_leaf=leaf,
+                step=st,
+                bucket=bucket,
+                parquet_label=parquet_label,
+                lmq_path=lmq_path,
+                model_preset=model_preset,
+                val_seqs=val_seqs,
+                eval_batch=batch_size,
+                seq_len=8192,
+                loss_type=loss_type,
+                kl_sigma=kl_sigma,
+                kl_sigma_unit=kl_sigma_unit,
+                mask_prior=mask_prior,
+                cache_dir_override=cache_dir_override,
+            )
+        except Exception as e:
+            err(f"[FAIL spawn step={st}] {type(e).__name__}: {e}")
+            continue
+        calls.append((st, call.object_id))
+        err(f"[vl-backfill spawned] step={st} call_id={call.object_id}")
+    err(f"[vl-backfill] all {len(calls)}/{len(step_list)} call(s) spawned. "
+        f"`modal app logs {vl_app.name}` to watch.")
+    print("\n[modal call IDs]")
+    for st, cid in sorted(calls):
+        print(f"  step={st:<6} timeout={timeout}s  {cid}")
 
 
 @evals.command("harvest")

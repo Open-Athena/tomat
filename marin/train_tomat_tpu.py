@@ -1306,9 +1306,14 @@ def main():
         keep=[{"every": 100, "until": 1000}, {"every": 1000, "until": None}],
     )
 
-    # Eval cadence: if val is on, every steps // 4 by default (so 4 evals in a
-    # 2000-step run — useful plot resolution). With no val, default keeps the
-    # old behavior (one mid-run eval, effectively a no-op).
+    # Eval cadence: fixed default = 1000 when val is on. The previous
+    # `steps // 4` default was a bug magnet — it gave bin5 (100k-step target)
+    # an eval-every-25k cadence so only ckpts 25k/50k/75k/100k ever evaluated,
+    # which we noticed mid-run when expecting nearer-by VL points. A fixed
+    # 1000 gives consistent plot resolution regardless of run length; override
+    # via TOMAT_STEPS_PER_EVAL when running e.g. a 100-step smoke (where 1000
+    # would disable eval entirely).
+    DEFAULT_STEPS_PER_EVAL = 1000
     if steps_per_eval_env is not None:
         _spe = int(steps_per_eval_env)
         # Sentinel: 0 or -1 disables the in-training eval callback. Levanter
@@ -1318,9 +1323,12 @@ def main():
         # propagation bug) without ripping out the callback wiring.
         steps_per_eval = steps + 1 if _spe <= 0 else _spe
     elif val_seqs > 0:
-        steps_per_eval = max(steps // 4, 1)
+        steps_per_eval = DEFAULT_STEPS_PER_EVAL
     else:
-        steps_per_eval = max(steps // 2, 1)
+        # No val → eval callback fires but is a no-op; keep cadence the same
+        # so future TOMAT_VAL_SEQS=N opt-in immediately gets reasonable
+        # resolution without rediscovering the magic-divisor problem.
+        steps_per_eval = DEFAULT_STEPS_PER_EVAL
 
     # bf16 compute + fp32 params/optimizer. TPU v6e has ~31 GB HBM/chip;
     # fp32 activations blow this at 200M/bs=32-per-chip. bf16 compute is also
@@ -1402,6 +1410,148 @@ def main():
         optimizer=optimizer,
         train_seq_len=seq_len,
     )
+
+    # TOMAT_EVAL_ONLY: short-circuit eval-only path. Loads ckpt-N, runs ONE
+    # eval pass over the same val carve-out the in-train eval used, writes
+    # JSON output, exits without training. Used by `tomat evals vl-backfill
+    # -m iris` to retroactively log eval/loss for runs whose `steps_per_eval`
+    # was sparser than wanted (or off entirely). Reuses all the MaskGIT-loss
+    # + density-loss + data-shuffle config already built above, so the VL
+    # number is bit-identical (within TPU non-determinism) to what an
+    # in-train eval at the same step would have produced.
+    #
+    # Env contract:
+    #   TOMAT_EVAL_ONLY=1                    enable this path
+    #   TOMAT_EVAL_CKPT_STEP=N               which ckpt-step to load (int)
+    #   TOMAT_EVAL_OUT_URI=gs://.../X.json   where to write the result JSON
+    #   TOMAT_EVAL_CKPT_ROOT=gs://.../ckpts  optional override for ckpt dir
+    #     (default: f"{BUCKET}/results/{results_label}/checkpoints")
+    if os.environ.get("TOMAT_EVAL_ONLY") == "1":
+        # CRITICAL: disable wandb sync before levanter.initialize() runs.
+        # Otherwise, since levanter resumes the run by `id=results_label`, our
+        # placeholder `TOMAT_STEPS=1` (passed so the trainer config builds at
+        # all) gets written into the parent run's `trainer.num_train_steps`
+        # — which obliterates the dashboard's step counter (showed "step 1"
+        # for bin5 after the first eval-only fire). Setting WANDB_MODE=disabled
+        # makes wandb a no-op: no run resume, no config writes, no history
+        # appends. The eval-loss number we want lives in the JSON output URI
+        # (TOMAT_EVAL_OUT_URI) anyway; `tomat runs sync` reads from there.
+        os.environ["WANDB_MODE"] = "disabled"
+        ckpt_step = int(os.environ["TOMAT_EVAL_CKPT_STEP"])
+        out_uri = os.environ.get("TOMAT_EVAL_OUT_URI")
+        # Levanter checkpointer nests under `<base_path>/<run_id>/step-N` — the
+        # base_path here is `results/<run>/checkpoints/` and run_id is the
+        # results_label (same as <run>), so the canonical layout is
+        # `results/<run>/checkpoints/<run>/step-N`. The extra `<run>` layer
+        # caught us on first smoke; if `TOMAT_EVAL_CKPT_ROOT` is passed, use
+        # it verbatim (callers may have already mirrored ckpts to a flat
+        # layout); otherwise build the nested canonical path.
+        ckpt_root = os.environ.get("TOMAT_EVAL_CKPT_ROOT") or \
+            f"{BUCKET}/results/{results_label}/checkpoints/{results_label}"
+        ckpt_path = f"{ckpt_root}/step-{ckpt_step}"
+        print(f"[tomat-tpu] TOMAT_EVAL_ONLY=1 → eval-only @ {ckpt_path}", flush=True)
+        print(f"[tomat-tpu] val carve-out: num_validation_sequences={val_seqs}, "
+              f"loss_type={os.environ.get('TOMAT_MG_LOSS_TYPE','ce')}", flush=True)
+
+        import json as _json
+        import time as _time
+        import fsspec as _fsspec
+        import jax.random as _jrandom
+        from haliax import Axis as _HxAxis
+        from haliax.partitioning import round_axis_for_partitioning as _round_axis
+        from levanter.trainer import Trainer as _Trainer
+        from levanter.checkpoint import latest_checkpoint_path as _latest_ckpt, load_checkpoint as _load_ckpt
+        from levanter.eval import TaggedEvaluator as _TaggedEvaluator, _default_lm_eval_loss_fn as _eval_loss_fn
+        import levanter as _levanter
+
+        _levanter.initialize(config)
+        _opt = config.optimizer.build(config.trainer.num_train_steps)
+        def _train_loss_fn(model, example, *, key=None):
+            return model.compute_next_token_loss(example, key=key, logsumexp_weight=config.z_loss_weight)
+
+        t0 = _time.time()
+        with _Trainer(config.trainer, _opt, _train_loss_fn) as _t:
+            compute_am = _t.compute_axis_mapping
+            param_am = _t.parameter_axis_mapping
+            model_max = config.model.max_seq_len
+            train_len = config.train_seq_len or model_max
+            Pos = config.model.max_Pos.resize(train_len)
+            _tokenizer = config.data.the_tokenizer
+            EvalBatch = config.trainer.EvalBatch
+            Vocab = _round_axis(_HxAxis("vocab", len(_tokenizer)), param_am)
+
+            tagged_eval = config.data.tagged_eval_sets(Pos)
+            if not tagged_eval:
+                err(f"[tomat-tpu] EVAL_ONLY: no tagged_eval_sets! "
+                    f"val_seqs={val_seqs}; check TOMAT_VAL_SEQS")
+                sys.exit(2)
+
+            print(f"[tomat-tpu] tagged_eval_sets: {[t[1] for t in tagged_eval]}", flush=True)
+
+            _mkey = _jrandom.PRNGKey(config.trainer.seed)
+            print(f"[tomat-tpu] building model + loading ckpt {ckpt_path}", flush=True)
+            _model = config.model.build(Vocab, key=_mkey)
+            _resolved = _latest_ckpt(ckpt_path) if not _fsspec.open(ckpt_path).fs.exists(ckpt_path.removeprefix("gs://")) else ckpt_path
+            print(f"[tomat-tpu] resolved ckpt path: {_resolved}", flush=True)
+            _model = _load_ckpt(_model, _resolved, subpath="model")
+            import haliax as _hax
+            _model = _hax.shard(_model, param_am)
+            _model = _hax.named_jit(config.trainer.mp.cast_to_param, param_am)(_model)
+            print(f"[tomat-tpu] model loaded; building evaluator …", flush=True)
+
+            _mp = config.trainer.mp
+            _eval = _TaggedEvaluator(
+                EvalBatch=EvalBatch,
+                tagged_eval_sets=tagged_eval,
+                loss_fn=lambda m, b: _eval_loss_fn(m, b, EvalBatch=EvalBatch, mp=_mp),
+                tokenizer=_tokenizer,
+                device_mesh=_t.device_mesh,
+                axis_mapping=compute_am,
+                max_examples_per_dataset=config.trainer.max_eval_batches,
+            )
+
+            print(f"[tomat-tpu] evaluating …", flush=True)
+            t_eval0 = _time.time()
+            result = _eval.evaluate(_model)
+            t_eval = _time.time() - t_eval0
+            vl = float(result.micro_avg_loss)
+
+            print(f"[tomat-tpu] EVAL_ONLY result: eval/loss={vl:.6f}  "
+                  f"macro_loss={result.macro_avg_loss:.6f}  "
+                  f"eval_time={t_eval:.1f}s  setup_time={t_eval0-t0:.1f}s",
+                  flush=True)
+
+            payload = {
+                "step": ckpt_step,
+                "ckpt_path": _resolved,
+                "eval_loss": vl,
+                "macro_avg_loss": float(result.macro_avg_loss),
+                "tag_micro_losses": {k: float(v) for k, v in result.tag_micro_losses.items()},
+                "run": results_label,
+                "val_seqs": val_seqs,
+                "seq_len": seq_len,
+                "model_preset": model_preset,
+                "loss_type": os.environ.get("TOMAT_MG_LOSS_TYPE", "ce"),
+                "kl_sigma": os.environ.get("TOMAT_MG_KL_SIGMA"),
+                "mg_mode": os.environ.get("TOMAT_MG_MODE", "0"),
+                "eval_seconds": t_eval,
+            }
+            if out_uri:
+                print(f"[tomat-tpu] writing JSON → {out_uri}", flush=True)
+                with _fsspec.open(out_uri, "w") as _f:
+                    _json.dump(payload, _f, indent=2)
+                print(f"[tomat-tpu] wrote {out_uri}", flush=True)
+            else:
+                print(f"[tomat-tpu] no TOMAT_EVAL_OUT_URI; payload:\n"
+                      f"{_json.dumps(payload, indent=2)}", flush=True)
+
+        try:
+            import wandb as _wb
+            if _wb.run is not None: _wb.finish(exit_code=0, quiet=True)
+        except Exception:
+            pass
+        print(f"[tomat-tpu] EVAL_ONLY done in {_time.time()-t0:.1f}s")
+        sys.exit(0)
 
     print("[tomat-tpu] calling levanter.main.train_lm.main …")
     _log_lifecycle_event("trainer_started", label=results_label, steps=steps)
