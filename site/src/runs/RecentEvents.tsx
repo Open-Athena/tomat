@@ -351,11 +351,11 @@ export function RecentEvents({ attempts, modalApp, history }: {
           cls: 'warn',
         })
       }
-      for (const fc of Object.values(modalApp.function_calls)) {
+      for (const fc of Object.values(modalApp.function_calls ?? {})) {
         // We don't have per-input timestamps from Modal — surface the
         // statuses with the app's created_at as a fallback (so they
         // appear in chronological order with the app event).
-        for (const inp of fc.inputs) {
+        for (const inp of fc.inputs ?? []) {
           if (inp.status === 'success' || inp.status === 'failure') {
             // No ts for these — fold under the modal app's lifetime.
             // Skip rather than fake a timestamp.
@@ -364,11 +364,13 @@ export function RecentEvents({ attempts, modalApp, history }: {
         }
         // Surface ERROR on the fc itself if any
         if (fc.error) {
+          const fcId = fc.function_call_id ?? '???????'
+          const errStr = typeof fc.error === 'string' ? fc.error : String(fc.error)
           out.push({
             ts_ms: modalApp.created_at_ms ?? Date.now(),
             source: 'modal',
-            label: `fc ${fc.function_call_id.slice(3, 10)}… ERROR`,
-            detail: fc.error.slice(0, 100),
+            label: `fc ${fcId.slice(3, 10)}… ERROR`,
+            detail: errStr.slice(0, 100),
             cls: 'error',
           })
         }
