@@ -147,6 +147,11 @@ const TZ_LABEL: string = (() => {
 
 export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step', attempts, manifest = null, lineageInfo = null, mevalMetric = 'nmae' }: Props) {
   const { isDark } = useTheme()
+  // Hoisted early so `applyShapeFade` (declared next) can reference it; the
+  // applyShapeFade callback runs in a `useEffect` and Plotly's afterplot
+  // listener, both of which read this color when computing the active-trace
+  // tint for annotation vlines.
+  const ANNOTATION_COLOR = isDark ? 'rgba(190,190,210,0.6)' : 'rgba(80,80,100,0.55)'
   // Wrapper around <Plot> so we can DOM-walk to the `.js-plotly-plot` element
   // and call `Plotly.restyle` on the band traces directly. Bands have
   // `showlegend: false`; pltly's built-in `applyFadeSolo` skips those (since
@@ -220,6 +225,97 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     plotDiv.on('plotly_afterplot', applyBandFade)
     return () => plotDiv.removeListener?.('plotly_afterplot', applyBandFade)
   }, [applyBandFade])
+
+  // Shape-fade side-effect (Bug 3 fix). Event vlines' active-color tint is
+  // applied here via `Plotly.relayout({ shapes })` instead of baked into the
+  // layout prop — that way the inline layout object's `shapes:` stays
+  // referentially stable across `activeTraceName` flips, so `Plotly.react`
+  // doesn't fire for every legend mouseover. The ref pattern matches
+  // `applyBandFade` above: the latest `baseEventShapes` is stashed during
+  // render and read by this effect when `activeTraceName` changes. Idempotent
+  // — bails when the freshly-computed shape colors match what's already on
+  // `_fullLayout.shapes`.
+  type ShapeColorTuple = string
+  const baseEventShapesRef = useRef<Array<{
+    type: 'line'; xref: 'x'; yref: 'paper'
+    x0: string | number; x1: string | number; y0: number; y1: number
+    line: { color: string; width: number; dash: 'dash' | 'dot' | 'solid' }
+    _baseColor: string
+  }>>([])
+  const applyShapeFade = useCallback(() => {
+    const root = plotWrapperRef.current
+    if (!root) return
+    const plotDiv = root.querySelector('.js-plotly-plot') as (HTMLElement & {
+      _Plotly?: { relayout: (el: HTMLElement, attrs: Record<string, unknown>) => Promise<void> }
+      _fullLayout?: { shapes?: Array<{ line?: { color?: string } }> }
+    }) | null
+    const P = plotDiv?._Plotly
+    if (!plotDiv || !P) return
+    const shapes = baseEventShapesRef.current
+    if (shapes.length === 0) return
+    // Recompute active color → per-shape tint mapping. Anything not in this
+    // map (TL, VL, NMAE, NEMD, step, etc.) means "user hovered a non-event
+    // trace" → fade ALL shapes.
+    let activeColor: string | null
+    const a = activeTraceName
+    if (a === null) activeColor = null
+    else if (a.startsWith('trainer_started')) activeColor = COLORS.start
+    else if (a.startsWith('sigterm')) activeColor = COLORS.sigterm
+    else if (a.startsWith('cluster preempt')) activeColor = COLORS.preempt
+    else if (a.startsWith('death: preempt')) activeColor = DEATH_COLORS.preempt
+    else if (a.startsWith('death: cascade')) activeColor = DEATH_COLORS.cascade
+    else if (a.startsWith('death: failed')) activeColor = DEATH_COLORS.failed
+    else if (a.startsWith('annotations')) activeColor = ANNOTATION_COLOR
+    else activeColor = ''
+    const tint = (base: string): ShapeColorTuple => {
+      if (activeColor === null || activeColor === base) return base
+      const rgb = hexToRgbTuple(base)
+      // 0.08 alpha (was 0.18): runs with many event vlines (e.g. 72 starts
+      // on `train-mg-kl-bin5-fs-tpu`) cluster densely on the x-axis. At 0.18,
+      // overlapping faded dashes alpha-blend back to near-full brightness
+      // and the "events stay full opacity" bug 1 manifests visually even
+      // though each shape is technically faded. 0.08 keeps individual
+      // shapes legible-but-clearly-dim and survives the dense-cluster
+      // compositing without re-becoming bright.
+      return `rgba(${rgb}, 0.08)`
+    }
+    // Build the new shapes array with retinted colors. Idempotency check:
+    // bail when the new colors exactly match the live `_fullLayout.shapes`
+    // colors (Plotly normalizes through r/g/b → string equality is the only
+    // contract we can trust here, but matches in practice).
+    const liveShapes = plotDiv._fullLayout?.shapes ?? []
+    const tinted = shapes.map((s) => ({
+      type: s.type, xref: s.xref, yref: s.yref,
+      x0: s.x0, x1: s.x1, y0: s.y0, y1: s.y1,
+      line: { ...s.line, color: tint(s._baseColor) },
+    }))
+    let changed = liveShapes.length !== tinted.length
+    if (!changed) {
+      for (let i = 0; i < tinted.length; i++) {
+        if (liveShapes[i]?.line?.color !== tinted[i].line.color) { changed = true; break }
+      }
+    }
+    if (!changed) return
+    P.relayout(plotDiv, { shapes: tinted })
+  }, [activeTraceName, ANNOTATION_COLOR])
+  useEffect(applyShapeFade, [applyShapeFade])
+  // Re-apply on every Plotly redraw — `Plotly.react` (xMode swap, data
+  // refetch, smoothing change) resets `_fullLayout.shapes` to whatever's
+  // in the inline layout (which we pin to BASE colors). If an active LI was
+  // hovered during the react, we need to re-tint after the redraw lands.
+  // Idempotency check inside `applyShapeFade` breaks the otherwise-infinite
+  // afterplot → relayout → afterplot loop.
+  useEffect(() => {
+    const root = plotWrapperRef.current
+    if (!root) return
+    const plotDiv = root.querySelector('.js-plotly-plot') as (HTMLElement & {
+      on?: (evt: string, fn: () => void) => void
+      removeListener?: (evt: string, fn: () => void) => void
+    }) | null
+    if (!plotDiv?.on) return
+    plotDiv.on('plotly_afterplot', applyShapeFade)
+    return () => plotDiv.removeListener?.('plotly_afterplot', applyShapeFade)
+  }, [applyShapeFade])
 
   // `?x=wallclock|elapsed|step|epoch` — URL-persisted so deep-links carry
   // the view choice. The run-detail page defaults to `'step'` (training
@@ -685,8 +781,17 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
 
   const customGsteps = (s: Series) => s.gsteps.map((g) => (g === null ? '?' : g))
 
-  const TL = series('train/loss')
-  const VL = series('eval/loss')
+  // Memoize TL / VL so the Plot's `data` prop stays referentially stable across
+  // re-renders that don't change the underlying parquet / xMode / segments
+  // (e.g. legend-hover state changes flowing through `activeTraceName` would
+  // otherwise rebuild these per render → Plotly.react fires for every hover).
+  // Same dep set as `stepTrace` above plus `segments` (whose change forces
+  // `series()` to re-bucket rows). Bug 3 (flicker) regressed when these were
+  // computed inline.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const TL = useMemo(() => series('train/loss'), [ordered, cols, xMode, history.rowCount, timestamps, flopXScale, segments])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const VL = useMemo(() => series('eval/loss'), [ordered, cols, xMode, history.rowCount, timestamps, flopXScale, segments])
 
   // Smoothing (shared URL state with the cross-run timeline). When raw the
   // TL/VL traces render unchanged; otherwise replace y, and optionally emit
@@ -1087,44 +1192,64 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     return false
   }, [evalSeries])
 
-  // Lifecycle event timestamps.
-  const eventTimes = (key: keyof RunHistoryRow): number[] => {
+  // Lifecycle event timestamps. Memoized so that `plotDataMemo` and
+  // `plotLayoutMemo` can include them in deps without re-invalidating on
+  // every render (these returned fresh array refs each time before, which
+  // defeated all of the layout/data memoization downstream).
+  const startTs = useMemo<number[]>(() => {
     const ts: number[] = []
-    const col = cols.get(key) ?? []
+    const col = cols.get('lifecycle/trainer_started') ?? []
     for (let i = 0; i < col.length; i++) {
       if (col[i] === 1 && timestamps[i] !== null) ts.push(timestamps[i] as number)
     }
     return ts.sort((a, b) => a - b)
-  }
-  const startTs = eventTimes('lifecycle/trainer_started')
-  const sigtermTs = eventTimes('lifecycle/sigterm_received')
-
-  const preemptCol = cols.get('cluster/preemptions') ?? []
-  const preemptTs: number[] = []
-  let prev: number | null = null
-  for (const { ts, i } of ordered) {
-    const v = preemptCol[i]
-    if (v === null) continue
-    if (prev !== null && v > prev) preemptTs.push(ts as number)
-    prev = v
-  }
+  }, [cols, timestamps])
+  const sigtermTs = useMemo<number[]>(() => {
+    const ts: number[] = []
+    const col = cols.get('lifecycle/sigterm_received') ?? []
+    for (let i = 0; i < col.length; i++) {
+      if (col[i] === 1 && timestamps[i] !== null) ts.push(timestamps[i] as number)
+    }
+    return ts.sort((a, b) => a - b)
+  }, [cols, timestamps])
+  const preemptTs = useMemo<number[]>(() => {
+    const preemptCol = cols.get('cluster/preemptions') ?? []
+    const out: number[] = []
+    let prev: number | null = null
+    for (const { ts, i } of ordered) {
+      const v = preemptCol[i]
+      if (v === null) continue
+      if (prev !== null && v > prev) out.push(ts as number)
+      prev = v
+    }
+    return out
+  }, [cols, ordered])
 
   const gridcolor = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'
   const zerolinecolor = isDark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.15)'
 
-  // Base color for hand-curated annotation vlines + the icon-stroke for the
-  // overlay icons. Declared here (not inline at the annotation block below)
-  // because `activeShapeColor` needs to reference it.
-  const ANNOTATION_COLOR = isDark ? 'rgba(190,190,210,0.6)' : 'rgba(80,80,100,0.55)'
+  // (`ANNOTATION_COLOR` is hoisted to the top of the component so
+  // `applyShapeFade` can reference it. Originally declared here.)
 
   // Event vlines spanning both panels via paper-coord shapes.
   //
   // Shapes also fade on legend hover: if the user hovers a real trace (TL /
-  // VL / etc.), all event vlines dim to alpha 0.18 so the trace stands out.
+  // VL / etc.), all event vlines dim to alpha 0.08 so the trace stands out
+  // (was 0.18; bumped down because dense overlapping dashed vlines on a
+  // 72-restart run alpha-blended back to near-baseline brightness).
   // If the user hovers an event LI ("trainer_started", "sigterm", "cluster
   // preempt", "death: preempt/cascade/failed", "annotations"), shapes
   // matching that event's color stay full opacity; the rest dim. With no
   // hover, all shapes render at full opacity.
+  //
+  // The active-color application is split into two phases so legend-hover
+  // doesn't churn the `layout` prop on every mouse move (Bug 3 fix —
+  // previously each hover rebuilt every shape's `line.color` with the
+  // current `activeTraceName`, which made `layout` change reference and
+  // triggered `Plotly.react` for every hover step). Now the shapes baked
+  // into `layout` carry BASE colors (stable across `activeTraceName`); a
+  // dedicated `useEffect` on `activeTraceName` recomputes the tinted
+  // versions and pushes them via `Plotly.relayout({ shapes })`.
   type Shape = {
     type: 'line'
     xref: 'x'
@@ -1135,37 +1260,24 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     y1: number
     line: { color: string; width: number; dash: 'dash' | 'dot' | 'solid' }
   }
-  // Map active-trace legend-item name → base color for the shapes it
-  // represents. Anything not in this map (TL, VL, NMAE, NEMD, step, etc.)
-  // means "user hovered a non-event trace" → fade ALL shapes.
-  function activeShapeColor(activeName: string | null): string | null {
-    if (activeName === null) return null  // no hover → full opacity for all
-    if (activeName.startsWith('trainer_started')) return COLORS.start
-    if (activeName.startsWith('sigterm')) return COLORS.sigterm
-    if (activeName.startsWith('cluster preempt')) return COLORS.preempt
-    if (activeName.startsWith('death: preempt')) return DEATH_COLORS.preempt
-    if (activeName.startsWith('death: cascade')) return DEATH_COLORS.cascade
-    if (activeName.startsWith('death: failed')) return DEATH_COLORS.failed
-    if (activeName.startsWith('annotations')) return ANNOTATION_COLOR
-    return ''  // hovered a non-event trace → fade everything
-  }
-  const activeColor = activeShapeColor(activeTraceName)
-  function shapeColor(baseColor: string): string {
-    if (activeColor === null) return baseColor
-    if (activeColor === baseColor) return baseColor
-    // Convert hex → rgba(…, 0.18) so non-matching shapes dim out.
-    const rgb = hexToRgbTuple(baseColor)
-    return `rgba(${rgb}, 0.18)`
-  }
-  const eventShapes: Shape[] = []
+  // Each "base" shape pairs the canonical (un-tinted) color with the
+  // currently-drawn color. `applyShapeFade` (below) walks `baseEventShapes`
+  // to recompute `line.color` per-hover without re-touching layout.
+  type BaseShape = Shape & { _baseColor: string }
+  // The active-trace → tinted-color logic lives inline in `applyShapeFade`
+  // (see the dedicated `useEffect` above). Old `activeShapeColor` /
+  // `shapeColor` helpers were removed: that path was per-render and
+  // dirtied the layout reference on every hover (Bug 3 root cause).
+  const baseEventShapes: BaseShape[] = []
   const addShapes = (ts: number[], color: string, dash: 'dash' | 'dot' | 'solid') => {
     for (const t of ts) {
       const x = xOfTs(t)
       if (typeof x === 'number' && Number.isNaN(x)) continue
-      eventShapes.push({
+      baseEventShapes.push({
         type: 'line', xref: 'x', yref: 'paper',
         x0: x, x1: x, y0: 0, y1: 1,
-        line: { color: shapeColor(color), width: dash === 'solid' ? 1 : 1.2, dash },
+        line: { color, width: dash === 'solid' ? 1 : 1.2, dash },
+        _baseColor: color,
       })
     }
   }
@@ -1184,21 +1296,34 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   // `xOfStep`), used both to draw the vline shape and to compute the
   // info-icon's pixel position in the HTML overlay below.
   type AnnotationPos = { ann: RunAnnotation; x: string | number }
-  const annotationPositions: AnnotationPos[] = []
-  for (const ann of annotations) {
-    const x = xOfStep(ann.step)
-    if (x === null || (typeof x === 'number' && Number.isNaN(x))) continue
-    annotationPositions.push({ ann, x })
-  }
+  // Memoized so that data/layout/applyShapeFade deps see a stable ref when
+  // the underlying inputs (annotations list, xMode, tsGstep mappings)
+  // haven't actually changed. Without this, `xOfStep` returns the same
+  // value but `annotationPositions` is a new array every render → memos
+  // downstream invalidate every hover. eslint-disable-next-line because
+  // `xOfStep` closes over many things that aren't in scope here; the
+  // explicit deps below capture what really matters.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const annotationPositions = useMemo<AnnotationPos[]>(() => {
+    const out: AnnotationPos[] = []
+    for (const ann of annotations) {
+      const x = xOfStep(ann.step)
+      if (x === null || (typeof x === 'number' && Number.isNaN(x))) continue
+      out.push({ ann, x })
+    }
+    return out
+  }, [annotations, xMode, manifest, tsGstep, flopXScale])
   // Whether the "annotations" LI is toggled on. Drives both the dashed
   // vlines and the HTML info-icons rendered as an overlay.
   const [annotationsEnabled, setAnnotationsEnabled] = useState(true)
   if (annotationsEnabled) {
     for (const { ann, x } of annotationPositions) {
-      eventShapes.push({
+      const color = ann.color ?? ANNOTATION_COLOR
+      baseEventShapes.push({
         type: 'line', xref: 'x', yref: 'paper',
         x0: x, x1: x, y0: 0, y1: 1,
-        line: { color: shapeColor(ann.color ?? ANNOTATION_COLOR), width: 0.8, dash: 'dash' },
+        line: { color, width: 0.8, dash: 'dash' },
+        _baseColor: color,
       })
     }
   }
@@ -1227,6 +1352,12 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   for (const cause of ['preempt', 'cascade', 'failed'] as const) {
     addShapes(deathBuckets[cause].map((b) => b.ts), DEATH_COLORS[cause], 'solid')
   }
+  // Stash base shapes into the ref so `applyShapeFade` (defined above) can
+  // recompute tinted colors on `activeTraceName` flips without re-running
+  // the `addShapes` chain. Done during render so the ref always points at
+  // the current shape set even when activeTraceName hasn't changed (other
+  // re-renders, e.g. xMode swap, refresh the shape geometry).
+  baseEventShapesRef.current = baseEventShapes
 
   // Legend-only invisible point so the event vlines show up in the legend
   // (real lines are `shapes`, which don't legend-ify). All event LIs share
@@ -1397,10 +1528,12 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   const logType: 'log' = 'log'
   // Domains: stack panels top → bottom with small inter-panel gaps. Each of
   // the 4 (showTopPanel × showEvalPanel) combinations gets its own layout so
-  // each panel uses the full available space.
-  const [stepDomain, lossDomain, evalDomain]: [
+  // each panel uses the full available space. Memoized so that
+  // `plotLayoutMemo` deps see stable array refs (the inline array literals
+  // changed identity every render and defeated layout memoization).
+  const [stepDomain, lossDomain, evalDomain] = useMemo<[
     [number, number] | null, [number, number], [number, number] | null,
-  ] = (() => {
+  ]>(() => {
     if (showTopPanel && showEvalPanel) {
       // 3 panels: step ~17%, TL/VL ~45%, MT/MV ~35%, with ~1.5% gaps between.
       return [[0.83, 1.0], [0.36, 0.815], [0.0, 0.345]]
@@ -1415,13 +1548,124 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     }
     // 1 panel: TL/VL only.
     return [null, [0.0, 1.0], null]
-  })()
+  }, [showTopPanel, showEvalPanel])
 
   const xTitle = xMode === 'time' ? TZ_LABEL
     : xMode === 'elapsed' ? 'elapsed (h)'
     : xMode === 'epoch' ? 'epoch'
     : xMode === 'flop' ? `FLOP (${flopUnit})`
     : 'global_step'
+
+  // Memoize `data` so the reference stays stable across `activeTraceName`
+  // flips that don't actually change trace content (Bug 3 fix — previously,
+  // every hover step rebuilt the inline data array and pltly's chain
+  // `styledData` → `finalData` → `dataWithSoloVisibility` → `plotData` saw
+  // new refs at every level, triggering a `Plotly.react` per hover). The dep
+  // list captures everything that ACTUALLY changes trace content; hover state
+  // is intentionally absent.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const plotDataMemo = useMemo(() => [
+    // 1. step (top panel) — only when not in step mode
+    ...(showTopPanel ? [{
+      x: stepTrace.xs, y: stepTrace.ys, name: 'step',
+      type: 'scatter' as const, mode: 'lines' as const,
+      line: { color: COLORS.step, width: 2, shape: 'hv' as const },
+      yaxis: 'y',
+      legendgroup: 'step',
+      legendgrouptitle: { text: 'progress' },
+      hovertemplate: 'step %{y}<extra></extra>',
+    }] : []),
+    ...smoothedSeriesTraces(TL, 'TL (train/loss)', COLORS.TL, 1.2, 'losses'),
+    ...smoothedSeriesTraces(VL, 'VL (eval/loss)', COLORS.VL, 1.4, 'losses'),
+    ...(showEvalPanel ? evalTraces : []),
+    ...(startTs.length > 0 ? [legendOnly(`trainer_started (${startTs.length})`, COLORS.start, 'dash')] : []),
+    ...(sigtermTs.length > 0 ? [legendOnly(`sigterm (${sigtermTs.length})`, COLORS.sigterm, 'dot')] : []),
+    ...(preemptTs.length > 0 ? [legendOnly(`cluster preempt (${preemptTs.length})`, COLORS.preempt, 'solid')] : []),
+    ...(attempts ? (['preempt', 'cascade', 'failed'] as const)
+      .filter((c) => deathBuckets[c].length > 0)
+      .map((c) => legendOnly(
+        `death: ${c} (${deathBuckets[c].length})`,
+        DEATH_COLORS[c], 'solid',
+      )) : []),
+    ...(annotationPositions.length > 0 ? [legendOnly(annotationsLegendName, ANNOTATION_COLOR, 'dash')] : []),
+  ], [
+    showTopPanel, stepTrace, TL, VL, smooth, bandsOn, segments, lineageInfo,
+    showEvalPanel, evalTraces,
+    startTs, sigtermTs, preemptTs, attempts,
+    annotationPositions, annotationsLegendName, ANNOTATION_COLOR, isDark,
+  ])
+
+  // Memoize `layout` similarly. `shapes:` carries BASE colors that don't
+  // change with `activeTraceName` (the per-hover tint is applied in
+  // `applyShapeFade` via `Plotly.relayout`, not by rebuilding the layout
+  // prop). Without this, every hover dirtied the layout ref → `Plotly.react`
+  // fired per hover step instead of per actual content change.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const plotLayoutMemo = useMemo(() => ({
+    title: {
+      text: (() => {
+        const segChunk = numSegments > 1 ? ` (${numSegments} seg)` : ''
+        const head = `${runId}  ·  ${startTs.length} starts${segChunk}, ${sigtermTs.length} sigterms, ${preemptTs.length} preempts`
+        if (!attempts) return head
+        const parts = (['preempt', 'cascade', 'failed'] as const)
+          .filter((c) => deathBuckets[c].length > 0)
+          .map((c) => `${deathBuckets[c].length} ${c}`)
+        return parts.length > 0 ? `${head}  ·  ${parts.join(', ')}` : head
+      })(),
+      font: { size: 14 },
+    },
+    autosize: true,
+    height: 640,
+    xaxis: {
+      title: { text: xTitle },
+      type: (xMode === 'time' ? 'date' : 'linear') as 'date' | 'linear',
+      ...(xMode === 'time' ? { tickformat: '%-m/%-d %H:%M' } : {}),
+      ...(xMode === 'flop' ? { tickformat: flopTickformat(flopUnit) } : {}),
+      gridcolor, zerolinecolor, linecolor: gridcolor,
+      anchor: (showEvalPanel ? 'y3' : 'y2') as 'y3' | 'y2',
+      ...(userXRange ? { range: userXRange, autorange: false } : {}),
+    },
+    yaxis: {
+      title: { text: 'step', font: { color: COLORS.step } },
+      tickfont: { color: COLORS.step },
+      domain: stepDomain ?? [0.99, 1.0],
+      gridcolor, zerolinecolor, linecolor: gridcolor,
+      visible: showTopPanel,
+      fixedrange: true,
+    },
+    yaxis2: {
+      title: { text: 'loss (log)' },
+      type: logType,
+      domain: lossDomain,
+      gridcolor, zerolinecolor, linecolor: gridcolor,
+      fixedrange: true,
+    },
+    yaxis3: {
+      title: { text: `mat-${mevalMetric.toUpperCase()} %` },
+      type: 'linear' as const,
+      domain: evalDomain ?? [0.0, 0.01],
+      gridcolor, zerolinecolor, linecolor: gridcolor,
+      visible: showEvalPanel,
+      fixedrange: true,
+    },
+    // shapes intentionally OMITTED here — `applyShapeFade` pushes them
+    // via `Plotly.relayout({ shapes })` on render and on every active-
+    // trace flip, decoupling shape churn from the layout-prop reference.
+    // See the Bug 3 fix comment above.
+    margin: { t: 50, l: 70, r: 210, b: 50 },
+    hovermode: 'x unified' as const,
+    hoverlabel: { ...themedHoverlabel(isDark), align: 'left' as const },
+    hoverdistance: -1,
+    legend: {
+      x: 1.02, y: 1, bgcolor: 'rgba(0,0,0,0)',
+      tracegroupgap: 10,
+    },
+  }), [
+    runId, numSegments, startTs.length, sigtermTs.length, preemptTs.length,
+    attempts, xTitle, xMode, flopUnit, gridcolor, zerolinecolor,
+    showEvalPanel, userXRange, stepDomain, showTopPanel, lossDomain,
+    mevalMetric, evalDomain, isDark,
+  ])
 
   return (
     <div>
@@ -1471,140 +1715,8 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         onActiveTraceChange={setActiveTraceName}
         onRelayout={onRelayout as (ev: unknown) => void}
         onAfterPlot={recomputeIconPositions}
-        data={[
-          // 1. step (top panel) — only when not in step mode
-          ...(showTopPanel ? [{
-            x: stepTrace.xs, y: stepTrace.ys, name: 'step',
-            type: 'scatter' as const, mode: 'lines' as const,
-            line: { color: COLORS.step, width: 2, shape: 'hv' as const },
-            yaxis: 'y',
-            legendgroup: 'step',
-            legendgrouptitle: { text: 'progress' },
-            hovertemplate: 'step %{y}<extra></extra>',
-          }] : []),
-          // 2. losses (shared log y2) — smoothing-aware. Bands (when on) share
-          //    each line's `legendgroup` so `applyBandFade` desats them with
-          //    their parent on hover.
-          // TL/VL share the `'losses'` legendgroup so their LIs sit flush
-          // (a single shared "losses (log)" group title above; no inter-group
-          // gap between them) — sweeping the cursor from TL to VL no longer
-          // crosses a dead zone that thrashes the hover state. Per-trace fade
-          // continues to work because pltly fades by `trace.name` and our
-          // `applyBandFade` matches band edges to their parent by name.
-          ...smoothedSeriesTraces(TL, 'TL (train/loss)', COLORS.TL, 1.2, 'losses'),
-          ...smoothedSeriesTraces(VL, 'VL (eval/loss)', COLORS.VL, 1.4, 'losses'),
-          // 3. mat-NMAE + mat-NEMD (from eval.json) on yaxis: 'y3' — only when
-          //    the run has eval data; otherwise the panel + traces are omitted
-          //    and we fall back to the legacy 2-panel layout.
-          ...(showEvalPanel ? evalTraces : []),
-          // Hide lifecycle LIs whose count is 0 — for a Modal run with no
-          // iris-style restarts / preempts / sigterms, three permanently
-          // greyed (0) rows just clutter the legend.
-          ...(startTs.length > 0 ? [legendOnly(`trainer_started (${startTs.length})`, COLORS.start, 'dash')] : []),
-          ...(sigtermTs.length > 0 ? [legendOnly(`sigterm (${sigtermTs.length})`, COLORS.sigterm, 'dot')] : []),
-          ...(preemptTs.length > 0 ? [legendOnly(`cluster preempt (${preemptTs.length})`, COLORS.preempt, 'solid')] : []),
-          // Death-cause legend entries — one row per non-empty bucket. Hidden
-          // when the sidecar hasn't loaded yet (`attempts == null`) so the
-          // legend doesn't grow until the data's in.
-          ...(attempts ? (['preempt', 'cascade', 'failed'] as const)
-            .filter((c) => deathBuckets[c].length > 0)
-            .map((c) => legendOnly(
-              `death: ${c} (${deathBuckets[c].length})`,
-              DEATH_COLORS[c], 'solid',
-            )) : []),
-          // Annotation LI — only when the run has any annotations. Click
-          // toggles `annotationsEnabled`, which gates the vlines (above) +
-          // the HTML info-icon overlay (rendered below the Plot).
-          ...(annotationPositions.length > 0 ? [legendOnly(annotationsLegendName, ANNOTATION_COLOR, 'dash')] : []),
-        ]}
-        layout={{
-          title: {
-            text: (() => {
-              const segChunk = numSegments > 1 ? ` (${numSegments} seg)` : ''
-              const head = `${runId}  ·  ${startTs.length} starts${segChunk}, ${sigtermTs.length} sigterms, ${preemptTs.length} preempts`
-              if (!attempts) return head
-              const parts = (['preempt', 'cascade', 'failed'] as const)
-                .filter((c) => deathBuckets[c].length > 0)
-                .map((c) => `${deathBuckets[c].length} ${c}`)
-              return parts.length > 0 ? `${head}  ·  ${parts.join(', ')}` : head
-            })(),
-            font: { size: 14 },
-          },
-          autosize: true,
-          height: 640,
-          xaxis: {
-            title: { text: xTitle },
-            type: xMode === 'time' ? 'date' : 'linear',
-            ...(xMode === 'time' ? { tickformat: '%-m/%-d %H:%M' } : {}),
-            // FLOP mode: x values are scaled by `flopXScale` upstream so the
-            // axis ticks read in the user-chosen unit (EF / PF / TF / sci).
-            // Tickformat varies with the unit since EF lands in 0.1-1000,
-            // PF in the thousands, and TF / sci span enough magnitude that
-            // scientific notation reads better than grouped fixed-point.
-            ...(xMode === 'flop' ? { tickformat: flopTickformat(flopUnit) } : {}),
-            gridcolor, zerolinecolor, linecolor: gridcolor,
-            // Anchor to the bottom-most y-axis so tick labels render BELOW
-            // the bottom panel (MT/MV when present, TL/VL when not), instead
-            // of below the topmost panel (the step counter) which is plotly's
-            // default for a shared xaxis. Without this, the bottom panel has
-            // no visible x reference.
-            anchor: showEvalPanel ? 'y3' : 'y2',
-            // Restore user-picked range across re-renders triggered by
-            // smoothing / bands toggles. `null` → omit → plotly autoranges.
-            ...(userXRange ? { range: userXRange, autorange: false } : {}),
-          },
-          yaxis: {
-            title: { text: 'step', font: { color: COLORS.step } },
-            tickfont: { color: COLORS.step },
-            // When step panel is hidden, the domain is unused, but plotly
-            // requires SOMETHING valid here; pick a tiny offscreen slice.
-            domain: stepDomain ?? [0.99, 1.0],
-            gridcolor, zerolinecolor, linecolor: gridcolor,
-            visible: showTopPanel,
-            // Lock y-zoom: click-drag should zoom x-only (constraint imposed
-            // by `fixedrange: true` on every y-axis; plotly's box-zoom then
-            // spans the full y range automatically).
-            fixedrange: true,
-          },
-          yaxis2: {
-            title: { text: 'loss (log)' },
-            type: logType,
-            domain: lossDomain,
-            gridcolor, zerolinecolor, linecolor: gridcolor,
-            fixedrange: true,
-          },
-          yaxis3: {
-            // Linear scale: MT/MV values are typically 100-600% (< 6× range),
-            // not orders of magnitude — log here compresses the range without
-            // adding information. Title tracks the active metric (NMAE / NEMD)
-            // so the user always knows what the panel is showing.
-            title: { text: `mat-${mevalMetric.toUpperCase()} %` },
-            type: 'linear',
-            domain: evalDomain ?? [0.0, 0.01],
-            gridcolor, zerolinecolor, linecolor: gridcolor,
-            visible: showEvalPanel,
-            fixedrange: true,
-          },
-          shapes: eventShapes,
-          margin: { t: 50, l: 70, r: 210, b: 50 },
-          hovermode: 'x unified',
-          // Anchor the unified TT to a fixed paper-Y position so it doesn't
-          // chase the (noisy) trace values as the cursor scans horizontally.
-          // User reported jitter when TT was bouncing up/down with TL.
-          hoverlabel: { ...themedHoverlabel(isDark), align: 'left' },
-          // `hovermode: x unified` follows the cursor X but the box y-pos is
-          // computed to avoid the highest trace; using `hoverdistance: -1`
-          // disables nearest-point Y snapping → cursor-following Y.
-          hoverdistance: -1,
-          // Single legend on the right with grouped headers per panel.
-          // `tracegroupgap` adds vertical breathing room between groups so
-          // the per-group `legendgrouptitle` rows visually separate the
-          // panels' entries (step / losses / MT·MV / events).
-          legend: {
-            x: 1.02, y: 1, bgcolor: 'rgba(0,0,0,0)',
-            tracegroupgap: 10,
-          },
-        }}
+        data={plotDataMemo}
+        layout={plotLayoutMemo}
       />
       {/* Annotation info-icon overlay. Pixel-positioned by
           `recomputeIconPositions`; each icon wraps in a `<Tooltip>` that
@@ -1634,7 +1746,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
                     step {sd.display}
                   </div>
                   <div style={{ whiteSpace: 'pre-wrap' }}>{ann.label}</div>
-                  {sd.isSnapped && (
+                  {sd.isLegacy && (
                     <div style={{ fontSize: '0.65rem', opacity: 0.55,
                                   borderTop: '1px solid rgba(255,255,255,0.1)',
                                   paddingTop: 3, marginTop: 2 }}>
