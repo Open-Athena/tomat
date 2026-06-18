@@ -197,11 +197,11 @@ export function EvalsPanel({ runId, evalsIndex }: {
             <tr key={step}>
               <td style={cellStyle}>
                 {(() => {
-                  // `≈Nk` prefix marks Levanter's final-of-segment ckpts
-                  // (saved at `step-(N-1)` because `info.step` is 0-indexed);
-                  // the tooltip explains the raw value + naming convention.
+                  // `*` flags legacy info.step-OBO interpretation (pre-fix
+                  // Levanter; see `formatStepDetail` for the full semantics).
+                  // The tooltip narrates raw vs completed steps.
                   const d = formatStepDetail(step)
-                  return d.isSnapped ? (
+                  return d.isLegacy ? (
                     <Tooltip content={d.tooltip}>
                       <span>{d.display}</span>
                     </Tooltip>

@@ -9,7 +9,10 @@
 import { strict as assert } from 'node:assert'
 import { describe, it } from 'node:test'
 import {
-  nemdBucket, nmaeBucket, parseEvalJobId, stepsDescOf, type Bucket,
+  evalPhase,
+  IRIS_LIVE_JOB_STATES, IRIS_TERMINAL_JOB_STATES,
+  nemdBucket, nmaeBucket, parseEvalJobId, stepsDescOf,
+  type Bucket, type EvalPhase,
 } from './MEvalTable.helpers.ts'
 
 const point = (step: number) => ({
@@ -166,5 +169,81 @@ describe('parseEvalJobId', () => {
     assert.deepEqual(r, {
       mode: 'oneshot', runLabel: 'junk-train-foo', matSet: 'val_200', step: 100, taskIdx: null,
     })
+  })
+})
+
+describe('evalPhase', () => {
+  // Regression: prior implementation's `default → 'flight'` bucketed
+  // `KILLED` (and any other state iris would add) as in-flight forever.
+  // The bin5 run card showed `⏳ 3 m-evals` indefinitely because three
+  // worker_lost_spec'd jobs sat in `KILLED` after their workers died.
+  // Mirror of iris's `TERMINAL_JOB_STATES` (`marin/lib/iris/src/iris/
+  // cluster/types.py`): SUCCEEDED → 'done', FAILED/KILLED/WORKER_FAILED/
+  // UNSCHEDULABLE → 'failed', PENDING/BUILDING/RUNNING → 'flight'.
+  const cases: [string, EvalPhase][] = [
+    // — Live (non-terminal) iris job states. These must be 'flight'.
+    ['PENDING',       'flight'],
+    ['BUILDING',      'flight'],
+    ['RUNNING',       'flight'],
+    // Transient states that may appear in iris snapshots; bucket as flight
+    // so we don't flap to 'failed' during normal scheduling.
+    ['SUBMITTED',     'flight'],
+    ['QUEUED',        'flight'],
+    ['ASSIGNED',      'flight'],
+    ['UNKNOWN',       'flight'],
+    // — Terminal states.
+    ['SUCCEEDED',     'done'],
+    ['FAILED',        'failed'],
+    ['KILLED',        'failed'],   // ← the bin5 case
+    ['WORKER_FAILED', 'failed'],
+    ['UNSCHEDULABLE', 'failed'],
+    ['CANCELLED',     'failed'],   // historical alias from earlier iris versions
+  ]
+  for (const [state, want] of cases) {
+    it(`${state} → ${want}`, () => {
+      assert.equal(evalPhase({ state }), want)
+    })
+  }
+
+  it('unknown / mistyped states bucket as failed (not flight)', () => {
+    // The whole point of the fix: a state the FE doesn't recognise is
+    // almost certainly stale, not in flight. Surface it as a failure so
+    // the run card stops claiming a hourglass forever.
+    assert.equal(evalPhase({ state: 'NOT_A_REAL_STATE' }), 'failed')
+    assert.equal(evalPhase({ state: '' }), 'failed')
+    assert.equal(evalPhase({ state: 'killed' /* lowercase typo */ }), 'failed')
+  })
+
+  it('IRIS_LIVE_JOB_STATES + IRIS_TERMINAL_JOB_STATES cover every state the helper buckets', () => {
+    // Belt-and-braces: every name listed in the two canonical sets is
+    // handled by the bucketing logic (the inverse — that no listed name
+    // falls through to the unknown bucket — is implicit in this assertion
+    // because the unknown bucket returns 'failed' and we already match
+    // SUCCEEDED → 'done' / live → 'flight'.)
+    for (const s of IRIS_LIVE_JOB_STATES) {
+      assert.equal(evalPhase({ state: s }), 'flight', `live state ${s} should be flight`)
+    }
+    for (const s of IRIS_TERMINAL_JOB_STATES) {
+      const want: EvalPhase = s === 'SUCCEEDED' ? 'done' : 'failed'
+      assert.equal(evalPhase({ state: s }), want, `terminal state ${s} should be ${want}`)
+    }
+  })
+
+  it('bin5 reproducer: KILLED jobs do not contribute to "in-flight" count', () => {
+    // The 3 bin5 m-evals from 2026-06-16 that all worker_lost_spec'd. The
+    // chip aggregator reads `evalPhase(job)` and counts 'flight' separately
+    // from 'failed'; before the fix all three counted as flight, so the
+    // card showed `⏳ 3 m-evals` forever. After the fix the count is 0.
+    const bin5Jobs = [
+      { state: 'KILLED' },  // train_200 step-60000
+      { state: 'KILLED' },  // train_200 step-89999
+      { state: 'KILLED' },  // val_200 step-49999
+      { state: 'FAILED' },  // train_200 step-40000 (SIGSEGV)
+      { state: 'SUCCEEDED' },  // val_200 step-89999, etc.
+    ]
+    const phases = bin5Jobs.map(j => evalPhase(j))
+    const counts = { flight: 0, failed: 0, done: 0 }
+    for (const p of phases) counts[p]++
+    assert.deepEqual(counts, { flight: 0, failed: 4, done: 1 })
   })
 })

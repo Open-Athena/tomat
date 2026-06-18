@@ -118,21 +118,15 @@ export function shortenStep(step: number, opts?: { snap?: boolean }): string {
   return s === step ? pretty : `${pretty}*`
 }
 
-/** Pretty-print a 0-based `step_idx` for tables / tooltips, snapping near-round
- *  values to the round form. Snapped values are suffixed with `*` so the rendering
- *  is transparent: a reader sees `90k*` and knows the on-disk artifact is at a
- *  nearby raw value (e.g. `step-89999`). Non-snappable values render plain
- *  (e.g. `53,000`).
+/** Pretty-print a 0-based `step_idx` for tables / tooltips. Delegates to
+ *  `formatStepDetail(step).display` so the two functions are guaranteed
+ *  consistent — see that function for the asterisk semantics and the
+ *  Levanter `info.step` OBO history.
  *
  *  `step` is a 0-based Levanter `info.step` value. See `docs/step-conventions.md`.
- *
- *  Pair with `formatStepDetail` to wire a tooltip that explains the underlying
- *  raw value + Levanter's final-of-segment naming convention.
  */
-export function formatStep(step: number): string {
-  const snapped = snapStep(step)
-  const pretty = prettifyRound(snapped)
-  return snapped === step ? pretty : `${pretty}*`
+export function formatStep(step: number, opts?: { writtenAt?: string | Date }): string {
+  return formatStepDetail(step, opts).display
 }
 
 /** Format a round step with `k`/`M` suffix where exact, else comma-separate.
@@ -146,38 +140,122 @@ function prettifyRound(n: number): string {
   return n.toLocaleString()
 }
 
-/** Build the snapped display string + a tooltip that explains the snap.
+/** UTC instant when the marin `rw/integration` HEAD `e20bdd1892ea` (which
+ *  switches Levanter ckpt naming from `info.step` to `info.next_step`, so
+ *  on-disk `step-N` matches N actual completed steps) was deployed to
+ *  bin5's training venv. Ckpts written before this fall under the legacy
+ *  OBO convention — `step-N` on disk = N+1 completed steps (periodic) or
+ *  step-(N-1) for force-saves at end-of-segment.
+ */
+export const LEGACY_STEP_NAMING_CUTOFF = new Date('2026-06-17T03:30:00Z')
+
+/** Was the ckpt this `written_at` was attached to written under the
+ *  legacy info.step-naming convention? `undefined` falls back to legacy
+ *  (conservative: nearly all current data predates the cutoff). */
+function writtenAtIsLegacy(writtenAt?: string | Date): boolean {
+  if (writtenAt === undefined) return true
+  const d = typeof writtenAt === 'string' ? new Date(writtenAt) : writtenAt
+  return d < LEGACY_STEP_NAMING_CUTOFF
+}
+
+/** Build a display string + tooltip for a 0-based `step_idx` accounting for
+ *  Levanter's pre-fix info.step OBO convention.
  *
- *  `step` is a 0-based `step_idx` (Levanter `info.step` value; see
- *  `docs/step-conventions.md`). When the raw step was within the snap
- *  tolerance of a round Nk anchor, the display is prefixed with `≈` and the
- *  tooltip narrates the Levanter convention: end-of-segment ckpts save as
- *  `step-(N-1)` because Levanter's force-save hook uses
- *  `info.step = state.step − 1` (0-indexed) as the filename, while periodic
- *  ckpts (modulo against the same 0-indexed value) happen to land on clean Nk.
+ *  Background: Before marin commit `e20bdd1892ea` (deployed 2026-06-17),
+ *  Levanter wrote ckpts named with `info.step = state.step − 1`, so:
+ *    - **Periodic** ckpts (e.g. save-every-10000): on-disk `step-30000`
+ *      actually represents 30,001 completed steps.
+ *    - **Force-save** end-of-segment ckpts: on-disk `step-49999` actually
+ *      represents 50,000 completed steps (state.step was N when info.step
+ *      = N−1 hit the disk).
+ *
+ *  Post-fix: on-disk `step-N` is exact — N completed steps.
+ *
+ *  Display semantics (`*` flags "this is an interpretation, hover for why"):
+ *    - **Legacy force-save** (raw = round−1, e.g. `step-49999`): display
+ *      the round form (`50k`), NO asterisk — it's the count of completed
+ *      steps, exact after +1.
+ *    - **Legacy periodic** (raw = round, e.g. `step-30000`): display the
+ *      rounded raw + asterisk (`30k*`) — actual count is 30,001 but we
+ *      keep the round label and flag the legacy interpretation.
+ *    - **Post-fix** (raw = anything; on-disk is exact): plain `prettifyRound(raw)`.
+ *
+ *  `step` is a 0-based `step_idx` (Levanter `info.step` value). The
+ *  `writtenAt` opt is the ISO timestamp on the carrying object (eval JSON,
+ *  ckpt manifest, etc.); omit to default to "legacy" (the conservative
+ *  assumption for now — all pre-2026-06-17 data).
  *
  *  Callers that already host a parent `Tooltip` should inline `tooltip` into
  *  their existing content (the explanation isn't gated on a separate hover).
  */
-export function formatStepDetail(step: number): {
+export function formatStepDetail(
+  step: number,
+  opts?: { writtenAt?: string | Date },
+): {
   display: string
-  isSnapped: boolean
-  raw: number
-  snapped: number
+  isLegacy: boolean
+  /** True iff the display was derived (snapped or +1'd from raw) rather
+   *  than rendered as-is. Carries the *. */
+  isMarked: boolean
+  /** Raw on-disk `step-N` value (Levanter `info.step`). */
+  rawStep: number
+  /** Number of actually-completed steps (raw + OBO correction). */
+  completedSteps: number
   tooltip: string
 } {
+  const isLegacy = writtenAtIsLegacy(opts?.writtenAt)
+  if (!isLegacy) {
+    // Post-fix: disk name is exact; no asterisk, no +1.
+    return {
+      display: prettifyRound(step),
+      isLegacy: false,
+      isMarked: false,
+      rawStep: step,
+      completedSteps: step,
+      tooltip: `step ${step.toLocaleString()}`,
+    }
+  }
+  // Legacy era: classify periodic vs force-save by structure of `raw`.
+  // Force-saves leave on-disk `step-(N-1)` for a round target N; snapStep
+  // detects "is this near a round Nk?", and a diff of exactly 1 (with raw
+  // = snapped − 1) identifies the force-save case.
   const snapped = snapStep(step)
-  const isSnapped = snapped !== step
-  const display = isSnapped ? `${prettifyRound(snapped)}*` : prettifyRound(snapped)
-  const tooltip = isSnapped
-    ? `raw step ${step.toLocaleString()} on disk; snapped to ${snapped.toLocaleString()}. `
-      + `Levanter saves the final ckpt of each training segment using `
-      + `info.step (0-indexed, = state.step − 1), so step-${step} is the `
-      + `artifact name for what is logically the `
-      + `${snapped.toLocaleString()}th step completed. Periodic ckpts within `
-      + `the same run save at clean N.`
-    : `step ${step.toLocaleString()}`
-  return { display, isSnapped, raw: step, snapped, tooltip }
+  const isForceSave = snapped !== step && snapped - step === 1
+  if (isForceSave) {
+    // Legacy force-save: disk = round−1; actual completed = round (exact after +1).
+    const display = prettifyRound(snapped)
+    const tooltip
+      = `Legacy force-save: disk name step-${step} represents `
+      + `${snapped.toLocaleString()} actual completed steps (exact after +1). `
+      + `Pre-fix Levanter wrote info.step = state.step − 1, so end-of-segment `
+      + `force-saves land at step-(N−1); fixed in marin e20bdd1892ea `
+      + `(deployed 2026-06-17).`
+    return {
+      display,
+      isLegacy: true,
+      isMarked: false,
+      rawStep: step,
+      completedSteps: snapped,
+      tooltip,
+    }
+  }
+  // Legacy periodic (or non-snap-eligible legacy value): actual is raw + 1.
+  // Display the rounded raw + `*` to flag the legacy interpretation.
+  const completed = step + 1
+  const display = `${prettifyRound(step)}*`
+  const tooltip
+    = `Legacy artifact: disk name step-${step} represents `
+    + `${completed.toLocaleString()} actual completed steps due to Levanter `
+    + `info.step OBO (fixed in marin commit e20bdd1892ea, deployed 2026-06-17). `
+    + `Post-fix periodic ckpts save with exact-match disk names.`
+  return {
+    display,
+    isLegacy: true,
+    isMarked: true,
+    rawStep: step,
+    completedSteps: completed,
+    tooltip,
+  }
 }
 
 const STEP_RE = /^[≈]?(\d+(?:\.\d+)?)([kM])?\*?$/

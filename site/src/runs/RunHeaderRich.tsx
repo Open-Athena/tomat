@@ -702,7 +702,7 @@ function ParentChip({
   const stepDetail = lin.parent_step != null ? formatStepDetail(lin.parent_step) : null
   const stepTail = stepDetail != null ? ` @ ${stepDetail.display}` : ''
   const tipBase = `resumed from ${defaultShortLabel(lin.parent)}${stepTail}`
-  const snapNote = stepDetail?.isSnapped ? `${stepDetail.tooltip}\n\n` : ''
+  const snapNote = stepDetail?.isLegacy ? `${stepDetail.tooltip}\n\n` : ''
   const tipBody = onScrollToParent
     ? (parentWandbUrl
         ? `${tipBase}. Click to scroll to the parent's card (or open its wandb).`

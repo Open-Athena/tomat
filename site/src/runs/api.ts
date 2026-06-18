@@ -549,21 +549,11 @@ export async function fireEval(req: EvalFireRequest): Promise<EvalFireResponse> 
   return body
 }
 
-export type EvalPhase = 'flight' | 'done' | 'failed'
-
-/** Coarse lifecycle bucket for an m-eval job's iris state. */
-export function evalPhase(job: IrisJob): EvalPhase {
-  switch (job.state) {
-    case 'SUCCEEDED':
-      return 'done'
-    case 'FAILED':
-    case 'WORKER_FAILED':
-    case 'CANCELLED':
-      return 'failed'
-    default:  // QUEUED, RUNNING, PENDING, SUBMITTED, UNKNOWN, …
-      return 'flight'
-  }
-}
+// `evalPhase` + `EvalPhase` live in `MEvalTable.helpers.ts` so they can be
+// exercised by `node --test --experimental-strip-types` without dragging
+// `api.ts`'s `import.meta.env` reads in. Re-exported here so existing
+// imports (`from './api'`) keep working.
+export { evalPhase, type EvalPhase } from './MEvalTable.helpers'
 
 // ── Modal snapshot (tomat modal sync) ───────────────────────────────────────
 // Mirrors the python schema in `tomat::modal_sync`. App state names are

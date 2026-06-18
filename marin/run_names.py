@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
@@ -138,44 +139,118 @@ def shorten_step(step_idx: int) -> str:
     return pretty if snapped == step_idx else f"{pretty}*"
 
 
-def format_step(step_idx: int) -> str:
-    """Snap + pretty-print a 0-based `step_idx`, mirroring `formatStep` in `site/src/lib/runNames.ts`.
-
-    `step_idx` is a 0-based Levanter `info.step` value. Identical to
-    `shorten_step` for now — both produce `≈90k` for snapped values, plain
-    `30k` / `1.5M` for clean ones. Kept as a separate symbol so future
-    divergence (e.g. a tables-only variant that prefers comma-grouped digits)
-    doesn't churn the call sites.
-    """
-    return shorten_step(step_idx)
+# UTC instant when marin `rw/integration` HEAD `e20bdd1892ea` (switches
+# Levanter ckpt naming from `info.step` to `info.next_step`, so on-disk
+# `step-N` = N actual completed steps) was deployed to bin5's training venv.
+# Ckpts written before this fall under the legacy OBO convention.
+LEGACY_STEP_NAMING_CUTOFF = datetime(2026, 6, 17, 3, 30, 0, tzinfo=timezone.utc)
 
 
-def format_step_detail(step_idx: int) -> dict:
-    """Snap + emit (display, raw, snapped, is_snapped, tooltip) for a 0-based `step_idx`.
-
-    `step_idx` is a 0-based Levanter `info.step` value. Mirrors
-    `formatStepDetail` in `site/src/lib/runNames.ts`. The tooltip explains the
-    Levanter end-of-segment naming convention (info.step = state.step − 1) so
-    consumers can surface the raw value when a viewer hovers a `≈90k`-style cell.
-    """
-    snapped = snap_step(step_idx)
-    is_snapped = snapped != step_idx
-    display = shorten_step(step_idx)
-    if is_snapped:
-        tooltip = (
-            f"raw step {step_idx:,} on disk; snapped to {snapped:,}. "
-            f"Levanter saves the final ckpt of each training segment using "
-            f"info.step (0-indexed, = state.step − 1), so step-{step_idx} is the "
-            f"artifact name for what is logically the {snapped:,}th step "
-            f"completed. Periodic ckpts within the same run save at clean N."
-        )
+def _written_at_is_legacy(written_at: str | datetime | None) -> bool:
+    """`None` → assume legacy (conservative: nearly all current data is)."""
+    if written_at is None:
+        return True
+    if isinstance(written_at, str):
+        # Parse ISO-8601; accept trailing `Z`.
+        s = written_at.rstrip("Z")
+        try:
+            d = datetime.fromisoformat(s)
+        except ValueError:
+            return True
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
     else:
-        tooltip = f"step {step_idx:,}"
+        d = written_at
+    return d < LEGACY_STEP_NAMING_CUTOFF
+
+
+def _prettify_round(n: int) -> str:
+    """Mirror of `prettifyRound` in `site/src/lib/runNames.ts`."""
+    if n >= 1_000_000 and n % 1_000_000 == 0:
+        return f"{n // 1_000_000}M"
+    if n >= 1_000_000 and n % 100_000 == 0:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000 and n % 1_000 == 0:
+        return f"{n // 1_000}k"
+    if n >= 1_000 and n % 100 == 0:
+        return f"{n / 1_000:.1f}k"
+    return f"{n:,}"
+
+
+def format_step(step_idx: int, written_at: str | datetime | None = None) -> str:
+    """Pretty-print a 0-based `step_idx`. Delegates to `format_step_detail`.
+
+    Mirrors `formatStep` in `site/src/lib/runNames.ts`. See `format_step_detail`
+    for asterisk semantics + Levanter info.step OBO background.
+    """
+    return format_step_detail(step_idx, written_at=written_at)["display"]
+
+
+def format_step_detail(
+    step_idx: int,
+    written_at: str | datetime | None = None,
+) -> dict:
+    """Build display + tooltip for a 0-based `step_idx` accounting for the
+    pre-fix Levanter info.step OBO.
+
+    Mirrors `formatStepDetail` in `site/src/lib/runNames.ts`. Background:
+    Before marin commit `e20bdd1892ea` (deployed 2026-06-17), Levanter wrote
+    ckpts named with `info.step = state.step − 1`, so on-disk `step-30000`
+    represents 30,001 completed steps (periodic) and `step-49999` represents
+    50,000 completed steps (end-of-segment force-save). Post-fix: on-disk
+    `step-N` is exact.
+
+    `*` flags "this is an interpretation, hover for why":
+      - Legacy force-save (raw = round−1): display the round form, no `*`.
+      - Legacy periodic: display rounded raw + `*`.
+      - Post-fix: plain `prettify_round(raw)`, no `*`.
+
+    Returned dict keys: `display`, `is_legacy`, `is_marked`, `raw_step`,
+    `completed_steps`, `tooltip`.
+    """
+    is_legacy = _written_at_is_legacy(written_at)
+    if not is_legacy:
+        return {
+            "display": _prettify_round(step_idx),
+            "is_legacy": False,
+            "is_marked": False,
+            "raw_step": step_idx,
+            "completed_steps": step_idx,
+            "tooltip": f"step {step_idx:,}",
+        }
+    snapped = snap_step(step_idx)
+    is_force_save = snapped != step_idx and snapped - step_idx == 1
+    if is_force_save:
+        display = _prettify_round(snapped)
+        tooltip = (
+            f"Legacy force-save: disk name step-{step_idx} represents "
+            f"{snapped:,} actual completed steps (exact after +1). "
+            f"Pre-fix Levanter wrote info.step = state.step − 1, so "
+            f"end-of-segment force-saves land at step-(N−1); fixed in "
+            f"marin e20bdd1892ea (deployed 2026-06-17)."
+        )
+        return {
+            "display": display,
+            "is_legacy": True,
+            "is_marked": False,
+            "raw_step": step_idx,
+            "completed_steps": snapped,
+            "tooltip": tooltip,
+        }
+    completed = step_idx + 1
+    display = f"{_prettify_round(step_idx)}*"
+    tooltip = (
+        f"Legacy artifact: disk name step-{step_idx} represents {completed:,} "
+        f"actual completed steps due to Levanter info.step OBO (fixed in marin "
+        f"commit e20bdd1892ea, deployed 2026-06-17). Post-fix periodic ckpts "
+        f"save with exact-match disk names."
+    )
     return {
         "display": display,
-        "is_snapped": is_snapped,
-        "raw": step_idx,
-        "snapped": snapped,
+        "is_legacy": True,
+        "is_marked": True,
+        "raw_step": step_idx,
+        "completed_steps": completed,
         "tooltip": tooltip,
     }
 

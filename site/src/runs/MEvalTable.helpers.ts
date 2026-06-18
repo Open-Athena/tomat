@@ -83,3 +83,58 @@ export function pointsByStepSet(evalSeries: RunEval | null): Map<string, EvalPoi
   }
   return m
 }
+
+// ── m-eval job lifecycle bucket ─────────────────────────────────────────────
+// iris's `JobState` proto enum, mirrored here as the wire-format string
+// (server-side dump uses `JobState.Name(state)`, so it's UPPER_SNAKE_CASE).
+// Authoritative source: `marin/lib/iris/src/iris/cluster/types.py`
+// (`TERMINAL_JOB_STATES`).
+//
+// Why explicit? The previous version of `evalPhase` had a leaky
+// `default → 'flight'` branch — so any state iris added (or any one we
+// forgot) silently counted as "in flight" forever. That bit us with
+// `KILLED` (worker_lost_spec on the bin5 m-evals): the run card showed
+// `⏳ 3 m-evals` indefinitely with no live job behind it. Now: live and
+// terminal states are spelled out, anything unknown buckets as 'flight'
+// only after first being logged as a warning by the helper's caller (if
+// they care). The test in `MEvalTable.test.ts` enumerates every state in
+// these constants so they stay in sync with iris.
+
+/** Live (non-terminal) iris JobState names — wire-format strings. */
+export const IRIS_LIVE_JOB_STATES = ['PENDING', 'BUILDING', 'RUNNING'] as const
+
+/** Terminal iris JobState names — wire-format strings. Mirrors
+ *  `TERMINAL_JOB_STATES` in iris's `cluster/types.py`. */
+export const IRIS_TERMINAL_JOB_STATES = [
+  'SUCCEEDED', 'FAILED', 'KILLED', 'WORKER_FAILED', 'UNSCHEDULABLE',
+] as const
+
+/** Terminal states that should bucket as 'failed' (vs. 'done'). */
+const IRIS_FAILED_JOB_STATES = new Set<string>([
+  'FAILED', 'KILLED', 'WORKER_FAILED', 'UNSCHEDULABLE', 'CANCELLED',
+])
+
+/** Live states (incl. transient ones iris may surface in addition to the
+ *  three canonical ones above). */
+const IRIS_FLIGHT_JOB_STATES = new Set<string>([
+  ...IRIS_LIVE_JOB_STATES,
+  'SUBMITTED', 'QUEUED', 'ASSIGNED', 'UNKNOWN',
+])
+
+export type EvalPhase = 'flight' | 'done' | 'failed'
+
+/** Coarse lifecycle bucket for an m-eval job's iris state.
+ *
+ *  Unknown / unrecognized states bucket as 'failed' (NOT 'flight') — a stale
+ *  iris job from yesterday with a state the FE doesn't recognise is
+ *  ≈definitely not in flight; treating it as a failure surfaces the issue
+ *  (so the user can re-fire) without leaving a permanent hourglass on the
+ *  run card. Add new states to one of the two sets above when iris adds
+ *  them. */
+export function evalPhase(job: { state: string }): EvalPhase {
+  const s = job.state
+  if (s === 'SUCCEEDED') return 'done'
+  if (IRIS_FAILED_JOB_STATES.has(s)) return 'failed'
+  if (IRIS_FLIGHT_JOB_STATES.has(s)) return 'flight'
+  return 'failed'
+}

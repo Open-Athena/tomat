@@ -518,12 +518,15 @@ export function MEvalTable({
             <tr key={step}>
               <td style={cellStyle}>
                 {(() => {
-                  // Surface the snap state explicitly: `≈90k` for
-                  // final-of-segment ckpts (saved at `step-89999` because
-                  // Levanter's force-save uses `info.step = state.step − 1`),
-                  // plain `30k` / `50k` for periodic clean-N ckpts.
+                  // `*` flags legacy info.step-OBO interpretation: pre-fix
+                  // Levanter wrote `info.step = state.step − 1`, so periodic
+                  // ckpts named `step-30000` actually = 30,001 completed
+                  // steps, and force-save end-of-segment ckpts at `step-49999`
+                  // = 50,000 completed steps (exact after +1). `*` is the
+                  // periodic / off-by-one case; the force-save snap renders
+                  // as round Nk with no asterisk (tooltip explains).
                   const d = formatStepDetail(step)
-                  return d.isSnapped ? (
+                  return d.isLegacy ? (
                     <Tooltip content={d.tooltip}>
                       <span>{d.display}</span>
                     </Tooltip>

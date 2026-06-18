@@ -62,37 +62,78 @@ describe('snapStep', () => {
 })
 
 describe('formatStep', () => {
-  it('suffixes snapped values with *', () => {
-    assert.equal(formatStep(50000), '50k')
-    assert.equal(formatStep(49999), '50k*')
-    assert.equal(formatStep(89999), '90k*')
+  it('legacy periodic values get the asterisk (off-by-one from raw)', () => {
+    // Default (no writtenAt) = legacy.
+    assert.equal(formatStep(30000), '30k*')      // actual 30,001
+    assert.equal(formatStep(50000), '50k*')      // actual 50,001
+    assert.equal(formatStep(60000), '60k*')      // actual 60,001
+    assert.equal(formatStep(1_500_000), '1.5M*') // actual 1,500,001
   })
-  it('renders mid-target snap-eligible values per tolerance', () => {
-    assert.equal(formatStep(53000), '53k')
-    // 52999 is within 0.1% of 53000 (Δ/raw ≈ 1.9e-5), so it snaps and the
-    // display gets the * suffix.
-    assert.equal(formatStep(52999), '53k*')
-    assert.equal(formatStep(1_500_000), '1.5M')
+  it('legacy force-save values display exactly (no asterisk)', () => {
+    assert.equal(formatStep(49999), '50k')       // disk=49999, actual=50,000
+    assert.equal(formatStep(89999), '90k')       // disk=89999, actual=90,000
+  })
+  it('legacy non-snap-eligible values get *', () => {
+    // 52999 → snapStep = 53000 (within tolerance), diff = 1 → force-save.
+    assert.equal(formatStep(52999), '53k')
+    // 53000 itself is legacy periodic → actual 53,001 → display 53k*.
+    assert.equal(formatStep(53000), '53k*')
+  })
+  it('post-fix values render plain', () => {
+    const writtenAt = '2026-07-01T00:00:00Z'
+    assert.equal(formatStep(100000, { writtenAt }), '100k')
+    assert.equal(formatStep(30000, { writtenAt }), '30k')
+    // Post-fix: no snapping applied (disk = exact).
+    assert.equal(formatStep(89999, { writtenAt }), '89,999')
   })
 })
 
 describe('formatStepDetail', () => {
-  it('flags snapped values + builds an explanatory tooltip', () => {
-    const d = formatStepDetail(89999)
-    assert.equal(d.display, '90k*')
-    assert.equal(d.isSnapped, true)
-    assert.equal(d.raw, 89999)
-    assert.equal(d.snapped, 90000)
-    assert.ok(d.tooltip.includes('info.step'))
-    assert.ok(d.tooltip.includes('0-indexed'))
-    assert.ok(d.tooltip.includes('89,999'))
-    assert.ok(d.tooltip.includes('90,000'))
+  it('legacy periodic: display rounded raw + *, completed = raw + 1', () => {
+    const d = formatStepDetail(30000)
+    assert.equal(d.display, '30k*')
+    assert.equal(d.isLegacy, true)
+    assert.equal(d.isMarked, true)
+    assert.equal(d.rawStep, 30000)
+    assert.equal(d.completedSteps, 30001)
+    assert.ok(d.tooltip.includes('Legacy artifact'))
+    assert.ok(d.tooltip.includes('30,001'))
+    assert.ok(d.tooltip.includes('e20bdd1892ea'))
   })
-  it('renders clean values without * and a plain tooltip', () => {
-    const d = formatStepDetail(50000)
+  it('legacy force-save: display round form exact (no *), completed = snapped', () => {
+    const d = formatStepDetail(49999)
     assert.equal(d.display, '50k')
-    assert.equal(d.isSnapped, false)
-    assert.equal(d.tooltip, 'step 50,000')
+    assert.equal(d.isLegacy, true)
+    assert.equal(d.isMarked, false)
+    assert.equal(d.rawStep, 49999)
+    assert.equal(d.completedSteps, 50000)
+    assert.ok(d.tooltip.includes('Legacy force-save'))
+    assert.ok(d.tooltip.includes('50,000'))
+  })
+  it('legacy force-save 89999 → 90k exact', () => {
+    const d = formatStepDetail(89999)
+    assert.equal(d.display, '90k')
+    assert.equal(d.completedSteps, 90000)
+    assert.equal(d.isMarked, false)
+  })
+  it('legacy periodic 60000 → 60k* (actual 60,001)', () => {
+    const d = formatStepDetail(60000)
+    assert.equal(d.display, '60k*')
+    assert.equal(d.completedSteps, 60001)
+    assert.equal(d.isMarked, true)
+  })
+  it('post-fix: display = raw, no asterisk, plain tooltip', () => {
+    const d = formatStepDetail(100000, { writtenAt: '2026-07-01T00:00:00Z' })
+    assert.equal(d.display, '100k')
+    assert.equal(d.isLegacy, false)
+    assert.equal(d.isMarked, false)
+    assert.equal(d.completedSteps, 100000)
+    assert.equal(d.tooltip, 'step 100,000')
+  })
+  it('post-fix non-round value renders plain (no snap)', () => {
+    const d = formatStepDetail(89999, { writtenAt: '2026-07-01T00:00:00Z' })
+    assert.equal(d.display, '89,999')
+    assert.equal(d.isLegacy, false)
   })
 })
 
