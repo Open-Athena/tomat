@@ -16,7 +16,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { API_BASE } from '../runs/api'
 import { shortenRun, formatStep } from '../lib/runNames'
-import { ThemeToggle } from '../theme'
 
 /** One row of the grid index — mirrors the CFW's `GridRow` shape. */
 interface GridRow {
@@ -171,7 +170,6 @@ export function MpPage({ mpId }: { mpId: string }) {
           <a href="#/posts">posts</a>
           <a href="#/deck">deck</a>
         </nav>
-        <ThemeToggle />
       </header>
 
       <MaterialHeader mpId={mpId} attrs={attrsQ.data ?? null} loading={attrsQ.isLoading} />

@@ -1,5 +1,4 @@
 import { useEffect, useState } from 'react'
-import { ThemeToggle } from './theme'
 
 function ExtLink({ href, children }: { href: string; children: React.ReactNode }) {
   return <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>
@@ -41,7 +40,6 @@ export function HomePage() {
     <>
       <header>
         <h1>tomat 🍅 — tokenized materials</h1>
-        <ThemeToggle />
       </header>
 
       <p className="meta">

@@ -16,7 +16,6 @@ import rehypeSlug from 'rehype-slug'
 import rehypeAutolinkHeadings from 'rehype-autolink-headings'
 import 'katex/dist/katex.min.css'
 import 'highlight.js/styles/github-dark.css'
-import { ThemeToggle } from '../theme'
 import './posts.css'
 
 interface PostMeta {
@@ -44,7 +43,6 @@ function PostsHeader({ subtitle }: { subtitle?: string }) {
         <a href="#/files">files</a>
         <a href="#/deck">deck</a>
       </nav>
-      <ThemeToggle />
     </header>
   )
 }

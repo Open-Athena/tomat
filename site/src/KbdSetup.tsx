@@ -23,6 +23,7 @@ import {
   useOmnibarEndpoint,
 } from 'use-kbd'
 import 'use-kbd/styles.css'
+import { useThemeToggle } from './theme'
 import { fetchRunsSnapshot } from './runs/api'
 import { ALL_TAGS, RUN_TAGS } from './runs/tags'
 import { RUN_LINEAGE } from './runs/lineage'
@@ -215,15 +216,37 @@ export function KbdShell({ children }: { children: React.ReactNode }) {
       <ExtraOmnibarHotkeys />
       <Omnibar placeholder="Search runs, tags, …" />
       <ShortcutsModal />
-      <SpeedDial
-        position={{ bottom: 16, right: 16 }}
-        actions={[{
+      <SpeedDialWithTheme />
+    </HotkeysProvider>
+  )
+}
+
+/** SpeedDial actions list: GitHub + theme cycle (light → auto → dark → light).
+ *  Defined inline rather than directly inside `KbdSetup` so the theme hook
+ *  has its own component scope (avoids re-rendering the whole HotkeysProvider
+ *  subtree on each theme cycle). */
+function SpeedDialWithTheme() {
+  const [mode, setMode] = useThemeToggle()
+  const cycleTheme = () =>
+    setMode(m => (m === 'dark' ? 'light' : m === 'light' ? 'auto' : 'dark'))
+  const themeIcon = mode === 'dark' ? '🌙' : mode === 'light' ? '☀️' : '🖥️'
+  return (
+    <SpeedDial
+      position={{ bottom: 16, right: 16 }}
+      actions={[
+        {
+          key: 'theme',
+          label: `theme: ${mode}`,
+          icon: <span style={{ fontSize: '1.1em' }}>{themeIcon}</span>,
+          onClick: cycleTheme,
+        },
+        {
           key: 'github',
           label: 'GitHub',
           icon: <GitHubIcon />,
           href: GITHUB_URL,
-        }]}
-      />
-    </HotkeysProvider>
+        },
+      ]}
+    />
   )
 }

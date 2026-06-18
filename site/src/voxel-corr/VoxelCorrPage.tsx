@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Plot, useTheme } from 'pltly/react'
 import { intParam, useUrlState } from 'use-prms'
-import { themedHoverlabel, ThemeToggle } from '../theme'
+import { themedHoverlabel } from '../theme'
 import { API_BASE } from '../runs/api'
 
 /** Empirical MP charge-density grid resolution (~0.065 Å/voxel ≈ uniform
@@ -644,7 +644,6 @@ export function VoxelCorrPage({ parts }: Props) {
     <>
       <header>
         <h1>tomat 🍅 voxel-position corr</h1>
-        <ThemeToggle />
       </header>
       <p className="meta">
         Pearson correlation between voxel-positions across patches: each

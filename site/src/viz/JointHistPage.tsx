@@ -10,7 +10,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { enumParam, intParam, stringParam, useUrlState } from 'use-prms'
 import { boolTrueParam } from '../lib/urlParams'
-import { ThemeToggle } from '../theme'
 import { parseSpec, shortenSpec, zarrUrlFor } from './specs'
 import { loadZarrLevel0 } from './zarrLoader'
 import { JointHistPlot, type JointHistRange } from './JointHistPlot'
@@ -171,7 +170,6 @@ export function JointHistPage() {
     <>
       <header>
         <h1>tomat 🍅 joint-histogram</h1>
-        <ThemeToggle />
       </header>
       <p className="meta">
         Voxel-wise joint distribution of two charge-density grids on the
