@@ -158,7 +158,17 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   // they don't appear in the legend) — so without this fix the teal NEMD bands
   // stay full opacity when MV NMAE is hovered.
   const plotWrapperRef = useRef<HTMLDivElement | null>(null)
-  const [activeTraceName, setActiveTraceName] = useState<string | null>(null)
+  // Two independent inputs feed the "which trace is highlighted" state:
+  //   - `hoveredTraceName`: pltly's `onActiveTraceChange` (legend MOUSEOVER)
+  //   - `pinnedTraceName`:  our `plotly_legendclick` handler (legend CLICK)
+  // Pin wins over hover so the user can click-pin TL, mouseover something
+  // else briefly, mouseleave, and find TL still pinned. Click the SAME pinned
+  // LI to unpin. The downstream fade machinery (`applyBandFade` /
+  // `applyShapeFade`) reads `activeTraceName` only, so it doesn't care which
+  // input is driving — visual treatment is identical.
+  const [hoveredTraceName, setHoveredTraceName] = useState<string | null>(null)
+  const [pinnedTraceName, setPinnedTraceName] = useState<string | null>(null)
+  const activeTraceName = pinnedTraceName ?? hoveredTraceName
   type PlotlyDiv = HTMLElement & {
     data?: Array<Record<string, unknown>>
     _Plotly?: { restyle: (el: HTMLElement, attrs: Record<string, unknown>, indices?: number[]) => Promise<void> }
@@ -284,11 +294,36 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     // colors (Plotly normalizes through r/g/b → string equality is the only
     // contract we can trust here, but matches in practice).
     const liveShapes = plotDiv._fullLayout?.shapes ?? []
-    const tinted = shapes.map((s) => ({
+    const tintedRaw = shapes.map((s) => ({
       type: s.type, xref: s.xref, yref: s.yref,
       x0: s.x0, x1: s.x1, y0: s.y0, y1: s.y1,
       line: { ...s.line, color: tint(s._baseColor) },
     }))
+    // Cluster-dedup faded shapes: when N event vlines pile up near the same
+    // x (e.g. 36 trainer_starts in a retry-storm), α=0.08 alpha-blends back
+    // to ~95% effective opacity, defeating the fade. Per (faded color, x-
+    // bucket), keep only one. The active-color shapes (not faded) keep their
+    // full density — only the de-emphasized ones collapse. Bucket is 1/300th
+    // of the visible x-range so the dedup tracks the rendered pixel
+    // resolution rather than absolute step / wallclock units.
+    type Range = [number, number]
+    const xRange = (plotDiv._fullLayout?.xaxis?.range as Range | undefined) ?? null
+    const bucketWidth = xRange ? Math.max(1, (xRange[1] - xRange[0]) / 300) : null
+    const tinted: typeof tintedRaw = []
+    const seenBucketKey = new Set<string>()
+    for (const s of tintedRaw) {
+      const isFaded = typeof s.line.color === 'string' && s.line.color.startsWith('rgba(')
+      if (!isFaded || bucketWidth == null) {
+        tinted.push(s)
+        continue
+      }
+      const x = typeof s.x0 === 'number' ? s.x0 : Number(s.x0)
+      const bucket = Number.isFinite(x) ? Math.floor(x / bucketWidth) : null
+      const key = `${bucket}|${s.line.color}`
+      if (seenBucketKey.has(key)) continue
+      seenBucketKey.add(key)
+      tinted.push(s)
+    }
     let changed = liveShapes.length !== tinted.length
     if (!changed) {
       for (let i = 0; i < tinted.length; i++) {
@@ -1413,9 +1448,23 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     const fn = (ev: unknown) => {
       const e = ev as { curveNumber?: number; data?: Array<{ name?: string }> }
       const idx = e.curveNumber
-      if (typeof idx === 'number' && e.data?.[idx]?.name === annotationsLegendName) {
+      if (typeof idx !== 'number') return undefined
+      const name = e.data?.[idx]?.name
+      if (!name) return undefined
+      // Annotations LI gets its dedicated toggle — fall through to pltly's
+      // default after flipping our flag so the dashed vlines actually
+      // appear/disappear via the layout `shapes:` update.
+      if (name === annotationsLegendName) {
         setAnnotationsEnabled((v) => !v)
+        return undefined
       }
+      // Every other LI (TL/VL/MT/MV/event traces) → toggle pin. Same-name
+      // re-click unpins; different name switches pin. Return false to
+      // suppress pltly's default click handler (which toggles trace
+      // visibility + shows the "Double-click to isolate" toast — we're
+      // commandeering legend-click semantics for pin-style highlighting).
+      setPinnedTraceName((prev) => (prev === name ? null : name))
+      return false
     }
     plotDiv.on('plotly_legendclick', fn)
     legendListenerRef.current = { el: plotDiv, fn }
@@ -1712,7 +1761,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       </div>
       <div ref={plotWrapperRef} style={{ position: 'relative' }}>
       <Plot
-        onActiveTraceChange={setActiveTraceName}
+        onActiveTraceChange={setHoveredTraceName}
         onRelayout={onRelayout as (ev: unknown) => void}
         onAfterPlot={recomputeIconPositions}
         data={plotDataMemo}
