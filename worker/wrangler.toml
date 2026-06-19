@@ -11,3 +11,22 @@ bucket_name = "openathena"
 CORS_ORIGIN = "*"
 R2_RUNS_PREFIX = "tomat/runs"
 FILES_PREFIX = "tomat/,electrai/"
+
+# ── staging deployment ─────────────────────────────────────────────────
+# Same code + same R2 bucket, separate worker name so prod traffic isn't
+# affected during iteration. Deploy via `pnpm --dir worker run deploy:staging`;
+# live URL is `tomat-runs-api-staging.openathena.workers.dev`. The FE
+# points at staging when launched with `VITE_RUNS_API_BASE=<staging-url>
+# pnpm --dir site dev` (or via the `?api=<url>` query-string override on
+# any page).
+[env.staging]
+name = "tomat-runs-api-staging"
+
+[[env.staging.r2_buckets]]
+binding = "R2"
+bucket_name = "openathena"
+
+[env.staging.vars]
+CORS_ORIGIN = "*"
+R2_RUNS_PREFIX = "tomat/runs"
+FILES_PREFIX = "tomat/,electrai/"
