@@ -50,6 +50,7 @@ TIMERS=(
     tomat-runs-sync-active.timer
     tomat-runs-sync-stale.timer
     tomat-modal-sync.timer
+    tomat-iris-sync.timer
     tomat-evals-sync.timer
     tomat-self-update.timer
 )
@@ -57,6 +58,7 @@ SERVICES=(
     tomat-runs-sync-active.service
     tomat-runs-sync-stale.service
     tomat-modal-sync.service
+    tomat-iris-sync.service
     tomat-evals-sync.service
     tomat-self-update.service
 )

@@ -1,0 +1,11 @@
+[Unit]
+Description=tomat: sync iris-state.json — every 1 min
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=1min
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

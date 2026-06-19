@@ -23,6 +23,7 @@ gce/
     ├── runs-sync-active.sh   # iterates active runs (curl + jq on snapshot)
     ├── runs-sync-stale.sh    # full-sweep `tomat runs sync`
     ├── modal-sync.sh         # `tomat modal sync --all-pending`
+    ├── iris-sync.sh          # exec `$HOME/iris-sync.py` (legacy standalone)
     ├── evals-sync.sh         # `tomat evals sync`
     ├── self-update.sh        # `git fetch + reset --hard @{u} && install.sh`
     └── heartbeat.sh          # writes cron-heartbeat.json to R2
@@ -35,6 +36,7 @@ gce/
 | `tomat-runs-sync-active.timer` | 2 min | sync runs whose wandb `run.state == "running"` OR whose iris job is `RUNNING`/`PENDING`/`BUILDING` |
 | `tomat-runs-sync-stale.timer` | 30 min | full-sweep `tomat runs sync` (empty substr = all runs); catches GC + late evals on finished runs |
 | `tomat-modal-sync.timer` | 1 min | refresh `modal-state.json` for the Modal-state badge |
+| `tomat-iris-sync.timer` | 1 min | refresh `iris-state.json` (job + pool state) — drives the iris badges + `/runs-snapshot.json` job index |
 | `tomat-evals-sync.timer` | 10 min | pull m-eval JSONs newly landed in GCS |
 | `tomat-self-update.timer` | 5 min | `git fetch && git reset --hard @{u}` + re-exec `install.sh` (zero-ssh deploy loop) |
 

@@ -1,0 +1,20 @@
+[Unit]
+Description=tomat: sync iris-state.json from iris controller to R2 (every 1 min)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ryan_williams_openathena_ai
+WorkingDirectory=/home/ryan_williams_openathena_ai/tomat
+Environment=PATH=/home/ryan_williams_openathena_ai/iris-sync-venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/ryan_williams_openathena_ai
+Environment=GOOGLE_APPLICATION_CREDENTIALS=/home/ryan_williams_openathena_ai/.config/gcloud/application_default_credentials.json
+Environment=AWS_SHARED_CREDENTIALS_FILE=/home/ryan_williams_openathena_ai/.aws/credentials
+Environment=AWS_PROFILE=cfo
+ExecStart=/home/ryan_williams_openathena_ai/tomat/gce/sync/iris-sync.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
