@@ -50,7 +50,13 @@ function corsHeaders(env: Env): HeadersInit {
 	return {
 		'Access-Control-Allow-Origin': env.CORS_ORIGIN,
 		'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-		'Access-Control-Allow-Headers': 'Content-Type',
+		'Access-Control-Allow-Headers': 'Content-Type, Range',
+		// hyparquet reads `Content-Range` to know which byte slice it just
+		// received. CFW sends the header on 206 responses, but cross-origin
+		// JS can't see it unless we explicitly expose. `Content-Length` is
+		// already a CORS-safelisted response header; listing it is belt-and-
+		// suspenders against future safelist trims.
+		'Access-Control-Expose-Headers': 'Content-Range, Content-Length',
 		'Access-Control-Max-Age': '86400',
 	};
 }
