@@ -348,22 +348,34 @@ function buildFigure(args: BuildArgs): BuiltFigure {
       // both sides (the bug we're fixing).
       ...(showMarginals ? { scaleanchor: 'x' as const, scaleratio: 1 } : {}),
     },
+    // Count-axis treatment for both marginals — small, faded ticks +
+    // gridlines so the reader can put a magnitude on the peak heights
+    // ("is that 1k or 10k?") without the axis dominating the layout.
+    // Shared `margCountMax` range (see above) means the two count axes
+    // tick at the same values — visually-equal bars represent equal
+    // counts.
     xaxis2: {
       domain: margXDomain,
       type: 'linear',
-      showticklabels: false,
-      showgrid: false,
+      showticklabels: true,
+      showgrid: true,
+      gridcolor: grid,
       zeroline: false,
-      // Shared count scale across both marginals — see `margCountMax` above.
+      nticks: 3,
+      tickfont: { size: 9, color: fg },
+      tickformat: '~s',  // SI suffix: 1.2k / 3.4k / 12k
       range: [0, margCountMax],
     },
     yaxis2: {
       domain: margYDomain,
       type: 'linear',
-      showticklabels: false,
-      showgrid: false,
+      showticklabels: true,
+      showgrid: true,
+      gridcolor: grid,
       zeroline: false,
-      // Shared count scale across both marginals — see `margCountMax` above.
+      nticks: 3,
+      tickfont: { size: 9, color: fg },
+      tickformat: '~s',
       range: [0, margCountMax],
     },
     shapes: [
