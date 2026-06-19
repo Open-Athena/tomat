@@ -298,36 +298,24 @@ def parse_tpu_hardware_from_manifest(manifest: dict | None) -> tuple[str, int] |
 
 
 def detect_allocation_class(attempts: dict | None) -> str:
-    """Sniff the allocation class out of an attempts-sidecar's worker names.
+    """Always returns `preemptible` — see "MSRP assume preemptible" decision.
 
-    Iris worker hostnames embed `<variant>-<class>-<chips>` (see
-    `iris-pool-naming` memory). Worker IDs themselves are sometimes empty
-    (early attempts), but the `error` field of a failed attempt typically
-    includes the full worker hostname (`Worker marin-tpu-v6e-preemptible-16-...
-    failed: ...`). Walk both.
+    Background: the function used to sniff the allocation class out of an
+    iris worker hostname embedded in attempt error fields
+    (`marin-tpu-v6e-preemptible-16-…`). This let us per-attempt distinguish
+    preemptible vs reserved/serving slices and bill at the right rate.
 
-    Defaults to `preemptible` when no signal is present — Marin's spot pool
-    is the overwhelmingly common case and over-attributing to preemptible
-    biases the MSRP estimate DOWN, which is the safer direction for a
-    public-facing chip.
+    Per ryan 2026-06-19: skip that machinery for now and just assume
+    preemptible across the board. Marin's spot pool is the overwhelmingly
+    common case; the under-bill on the occasional reserved slice is in
+    the safe direction for a public-facing chip. Revisit when iris
+    surfaces allocation class as a first-class field (#207 attempts
+    sidecar work).
+
+    `attempts` is kept in the signature for callers; the body ignores it.
+    `_WORKER_HOSTNAME_RE` stays defined because callers still use it for
+    `parse_tpu_hardware_from_attempts` (variant + num_chips recovery).
     """
-    if attempts is None:
-        return "preemptible"
-    candidates: list[str] = []
-    for t in attempts.get("tasks", []):
-        if t.get("error"):
-            candidates.append(t["error"])
-        for a in t.get("attempts", []):
-            if a.get("worker_id"):
-                candidates.append(a["worker_id"])
-            if a.get("error"):
-                candidates.append(a["error"])
-            if a.get("error_first_line"):
-                candidates.append(a["error_first_line"])
-    for s in candidates:
-        m = _WORKER_HOSTNAME_RE.search(s)
-        if m:
-            return m.group("klass")
     return "preemptible"
 
 

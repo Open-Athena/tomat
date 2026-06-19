@@ -13,6 +13,7 @@ from tomat.cost import (
     build_cost_record,
     compute_modal_segment_from_manifest,
     compute_tpu_segment_from_manifest,
+    detect_allocation_class,
     parse_modal_gpu,
     parse_tpu_hardware_from_manifest,
 )
@@ -277,3 +278,33 @@ def test_build_cost_record_modal_segment_sorted():
     assert rec["pricing_table_version"] == "2026-06-02"
     assert rec["schema_version"] == 1
     assert rec["notes"] == []
+
+
+# ── TPU: allocation class — always preemptible (ryan 2026-06-19) ────────────
+
+
+def test_detect_allocation_class_always_preemptible_no_attempts():
+    assert detect_allocation_class(None) == "preemptible"
+
+
+def test_detect_allocation_class_always_preemptible_with_attempts():
+    # Even when the attempts sidecar carries a `reserved`/`serving` worker
+    # hostname, we override to preemptible per ryan's "assume preemptible"
+    # decision. The under-bill is the safe direction for a public chip.
+    attempts = {
+        "tasks": [
+            {
+                "task_id": "t0",
+                "error": "Worker marin-tpu-v6e-reserved-16-us-east1-d-… failed",
+                "attempts": [
+                    {
+                        "attempt_id": 1,
+                        "worker_id": "marin-tpu-v5p-serving-32-us-east5-a-…",
+                        "started_at_ms": 1000,
+                        "finished_at_ms": 2000,
+                    },
+                ],
+            },
+        ],
+    }
+    assert detect_allocation_class(attempts) == "preemptible"
