@@ -30,3 +30,10 @@ export const FIXTURES = {
 } as const
 
 export type FixtureRunId = (typeof FIXTURES)[keyof typeof FIXTURES]
+
+/** A material with both a GT zarr and ≥1 pred zarr in R2 — drives the
+ *  ELVis diff-URL assertions on `/#/mp/<id>`. Both rows render an
+ *  "Open in ELVis ↗" link; the GT row's link is `?m=…&v1=…` (single
+ *  volume, no diff) while the pred row's link is `?m=…&s=d&v0=<gt>&v1=…`
+ *  (side-by-side diff anchored at the GT). */
+export const FIXTURE_MP_ID = 'mp-1797712'
