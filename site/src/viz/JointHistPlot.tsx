@@ -144,6 +144,23 @@ function buildFigure(args: BuildArgs): BuiltFigure {
       yMarg[yi] += v
     }
   }
+  // Marginals share the same total mass (n voxels) by construction. We
+  // pin both count-axes to the same range so visually-equal-area bars
+  // represent equal counts. Without this, Plotly auto-fits each marginal
+  // independently, and a tall-narrow PDF (e.g. low-density GT mode at
+  // ρ≈30) normalizes against its own peak while the partner's broader
+  // PDF (e.g. bin5's mode-collapsed prediction) auto-fits to ITS lower
+  // per-bin peak — making it look like the broader marginal carries
+  // MORE total mass, which is impossible by construction. Yael spotted
+  // this on mp-1797712 (GT mode 37 e/Å³ vs bin5 mode 28 e/Å³ rendered
+  // misleadingly).
+  let margCountMax = 0
+  for (let i = 0; i < bins; i++) {
+    if (xMarg[i] > margCountMax) margCountMax = xMarg[i]
+    if (yMarg[i] > margCountMax) margCountMax = yMarg[i]
+  }
+  // Padding so the tallest bar doesn't kiss the subplot edge.
+  margCountMax = margCountMax * 1.05
 
   const xMin = xEdges[0]
   const xMax = xEdges[bins]
@@ -337,6 +354,8 @@ function buildFigure(args: BuildArgs): BuiltFigure {
       showticklabels: false,
       showgrid: false,
       zeroline: false,
+      // Shared count scale across both marginals — see `margCountMax` above.
+      range: [0, margCountMax],
     },
     yaxis2: {
       domain: margYDomain,
@@ -344,6 +363,8 @@ function buildFigure(args: BuildArgs): BuiltFigure {
       showticklabels: false,
       showgrid: false,
       zeroline: false,
+      // Shared count scale across both marginals — see `margCountMax` above.
+      range: [0, margCountMax],
     },
     shapes: [
       // y = x diagonal across the heatmap's data extent. In log mode Plotly
