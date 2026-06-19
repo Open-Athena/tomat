@@ -36,7 +36,7 @@ gce/
 | `tomat-runs-sync-active.timer` | 2 min | sync runs whose wandb `run.state == "running"` OR whose iris job is `RUNNING`/`PENDING`/`BUILDING` |
 | `tomat-runs-sync-stale.timer` | 30 min | full-sweep `tomat runs sync` (empty substr = all runs); catches GC + late evals on finished runs |
 | `tomat-modal-sync.timer` | 1 min | refresh `modal-state.json` for the Modal-state badge |
-| `tomat-iris-sync.timer` | 1 min | refresh `iris-state.json` (job + pool state) — drives the iris badges + `/runs-snapshot.json` job index |
+| `tomat-iris-sync.timer` | 5 min idle | refresh `iris-state.json` (job + pool state) — drives the iris badges + `/runs-snapshot.json` job index. `OnUnitInactiveSec` (not `Active`) — each run takes ~3 min on the shared iris controller, so a 1-min `Active` cadence would pin the controller back-to-back. Effective cadence ≈ 8 min |
 | `tomat-evals-sync.timer` | 10 min | pull m-eval JSONs newly landed in GCS |
 | `tomat-self-update.timer` | 5 min | `git fetch && git reset --hard @{u}` + re-exec `install.sh` (zero-ssh deploy loop) |
 

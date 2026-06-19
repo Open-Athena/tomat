@@ -1,9 +1,18 @@
 [Unit]
-Description=tomat: sync iris-state.json — every 1 min
+Description=tomat: sync iris-state.json — 5 min after each completion
 
 [Timer]
 OnBootSec=20s
-OnUnitActiveSec=1min
+# `OnUnitInactiveSec` (vs `OnUnitActiveSec`) — wait 5 min AFTER the
+# previous run FINISHES rather than counting from start. Each
+# `iris-sync.py` invocation takes ~3 min on the shared iris controller
+# (3 prefixes × ~45s `iris job list --prefix --json` RPCs; the script's
+# own comment notes "typical, can spike to 200s"), so an `Active`-based
+# 1-min cadence just kept it firing back-to-back at 100% utilisation.
+# The 5-min idle gap respects the script author's original "every 5 min"
+# design and the `iris-controller load` memory ("no polling/watch
+# loops"). Effective cadence ≈ 8 min including run time.
+OnUnitInactiveSec=5min
 AccuracySec=5s
 Persistent=true
 
