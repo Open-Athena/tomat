@@ -202,6 +202,26 @@ function ExtraOmnibarHotkeys() {
     defaultBindings: ['g h'],
     handler: () => { window.location.hash = '#/' },
   })
+  // Swap host between prod (`tomat.oa.dev`) and local dev (`localhost:4273`),
+  // preserving path + query + hash. Useful when CIC'ing the prod site and
+  // wanting to A/B against the in-tree dev server (or vice versa) on the
+  // exact same view — the hash already carries the page state via
+  // use-prms, so the same path lands you on the same panel.
+  useAction('nav:toggle-host', {
+    label: 'Toggle prod ↔ localhost:4273',
+    group: 'Navigation',
+    defaultBindings: ['g d'],
+    handler: () => {
+      const { origin, pathname, search, hash } = window.location
+      const PROD = 'https://tomat.oa.dev'
+      const DEV = 'http://localhost:4273'
+      // Swap based on which host we're currently on. Anything outside
+      // {PROD, DEV} (preview deploy, tailnet origin, etc.) defaults to
+      // PROD — the most common "get me back to the live site" intent.
+      const next = origin === PROD ? DEV : PROD
+      window.location.href = `${next}${pathname}${search}${hash}`
+    },
+  })
   return null
 }
 
