@@ -196,6 +196,17 @@ export function JointHistPage() {
       <div className="voxel-corr-controls">
         <label>
           mp: <code>{mp || '—'}</code>
+          {(() => {
+            // Show the dataset split (val/train) once per page as a
+            // property OF THE MAT, derived from which GT zarr exists
+            // for this mp. Was previously qualifying every `GT` /
+            // `bin5 · val · K=12` label — Yael flagged the
+            // redundancy.
+            const gtSet = gridsQ.data?.find((g) => g.role === 'gt')?.set
+            const split = gtSet?.startsWith('val') ? 'val' : gtSet?.startsWith('train') ? 'train' : null
+            if (!split) return null
+            return <span className="meta" style={{ marginLeft: 4 }}>({split})</span>
+          })()}
         </label>
         <AxisPicker axis="x" spec={xSpec ?? ''} setSpec={setXSpec} grids={gridsQ.data ?? []} />
         <AxisPicker axis="y" spec={ySpec ?? ''} setSpec={setYSpec} grids={gridsQ.data ?? []} />

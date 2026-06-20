@@ -41,13 +41,17 @@ export function parseSpec(s: string): SourceSpec | null {
   return null
 }
 
-/** Human-readable short label for axis titles, hover, etc. */
+/** Human-readable short label for axis titles, hover, etc.
+ *
+ *  `GT` is rendered WITHOUT the val/train qualifier — which split a mat
+ *  is in is a property of the MAT, not the GT, and gets shown once near
+ *  the `mp:` field on /viz/joint-hist. Qualifying every `GT` mention
+ *  with `(val)` was noise (Yael flagged 4 hits in a single render). */
 export function shortenSpec(spec: string): string {
-  if (spec === 'gt:val') return 'GT (val)'
-  if (spec === 'gt:train') return 'GT (train)'
+  if (spec === 'gt:val' || spec === 'gt:train') return 'GT'
   const parsed = parseSpec(spec)
   if (!parsed) return spec
-  if (parsed.kind === 'gt') return parsed.set === 'val' ? 'GT (val)' : 'GT (train)'
+  if (parsed.kind === 'gt') return 'GT'
   // pred: strip the noisy training-fire prefix/suffix to surface the "arm".
   const armRaw = parsed.run
     .replace(/^train-mg-([a-z0-9-]+?)-fs-tpu$/, '$1')
