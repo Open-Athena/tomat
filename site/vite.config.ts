@@ -80,8 +80,5 @@ export default defineConfig({
     host: true,
     allowedHosts,
   },
-  plugins: [react(), postsPlugin()],
-  optimizeDeps: {
-    exclude: ['pltly'],
-  },
+  plugins: [react(), postsPlugin()]
 })
