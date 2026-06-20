@@ -285,7 +285,14 @@ function sourceKeyStepToSpec(sourceKey: string, step: number | null): string {
 }
 
 /** Build the set of available source keys + labels + steps from the grids
- *  index. Order: GT first, then pred sources sorted by (run, setmode). */
+ *  index. Order: GT first, then pred sources sorted by (run, setmode).
+ *
+ *  The set token (`val` / `train`) is dropped from labels when only ONE
+ *  set is available for this mat — by construction every mat is in
+ *  either val_200 OR train_200 (never both), so showing it would be
+ *  redundant noise on every option. The dropping logic falls back to
+ *  including the set token if (somehow) both sets appear, so future-
+ *  proofing isn't lost. */
 function sourcesFromGrids(grids: GridRow[]): SourceKey[] {
   const out: SourceKey[] = []
   // GT: collect distinct sets seen across gt rows.
@@ -295,12 +302,31 @@ function sourcesFromGrids(grids: GridRow[]): SourceKey[] {
   // shorthand `val`/`train`. The /api/mp/<id>/grids rows use the full
   // GCS subdir name; the joint-hist URL spec uses the abbreviated form.
   const gtNorm = (s: string) => (s.startsWith('val') ? 'val' : s.startsWith('train') ? 'train' : null)
+  // Collect distinct (run, set-without-mode) pairs across BOTH gt and
+  // pred. If exactly one set token appears across all options, drop it
+  // from the labels for ambient clarity. Otherwise keep it to
+  // disambiguate.
+  const setTokens = new Set<string>()
+  for (const s of gtSets) {
+    const n = gtNorm(s)
+    if (n) setTokens.add(n)
+  }
+  for (const g of grids) {
+    if (g.role !== 'pred' || !g.set) continue
+    if (g.set.startsWith('val')) setTokens.add('val')
+    else if (g.set.startsWith('train')) setTokens.add('train')
+  }
+  const dropSet = setTokens.size <= 1
   const seenGt = new Set<string>()
   for (const s of gtSets) {
     const n = gtNorm(s)
     if (!n || seenGt.has(n)) continue
     seenGt.add(n)
-    out.push({ key: `gt:${n}`, label: `GT (${n})`, steps: [] })
+    out.push({
+      key: `gt:${n}`,
+      label: dropSet ? 'GT' : `GT (${n})`,
+      steps: [],
+    })
   }
   // Pred: group by (run_id, set) and synthesize the setMode the URL
   // spec expects. The grids API returns `set` values like `val_200` and
@@ -319,10 +345,11 @@ function sourcesFromGrids(grids: GridRow[]): SourceKey[] {
   const friendlyLabel = (run: string, setMode: string): string => {
     const runShort = shortenRun(run)
     // setMode is e.g. `val_200`, `val_200-maskgit`, `train_200`,
-    // `train_200-maskgit`. Reduce to `val K=12` / `val K=1` etc.
+    // `train_200-maskgit`. Mode is the K=1/K=12 distinction; set is
+    // val/train (omitted when there's only one).
     const set = setMode.startsWith('val') ? 'val' : 'train'
     const mode = setMode.endsWith('-maskgit') ? 'K=12' : 'K=1'
-    return `${runShort} · ${set} · ${mode}`
+    return dropSet ? `${runShort} · ${mode}` : `${runShort} · ${set} · ${mode}`
   }
   const sorted = [...buckets.values()].sort((a, b) =>
     a.run.localeCompare(b.run) || a.setMode.localeCompare(b.setMode))
