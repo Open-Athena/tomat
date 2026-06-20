@@ -236,7 +236,13 @@ function buildFigure(args: BuildArgs): BuiltFigure {
       ? z.map(row => row.map(v => (Number.isFinite(v) ? v / total : NaN)))
       : z,
     colorbar: {
-      title: { text: scale === 'log' ? 'log₁₀(count+1)' : 'count', font: { color: fg } },
+      // `z` carries `log10(count+1)` under `scale: 'log'` (see transform
+      // below) but the user thinks in raw counts. Tick labels are pinned
+      // to round powers of 10 in count-space; the underlying tick
+      // POSITIONS are the same numbers transformed (1 → log10(2), 10 →
+      // log10(11), 100 → log10(101), …). Computed lazily after we know
+      // `maxCount`; see the `scale === 'log'` block below.
+      title: { text: 'count', font: { color: fg } },
       len: showMarginals ? 0.7 : 0.9,
       x: showMarginals ? 1.12 : 1.02,
       y: showMarginals ? 0.39 : 0.5,
@@ -283,6 +289,29 @@ function buildFigure(args: BuildArgs): BuiltFigure {
     ;(heat as { customdata: number[][] }).customdata = rawCustom
     ;(heat as { hovertemplate: string }).hovertemplate =
       `${xLabel}=%{x:.3g}<br>${yLabel}=%{y:.3g}<br>count=%{customdata:,.0f}<extra></extra>`
+    // Colorbar ticks: pin to powers of 10 in count-space (1, 10, 100,
+    // 1k, …). z-values are `log10(count+1)`, so tickvals are
+    // `log10(N+1)` for each chosen `N`; ticktext is the human-readable
+    // count. Always include 0 (the empty-bin floor) and a 1-count tick
+    // (smallest meaningful signal). Above 1 we step by decades to the
+    // largest decade ≤ maxCount.
+    const tickCounts: number[] = [0, 1]
+    for (let p = 1; ; p++) {
+      const v = 10 ** p
+      if (v > maxCount) break
+      tickCounts.push(v)
+    }
+    const fmtCount = (n: number): string => {
+      if (n === 0) return '0'
+      if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(0)}M`
+      if (n >= 1_000) return `${(n / 1_000).toFixed(0)}k`
+      return String(n)
+    }
+    ;(heat as { colorbar: Record<string, unknown> }).colorbar = {
+      ...((heat as { colorbar: Record<string, unknown> }).colorbar ?? {}),
+      tickvals: tickCounts.map(n => Math.log10(n + 1)),
+      ticktext: tickCounts.map(fmtCount),
+    }
   }
 
   // 1-D marginal histograms as bar traces, sharing the main trace's x/y
