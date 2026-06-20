@@ -174,7 +174,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     _Plotly?: { restyle: (el: HTMLElement, attrs: Record<string, unknown>, indices?: number[]) => Promise<void> }
   }
   // Fade bands by trace `name` whenever the active trace changes. Each band
-  // edge trace shares its parent line's `name` (e.g. `'TL (train/loss)'`), so
+  // edge trace shares its parent line's `name` (e.g. `'TL (train loss)'`), so
   // matching by name brushes the band with its parent. We previously matched
   // by `legendgroup`, but TL and VL now share `legendgroup: 'losses'` so
   // their legend items sit flush (no flicker-inducing duplicate group-title
@@ -1002,7 +1002,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         // Label per-segment as `<name> #k/N` (1-based, matches the
         // restart-segment header count). The hovertemplate uses `segName`
         // too so the x-unified tooltip shows distinct lines per segment
-        // instead of three identical "TL (train/loss)" rows.
+        // instead of three identical "TL (train loss)" rows.
         segName = numCurrentSegs > 1 && !isLatest
           ? `${name} #${relIdx + 1}/${numCurrentSegs}` : name
         hoverLabel = segName
@@ -1624,8 +1624,8 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       legendgrouptitle: { text: 'progress' },
       hovertemplate: 'step %{y}<extra></extra>',
     }] : []),
-    ...smoothedSeriesTraces(TL, 'TL (train/loss)', COLORS.TL, 1.2, 'losses'),
-    ...smoothedSeriesTraces(VL, 'VL (eval/loss)', COLORS.VL, 1.4, 'losses'),
+    ...smoothedSeriesTraces(TL, 'TL (train loss)', COLORS.TL, 1.2, 'losses'),
+    ...smoothedSeriesTraces(VL, 'VL (eval loss)', COLORS.VL, 1.4, 'losses'),
     ...(showEvalPanel ? evalTraces : []),
     ...(startTs.length > 0 ? [legendOnly(`trainer_started (${startTs.length})`, COLORS.start, 'dash')] : []),
     ...(sigtermTs.length > 0 ? [legendOnly(`sigterm (${sigtermTs.length})`, COLORS.sigterm, 'dot')] : []),
