@@ -8,8 +8,11 @@
 // precompute → R2) lands later.
 
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { enumParam, intParam, stringParam, useUrlState } from 'use-prms'
 import { boolTrueParam } from '../lib/urlParams'
+import { fetchGrids, type GridRow } from '../mp/api'
+import { shortenRun } from '../lib/runNames'
 import { parseSpec, shortenSpec, zarrUrlFor } from './specs'
 import { loadZarrLevel0 } from './zarrLoader'
 import { JointHistPlot, type JointHistRange } from './JointHistPlot'
@@ -47,8 +50,8 @@ interface LoadState {
 
 export function JointHistPage() {
   const [mp] = useUrlState('mp', stringParam(''))
-  const [xSpec] = useUrlState('x', stringParam(''))
-  const [ySpec] = useUrlState('y', stringParam(''))
+  const [xSpec, setXSpec] = useUrlState('x', stringParam(''))
+  const [ySpec, setYSpec] = useUrlState('y', stringParam(''))
   const [bins] = useUrlState('bins', intParam(256))
   const [scale, setScale] = useUrlState('scale', enumParam<Scale>('log', SCALES))
   // `?M` — present (any value) → marginals HIDDEN; absent → marginals shown
@@ -96,6 +99,15 @@ export function JointHistPage() {
 
   const xParsed = useMemo(() => xSpec ? parseSpec(xSpec) : null, [xSpec])
   const yParsed = useMemo(() => ySpec ? parseSpec(ySpec) : null, [ySpec])
+
+  // Per-mat grid index — powers the per-axis source/step dropdowns. Same
+  // endpoint the /mp/<id> page consumes; cache hits across the two views.
+  const gridsQ = useQuery({
+    queryKey: ['mp-grids', mp],
+    queryFn: () => fetchGrids(mp ?? ''),
+    enabled: !!mp,
+    staleTime: 30 * 60 * 1000,
+  })
 
   const [state, setState] = useState<LoadState>({ status: 'idle' })
 
@@ -185,8 +197,8 @@ export function JointHistPage() {
         <label>
           mp: <code>{mp || '—'}</code>
         </label>
-        <SourceLabel axis="x" spec={xSpec} short={xLabel} />
-        <SourceLabel axis="y" spec={ySpec} short={yLabel} />
+        <AxisPicker axis="x" spec={xSpec ?? ''} setSpec={setXSpec} grids={gridsQ.data ?? []} />
+        <AxisPicker axis="y" spec={ySpec ?? ''} setSpec={setYSpec} grids={gridsQ.data ?? []} />
         <label>
           scale:{' '}
           <select value={scale} onChange={e => setScale(e.target.value as Scale)}>
@@ -233,24 +245,164 @@ export function JointHistPage() {
   )
 }
 
-/** Render one axis's source label as `<axis>: <short>`, linking pred specs
- *  to their run page and surfacing the full canonical spec as a `title`
- *  tooltip. GT specs (no run page) render plain. Empty/unparseable specs
- *  render as `—`. */
-function SourceLabel({ axis, spec, short }: { axis: 'x' | 'y'; spec: string; short: string }) {
-  if (!spec) {
-    return <label>{axis}: <code>—</code></label>
+/** Per-axis source picker — flat "source" dropdown (GT (val), GT (train),
+ *  pred run × setmode flattened) + a step dropdown that activates when
+ *  source is a pred. URL spec format unchanged (`gt:val` /
+ *  `pred:<run>:<setmode>:<step>`), so deep-links keep working.
+ *
+ *  Source key encoding:
+ *    - `gt:val`, `gt:train` for ground truth
+ *    - `pred:<run>:<setmode>` for a per-(run, setmode) source — step is a
+ *      second picker
+ *  Available steps per source come from the grids index. */
+interface SourceKey {
+  /** Stable string key used in the source <select>. */
+  key: string
+  /** Display label, e.g. `GT (val)`, `bin5 · val · K=12`. */
+  label: string
+  /** Steps available for this source (empty for GT). Sorted ascending. */
+  steps: number[]
+}
+
+/** Parse the current spec into `(sourceKey, step | null)`. Returns null
+ *  for empty/malformed specs. */
+function specToSourceKeyStep(spec: string): { sourceKey: string; step: number | null } | null {
+  if (!spec) return null
+  const gt = /^gt:(val|train)$/.exec(spec)
+  if (gt) return { sourceKey: `gt:${gt[1]}`, step: null }
+  const pred = /^pred:([^:]+):([^:]+):(\d+)$/.exec(spec)
+  if (pred) return { sourceKey: `pred:${pred[1]}:${pred[2]}`, step: parseInt(pred[3], 10) }
+  return null
+}
+
+/** Compose (sourceKey, step) back into a canonical spec string. */
+function sourceKeyStepToSpec(sourceKey: string, step: number | null): string {
+  if (sourceKey.startsWith('gt:')) return sourceKey
+  if (sourceKey.startsWith('pred:') && step != null) {
+    return `${sourceKey}:${step}`
   }
-  const m = /^pred:([^:]+):[^:]+:\d+$/.exec(spec)
-  const runId = m?.[1]
-  if (runId) {
-    return (
-      <label>
-        {axis}: <a href={`#/runs/${runId}`} title={spec}>{short}</a>
-      </label>
-    )
+  return ''
+}
+
+/** Build the set of available source keys + labels + steps from the grids
+ *  index. Order: GT first, then pred sources sorted by (run, setmode). */
+function sourcesFromGrids(grids: GridRow[]): SourceKey[] {
+  const out: SourceKey[] = []
+  // GT: collect distinct sets seen across gt rows.
+  const gtSets = new Set<string>()
+  for (const g of grids) if (g.role === 'gt' && g.set) gtSets.add(g.set)
+  // Normalize MP-side `validation`/`train` set names to the URL-spec
+  // shorthand `val`/`train`. The /api/mp/<id>/grids rows use the full
+  // GCS subdir name; the joint-hist URL spec uses the abbreviated form.
+  const gtNorm = (s: string) => (s.startsWith('val') ? 'val' : s.startsWith('train') ? 'train' : null)
+  const seenGt = new Set<string>()
+  for (const s of gtSets) {
+    const n = gtNorm(s)
+    if (!n || seenGt.has(n)) continue
+    seenGt.add(n)
+    out.push({ key: `gt:${n}`, label: `GT (${n})`, steps: [] })
   }
-  return <label title={spec}>{axis}: {short}</label>
+  // Pred: group by (run_id, set) and synthesize the setMode the URL
+  // spec expects. The grids API returns `set` values like `val_200` and
+  // `val_200-maskgit` — these are themselves the setMode token used in
+  // `pred:<run>:<setMode>:<step>`. So we use `g.set` directly as the
+  // setMode in the spec, and label the picker with a friendlier form.
+  type Bucket = { run: string; setMode: string; steps: Set<number> }
+  const buckets = new Map<string, Bucket>()
+  for (const g of grids) {
+    if (g.role !== 'pred' || !g.run_id || !g.set || g.step == null) continue
+    const key = `${g.run_id}|${g.set}`
+    const b = buckets.get(key) ?? { run: g.run_id, setMode: g.set, steps: new Set<number>() }
+    b.steps.add(g.step)
+    buckets.set(key, b)
+  }
+  const friendlyLabel = (run: string, setMode: string): string => {
+    const runShort = shortenRun(run)
+    // setMode is e.g. `val_200`, `val_200-maskgit`, `train_200`,
+    // `train_200-maskgit`. Reduce to `val K=12` / `val K=1` etc.
+    const set = setMode.startsWith('val') ? 'val' : 'train'
+    const mode = setMode.endsWith('-maskgit') ? 'K=12' : 'K=1'
+    return `${runShort} · ${set} · ${mode}`
+  }
+  const sorted = [...buckets.values()].sort((a, b) =>
+    a.run.localeCompare(b.run) || a.setMode.localeCompare(b.setMode))
+  for (const b of sorted) {
+    out.push({
+      key: `pred:${b.run}:${b.setMode}`,
+      label: friendlyLabel(b.run, b.setMode),
+      steps: [...b.steps].sort((a, b) => a - b),
+    })
+  }
+  return out
+}
+
+/** Format a step int as a compact label (e.g. 89999 → `90k`, 30000 → `30k`).
+ *  Mirrors the run-cards convention; we don't carry the asterisk semantics
+ *  here since the joint-hist viewer just needs a picker label. */
+function shortStepLabel(step: number): string {
+  if (step >= 1_000_000 && step % 100_000 === 0) {
+    const v = step / 1_000_000
+    return v === Math.floor(v) ? `${v}M` : `${v.toFixed(1)}M`
+  }
+  if (step >= 1000) {
+    // Snap to nearest round k for the legacy `-1` force-saves (`89999 →
+    // 90k`). Anything else → `Math.round(step/1000)k`.
+    const round = Math.round(step / 1000)
+    const expected = round * 1000
+    if (Math.abs(expected - step) <= 1) return `${round}k`
+    return step.toLocaleString()
+  }
+  return String(step)
+}
+
+function AxisPicker({
+  axis, spec, setSpec, grids,
+}: {
+  axis: 'x' | 'y'
+  spec: string
+  setSpec: (s: string) => void
+  grids: GridRow[]
+}) {
+  const sources = useMemo(() => sourcesFromGrids(grids), [grids])
+  const current = useMemo(() => specToSourceKeyStep(spec), [spec])
+  const activeSource = sources.find((s) => s.key === current?.sourceKey)
+
+  const onSourceChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const nextKey = e.target.value
+    const next = sources.find((s) => s.key === nextKey)
+    if (!next) return
+    // GT sources have no step. For pred, pick the LATEST step by default
+    // when switching sources (the most-recent ckpt is usually what you
+    // want; the user can pull the step dropdown back to override).
+    const nextStep = next.steps.length > 0 ? next.steps[next.steps.length - 1] : null
+    setSpec(sourceKeyStepToSpec(nextKey, nextStep))
+  }
+  const onStepChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const nextStep = parseInt(e.target.value, 10)
+    if (!current || Number.isNaN(nextStep)) return
+    setSpec(sourceKeyStepToSpec(current.sourceKey, nextStep))
+  }
+  return (
+    <label>
+      {axis}:{' '}
+      <select value={current?.sourceKey ?? ''} onChange={onSourceChange}>
+        {!current && <option value="">—</option>}
+        {sources.map((s) => (
+          <option key={s.key} value={s.key}>{s.label}</option>
+        ))}
+      </select>
+      {activeSource && activeSource.steps.length > 0 && current?.step != null && (
+        <>
+          {' '}@{' '}
+          <select value={current.step} onChange={onStepChange}>
+            {activeSource.steps.map((s) => (
+              <option key={s} value={s}>{shortStepLabel(s)}</option>
+            ))}
+          </select>
+        </>
+      )}
+    </label>
+  )
 }
 
 /** Pick a (vmin, vmax) for log-binning. Uses the union of finite-positive

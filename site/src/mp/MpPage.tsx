@@ -17,18 +17,7 @@ import { useQuery } from '@tanstack/react-query'
 import { API_BASE } from '../runs/api'
 import { shortenRun, formatStep } from '../lib/runNames'
 
-/** One row of the grid index — mirrors the CFW's `GridRow` shape. */
-interface GridRow {
-  mp_id: string
-  role: 'gt' | 'pred'
-  run_id: string | null
-  set: string | null
-  step: number | null
-  r2_key: string
-  size_bytes: number
-  written_at: string
-  nmae: number | null
-}
+import { fetchGrids, type GridRow } from './api'
 
 /** Subset of the zarr `elvis` attrs block we render in the header. The full
  *  schema also carries `stats`, `quantiles`, `shape`, etc.; we only pull the
@@ -68,12 +57,6 @@ function elvisUrlFor(mp_id: string, r2_key: string, gt_key?: string | null): str
     return `${ELVIS_BASE}/?m=${encodeURIComponent(mp_id)}&s=d&v0=${v0}&v1=${v1}`
   }
   return `${ELVIS_BASE}/?m=${encodeURIComponent(mp_id)}&v1=${v1}`
-}
-
-async function fetchGrids(mp_id: string): Promise<GridRow[]> {
-  const r = await fetch(`${API_BASE}/api/mp/${encodeURIComponent(mp_id)}/grids`)
-  if (!r.ok) throw new Error(`fetchGrids(${mp_id}) ${r.status}`)
-  return r.json()
 }
 
 /** Fetch `<r2_key>/zarr.json` and pluck the `elvis` attrs block. The header
