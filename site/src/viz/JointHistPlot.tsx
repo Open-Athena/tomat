@@ -75,8 +75,30 @@ export function JointHistPlot({
     onRangeChange(next)
   }
 
+  // Title + subtitle rendered as selectable HTML, OUTSIDE plotly. Plotly's
+  // SVG-rendered titles can't be copy/pasted, and as a bonus we get more
+  // typographic control AND we free plotly's top margin (it was 130px to
+  // make room for 4 lines of `<sub>` text, which crowded the top
+  // marginal — see Yael's CIC).
+  const { total, xStats, yStats, onDiagFrac } = hist
+  const fmt = (s: { mean: number; p50: number; p99: number; max: number }) =>
+    `μ=${s.mean.toFixed(1)}, p50=${s.p50.toFixed(1)}, p99=${s.p99.toFixed(1)}, max=${s.max.toFixed(1)}`
   return (
     <div className="plot-card">
+      <div style={{
+        textAlign: 'center', marginBottom: '0.4rem', userSelect: 'text',
+      }}>
+        <div style={{ fontSize: '1.05rem', fontWeight: 600 }}>{title}</div>
+        <div style={{ fontSize: '0.8rem', opacity: 0.85, marginTop: 2 }}>
+          {xLabel}: {fmt(xStats)}
+        </div>
+        <div style={{ fontSize: '0.8rem', opacity: 0.85 }}>
+          {yLabel}: {fmt(yStats)}
+        </div>
+        <div style={{ fontSize: '0.8rem', opacity: 0.85 }}>
+          on-diag(|y/x−1|≤10%): {(onDiagFrac * 100).toFixed(2)}% · n={total.toLocaleString()} voxels
+        </div>
+      </div>
       <Plot
         data={traces}
         layout={layout}
@@ -109,8 +131,10 @@ interface BuiltFigure {
 }
 
 function buildFigure(args: BuildArgs): BuiltFigure {
-  const { hist, title, xLabel, yLabel, scale, showMarginals, xRange, yRange, isDark } = args
-  const { H, xEdges, yEdges, xStats, yStats, onDiagFrac, total } = hist
+  // `title` + the stats summary (`xStats`/`yStats`/`onDiagFrac`) are
+  // rendered as selectable HTML in the wrapper component, NOT here.
+  const { hist, xLabel, yLabel, scale, showMarginals, xRange, yRange, isDark } = args
+  const { H, xEdges, yEdges, total } = hist
   const bins = xEdges.length - 1
 
   // Plotly's `heatmap` trace wants 2-D `z` and 1-D `x`/`y` arrays. We
@@ -308,17 +332,15 @@ function buildFigure(args: BuildArgs): BuiltFigure {
   const xAxRange = toAxRange(xRange, xMin, xMax)
   const yAxRange = toAxRange(yRange, yMin, yMax)
 
+  // `title` + the per-axis stats line + on-diag stat are rendered as
+  // SELECTABLE HTML above the Plot (see JSX in the wrapper component).
+  // Leaving Plotly's `title:` empty means margin.t only needs to clear
+  // the top marginal's count-axis tick labels (~30px), not 4 stacked
+  // lines of `<sub>` SVG (was 130px and crowded the GT marginal —
+  // Yael's CIC).
   const layout: Partial<Layout> = {
     autosize: true,
-    title: {
-      text:
-        `${title}<br>` +
-        `<sub>${xLabel}: μ=${xStats.mean.toFixed(1)}, p50=${xStats.p50.toFixed(1)}, p99=${xStats.p99.toFixed(1)}, max=${xStats.max.toFixed(1)}</sub><br>` +
-        `<sub>${yLabel}: μ=${yStats.mean.toFixed(1)}, p50=${yStats.p50.toFixed(1)}, p99=${yStats.p99.toFixed(1)}, max=${yStats.max.toFixed(1)}</sub><br>` +
-        `<sub>on-diag(|y/x−1|≤10%): ${(onDiagFrac * 100).toFixed(2)}% · n=${total.toLocaleString()} voxels</sub>`,
-      font: { color: fg },
-    },
-    margin: { t: 130, r: 80, b: 60, l: 80 },
+    margin: { t: 30, r: 80, b: 60, l: 80 },
     showlegend: false,
     paper_bgcolor: 'rgba(0,0,0,0)',
     plot_bgcolor: isDark ? '#1d2125' : '#ffffff',
