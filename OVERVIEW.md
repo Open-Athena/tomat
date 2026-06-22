@@ -1,5 +1,17 @@
 # tomat — state of experiments (2026-05-11)
 
+> ⚠️ **STALE SNAPSHOT (2026-05-11).** This document was written before the
+> MaskGIT path (`train-mg-kl-bin5-fs-tpu` + σ-ablations), the honest-K=1
+> eval methodology change, and the dashboard rebuild. The 1.73 % / 1.76 %
+> NMAE/NEMD numbers below were AR teacher-forced + bidirectional-eval and
+> are GIGO — not directly comparable to anything in the current era.
+> Current best is bin5@100k val K=1 NMAE mean 7.46 % / median 5.35 %
+> (200M, KL-Gauss σ=5) under the honest diagnostic path.
+>
+> For **live state**, see [`tomat.oa.dev/runs`](https://tomat.oa.dev).
+> The dashboard now carries per-step m-NMAE / m-NEMD, K=1/K=12 columns,
+> ELVis per-mat diffs, run lineage, and cost (MSRP) chips.
+
 Snapshot. Living doc — `./tomat runs links` regenerates the runs table.
 Previous snapshot: [`docs/2026-04-30-overview-snapshot.md`](docs/2026-04-30-overview-snapshot.md).
 

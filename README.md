@@ -64,9 +64,9 @@ density codec, P=19, M=64 patches/mat, lattice-aware preamble, pad_to=8192,
 seed 42. ~77 k train mats × 64 = ~2.5 M sequences; ~4.3 k val mats × 64 =
 ~277 k sequences. Stored at `gs://marin-eu-west4/tomat/tokenized/{train,val}-full-v3/`.
 
-Just-tokenized (2026-05-10): `train-full-v3-m128` / `val-full-v3-m128`
-(same recipe, M=128) — enables 2-epoch training without repeating tokens.
-Awaiting GCS sync from the Modal volumes.
+Also tokenized: `train-full-v3-m128` / `val-full-v3-m128` (same recipe,
+M=128) — enables 2-epoch training without repeating tokens. Synced to
+GCS as of 2026-05-12.
 
 Raw Zarrs live on Princeton della (`/scratch/gpfs/…/rho_gga/`, ~412 GB
 total); staged onto two Modal volumes (`tomat-rho-gga` val, 22 GB;
@@ -133,8 +133,34 @@ Headlines:
 > [`docs/2026-04-30-overview-snapshot.md`](./docs/2026-04-30-overview-snapshot.md)):**
 > these train/eval *losses* and *BPB* are token-space cross-entropy,
 > not directly comparable to electrAI / ChargE3Net's voxel-space NMAE.
-> Mat-NMAE + mat-NEMD eval is now in place and reported in OVERVIEW;
-> current best is 1.73% / 1.76% (200M cont7k-ext).
+
+For **live experiment state** — current ckpts, m-NMAE, m-NEMD per run —
+see [`tomat.oa.dev/runs`](https://tomat.oa.dev). The text-dump
+[`OVERVIEW.md`](./OVERVIEW.md) is a 2026-05-11 snapshot and is no longer
+the source of truth.
+
+## Recent (post-2026-05-12) work, in brief
+
+- **MaskGIT path** for density tokens — `train-mg-kl-bin5-fs-tpu` (200M,
+  σ=5 KL-Gauss, absorbing prior, 100k steps on v6e-16); cos-r mask
+  schedule and σ ∈ {3,10,20} ablations now in flight (`scripts/fires/`).
+- **Honest K=1 eval methodology**. The earlier
+  `eval_mat_nmae.py` ran a re-forward pass over the fully-filled grid
+  after K MaskGIT iterations, which was OOD for any MG-trained model
+  (causal training, bidir eval). Removed in 162f16f; the
+  `nmae_filled_*` aggregates on `recon[filled_bins]` are the new
+  honest in-distribution numbers (e.g. bin5@100k val K=1 NMAE = 5.35%
+  median, 7.46% mean over 200 mats). Prior K=1 / K=12 results pre-fix
+  are GIGO; `--output-suffix K1` (or other) keeps ablations from
+  clobbering each other within the same `<set>-<mode>/` GCS dir.
+- **Fire scripts** persist under `scripts/fires/` (one per training
+  invocation); the `tmp/` versions are gitignored.
+- **Dashboard infra** — `/runs` rebuilt with per-step m-eval table,
+  K=1/K=12 columns, ELVis per-mat diff links, joint-histogram and
+  voxel-position-correlation plots. Drill-down page spec at
+  [`specs/60-m-eval-drilldown.md`](./specs/60-m-eval-drilldown.md).
+- **Marin pin** at `e20bdd1` (includes the step-naming OBO fix
+  `dc0edbb`); new ckpts write at literal step-N.
 
 ## Running
 
