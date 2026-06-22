@@ -43,9 +43,23 @@ for SIGMA in 3 10 20; do
 
   # 1. Mirror bin5's step-100000 into the new label's nested ckpt dir
   # (server-side, same bucket → fast). Skip if already mirrored.
+  # NOTE: use gcsfs not `gsutil -m cp -r` — gsutil deadlocked for 50+ min
+  # on bin5's ocdbt `d/` subdir (~50 hash-named tree files) producing zero
+  # output. gcsfs walks `fs.find()` + per-file `fs.cp()` and finishes in
+  # under 5 s for the same set.
   if ! gsutil -q stat "${DST_CKPT_DIR}/${SRC_STEP}/metadata.json" >/dev/null 2>&1; then
     echo "  [mirror] ${SRC_CKPT_DIR}/${SRC_STEP}/ → ${DST_CKPT_DIR}/${SRC_STEP}/"
-    gsutil -m cp -r "${SRC_CKPT_DIR}/${SRC_STEP}" "${DST_CKPT_DIR}/" 2>&1 | tail -3
+    SRC_NO_PROTO="${SRC_CKPT_DIR#gs://}/${SRC_STEP}" \
+    DST_NO_PROTO="${DST_CKPT_DIR#gs://}/${SRC_STEP}" \
+    python3 -c "
+import fsspec, os
+fs = fsspec.filesystem('gcs')
+src, dst = os.environ['SRC_NO_PROTO'], os.environ['DST_NO_PROTO']
+files = fs.find(src)
+for f in files:
+    fs.cp(f, f'{dst}/{f[len(src)+1:]}')
+print(f'  mirrored {len(files)} files')
+"
   else
     echo "  [mirror] already present, skipping"
   fi
