@@ -54,8 +54,8 @@ per voxel (Lloyd-Max quantized — see
 [`scripts/show_tokens.py`](./scripts/show_tokens.py) renders any parquet
 row in this form.
 
-For the current state of experiments, ckpts, and NMAE numbers, see
-[`OVERVIEW.md`](./OVERVIEW.md).
+For current experiment state — ckpts, m-NMAE, m-NEMD per run — see
+[`tomat.oa.dev`](https://tomat.oa.dev) (live dashboard).
 
 ## Tokenized datasets
 
@@ -79,9 +79,9 @@ v3 refresh).
 
 ## Scale training runs
 
-Current runs (200M / 1B v3): see [`OVERVIEW.md`](./OVERVIEW.md) for the
-live table + best NMAE/NEMD numbers. `./tomat runs links` regenerates a
-slack-paste-ready markdown table.
+Current runs (200M / 1B v3): see [`tomat.oa.dev`](https://tomat.oa.dev)
+for the live table + best NMAE/NEMD numbers. `./tomat runs links`
+regenerates a slack-paste-ready markdown table.
 
 The original v2-era 30M/208M/1B scaling-study (P=14, two-token codec)
 is archived below for reference.
@@ -135,9 +135,7 @@ Headlines:
 > not directly comparable to electrAI / ChargE3Net's voxel-space NMAE.
 
 For **live experiment state** — current ckpts, m-NMAE, m-NEMD per run —
-see [`tomat.oa.dev/runs`](https://tomat.oa.dev). The text-dump
-[`OVERVIEW.md`](./OVERVIEW.md) is a 2026-05-11 snapshot and is no longer
-the source of truth.
+see [`tomat.oa.dev`](https://tomat.oa.dev).
 
 ## Recent (post-2026-05-12) work, in brief
 
