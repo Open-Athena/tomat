@@ -523,48 +523,11 @@ export function evalJobsByRun(iris: IrisState | undefined): Map<string, EvalJob[
   return byRun
 }
 
-// ── eval-fire request (FE → CFW → R2 → autosync.sh) ─────────────────────────
-// FE POSTs a small request blob to the runs API; the worker appends it to
-// `tomat/eval-fire-requests/<ts>-<rand>.json` on R2; the GCE-VM cron
-// (`scripts/autosync.sh`) lists the prefix and calls `tomat evals fire` for
-// each pending entry. This avoids a public live `tomat evals fire` endpoint
-// (TPU spend) while still giving the dashboard a one-click "fire this cell"
-// affordance.
-
-export interface EvalFireRequest {
-  run_id: string
-  /** 0-based `step_idx` (Levanter `info.step`). Matches the GCS ckpt
-   *  `step-{step_idx}` directory. See `docs/step-conventions.md`. */
-  step: number
-  mat_set: string         // 'val_200' | 'train_200'
-  mode: EvalMode          // 'oneshot' | 'maskgit' | 'free'
-  /** Optional override of the eval-fire `--eval-label`; the autosync runner
-   *  picks a sensible default per-run if missing. */
-  eval_label?: string
-  /** Free-form reason for audit (logged with the fire request). */
-  reason?: string
-}
-
-export interface EvalFireResponse {
-  ok: boolean
-  request_id?: string
-  error?: string
-}
-
-/** Submit an eval-fire request. Returns the response from the CFW endpoint
- *  (which only writes the request to R2 — actual firing happens out-of-band
- *  via the GCE-VM autosync cron). */
-export async function fireEval(req: EvalFireRequest): Promise<EvalFireResponse> {
-  const r = await fetch(`${API_BASE}/api/eval/fire`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(req),
-  })
-  let body: EvalFireResponse
-  try { body = await r.json() } catch { body = { ok: false, error: `non-JSON response (${r.status})` } }
-  if (!r.ok && body.ok !== false) body.ok = false
-  return body
-}
+// (Eval-fire request types + `fireEval` helper removed — the
+// `POST /api/eval/fire` worker route was unauthenticated and could be
+// abused to queue real TPU spend from anyone hitting tomat.oa.dev. Restore
+// when re-introducing the dashboard fire / retry affordances under a real
+// auth gate.)
 
 // `evalPhase` + `EvalPhase` live in `MEvalTable.helpers.ts` so they can be
 // exercised by `node --test --experimental-strip-types` without dragging

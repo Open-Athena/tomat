@@ -18,8 +18,6 @@
  *   GET  /api/modal-state.json           — Modal app + function-call snapshot (synced by tomat modal sync)
  *   GET  /api/pending-fires.json         — Modal-spawned training fires not yet wandb-manifested (synced by tomat modal pending-fire add)
  *   GET  /api/cron-heartbeat.json        — GCE-VM cron last-fired timestamp (written by gce/sync/runs-sync-active.sh)
- *   POST /api/eval/fire                  — append a pending eval-fire request to R2 (processed out-of-band by autosync.sh)
- *   GET  /api/eval/fire-requests         — list pending eval-fire-request keys (for autosync.sh + the dashboard)
  *   GET  /api/files/list?prefix=&cursor= — generic R2 list (under FILES_PREFIX allow-list)
  *   GET  /api/files/get?path=…           — generic R2 get with Range support
  *   GET  /health
@@ -61,127 +59,6 @@ function corsHeaders(env: Env): HeadersInit {
 	};
 }
 
-// Prefix on R2 where eval-fire requests land. `scripts/autosync.sh` lists
-// this prefix every cron pass, dispatches `tomat evals fire` for each
-// request, then deletes the consumed request.
-const EVAL_FIRE_REQUESTS_PREFIX = 'tomat/eval-fire-requests';
-
-/** Eval-fire request payload accepted by `POST /api/eval/fire`. Keep the
- *  schema narrow: only fields autosync.sh actually consumes. */
-interface EvalFireRequest {
-	run_id: string;
-	step: number;
-	mat_set: 'val_200' | 'train_200';
-	mode: 'oneshot' | 'maskgit' | 'free';
-	eval_label?: string;
-	reason?: string;
-}
-
-/** Validate + normalize a raw POST body. Returns the canonical
- *  EvalFireRequest on success, or an error string. Defensive: the endpoint
- *  is unauthenticated, so we reject anything unexpected. */
-function validateFireRequest(body: unknown): EvalFireRequest | string {
-	if (!body || typeof body !== 'object') return 'body must be a JSON object';
-	const b = body as Record<string, unknown>;
-	const run_id = b.run_id;
-	if (typeof run_id !== 'string' || !run_id) return '`run_id` required (string)';
-	// Defensive: run_id is going into an R2 key + an iris job name. Restrict
-	// to the chars our run names actually use.
-	if (!/^[A-Za-z0-9_-]+$/.test(run_id)) return '`run_id` must match [A-Za-z0-9_-]+';
-	if (run_id.length > 200) return '`run_id` too long';
-	const step = b.step;
-	if (typeof step !== 'number' || !Number.isFinite(step) || step < 0 || step > 10_000_000) {
-		return '`step` must be a non-negative finite number';
-	}
-	if (!Number.isInteger(step)) return '`step` must be an integer';
-	const mat_set = b.mat_set;
-	if (mat_set !== 'val_200' && mat_set !== 'train_200') {
-		return '`mat_set` must be one of val_200, train_200';
-	}
-	const mode = b.mode;
-	if (mode !== 'oneshot' && mode !== 'maskgit' && mode !== 'free') {
-		return '`mode` must be one of oneshot, maskgit, free';
-	}
-	const out: EvalFireRequest = { run_id, step, mat_set, mode };
-	if (typeof b.eval_label === 'string') {
-		if (!/^[A-Za-z0-9._-]+$/.test(b.eval_label) || b.eval_label.length > 100) {
-			return '`eval_label` must match [A-Za-z0-9._-]+ and be <= 100 chars';
-		}
-		out.eval_label = b.eval_label;
-	}
-	if (typeof b.reason === 'string') {
-		// Reason is free-form audit text; clip to keep keys/blobs small.
-		out.reason = b.reason.slice(0, 200);
-	}
-	return out;
-}
-
-async function handleEvalFire(req: Request, env: Env): Promise<Response> {
-	let raw: unknown;
-	try {
-		raw = await req.json();
-	} catch {
-		return jsonResponse({ ok: false, error: 'invalid JSON body' }, env, { status: 400 });
-	}
-	const validated = validateFireRequest(raw);
-	if (typeof validated === 'string') {
-		return jsonResponse({ ok: false, error: validated }, env, { status: 400 });
-	}
-	// Per-request key: `<run_id>/<step>-<mat_set>-<mode>-<iso>.json`. The
-	// `<run_id>/` prefix groups requests per run so `autosync.sh` can list
-	// them in batches; the trailing ISO timestamp keeps re-fires from the
-	// same cell distinguishable (and is sortable).
-	const now = new Date();
-	const iso = now.toISOString().replace(/[:.]/g, '-');
-	const key = `${EVAL_FIRE_REQUESTS_PREFIX}/${validated.run_id}/`
-		+ `${validated.step}-${validated.mat_set}-${validated.mode}-${iso}.json`;
-	// Best-effort dedupe: if a request for this exact (run, step, set, mode)
-	// is already pending in R2 — i.e. an earlier file with the same prefix
-	// is still there — drop the new one. This stops a double-click on the
-	// fire button from queueing two iris jobs for the same cell.
-	const dedupePrefix = `${EVAL_FIRE_REQUESTS_PREFIX}/${validated.run_id}/`
-		+ `${validated.step}-${validated.mat_set}-${validated.mode}-`;
-	const existing = await env.R2.list({ prefix: dedupePrefix, limit: 1 });
-	if (existing.objects.length > 0) {
-		return jsonResponse({
-			ok: true,
-			request_id: existing.objects[0].key,
-			deduped: true,
-		}, env);
-	}
-	const body = {
-		schema_version: 1,
-		fired_at: now.toISOString(),
-		...validated,
-	};
-	await env.R2.put(key, JSON.stringify(body, null, 2), {
-		httpMetadata: { contentType: 'application/json' },
-	});
-	return jsonResponse({ ok: true, request_id: key }, env);
-}
-
-async function handleEvalFireList(env: Env): Promise<Response> {
-	// List all pending eval-fire requests across all runs. Used by
-	// `autosync.sh`'s consumer to know what to process this pass.
-	const out: { key: string; fired_at: string; uploaded: string }[] = [];
-	let cursor: string | undefined;
-	for (let i = 0; i < 5; i++) {
-		const listing = await env.R2.list({
-			prefix: `${EVAL_FIRE_REQUESTS_PREFIX}/`,
-			...(cursor ? { cursor } : {}),
-		});
-		for (const o of listing.objects) {
-			out.push({
-				key: o.key,
-				fired_at: o.uploaded.toISOString(),
-				uploaded: o.uploaded.toISOString(),
-			});
-		}
-		if (!listing.truncated) break;
-		cursor = listing.cursor;
-	}
-	return jsonResponse({ requests: out, count: out.length }, env);
-}
 
 function jsonResponse(data: unknown, env: Env, init?: ResponseInit): Response {
 	return new Response(JSON.stringify(data), {
@@ -839,18 +716,12 @@ export default {
 		const url = new URL(req.url);
 		const path = url.pathname;
 
-		// Single mutating endpoint: POST /api/eval/fire. Everything else
-		// is read-only, so we 405 non-GET/HEAD requests against any other
-		// path.
-		if (req.method === 'POST') {
-			if (path === '/api/eval/fire') {
-				return handleEvalFire(req, env);
-			}
-			return new Response('Method not allowed', {
-				status: 405,
-				headers: corsHeaders(env),
-			});
-		}
+		// Read-only worker: 405 any non-GET/HEAD. The POST /api/eval/fire
+		// endpoint + GET /api/eval/fire-requests listing were removed
+		// because they were unauthenticated and could be used by anyone
+		// hitting tomat.oa.dev to queue real TPU spend via autosync.sh.
+		// Re-add behind Cloudflare Access (or equivalent) before bringing
+		// the dashboard fire / retry buttons back.
 		if (req.method !== 'GET' && req.method !== 'HEAD') {
 			return new Response('Method not allowed', {
 				status: 405,
@@ -860,10 +731,6 @@ export default {
 
 		if (path === '/health' || path === '/api/health') {
 			return jsonResponse({ ok: true }, env);
-		}
-
-		if (path === '/api/eval/fire-requests') {
-			return handleEvalFireList(env);
 		}
 
 		if (path === '/api/runs-snapshot.json') {

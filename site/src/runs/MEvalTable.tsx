@@ -6,8 +6,12 @@
 // `train_200-maskgit`. Each set cell is `<NMAE> / <NEMD> / n=<N>` with
 // subtle colour-coding by quality threshold; in-flight cells show a spinner
 // + iris state + elapsed time; failed cells show a failure chip with the
-// iris error in a tooltip; missing cells show a `[ fire ]` button so the
-// user can request a new fire without leaving the page.
+// iris error in a tooltip; missing cells render as `–`.
+//
+// Fire / retry buttons were removed pending an auth story on the public
+// site (the underlying `POST /api/eval/fire` worker route is
+// unauthenticated). Re-add by restoring `fireOne` + the FireButton render
+// behind a per-user gate.
 //
 // Rows sorted by step descending (latest first). Hidden entirely when neither
 // `eval.json` nor any in-flight eval job exists.
@@ -24,11 +28,11 @@
 // already carries `per_mat[].mp_id`, so the elvis link-out is just a
 // (run_id, step, mp_id) tuple → an elvis URL.
 
-import { useState, type CSSProperties, type ReactElement } from 'react'
+import { type CSSProperties, type ReactElement } from 'react'
 import { useTheme } from 'pltly/react'
 import { Tooltip } from '../Tooltip'
 import {
-  evalPhase, evalSetKey, fireEval,
+  evalPhase, evalSetKey,
   type EvalJob, type EvalMode, type EvalPoint, type RunEval,
 } from './api'
 import {
@@ -211,13 +215,9 @@ function InFlightCell({ job, jobs }: InFlightCellProps): ReactElement {
 interface FailedCellProps {
   job: EvalJob
   jobs: EvalJob[]
-  /** Renders a [retry] button alongside the failure chip. */
-  onFire: () => void
-  isFiring: boolean
-  fireError: string | null
 }
 
-function FailedCell({ job, jobs, onFire, isFiring, fireError }: FailedCellProps): ReactElement {
+function FailedCell({ job, jobs }: FailedCellProps): ReactElement {
   const j = job.job
   const tip = [
     job.jobId,
@@ -225,51 +225,10 @@ function FailedCell({ job, jobs, onFire, isFiring, fireError }: FailedCellProps)
     j.error ? `error: ${j.error}` : null,
     j.finished_at_ms != null ? `finished: ${new Date(j.finished_at_ms).toLocaleString()}` : null,
     jobs.length > 1 ? `${jobs.length} task(s) for this cell` : null,
-    fireError ? `last fire-request error: ${fireError}` : null,
   ].filter(Boolean).join(' · ')
   return (
     <Tooltip content={tip}>
-      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-        <span style={{ color: '#cb2431' }}>failed</span>
-        <FireButton onClick={onFire} isFiring={isFiring} label="retry" />
-      </span>
-    </Tooltip>
-  )
-}
-
-function FireButton({
-  onClick, isFiring, label = 'fire',
-}: { onClick: () => void; isFiring: boolean; label?: string }): ReactElement {
-  return (
-    <button
-      type="button"
-      onClick={(e) => { e.stopPropagation(); onClick() }}
-      disabled={isFiring}
-      style={{
-        fontFamily: 'monospace', fontSize: '0.7rem',
-        padding: '0px 5px',
-        borderRadius: 3,
-        border: '1px solid #4a8aff',
-        background: 'rgba(74,138,255,0.08)',
-        color: isFiring ? '#666' : '#9aa6c2',
-        cursor: isFiring ? 'progress' : 'pointer',
-      }}
-    >
-      [{isFiring ? '…' : label}]
-    </button>
-  )
-}
-
-function QueuedCell({ tooltip }: { tooltip: string }): ReactElement {
-  return (
-    <Tooltip content={tooltip}>
-      <span style={{
-        display: 'inline-flex', alignItems: 'center', gap: 4,
-        animation: 'meval-pulse 1.6s ease-in-out infinite',
-      }}>
-        <Spinner size={9} color="#4a8aff" />
-        <span style={{ color: '#9aa6c2' }}>queued</span>
-      </span>
+      <span style={{ color: '#cb2431' }}>failed</span>
     </Tooltip>
   )
 }
@@ -345,16 +304,10 @@ function representativeJob(jobs: EvalJob[]): EvalJob {
 }
 
 export function MEvalTable({
-  runId, evalSeries, evalJobs, metric, setMetric,
+  evalSeries, evalJobs, metric, setMetric,
 }: Props): ReactElement | null {
   const { isDark } = useTheme()
   injectStyles()
-
-  // Local UI state for fire-button optimistic / error rendering. Map key is
-  // `${step}|${colKey}`.
-  const [queued, setQueued] = useState<Set<string>>(new Set())
-  const [firing, setFiring] = useState<Set<string>>(new Set())
-  const [fireErrors, setFireErrors] = useState<Map<string, string>>(new Map())
 
   const evalSteps = stepsDescOf(evalSeries)
   const lookup = pointsByStepSet(evalSeries)
@@ -374,47 +327,6 @@ export function MEvalTable({
     steps.some((s) => lookup.has(`${s}|${c.key}`) || jobsByCol.has(`${s}|${c.key}`)),
   )
   if (colsWithData.length === 0) return null
-
-  // (The K=12 bulk-fire button is gone post-decision to drop K>1 evals —
-  // see memory [[k1-oneshot-on-mg-is-gigo]] and the K=1-only columns above.
-  // Missing cells still surface per-row via the `[fire]` button next to
-  // empty cells; per-cell `fireOne` handles its own state.)
-
-  const fireOne = async (step: number, col: ColSpec, reason: string): Promise<void> => {
-    const key = `${step}|${col.key}`
-    setFiring((prev) => new Set(prev).add(key))
-    setFireErrors((prev) => {
-      const m = new Map(prev)
-      m.delete(key)
-      return m
-    })
-    try {
-      const resp = await fireEval({
-        run_id: runId, step, mat_set: col.matSet, mode: col.mode, reason,
-      })
-      if (!resp.ok) {
-        setFireErrors((prev) => {
-          const m = new Map(prev)
-          m.set(key, resp.error ?? 'fire request failed')
-          return m
-        })
-      } else {
-        setQueued((prev) => new Set(prev).add(key))
-      }
-    } catch (e) {
-      setFireErrors((prev) => {
-        const m = new Map(prev)
-        m.set(key, String(e))
-        return m
-      })
-    } finally {
-      setFiring((prev) => {
-        const s = new Set(prev)
-        s.delete(key)
-        return s
-      })
-    }
-  }
 
   const headerStyle: React.CSSProperties = {
     padding: '4px 12px 4px 0',
@@ -478,9 +390,6 @@ export function MEvalTable({
                 const key = `${step}|${c.key}`
                 const pt = lookup.get(key)
                 const jobs = jobsByCol.get(key)
-                const isQueued = queued.has(key)
-                const isFiring = firing.has(key)
-                const fireError = fireErrors.get(key) ?? null
                 let inner: ReactElement
                 if (pt) {
                   inner = <SetCell pt={pt} isDark={isDark} metric={metric} />
@@ -492,14 +401,7 @@ export function MEvalTable({
                   if (phase === 'flight') {
                     inner = <InFlightCell job={rep} jobs={jobs} />
                   } else if (phase === 'failed') {
-                    inner = (
-                      <FailedCell
-                        job={rep} jobs={jobs}
-                        onFire={() => fireOne(step, c, 'retry-from-dashboard')}
-                        isFiring={isFiring}
-                        fireError={fireError}
-                      />
-                    )
+                    inner = <FailedCell job={rep} jobs={jobs} />
                   } else {
                     // SUCCEEDED but no eval.json point — shouldn't really
                     // happen (`tomat evals sync` would have ingested the
@@ -507,26 +409,8 @@ export function MEvalTable({
                     // a confusing dash.
                     inner = <span style={{ color: '#7bd99d' }}>succeeded</span>
                   }
-                } else if (isQueued) {
-                  inner = <QueuedCell tooltip={
-                    `fire-request queued on R2 for ${runId} step ${step} ${c.matSet} (${c.mode}). `
-                    + `The GCE-VM cron picks it up on its next pass.`
-                  } />
                 } else {
-                  inner = (
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                      <span style={{ color: '#555' }}>–</span>
-                      <FireButton
-                        onClick={() => fireOne(step, c, 'single-from-dashboard')}
-                        isFiring={isFiring}
-                      />
-                      {fireError && (
-                        <Tooltip content={fireError}>
-                          <span style={{ color: '#cb2431', fontSize: '0.7rem' }}>err</span>
-                        </Tooltip>
-                      )}
-                    </span>
-                  )
+                  inner = <span style={{ color: '#555' }}>–</span>
                 }
                 return (
                   <td key={c.key} style={cellStyle}>
