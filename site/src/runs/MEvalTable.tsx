@@ -373,10 +373,17 @@ export function MEvalTable({
   const jobsByCol = jobsByStepCol(evalJobs)
 
   // Steps come from both eval.json (completed rows) and in-flight iris jobs
-  // (so an in-flight K=12 fire at a step that has no completed rows still
-  // renders as its own row). Sort descending.
+  // — but only jobs whose `(matSet, mode, variant)` actually maps to one of
+  // the displayed columns. Otherwise legacy K=12 (variant=null) maskgit
+  // jobs at steps the K=1 series never covered (e.g. bin5 step-30000 +
+  // step-90000) inject empty `30k*`/`90k*` rows that look like missing
+  // data. Sort descending.
+  const colKeys = new Set(COLUMNS.map((c) => c.key))
   const allStepsSet = new Set<number>(evalSteps)
-  for (const j of evalJobs) allStepsSet.add(j.step)
+  for (const j of evalJobs) {
+    const setKey = evalSetKey(j.matSet, j.mode, j.variant)
+    if (colKeys.has(setKey)) allStepsSet.add(j.step)
+  }
   const steps = [...allStepsSet].sort((a, b) => b - a)
   if (steps.length === 0) return null
   // Only render columns that have at least one data point OR an iris job

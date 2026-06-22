@@ -174,10 +174,18 @@ test.describe('run detail — MEvalTable', () => {
     page,
   }) => {
     const { errors } = startConsoleErrorCapture(page)
-    await goHash(page, `/runs/${FIXTURES.modalMEvalFull}`)
-    await page.getByText(FIXTURES.modalMEvalFull).first().waitFor({ timeout: 30_000 })
+    // Use the bin5 run rather than the older `modalMEvalFull` fixture: the
+    // K=12-only / oneshot-only modal run pre-dates `--mg-k-steps 1` and
+    // the MEvalTable column layout now only surfaces the K=1 maskgit
+    // columns (memo: `k1-oneshot-on-mg-is-gigo` + `cont33k-is-gigo`).
+    // Bin5 has all 7 K=1 cells populated, so the table renders, the set
+    // names show up in headers, and the XX.XX% pattern check is real.
+    await goHash(page, `/runs/${FIXTURES.irisRunningFourSeg}`)
+    await page.getByText(FIXTURES.irisRunningFourSeg).first().waitFor({ timeout: 30_000 })
     // MEvalTable lives in EvalsPanel. The table header has the set names.
-    // Wait for at least one of the canonical set names.
+    // Wait for at least one of the canonical set names. Only K=1 columns
+    // render now, so the header reads e.g. `val_200 · K=1`; the substring
+    // match still hits.
     const setNames = ['val_200', 'train_200', 'val_200-maskgit', 'train_200-maskgit']
     await expect.poll(
       async () => {

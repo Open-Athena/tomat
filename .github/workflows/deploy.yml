@@ -1,11 +1,16 @@
 name: Deploy site
 
-# Deploy on every push to `main` (no CI gate). The e2e suite drifts
-# under live R2 fixture data and intermittently blocks ship-worthy
-# changes (e.g. removing the unauthenticated `[fire]`/`[retry]` buttons).
-# `workflow_dispatch` keeps the manual hatch.
+# Gate prod deploy on a green CI run. `workflow_run` fires after `CI`
+# (the workflow named in `ci.yml`) completes on `main` — and we only
+# proceed when the conclusion is `success`, so a failing e2e / pytest /
+# README / dvx-status check blocks the deploy. `workflow_dispatch` keeps
+# the manual escape hatch (e.g. for a hot ship-worthy change when CI is
+# wedged on unrelated drift, as it was during the cb37232 → c73fdbd
+# security cleanup).
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
 
@@ -20,6 +25,10 @@ concurrency:
 
 jobs:
   build:
+    # Only build when CI was green. Manual dispatch (`workflow_dispatch`)
+    # has no `workflow_run` context, so the conclusion check passes via
+    # the `== ''` branch and the dispatch always proceeds.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

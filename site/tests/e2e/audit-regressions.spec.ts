@@ -62,12 +62,14 @@ test.describe('MEvalTable — legacy step-naming asterisk semantics', () => {
       }
       return [] as string[]
     })
-    // bin5 eval.json currently has steps {30000, 40000, 49999, 60000,
-    // 70000, 80000, 89999, 100000}. Asserting the FULL list pins both the
-    // sort (desc) and the per-step display formatting (asterisk semantics).
-    // If/when a new eval step is added, this list grows; that's the right
+    // bin5 K=1 eval.json currently has steps {40000, 49999, 60000, 70000,
+    // 80000, 89999, 100000}. Asserting the FULL list pins both the sort
+    // (desc) and the per-step display formatting (asterisk semantics). If
+    // a new K=1 eval step is added, this list grows; that's the right
     // signal — a regression in the rendering code would flip an entry,
-    // not extend the set.
+    // not extend the set. Legacy K=12 (variant=null) iris jobs at
+    // step-30000 + step-90000 used to inject phantom `30k*`/`90k*` rows
+    // here; the K=1-only column-key filter in MEvalTable.tsx drops them.
     expect(stepLabels).toEqual([
       '100k*', // 100000 = round, no force-save → legacy periodic → *
       '90k',   // 89999  = round−1                → legacy force-save → no *
@@ -76,7 +78,6 @@ test.describe('MEvalTable — legacy step-naming asterisk semantics', () => {
       '60k*',
       '50k',   // 49999                        → legacy force-save → no *
       '40k*',
-      '30k*',
     ])
   })
 })
