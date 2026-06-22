@@ -15,10 +15,17 @@ FILES_PREFIX = "tomat/,electrai/"
 # ── staging deployment ─────────────────────────────────────────────────
 # Same code + same R2 bucket, separate worker name so prod traffic isn't
 # affected during iteration. Deploy via `pnpm --dir worker run deploy:staging`;
-# live URL is `tomat-runs-api-staging.openathena.workers.dev`. The FE
-# points at staging when launched with `VITE_RUNS_API_BASE=<staging-url>
-# pnpm --dir site dev` (or via the `?api=<url>` query-string override on
-# any page).
+# live URL is `tomat-runs-api-staging.openathena.workers.dev`. Dev FE
+# (`pnpm dev`) defaults to staging via `api.ts::DEV_DEFAULT_API_BASE`;
+# `VITE_RUNS_API_BASE=…` or `?api=…` override that.
+#
+# `ALLOW_WRITE = "true"` is the killswitch for the `POST /api/eval/fire`
+# + `GET /api/eval/fire-requests` endpoints. We deliberately leave it
+# UNSET on the prod worker above so prod 405s every POST and 404s the
+# listing — those routes are unauthenticated and any anon visitor could
+# enumerate runs and queue real TPU spend via `autosync.sh`. Staging is
+# the only live home for the write side until CFW Access (or equivalent)
+# fronts the prod worker. See cb37232 + follow-up restore for context.
 [env.staging]
 name = "tomat-runs-api-staging"
 
@@ -30,3 +37,4 @@ bucket_name = "openathena"
 CORS_ORIGIN = "*"
 R2_RUNS_PREFIX = "tomat/runs"
 FILES_PREFIX = "tomat/,electrai/"
+ALLOW_WRITE = "true"
