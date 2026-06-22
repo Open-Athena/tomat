@@ -1233,6 +1233,17 @@ def main():
             nmaes = np.array([r["nmae"] for r in per_mat_results], dtype=np.float64)
             nemds = np.array([r["nemd"] for r in per_mat_results], dtype=np.float64)
             n = len(per_mat_results)
+            # `nmae_filled` is only emitted on the maskgit branch (the
+            # diagnostic-path NMAE from argmax-per-iter `filled_bins`, before
+            # the OOD final-all-filled re-forward — see memory
+            # `k1-oneshot-on-mg-is-gigo` and the discussion that re-forward
+            # is non-standard MaskGIT). For non-maskgit modes the field is
+            # absent in per_mat_results; skip the aggregate then.
+            has_filled = bool(per_mat_results) and "nmae_filled" in per_mat_results[0]
+            nmaes_filled = (
+                np.array([r["nmae_filled"] for r in per_mat_results], dtype=np.float64)
+                if has_filled else None
+            )
             return {
                 "checkpoint": checkpoint_path,
                 "label": label,
@@ -1244,6 +1255,15 @@ def main():
                 "nmae_median": float(np.median(nmaes)) if n else None,
                 "nmae_p99": float(np.percentile(nmaes, 99)) if n else None,
                 "nmae_ci95": _bootstrap_ci(nmaes),
+                # `nmae_filled_*`: the in-distribution NMAE from the
+                # diagnostic-path argmax-per-iter `filled_bins`, bypassing
+                # the OOD re-forward. For absorbing-trained MaskGIT runs
+                # this is the honest number; `nmae_*` (the re-forward) is
+                # GIGO under these conditions. Present only in maskgit mode.
+                "nmae_filled_mean": float(nmaes_filled.mean()) if has_filled else None,
+                "nmae_filled_median": float(np.median(nmaes_filled)) if has_filled else None,
+                "nmae_filled_p99": float(np.percentile(nmaes_filled, 99)) if has_filled else None,
+                "nmae_filled_ci95": _bootstrap_ci(nmaes_filled) if has_filled else None,
                 "nemd_mean": float(nemds.mean()) if n else None,
                 "nemd_median": float(np.median(nemds)) if n else None,
                 "nemd_p99": float(np.percentile(nemds, 99)) if n else None,
@@ -1937,33 +1957,25 @@ def main():
                     dl_arr = full_ids[:, dens_positions] - density_offset     # (B, P3) true bins
                     dl_arr = np.clip(dl_arr, 0, len(recon) - 1)
 
-                    # DIAGNOSTIC PATH: ρ from the argmax-per-iter filled_bins,
-                    # bypassing the final all-filled re-forward. If the
-                    # re-forward is OOD, this should yield much better NMAE.
+                    # ρ point estimate: argmax-per-iter committed bins decoded
+                    # via the codec. Standard MaskGIT inference — the iterated
+                    # filled grid IS the prediction. We previously did an extra
+                    # forward pass over the fully-filled grid (the "re-forward"
+                    # path) and decoded its softmax via median/mean/argmax, but
+                    # that's both (a) non-standard MaskGIT (the paper has no
+                    # such pass) and (b) catastrophically OOD for
+                    # absorbing-trained models which never saw filled-density
+                    # inputs during training. See memory
+                    # [[k1-oneshot-on-mg-is-gigo]] — the re-forward decode was
+                    # the source of the ~70-130% NMAE noise; the honest
+                    # in-distribution number is ~5%. Both `mg_decoder` knob and
+                    # NEMD are re-forward concepts and lose meaning without it.
                     rho_b_filled = recon[filled_bins]               # (B, P3)
-
-                    # Decode ρ point estimate (current primary path).
-                    Pos_d = hax.Axis("position", pad_to)
-                    tok_ha_f = hax.named(jnp.asarray(tokens), (Batch, Pos_d))
-                    dl_full2 = np.asarray(maskgit_forward(tok_ha_f))
-                    dl_dens2 = dl_full2[:, dens_positions, :]   # (B, P3, n_bins)
-                    probs2 = np.asarray(jax.nn.softmax(jnp.asarray(dl_dens2), axis=-1))
-
-                    if mg_decoder == "argmax":
-                        rho_b = recon[dl_dens2.argmax(axis=-1)]  # (B, P3)
-                    elif mg_decoder == "median":
-                        cumP2 = np.cumsum(probs2, axis=-1)
-                        bin_idx2 = np.clip(
-                            (cumP2 < 0.5).sum(axis=-1), 0, len(recon) - 1,
-                        )
-                        rho_b = recon[bin_idx2]
-                    else:  # mean
-                        rho_b = np.einsum("bpv,v->bp", probs2, recon)
-
-                    # EMD at each position vs true density.
-                    true_dens_b = recon[dl_arr]  # (B, P3) codec-round-tripped
-                    abs_diff = np.abs(recon[None, None, :] - true_dens_b[..., None])  # (B, P3, V)
-                    emd_b = np.einsum("bpv,bpv->bp", probs2, abs_diff)  # (B, P3)
+                    rho_b = rho_b_filled
+                    # emd_b kept as zeros so the per-position accumulator below
+                    # doesn't choke on a None; per_mat["nemd"] is set to None
+                    # downstream so the aggregator skips it.
+                    emd_b = np.zeros_like(rho_b)
 
                     # Scatter into full grids + per-position diagnostics.
                     rho_b_flat = rho_b
@@ -1990,31 +2002,31 @@ def main():
                 t_gen = time.time() - t_gen0
                 rho_true = density
                 mae = float(np.mean(np.abs(rho_pred - rho_true)))
-                mae_filled = float(np.mean(np.abs(rho_pred_filled - rho_true)))
+                # Post-reforward-removal, rho_pred IS rho_pred_filled, so
+                # mae_filled == mae and nmae_filled == nmae. Both fields
+                # preserved for JSON back-compat (dashboards/aggregators that
+                # still key off `nmae_filled_*` keep working unchanged).
+                mae_filled = mae
                 denom = float(np.mean(np.abs(rho_true)))
-                mean_emd = float(np.mean(emd_grid))
                 nmae = mae / max(denom, 1e-30)
-                nmae_filled = mae_filled / max(denom, 1e-30)
-                nemd = mean_emd / max(denom, 1e-30)
-                # Diagnostic stats on the predicted-vs-true distribution shape
-                # — helps tell "median is in top bin" from "median is reasonable
-                # but biased" from "median ≈ truth on this mat".
-                pf_mean = float(np.mean(rho_pred_filled))
-                pf_p50 = float(np.percentile(rho_pred_filled, 50))
-                pf_p99 = float(np.percentile(rho_pred_filled, 99))
-                rf_mean = float(np.mean(rho_pred))
-                rf_p50 = float(np.percentile(rho_pred, 50))
-                rf_p99 = float(np.percentile(rho_pred, 99))
+                nmae_filled = nmae
+                # NEMD = None: it was the expected-L1 under the (now removed)
+                # re-forward softmax. With argmax-committed bins there's no
+                # distribution to integrate over, so the field is meaningless
+                # for MaskGIT mode. Sync aggregator skips None entries. The
+                # field still gets populated by teacher/free modes elsewhere.
+                mean_emd = 0.0
+                nemd = None
+                pf_mean = float(np.mean(rho_pred))
+                pf_p50 = float(np.percentile(rho_pred, 50))
+                pf_p99 = float(np.percentile(rho_pred, 99))
                 t_mean = float(np.mean(rho_true))
                 t_p99 = float(np.percentile(rho_true, 99))
                 err(f"[eval-mat] {mp_id} MASKGIT: {n_patches} patches, "
                     f"K={mg_k_steps} iters, {t_gen:.1f}s")
-                err(f"  NMAE(reforward,{mg_decoder})={nmae:.4%}  "
-                    f"NMAE(filled_bins,argmax)={nmae_filled:.4%}  "
-                    f"NEMD={nemd:.4%}")
-                err(f"  rho_true        mean={t_mean:.3e}  p99={t_p99:.3e}")
-                err(f"  rho_pred(reforw) mean={rf_mean:.3e}  p50={rf_p50:.3e}  p99={rf_p99:.3e}")
-                err(f"  rho_pred(filled) mean={pf_mean:.3e}  p50={pf_p50:.3e}  p99={pf_p99:.3e}")
+                err(f"  NMAE={nmae:.4%}")
+                err(f"  rho_true mean={t_mean:.3e}  p99={t_p99:.3e}")
+                err(f"  rho_pred mean={pf_mean:.3e}  p50={pf_p50:.3e}  p99={pf_p99:.3e}")
                 _dump_voxel_zarr(mp_id, rho_pred, grid_shape, structure_json=_src_structure_json)
                 per_mat_results.append({
                     "mp_id": mp_id,
@@ -2205,14 +2217,19 @@ def main():
                 )
             _flush_results()
 
-        # Aggregate
+        # Aggregate. nemd is None for maskgit mode post-reforward-removal —
+        # filter the None entries so np.array doesn't poison the .mean().
         if per_mat_results:
-            nmaes = np.array([r["nmae"] for r in per_mat_results])
-            nemds = np.array([r["nemd"] for r in per_mat_results])
+            nmaes = np.array([r["nmae"] for r in per_mat_results], dtype=np.float64)
+            nemd_vals = [r["nemd"] for r in per_mat_results if r["nemd"] is not None]
+            nemds = np.array(nemd_vals, dtype=np.float64) if nemd_vals else None
             err(f"[eval-mat] AGGREGATE over {len(nmaes)} mats:")
-            err(f"  mean NMAE   : {nmaes.mean():.4%}    mean NEMD   : {nemds.mean():.4%}")
-            err(f"  median NMAE : {np.median(nmaes):.4%}    median NEMD : {np.median(nemds):.4%}")
-            err(f"  p99 NMAE    : {np.percentile(nmaes, 99):.4%}    p99 NEMD    : {np.percentile(nemds, 99):.4%}")
+            nemd_mean = f"{nemds.mean():.4%}" if nemds is not None else "N/A"
+            nemd_median = f"{np.median(nemds):.4%}" if nemds is not None else "N/A"
+            nemd_p99 = f"{np.percentile(nemds, 99):.4%}" if nemds is not None else "N/A"
+            err(f"  mean NMAE   : {nmaes.mean():.4%}    mean NEMD   : {nemd_mean}")
+            err(f"  median NMAE : {np.median(nmaes):.4%}    median NEMD : {nemd_median}")
+            err(f"  p99 NMAE    : {np.percentile(nmaes, 99):.4%}    p99 NEMD    : {nemd_p99}")
 
         # Per-position diagnostic curve (averaged across all real patches of
         # all mats). per_pos_mae[i] is the mean |pred - true| at row-major

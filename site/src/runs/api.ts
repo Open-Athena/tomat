@@ -236,6 +236,13 @@ export interface EvalRecordResult {
   nmae_mean: number | null
   nmae_median: number | null
   nmae_p99: number | null
+  /** MaskGIT-only: diagnostic-path NMAE from argmax-per-iter filled_bins,
+   *  bypassing the OOD final all-filled re-forward. For absorbing-trained
+   *  MG models, `nmae_*` (the re-forward) is GIGO; `nmae_filled_*` is the
+   *  honest in-distribution number. See memory `k1-oneshot-on-mg-is-gigo`. */
+  nmae_filled_mean: number | null
+  nmae_filled_median: number | null
+  nmae_filled_p99: number | null
   nemd_mean: number | null
   nemd_median: number | null
   nemd_p99: number | null
@@ -458,6 +465,10 @@ export interface EvalJob {
   /** 0-based `step_idx` parsed from the iris job name (`…-step-{step_idx}`).
    *  See `docs/step-conventions.md`. */
   step: number
+  /** Ablation variant from `--output-suffix` (e.g. `K1`). null when the job
+   *  was fired with no suffix. Goes through `evalSetKey` to land the job in
+   *  the right MEvalTable column. */
+  variant: string | null
   taskIdx: number | null
   jobId: string
   job: IrisJob
@@ -474,10 +485,14 @@ const EVAL_JOB_RE = new RegExp(EVAL_JOB_RE_SRC)
 
 /** Map the iris job name's mode infix to the column-set key the eval.json
  *  / MEvalTable uses. `oneshot`/`teacher` shares the bare set key
- *  (`val_200`), `maskgit` appends `-maskgit`, `free` appends `-free`. */
-export function evalSetKey(matSet: string, mode: EvalMode): string {
-  if (mode === 'oneshot') return matSet
-  return `${matSet}-${mode}`
+ *  (`val_200`), `maskgit` appends `-maskgit`, `free` appends `-free`. An
+ *  optional ablation `variant` (from `tomat evals fire --output-suffix`,
+ *  e.g. `K1`) appends as a further suffix so e.g. an honest-K=1 maskgit
+ *  ablation lands in `val_200-maskgit-K1` instead of the legacy K=12
+ *  bucket. Sync writes the same setKey shape (see `tomat evals_sync`). */
+export function evalSetKey(matSet: string, mode: EvalMode, variant?: string | null): string {
+  const base = mode === 'oneshot' ? matSet : `${matSet}-${mode}`
+  return variant ? `${base}-${variant}` : base
 }
 
 /** Group the iris snapshot's m-eval jobs by the run they evaluate. */
@@ -487,13 +502,14 @@ export function evalJobsByRun(iris: IrisState | undefined): Map<string, EvalJob[
   for (const [jobId, job] of Object.entries(iris.jobs)) {
     const m = EVAL_JOB_RE.exec(jobId)
     if (!m) continue
-    const [, modeInfix, runLabel, matSet, stepStr, taskStr] = m
+    const [, modeInfix, runLabel, matSet, stepStr, variantStr, taskStr] = m
     const mode: EvalMode = modeInfix === 'maskgit' ? 'maskgit'
       : modeInfix === 'free' ? 'free'
       : 'oneshot'
     const arr = byRun.get(runLabel) ?? []
     arr.push({
       runLabel, matSet, mode, step: Number(stepStr),
+      variant: variantStr ?? null,
       taskIdx: taskStr != null ? Number(taskStr) : null,
       jobId, job,
     })
@@ -501,7 +517,8 @@ export function evalJobsByRun(iris: IrisState | undefined): Map<string, EvalJob[
   }
   for (const arr of byRun.values()) {
     arr.sort((a, b) => a.step - b.step || a.matSet.localeCompare(b.matSet)
-      || a.mode.localeCompare(b.mode))
+      || a.mode.localeCompare(b.mode)
+      || (a.variant ?? '').localeCompare(b.variant ?? ''))
   }
   return byRun
 }

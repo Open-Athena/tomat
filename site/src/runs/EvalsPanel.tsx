@@ -88,12 +88,29 @@ function pct(v: number | null | undefined): string | null {
 }
 
 /** Pick the "primary" result scalar for a `(set, mode)`'s display.
- *  Teacher mode → nmae_mean. Free → nmae_mean. MaskGIT → nmae_mean. We
- *  show median as a sub-text. */
+ *
+ *  - **Teacher / Free** modes → `nmae_mean` (no diagnostic path; the
+ *    re-forward equivalent is the only number we have).
+ *  - **MaskGIT** mode → prefer `nmae_filled_mean` (the honest
+ *    diagnostic-path NMAE from argmax-per-iter `filled_bins`). The
+ *    `nmae_mean` field for MG is the re-forward over the fully-filled
+ *    grid — strictly OOD for absorbing-trained models, GIGO. See memory
+ *    `k1-oneshot-on-mg-is-gigo`.
+ *
+ *  Fallback to `nmae_mean` if `nmae_filled_mean` is missing (older
+ *  harvest record from before this field was extracted). Re-syncing
+ *  with `tomat evals sync` recomputes from `per_mat` and backfills. */
 function resultBlurb(rec: EvalRecord | null | undefined): { primary: string | null; secondary: string | null } {
   if (!rec?.result) return { primary: null, secondary: null }
-  const primary = pct(rec.result.nmae_mean)
-  const median = pct(rec.result.nmae_median)
+  const isMG = rec.mode === 'maskgit'
+  const primaryVal = isMG && rec.result.nmae_filled_mean != null
+    ? rec.result.nmae_filled_mean
+    : rec.result.nmae_mean
+  const medianVal = isMG && rec.result.nmae_filled_median != null
+    ? rec.result.nmae_filled_median
+    : rec.result.nmae_median
+  const primary = pct(primaryVal)
+  const median = pct(medianVal)
   return {
     primary,
     secondary: median && median !== primary ? `med ${median}` : null,

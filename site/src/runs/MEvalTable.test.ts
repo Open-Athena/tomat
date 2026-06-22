@@ -129,30 +129,58 @@ describe('parseEvalJobId', () => {
     // Oneshot: no mode infix, bare `tomat-eval-<run>-…`.
     assert.deepEqual(
       parseEvalJobId('/ryan/tomat-eval-train-mg-foo-val_200-step-40000'),
-      { mode: 'oneshot', runLabel: 'train-mg-foo', matSet: 'val_200', step: 40000, taskIdx: null },
+      { mode: 'oneshot', runLabel: 'train-mg-foo', matSet: 'val_200', step: 40000, variant: null, taskIdx: null },
     )
     // K=12: `tomat-eval-maskgit-<run>-…`. The pre-fix regex used a greedy
     // `(.+)` and bound runLabel to `maskgit-train-mg-foo`, never matching
     // any actual run on the dashboard.
     assert.deepEqual(
       parseEvalJobId('/ryan/tomat-eval-maskgit-train-mg-foo-val_200-step-40000'),
-      { mode: 'maskgit', runLabel: 'train-mg-foo', matSet: 'val_200', step: 40000, taskIdx: null },
+      { mode: 'maskgit', runLabel: 'train-mg-foo', matSet: 'val_200', step: 40000, variant: null, taskIdx: null },
     )
     // Free: `tomat-eval-free-<run>-…`.
     assert.deepEqual(
       parseEvalJobId('/ryan/tomat-eval-free-train-mg-foo-train_200-step-1000'),
-      { mode: 'free', runLabel: 'train-mg-foo', matSet: 'train_200', step: 1000, taskIdx: null },
+      { mode: 'free', runLabel: 'train-mg-foo', matSet: 'train_200', step: 1000, variant: null, taskIdx: null },
     )
   })
 
   it('captures the `-task<i>` fan-out suffix', () => {
     assert.deepEqual(
       parseEvalJobId('/ryan/tomat-eval-maskgit-train-foo-val_200-step-50000-task0'),
-      { mode: 'maskgit', runLabel: 'train-foo', matSet: 'val_200', step: 50000, taskIdx: 0 },
+      { mode: 'maskgit', runLabel: 'train-foo', matSet: 'val_200', step: 50000, variant: null, taskIdx: 0 },
     )
     assert.deepEqual(
       parseEvalJobId('/ryan/tomat-eval-train-foo-train_200-step-12345-task7'),
-      { mode: 'oneshot', runLabel: 'train-foo', matSet: 'train_200', step: 12345, taskIdx: 7 },
+      { mode: 'oneshot', runLabel: 'train-foo', matSet: 'train_200', step: 12345, variant: null, taskIdx: 7 },
+    )
+  })
+
+  it('captures the `-<variant>` `--output-suffix` ablation suffix', () => {
+    // Bare K1 variant — the honest-K=1 MG ablation sweep (memory
+    // [[k1-oneshot-on-mg-is-gigo]] / [[k1-honest-evals]]).
+    assert.deepEqual(
+      parseEvalJobId('/ryan/tomat-eval-maskgit-train-mg-kl-bin5-fs-tpu-val_200-step-40000-K1'),
+      {
+        mode: 'maskgit', runLabel: 'train-mg-kl-bin5-fs-tpu', matSet: 'val_200',
+        step: 40000, variant: 'K1', taskIdx: null,
+      },
+    )
+    // Compound variant (decoder ablation): `--output-suffix K1-median`.
+    assert.deepEqual(
+      parseEvalJobId('/ryan/tomat-eval-maskgit-train-foo-val_200-step-100000-K1-median'),
+      {
+        mode: 'maskgit', runLabel: 'train-foo', matSet: 'val_200',
+        step: 100000, variant: 'K1-median', taskIdx: null,
+      },
+    )
+    // Variant + task fan-out: variant captures `K1`, task captures `3`.
+    assert.deepEqual(
+      parseEvalJobId('/ryan/tomat-eval-maskgit-train-foo-val_200-step-50000-K1-task3'),
+      {
+        mode: 'maskgit', runLabel: 'train-foo', matSet: 'val_200',
+        step: 50000, variant: 'K1', taskIdx: 3,
+      },
     )
   })
 
@@ -167,7 +195,7 @@ describe('parseEvalJobId', () => {
     // optional group bypasses → runLabel = `junk-train-foo`, mode = oneshot.
     const r = parseEvalJobId('/ryan/tomat-eval-junk-train-foo-val_200-step-100')
     assert.deepEqual(r, {
-      mode: 'oneshot', runLabel: 'junk-train-foo', matSet: 'val_200', step: 100, taskIdx: null,
+      mode: 'oneshot', runLabel: 'junk-train-foo', matSet: 'val_200', step: 100, variant: null, taskIdx: null,
     })
   })
 })

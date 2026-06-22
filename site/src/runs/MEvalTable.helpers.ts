@@ -8,8 +8,15 @@ import type { EvalPoint, RunEval } from './api'
 // Lives here (not in api.ts) so the parsing logic stays node-testable
 // without dragging the vite `import.meta.env` reads in api.ts. The api.ts
 // `evalJobsByRun` re-uses this same regex string. Keep the two in sync.
+//
+// Trailing optional `-(variant)` corresponds to `--output-suffix` passed to
+// `tomat evals fire` (e.g. `-K1`, `-K1-median`). It distinguishes ablation
+// runs in the same matSet/mode bucket so the column-set key on the dashboard
+// (`val_200-maskgit-K1`) maps back to the same iris job. Without this we
+// couldn't show in-flight K=1 fires in MEvalTable's K=1 column. Lazy
+// `(.+?)?` so it backtracks to leave `-task(\d+)$` matchable.
 export const EVAL_JOB_RE_SRC
-  = '^/ryan/tomat-eval-(?:(maskgit|free)-)?(.+?)-(val_200|train_200)-step-(\\d+)(?:-task(\\d+))?$'
+  = '^/ryan/tomat-eval-(?:(maskgit|free)-)?(.+?)-(val_200|train_200)-step-(\\d+)(?:-(.+?))??(?:-task(\\d+))?$'
 
 export type EvalModeBucket = 'oneshot' | 'maskgit' | 'free'
 
@@ -20,12 +27,15 @@ export function parseEvalJobId(jobId: string): {
   matSet: 'val_200' | 'train_200'
   /** 0-based `step_idx` (Levanter `info.step`). See `docs/step-conventions.md`. */
   step: number
+  /** `--output-suffix` from the fire command, e.g. `K1` for `-K1`. null for
+   *  the default (no suffix). */
+  variant: string | null
   taskIdx: number | null
 } | null {
   const re = new RegExp(EVAL_JOB_RE_SRC)
   const m = re.exec(jobId)
   if (!m) return null
-  const [, modeInfix, runLabel, matSet, stepStr, taskStr] = m
+  const [, modeInfix, runLabel, matSet, stepStr, variantStr, taskStr] = m
   const mode: EvalModeBucket = modeInfix === 'maskgit' ? 'maskgit'
     : modeInfix === 'free' ? 'free'
     : 'oneshot'
@@ -34,6 +44,7 @@ export function parseEvalJobId(jobId: string): {
     runLabel,
     matSet: matSet as 'val_200' | 'train_200',
     step: Number(stepStr),
+    variant: variantStr ?? null,
     taskIdx: taskStr != null ? Number(taskStr) : null,
   }
 }

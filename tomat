@@ -2351,6 +2351,7 @@ def evals():
 @click.option("--zone", default=None, help="iris --zone (e.g. europe-west4-a); pin eval slice to the ckpt-bucket region to avoid x-reg ckpt-read egress. Repeatable via comma-sep list.")
 @click.option("--region", default=None, help="iris --region (e.g. europe-west4); broader pin than --zone.")
 @click.option("--decoder", default="median")
+@click.option("--output-suffix", default="", help="String appended to the result JSON's `step-N` basename (TOMAT_EVAL_OUTPUT_SUFFIX). Use to keep multiple ablation runs from clobbering each other within the same `<set>{-mode}/` dir — e.g. `--output-suffix -K1-mean` writes `step-N-K1-mean.json` instead of overwriting `step-N.json`. Composes with `--num-tasks > 1` (which appends its own `-task<i>`); when both are set the per-task suffix wins.")
 @click.option("-d", "--dry-run", is_flag=True, help="print iris commands without executing")
 @click.option("-D", "--debug-dump-mat", default="", help="dump per-voxel rho_pred/rho_true (and per-patch flat arrays in free mode) to GCS for this mp_id; overrides n_mats")
 @click.option("-f", "--free-batch", default=32, type=int, help="(--mode free) patches per forward — HBM knob, not a coverage cap")
@@ -2392,6 +2393,7 @@ def evals_fire(
     dump_predictions: bool,
     voxel_zarrs: bool,
     resume_eval: bool,
+    output_suffix: str,
 ):
     """Fire mat-NMAE eval jobs against a run's GCS checkpoints.
 
@@ -2561,8 +2563,11 @@ def evals_fire(
                 task_n_mats = per_task
                 # Single-task fires keep the existing job-name shape so they
                 # remain compatible with the dashboard's run-name parser.
+                # User --output-suffix gets folded into the name when set,
+                # so an ablation sweep over a single (ckpt, set) doesn't
+                # collide on iris job-names.
                 if num_tasks == 1:
-                    jn = f"tomat-{infix}-{run_label}-{s}-step-{step}"
+                    jn = f"tomat-{infix}-{run_label}-{s}-step-{step}{output_suffix}"
                 else:
                     jn = f"tomat-{infix}-{run_label}-{s}-step-{step}-task{task_i}"
                 cmd = [
@@ -2592,10 +2597,17 @@ def evals_fire(
                 # Tag the per-task result file so the N jobs' outputs don't
                 # collide in GCS. The eval script (see eval_mat_nmae.py) reads
                 # TOMAT_EVAL_OUTPUT_SUFFIX and appends it to the JSON path.
+                # User --output-suffix is for ablations that want multiple
+                # JSONs in the same dir without clobbering (e.g. K=1 decoder
+                # sweep). Per-task fanout takes precedence when both apply.
                 if num_tasks > 1:
                     cmd += [
                         "--env-vars", "TOMAT_EVAL_OUTPUT_SUFFIX",
                         f"-task{task_i}",
+                    ]
+                elif output_suffix:
+                    cmd += [
+                        "--env-vars", "TOMAT_EVAL_OUTPUT_SUFFIX", output_suffix,
                     ]
                 if mode == "free":
                     cmd += [
@@ -3061,42 +3073,71 @@ def evals_sync(substr: str | None, bucket: str, dry_run: bool, prefix: str):
                 if (n := p.rsplit("/", 1)[-1]).startswith("step-")
                 and n.endswith(".json")
             ]
-            # Per-task fan-out writes `step-<N>-task<i>.json`. Pool the
-            # per_mat arrays across tasks for the same step before computing
-            # stats, so the aggregated row reflects the full mat set.
-            per_step_mats: dict[int, list[dict]] = {}
+            # File-stem grammar:
+            #   `step-<N>`                — vanilla, single task, no variant
+            #   `step-<N>-task<i>`        — `--num-tasks > 1` fan-out
+            #   `step-<N>-<variant>`      — ablation variant (e.g. `K1` for the
+            #                               post-reforward-removal K=1 sweep —
+            #                               separate series from the original
+            #                               K=12 maskgit results that share
+            #                               the `<set>-maskgit/` directory).
+            #   `step-<N>-<variant>-task<i>` — variant + fanout
+            # Variants get their own sets_key (`<sets_key>-<variant>`) so a
+            # single set-mode dir can carry multiple series. Task-fan-out
+            # pools per (step, variant) so the row reflects the full mat set.
+            variant_step_mats: dict[str, dict[int, list[dict]]] = {}
             for path, raw in fs.cat(paths).items():  # parallel fetch
                 d = json.loads(raw)
                 name = path.rsplit("/", 1)[-1]
                 stem = name[len("step-"):-len(".json")]
-                if "-task" in stem:
-                    stem = stem.split("-task", 1)[0]
+                # Strip the trailing `-task<i>` first.
+                core, _, _task = stem.rpartition("-task")
+                if not core:  # rpartition returned ("", "", stem) — no -task
+                    core = stem
+                # core is now "<N>" or "<N>-<variant>".
+                if "-" in core:
+                    step_str, variant = core.split("-", 1)
+                else:
+                    step_str, variant = core, ""
                 try:
-                    step = int(stem)
+                    step = int(step_str)
                 except ValueError:
                     continue
-                per_step_mats.setdefault(step, []).extend(d.get("per_mat") or [])
-            rows = []
-            for step, per_mat in per_step_mats.items():
-                row = {"step": step, "n_mats": len(per_mat)}
-                # Recompute mean/median/p99 + spread percentiles from the
-                # pooled per_mat arrays — the per-task JSONs' own
-                # `nmae_mean` etc. fields are partial-set means and don't
-                # combine arithmetically.
-                for metric in ("nmae", "nemd"):
-                    vals = np.asarray(
-                        [m[metric] for m in per_mat if m.get(metric) is not None],
-                        dtype=float,
-                    )
-                    if not vals.size:
-                        continue
-                    row[f"{metric}_mean"] = float(vals.mean())
-                    for pct, key in ((1, "p1"), (25, "p25"), (50, "median"),
-                                     (75, "p75"), (99, "p99")):
-                        row[f"{metric}_{key}"] = float(np.percentile(vals, pct))
-                rows.append(row)
-            if rows:
-                sets[sets_key] = sorted(rows, key=lambda r: r["step"])
+                variant_step_mats.setdefault(variant, {}) \
+                    .setdefault(step, []).extend(d.get("per_mat") or [])
+            for variant, per_step_mats in variant_step_mats.items():
+                variant_sets_key = sets_key if not variant else f"{sets_key}-{variant}"
+                rows = []
+                for step, per_mat in per_step_mats.items():
+                    row = {"step": step, "n_mats": len(per_mat)}
+                    # Recompute mean/median/p99 + spread percentiles from the
+                    # pooled per_mat arrays — the per-task JSONs' own
+                    # `nmae_mean` etc. fields are partial-set means and don't
+                    # combine arithmetically.
+                    # `nmae_filled` is maskgit-only — the diagnostic-path NMAE
+                    # from argmax-per-iter filled_bins, bypassing the OOD final
+                    # all-filled re-forward (memory: [[k1-oneshot-on-mg-is-gigo]]
+                    # — for absorbing-trained MG models the re-forward is
+                    # double-OOD, so `nmae` is GIGO; `nmae_filled` is the honest
+                    # in-distribution number). Compute alongside the standard
+                    # metrics whenever per_mat carries it.
+                    metric_keys = ["nmae", "nemd"]
+                    if any(m.get("nmae_filled") is not None for m in per_mat):
+                        metric_keys.append("nmae_filled")
+                    for metric in metric_keys:
+                        vals = np.asarray(
+                            [m[metric] for m in per_mat if m.get(metric) is not None],
+                            dtype=float,
+                        )
+                        if not vals.size:
+                            continue
+                        row[f"{metric}_mean"] = float(vals.mean())
+                        for pct, key in ((1, "p1"), (25, "p25"), (50, "median"),
+                                         (75, "p75"), (99, "p99")):
+                            row[f"{metric}_{key}"] = float(np.percentile(vals, pct))
+                    rows.append(row)
+                if rows:
+                    sets[variant_sets_key] = sorted(rows, key=lambda r: r["step"])
         if not sets:
             err(f"[evals sync] {run}: no eval JSONs, skipping")
             continue
@@ -3524,12 +3565,21 @@ def _backfill_record_key(step: int, set_: str, mode: str, task_idx: int | None) 
 
 def _backfill_result_summary(d: dict) -> dict:
     """Copy out the scalar(s) the dashboard renders. The full per-step JSON
-    stays on GCS at `gcs_result_path`."""
+    stays on GCS at `gcs_result_path`.
+
+    `nmae_filled_*` is maskgit-only — the diagnostic-path NMAE from the
+    argmax-per-iter filled_bins, bypassing the OOD final all-filled
+    re-forward (memory: [[k1-oneshot-on-mg-is-gigo]]). Always copied
+    when present so dashboards can prefer it over the GIGO `nmae_*`
+    on MG runs without a schema migration."""
     return {
         "n_mats":      d.get("n_mats"),
         "nmae_mean":   d.get("nmae_mean"),
         "nmae_median": d.get("nmae_median"),
         "nmae_p99":    d.get("nmae_p99"),
+        "nmae_filled_mean":   d.get("nmae_filled_mean"),
+        "nmae_filled_median": d.get("nmae_filled_median"),
+        "nmae_filled_p99":    d.get("nmae_filled_p99"),
         "nemd_mean":   d.get("nemd_mean"),
         "nemd_median": d.get("nemd_median"),
         "nemd_p99":    d.get("nemd_p99"),

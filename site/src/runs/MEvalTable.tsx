@@ -70,11 +70,17 @@ interface ColSpec {
   matSet: string
   mode: EvalMode
 }
+// Per the project decision to drop the GIGO eval modes (memory
+// [[k1-oneshot-on-mg-is-gigo]] — oneshot mode for MG models was
+// double-OOD; the K=12 maskgit "re-forward" extra forward pass was also
+// strictly OOD for absorbing-trained models), we only surface the new
+// honest K=1 maskgit numbers — `--mode maskgit --mg-k-steps 1` with
+// the re-forward removed (so argmax-per-iter `filled_bins` is the
+// canonical prediction). Sync writes these to `<set>-maskgit-K1`
+// (separate series from any historic K=12 in `<set>-maskgit`).
 const COLUMNS: ColSpec[] = [
-  { key: 'val_200',           label: 'val_200 · K=1',   matSet: 'val_200',   mode: 'oneshot' },
-  { key: 'train_200',         label: 'train_200 · K=1', matSet: 'train_200', mode: 'oneshot' },
-  { key: 'val_200-maskgit',   label: 'val_200 · K=12',  matSet: 'val_200',   mode: 'maskgit' },
-  { key: 'train_200-maskgit', label: 'train_200 · K=12', matSet: 'train_200', mode: 'maskgit' },
+  { key: 'val_200-maskgit-K1',   label: 'val_200 · K=1',   matSet: 'val_200',   mode: 'maskgit' },
+  { key: 'train_200-maskgit-K1', label: 'train_200 · K=1', matSet: 'train_200', mode: 'maskgit' },
 ]
 
 const BUCKET_COLORS_LIGHT: Record<Bucket, string> = {
@@ -299,13 +305,6 @@ function MetricChips({
   )
 }
 
-/** (step, colKey) of a missing K=12 cell — used by the bulk-fire header
- *  button. Kept separate so we can count and confirm before firing. */
-interface MissingCell {
-  step: number
-  col: ColSpec
-}
-
 /**
  * Group eval jobs by (step, set, mode) key matching column keys. Picks the
  * "most relevant" job per cell:
@@ -320,7 +319,7 @@ interface MissingCell {
 function jobsByStepCol(jobs: EvalJob[]): Map<string, EvalJob[]> {
   const byKey = new Map<string, EvalJob[]>()
   for (const j of jobs) {
-    const setKey = evalSetKey(j.matSet, j.mode)
+    const setKey = evalSetKey(j.matSet, j.mode, j.variant)
     const k = `${j.step}|${setKey}`
     const arr = byKey.get(k) ?? []
     arr.push(j)
@@ -356,7 +355,6 @@ export function MEvalTable({
   const [queued, setQueued] = useState<Set<string>>(new Set())
   const [firing, setFiring] = useState<Set<string>>(new Set())
   const [fireErrors, setFireErrors] = useState<Map<string, string>>(new Map())
-  const [bulkFiring, setBulkFiring] = useState(false)
 
   const evalSteps = stepsDescOf(evalSeries)
   const lookup = pointsByStepSet(evalSeries)
@@ -377,19 +375,10 @@ export function MEvalTable({
   )
   if (colsWithData.length === 0) return null
 
-  // Count missing K=12 cells across all visible (step, col) pairs for the
-  // bulk-fire button. "Missing" = no eval.json point AND no iris job (so
-  // queued/in-flight cells are NOT counted).
-  const missingK12: MissingCell[] = []
-  for (const s of steps) {
-    for (const c of colsWithData) {
-      if (c.mode !== 'maskgit') continue
-      const key = `${s}|${c.key}`
-      if (lookup.has(key)) continue
-      if (jobsByCol.has(key)) continue
-      missingK12.push({ step: s, col: c })
-    }
-  }
+  // (The K=12 bulk-fire button is gone post-decision to drop K>1 evals —
+  // see memory [[k1-oneshot-on-mg-is-gigo]] and the K=1-only columns above.
+  // Missing cells still surface per-row via the `[fire]` button next to
+  // empty cells; per-cell `fireOne` handles its own state.)
 
   const fireOne = async (step: number, col: ColSpec, reason: string): Promise<void> => {
     const key = `${step}|${col.key}`
@@ -427,29 +416,6 @@ export function MEvalTable({
     }
   }
 
-  const fireBulkK12 = async (): Promise<void> => {
-    if (missingK12.length === 0) return
-    const ok = window.confirm(
-      `Fire ${missingK12.length} K=12 eval job${missingK12.length === 1 ? '' : 's'} `
-      + `for ${runId}?\n\n`
-      + missingK12.slice(0, 10).map((m) => `  step ${m.step}, ${m.col.matSet}`).join('\n')
-      + (missingK12.length > 10 ? `\n  … and ${missingK12.length - 10} more` : '')
-      + `\n\nFires are queued on R2; the GCE-VM cron picks them up.`,
-    )
-    if (!ok) return
-    setBulkFiring(true)
-    try {
-      for (const m of missingK12) {
-        // Sequential rather than parallel — keeps the UI's "firing" set
-        // reading naturally as each cell flips to "queued", and the CFW
-        // doesn't need to defend against burst floods.
-        await fireOne(m.step, m.col, 'bulk-K=12-from-dashboard')
-      }
-    } finally {
-      setBulkFiring(false)
-    }
-  }
-
   const headerStyle: React.CSSProperties = {
     padding: '4px 12px 4px 0',
     textAlign: 'left',
@@ -474,33 +440,8 @@ export function MEvalTable({
           <span style={{ color: '#888', fontWeight: 'normal' }}>{metric.toUpperCase()}</span>
         </h2>
         <MetricChips metric={metric} setMetric={setMetric} isDark={isDark} />
-        {missingK12.length > 0 && (
-          <Tooltip content={
-            `Queue ${missingK12.length} K=12 (maskgit) eval fire-requests on R2 for the\n`
-            + `missing cells below. The GCE-VM cron picks them up on its next\n`
-            + `pass (≤ 15 min) and runs \`tomat evals fire\`.\n\n`
-            + `~$0 on TRC TPUs; standard iris controller load.`
-          }>
-            <button
-              type="button"
-              onClick={fireBulkK12}
-              disabled={bulkFiring}
-              style={{
-                fontFamily: 'monospace', fontSize: '0.75rem',
-                padding: '0.15rem 0.5rem',
-                borderRadius: 4,
-                border: '1px solid #4a8aff',
-                background: 'rgba(74,138,255,0.12)',
-                color: bulkFiring ? '#666' : '#cdd6f4',
-                cursor: bulkFiring ? 'progress' : 'pointer',
-              }}
-            >
-              {bulkFiring
-                ? `firing… (${queued.size}/${missingK12.length})`
-                : `fire ${missingK12.length} missing K=12`}
-            </button>
-          </Tooltip>
-        )}
+        {/* Bulk-fire K=12 button removed — K>1 evals deprecated;
+            per-cell `[fire]` button is still available for missing cells. */}
       </div>
       <table style={{ borderCollapse: 'collapse', fontSize: '0.8rem' }}>
         <thead>
