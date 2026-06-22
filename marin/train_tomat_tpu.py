@@ -229,6 +229,64 @@ def _log_lifecycle_event(event: str, **fields):
         threading.Thread(target=_log_to_wandb_deferred, daemon=True).start()
 
 
+def _log_tomat_run_metadata_to_wandb():
+    """Persist TOMAT_* env vars + parent lineage to `wandb.config` once the
+    run is live. Spec 61, task #269: until now, fire-time config was only
+    visible in `iris job describe`'s env-vars — invisible to wandb's UI,
+    and the run config was the Levanter-side TrainerConfig with no record
+    of how the user invoked the fire. This dumps:
+
+      - `tomat.parent_run_id`  ← from `TOMAT_PARENT_RUN_ID` (set by
+        `tomat train --parent P`)
+      - `tomat.intended_resume_deltas` ← from `TOMAT_INTENDED_RESUME_DELTAS`
+        (comma-sep keys the user opted into drifting via
+        `--allow-config-change`)
+      - `tomat.env.*` ← every `TOMAT_*` env var, including the loss-config
+        knobs (`TOMAT_MG_KL_SIGMA`, `TOMAT_DENSITY_LOSS_TYPE`, etc.) that
+        the Levanter config doesn't natively capture.
+
+    Daemon-thread polling for `wandb.run` mirrors `_log_to_wandb_deferred`.
+    Best-effort — never let a wandb hiccup take down the trainer."""
+    import threading
+
+    def _push():
+        import time
+        try:
+            import wandb
+        except ImportError:
+            return
+        for _ in range(120):
+            if wandb.run is not None:
+                break
+            time.sleep(0.5)
+        else:
+            return
+        try:
+            tomat_envs = {
+                k[len("TOMAT_"):].lower(): v
+                for k, v in os.environ.items()
+                if k.startswith("TOMAT_") and k not in (
+                    "TOMAT_WANDB_ENTITY",  # already in WandbConfig.entity
+                )
+            }
+            cfg = {"tomat": {"env": tomat_envs}}
+            parent = os.environ.get("TOMAT_PARENT_RUN_ID")
+            if parent:
+                cfg["tomat"]["parent_run_id"] = parent
+            deltas = os.environ.get("TOMAT_INTENDED_RESUME_DELTAS")
+            if deltas:
+                cfg["tomat"]["intended_resume_deltas"] = [
+                    d for d in deltas.split(",") if d
+                ]
+            # `allow_val_change=True` because wandb refuses repeat-writes
+            # otherwise — we may end up here multiple times on resume.
+            wandb.run.config.update(cfg, allow_val_change=True)
+        except Exception:
+            pass
+
+    threading.Thread(target=_push, daemon=True).start()
+
+
 def _handle_sigterm(signum, _frame):
     _log_lifecycle_event("sigterm_received", signum=signum)
     # Best-effort wandb finish so the run state flips to "finished" (with
@@ -1555,6 +1613,10 @@ def main():
 
     print("[tomat-tpu] calling levanter.main.train_lm.main …")
     _log_lifecycle_event("trainer_started", label=results_label, steps=steps)
+    # spec 61 / task #269: dump TOMAT_* env vars + parent lineage to
+    # wandb.config. Daemon-thread polls for wandb.run; safe to call before
+    # wandb.init returns.
+    _log_tomat_run_metadata_to_wandb()
     train_lm_main(config)
     # Drain ckpt commits at a deterministic point (before atexit, before
     # interpreter teardown can race with tensorstore HTTP callbacks). The

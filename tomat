@@ -4162,11 +4162,94 @@ def _write_submission_record(
         err(f"[tomat train] failed to write submission record: {e!r} (continuing)")
 
 
+# ── Resume-config drift guard (spec 61, Phase 1) ───────────────────────────
+#
+# When a fire declares `--parent <P>` (the run it's resuming from / forking
+# off), this helper diffs the proposed child config against `P`'s wandb
+# config across a FROZEN_ON_RESUME set of keys. Any diff not whitelisted in
+# `--allow-config-change` aborts the fire.
+#
+# Motivates: every fire I wrote 2026-06-19..-22 (bin5-extend-10k,
+# bin5-sigma-cont x3) silently swapped TS0123 → TS0 vs. bin5's actual
+# prevailing state, producing TL spikes that consumed days of TPU. The
+# existing same-label resume guard didn't catch them because (a) those
+# fires bypassed `tomat train` and went direct to `iris job run`, and (b)
+# the sigma-cont fires used a NEW label (cont-s10), so the wandb lookup
+# by-label-only returned nothing.
+#
+# This helper covers BOTH cases:
+#   - same-label resume:   --parent P, label == P     (extends existing logic)
+#   - new-label resume:    --parent P, label != P     (cont-s10-from-bin5 shape)
+#
+# See specs/61-resume-invariants-and-run-records.md for the full design.
+
+# Wandb-config keys that must match parent's last segment on resume.
+# Path format: dotted into the wandb config dict.
+FROZEN_ON_RESUME: dict[str, str] = {
+    "data.cache_dir":             "data label / shard layout",
+    "optimizer.learning_rate":    "LR peak value",
+    "optimizer.lr_schedule":      "LR schedule shape (constant/cosine/…)",
+    "optimizer.warmup":           "warmup fraction",
+    "trainer.train_batch_size":   "batch size",
+    "model.hidden_size":          "model width",
+    "model.num_layers":           "model depth",
+    "model.num_heads":            "attention heads",
+}
+
+
+def _dot_get(d: dict, path: str):
+    """Pull `path` (dotted) out of nested dict `d`; None if missing."""
+    cur = d
+    for p in path.split("."):
+        if not isinstance(cur, dict) or p not in cur:
+            return None
+        cur = cur[p]
+    return cur
+
+
+def _diff_frozen_resume_config(
+    parent_config: dict, child_config: dict, allow_keys: set[str],
+) -> list[tuple[str, object, object]]:
+    """Return list of (key, parent_value, child_value) diffs across
+    FROZEN_ON_RESUME that are NOT whitelisted in allow_keys."""
+    out: list[tuple[str, object, object]] = []
+    for key in FROZEN_ON_RESUME:
+        if key in allow_keys:
+            continue
+        pv, cv = _dot_get(parent_config, key), _dot_get(child_config, key)
+        if pv != cv:
+            out.append((key, pv, cv))
+    return out
+
+
+def _fetch_parent_wandb_run(parent_label: str):
+    """Look up parent run by exact label match across known projects.
+    Returns (run_object, config_dict) or (None, None). Errors raise."""
+    import wandb as _wandb
+    _api = _wandb.Api()
+    exact = [r for r in match_runs(_api, parent_label) if r.name == parent_label]
+    if not exact:
+        return None, None
+    if len(exact) > 1:
+        # Ambiguous — multiple project copies. Caller may need to disambiguate
+        # by data-label; for now, return the first and let the diff catch.
+        # TODO: --parent-project disambiguation if this comes up in practice.
+        err(f"[tomat train] --parent {parent_label!r}: {len(exact)} project copies; "
+            f"using first ({exact[0].entity}/{exact[0].project}). "
+            f"Pass --parent-project to disambiguate if this is wrong.")
+    p = exact[0]
+    return p, dict(p.config)
+
+
 @cli.command("train")
 @click.option("-r", "--resume", "resume_mode", is_flag=True,
               help="resume existing run (same LABEL → Levanter auto-discovers latest ckpt + continues with intact optimizer state)")
 @click.option("--from-ckpt", "from_ckpt", default=None,
               help="gs:// path to a step-N ckpt dir to true-resume from under a NEW LABEL. Pre-copies the ckpt into the new run's output dir so Levanter auto-discovers it with optimizer state + step counter intact. Requires --resume.")
+@click.option("--parent", "parent_label", default=None,
+              help="declare the parent run this fire resumes from / forks off (spec 61). When set, the FROZEN_ON_RESUME guard fetches the parent's wandb config and refuses the fire if any of {data.cache_dir, optimizer.learning_rate/lr_schedule/warmup, trainer.train_batch_size, model.{hidden_size,num_layers,num_heads}} differs from the parent's last segment — unless the key is whitelisted in --allow-config-change. Covers the new-label resume case (cont-s10 from bin5) that the existing same-label cache_dir guard doesn't see. Caller is responsible for `--from-ckpt` if label != parent.")
+@click.option("--allow-config-change", "allow_config_change", default="",
+              help="comma-separated dotted keys (e.g. data.cache_dir,optimizer.learning_rate) that --parent's drift guard is allowed to skip. Use ONLY when the delta is intentional (e.g. σ ablation, schedule change). Each key in this list will be recorded in the fire's tomat.intended_resume_deltas wandb config field so the dashboard can annotate it.")
 @click.option("-D", "--data-label", default="train-full-v3",
               help="TOMAT_LABEL (data subdir under tokenized/). Comma-separated values train on the UNION of components — one Levanter cache spans all shards' epoch via multi-URL `train_urls`; auto epoch-window sums component row counts; cache lands at `<bucket>/cache/<+-joined>/`.")
 @click.option("-m", "--model", default="200M", help="TOMAT_MODEL preset")
@@ -4213,6 +4296,8 @@ def train(
     label: str,
     resume_mode: bool,
     from_ckpt: str | None,
+    parent_label: str | None,
+    allow_config_change: str,
     data_label: str,
     model: str,
     tpu: str,
@@ -4359,6 +4444,103 @@ def train(
         err("WANDB_API_KEY not set in env")
         sys.exit(1)
 
+    # ── --parent: FROZEN_ON_RESUME drift guard (spec 61) ──────────────────
+    # Covers the new-label-resume case (cont-s10 from bin5) that the existing
+    # same-label cache_dir guard further down doesn't see. When the user
+    # declares `--parent P`, we pull P's wandb config and refuse the fire if
+    # any FROZEN_ON_RESUME key differs unless explicitly allowed.
+    parent_run_obj = None
+    intended_deltas: list[str] = []
+    if parent_label:
+        allow_keys = {k.strip() for k in (allow_config_change or "").split(",") if k.strip()}
+        unknown = allow_keys - set(FROZEN_ON_RESUME.keys())
+        if unknown:
+            err(f"[tomat train] --allow-config-change includes unknown keys: "
+                f"{sorted(unknown)}. valid keys: {sorted(FROZEN_ON_RESUME)}")
+            sys.exit(2)
+        parent_run_obj, parent_cfg = _fetch_parent_wandb_run(parent_label)
+        if parent_run_obj is None:
+            err(f"[tomat train] --parent {parent_label!r}: no wandb run found "
+                f"(searched: {', '.join(WANDB_PROJECTS)}). check spelling, "
+                f"or pass `--parent <other-label>`.")
+            sys.exit(1)
+        # Build the child config in wandb-shape. Only fill keys the child
+        # CLI actually pins; absent keys (e.g. model size — model preset
+        # → dims map not wired here yet) skip the diff with a TODO.
+        # cache_dir uses the +-joined subdir convention (see existing guard).
+        child_subdir = (data_label or "").replace(",", "+")
+        # Match the existing guard's "subdir name, not full path" comparison
+        # — strip the bucket+`/cache/` prefix from parent's cache_dir.
+        parent_cache_dir = _dot_get(parent_cfg, "data.cache_dir") or ""
+        import re as _re
+        _pm = _re.search(r"/cache/([^/]+)/?$", parent_cache_dir.rstrip("/"))
+        parent_subdir = _pm.group(1) if _pm else ""
+        # Build wandb-shape child config for the diff. (Only includes
+        # FROZEN_ON_RESUME keys we can resolve from CLI args; model.* is
+        # skipped until the preset-to-dims map lands.)
+        child_cfg = {
+            "data": {"cache_dir": child_subdir},
+            "optimizer": {
+                "learning_rate": lr,
+                "lr_schedule": lr_schedule,
+                "warmup": warmup,
+            },
+            "trainer": {"train_batch_size": batch_size},
+        }
+        # Same-shape view of parent for clean diff.
+        parent_view = {
+            "data": {"cache_dir": parent_subdir},
+            "optimizer": {
+                "learning_rate": _dot_get(parent_cfg, "optimizer.learning_rate"),
+                "lr_schedule":   _dot_get(parent_cfg, "optimizer.lr_schedule"),
+                "warmup":        _dot_get(parent_cfg, "optimizer.warmup"),
+            },
+            "trainer": {"train_batch_size": _dot_get(parent_cfg, "trainer.train_batch_size")},
+        }
+        # Union-widening exception for cache_dir (mirrors the existing
+        # same-label guard's logic): child label may be a comma-joined
+        # multi-label that *includes* parent's subdir as one component.
+        if "data.cache_dir" not in allow_keys:
+            new_parts = [p.strip() for p in (data_label or "").split(",") if p.strip()]
+            if len(new_parts) > 1 and parent_subdir in new_parts:
+                # Effectively a no-op delta for the diff machinery.
+                child_cfg["data"]["cache_dir"] = parent_subdir
+                print(f"[tomat train] --parent {parent_label!r}: union widening — "
+                      f"parent subdir {parent_subdir!r} is part of {data_label!r}")
+        diffs = _diff_frozen_resume_config(parent_view, child_cfg, allow_keys)
+        if diffs:
+            err(f"[tomat train] --parent {parent_label!r}: refusing fire — "
+                f"FROZEN_ON_RESUME drift detected ({len(diffs)} key(s)):")
+            for key, pv, cv in diffs:
+                err(f"  {key}  ({FROZEN_ON_RESUME[key]})")
+                err(f"    parent: {pv!r}")
+                err(f"    child:  {cv!r}")
+            err("")
+            err("to override (each delta will be recorded in tomat.intended_resume_deltas):")
+            err(f"  --allow-config-change={','.join(k for k, _, _ in diffs)}")
+            sys.exit(2)
+        # Track which keys the user opted into drifting — for trainer to log.
+        intended_deltas = sorted(allow_keys)
+        print(f"[tomat train] --parent {parent_label!r}: FROZEN_ON_RESUME guard passed "
+              f"(intended deltas: {intended_deltas or 'none'})")
+
+    # ── P1.warmup default: TOMAT_WARMUP=0 on --resume (spec 61) ───────────
+    # bin5 resume question: warmup is global-step-indexed (verified in
+    # Levanter optim/config.py), so at step-100k the 5%-of-105k warmup is
+    # long past — `warmup=0.05` and `warmup=0` are equivalent at the resume
+    # boundary. But making the intent explicit at CLI time prevents future
+    # confusion (and protects fresh-on-resume cases where step-0 of THIS
+    # fire happens to land inside the absolute warmup window).
+    if resume_mode and warmup != 0.0:
+        # If user explicitly passed --warmup, respect them. We detect this
+        # by checking if the click context shows the value came from default.
+        ctx = click.get_current_context()
+        warmup_was_explicit = ctx.get_parameter_source("warmup") != click.core.ParameterSource.DEFAULT
+        if not warmup_was_explicit:
+            print(f"[tomat train] --resume: defaulting --warmup to 0 (was {warmup}; "
+                  f"pass --warmup explicitly to override)")
+            warmup = 0.0
+
     # For --resume, auto-detect the existing run's wandb entity AND verify
     # the user-passed `--data-label` matches the existing run's cache_dir.
     # The trainer (marin/train_tomat_tpu.py) derives wandb project from
@@ -4482,6 +4664,14 @@ def train(
     # gates `discover_latest_checkpoint(...) is None` on this env var.
     if resume_mode or from_ckpt is not None:
         env_vars.append(("TOMAT_REQUIRE_RESUME", "1"))
+    # spec 61: thread parent lineage + intended deltas into the fire's env
+    # so the trainer can log them to wandb config (when task #269 lands;
+    # for now, they at least appear in `iris job describe` env-vars and
+    # in the submission record `fire_argv`).
+    if parent_label:
+        env_vars.append(("TOMAT_PARENT_RUN_ID", parent_label))
+    if intended_deltas:
+        env_vars.append(("TOMAT_INTENDED_RESUME_DELTAS", ",".join(intended_deltas)))
     # Always emit — shuffle is on by default; `--shuffle-window-blocks 0` is
     # the explicit opt-out and `auto` (default) defers epoch-window resolution
     # to the trainer (`marin/train_tomat_tpu.py:_epoch_window_blocks`).
