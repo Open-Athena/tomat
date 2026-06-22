@@ -1060,10 +1060,19 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         }
         lineX = newX; lineY = newY; lineG = newG; lineYStd = newYStd
       }
+      // Sparse segments (≤1 point) can't draw as a line — VL on a 72-restart
+      // run lands at most one VL eval per segment, so every VL datapoint
+      // ends up the lone member of its segment and a `lines`-only render
+      // erases it. Fall back to a marker so the point is visible; multi-
+      // point segments stay as before (TL has thousands per segment, the
+      // line is dense, markers would only add noise).
+      const sparse = lineX.length <= 1
       const lineTrace: SmoothedTrace = {
         x: lineX, y: lineY, name: segName,
-        type: 'scatter', mode: 'lines',
+        type: 'scatter',
+        mode: sparse ? 'markers' : 'lines',
         line: { color: traceColor, width: lineWidth },
+        ...(sparse ? { marker: { color: traceColor, size: 5 } } : {}),
         opacity,
         yaxis: 'y2',
         legendgroup: legendGroup,
@@ -1190,22 +1199,43 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   const evalTraces = useMemo(() => {
     const out: Record<string, unknown>[] = []
     // setKey conventions on eval.json:
-    //   val_200          → MV · K=1   (oneshot / teacher-mode bare key)
-    //   train_200        → MT · K=1
-    //   val_200-maskgit  → MV · K=12  (full MaskGIT iterative decode)
-    //   train_200-maskgit→ MT · K=12
-    //   …-<other-mode>   → MV/MT · <mode>  (e.g. `-free`; falls through as
-    //                       a dashed trace to keep the legend coherent)
+    //   val_200             → MV · K=1   (oneshot / teacher-mode bare key)
+    //   train_200           → MT · K=1
+    //   val_200-maskgit     → MV · K=12  (bare maskgit = legacy K=12 iterative)
+    //   train_200-maskgit   → MT · K=12
+    //   val_200-maskgit-K1  → MV · K=1   (`--output-suffix K1` ablation —
+    //                          honest single-MG-step decode; the dashboard's
+    //                          primary number post-reforward-removal)
+    //   …-<other-mode>      → MV/MT · <mode>  (e.g. `-free`; falls through
+    //                          as a dashed trace to keep the legend coherent)
+    //
+    // `-K<N>` variants get K=N labelling and override the mode's default K
+    // (so e.g. `-maskgit-K1` renders dashed K=1, not solid K=12).
     const setKeys = Object.keys(evalSeries?.sets ?? {})
     const labelFor = (setKey: string): {
       mvmt: 'MT' | 'MV'; kLabel: string; dash: 'solid' | 'dash'
     } => {
-      const [base, mode] = setKey.split('-', 2) as [string, string | undefined]
-      const mvmt: 'MT' | 'MV' = base === 'val_200' ? 'MV' : 'MT'
-      // K=12 (solid) only for the maskgit mode; bare keys + other modes stay
-      // K=1-style dashed. Treat unknown modes as their literal mode name.
-      const kLabel = mode == null ? 'K=1' : mode === 'maskgit' ? 'K=12' : mode
-      const dash: 'solid' | 'dash' = mode === 'maskgit' ? 'solid' : 'dash'
+      const parts = setKey.split('-')
+      const mvmt: 'MT' | 'MV' = parts[0] === 'val_200' ? 'MV' : 'MT'
+      const mode: string | undefined = parts[1]
+      const variant: string = parts.slice(2).join('-')
+      const kMatch = variant.match(/^K(\d+)/)
+      let kLabel: string
+      let dash: 'solid' | 'dash'
+      if (kMatch) {
+        // Explicit K=N variant from `--output-suffix`; honour it.
+        const k = kMatch[1]
+        kLabel = `K=${k}`
+        dash = k === '1' ? 'dash' : 'solid'
+      } else if (mode === 'maskgit') {
+        // Bare `-maskgit` is the legacy K=12 iterative-decode bucket.
+        kLabel = 'K=12'
+        dash = 'solid'
+      } else {
+        // Bare matSet or any other mode (e.g. `-free`) is K=1-style dashed.
+        kLabel = mode == null ? 'K=1' : mode
+        dash = 'dash'
+      }
       return { mvmt, kLabel, dash }
     }
     for (const setKey of setKeys) {
