@@ -352,6 +352,76 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     return () => plotDiv.removeListener?.('plotly_afterplot', applyShapeFade)
   }, [applyShapeFade])
 
+  // x-unified hover post-filter — suppress entries whose trace doesn't
+  // actually have data at the cursor x. Plotly's `nearest non-null` logic
+  // shows the parent's terminal point even when the cursor is several k
+  // steps past it; this filter hides any entry whose trace's actual data
+  // x-range doesn't include the cursor.
+  const filterHoverByRange = useCallback((ev: { xvals?: number[]; points?: Array<{ data?: { x?: Array<number | null | string> } }> }) => {
+    const root = plotWrapperRef.current
+    const plotDiv = root?.querySelector('.js-plotly-plot') as HTMLElement | null
+    if (!plotDiv) return
+    const cursorX = ev.xvals?.[0]
+    if (cursorX == null || !ev.points || ev.points.length === 0) return
+    const dropDataIdx = new Set<number>()
+    ev.points.forEach((p, i) => {
+      const xs = p.data?.x
+      if (!Array.isArray(xs)) return
+      let xMin = Infinity
+      let xMax = -Infinity
+      for (const x of xs) {
+        if (typeof x !== 'number') continue
+        if (x < xMin) xMin = x
+        if (x > xMax) xMax = x
+      }
+      if (xMin === Infinity) return
+      if (cursorX < xMin || cursorX > xMax) dropDataIdx.add(i)
+    })
+    if (dropDataIdx.size === 0) return
+    const hl = plotDiv.querySelector('.hoverlayer')
+    if (!hl) return
+    // Walk g.traces in DOM order; skip legendgrouptitle nodes (they have
+    // no marker line so their first child isn't a path/line), count the
+    // remaining as data entries, hide whichever match dropDataIdx.
+    const allTraces = Array.from(hl.querySelectorAll('g.legend g.traces')) as SVGGElement[]
+    let dataIdx = 0
+    for (const tr of allTraces) {
+      const firstChild = tr.firstChild as Element | null
+      const isTitle = firstChild?.tagName !== 'g' && firstChild?.tagName !== 'path' && firstChild?.tagName !== 'line'
+      if (isTitle) {
+        tr.style.display = ''
+        continue
+      }
+      if (dropDataIdx.has(dataIdx)) tr.style.display = 'none'
+      else tr.style.display = ''
+      dataIdx++
+    }
+  }, [])
+  // Attach the hover filter via a poll — the plotDiv is replaced after
+  // the first data-driven redraw (~10 s after mount), so a one-shot
+  // attach races with the redraw and ends up bound to a stale node. The
+  // polling effect re-checks every 500 ms and re-attaches via a tagged
+  // attribute (idempotent: only attaches once per new plotDiv).
+  useEffect(() => {
+    const root = plotWrapperRef.current
+    if (!root) return
+    const TAG = 'data-tomat-hover-filter-attached'
+    let stopped = false
+    const tryAttach = () => {
+      if (stopped) return
+      const plotDiv = root.querySelector('.js-plotly-plot') as (HTMLElement & {
+        on?: (evt: string, fn: (ev: unknown) => void) => void
+      }) | null
+      if (plotDiv?.on && plotDiv.getAttribute(TAG) !== '1') {
+        plotDiv.setAttribute(TAG, '1')
+        plotDiv.on('plotly_hover', filterHoverByRange as unknown as (ev: unknown) => void)
+      }
+    }
+    tryAttach()
+    const id = window.setInterval(tryAttach, 500)
+    return () => { stopped = true; window.clearInterval(id) }
+  }, [filterHoverByRange])
+
   // `?x=wallclock|elapsed|step|epoch` — URL-persisted so deep-links carry
   // the view choice. The run-detail page defaults to `'step'` (training
   // progress is the obvious x for a single run); callers can override.
@@ -974,11 +1044,16 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
             segIndices: [],
             isCurrent: false,
             color: ancestor.color,
-            legendGroup: `lineage:${ancestor.name}`,
+            // Share the current run's legendgroup so all TL/VL traces — the
+            // current run's plus every ancestor's — collapse to ONE legend
+            // row per metric, toggle together. Each ancestor still draws in
+            // its own color (line color is per-trace), but the legend reads
+            // as a single virtual TL + VL pair.
+            legendGroup: lg,
             groupTitle: rel,
             hoverName: `${name} (${rel})`,
             legendName: name,
-            showLegend: true,
+            showLegend: false,
           })
         }
         buckets.get(bk)!.segIndices.push(i)
@@ -1058,7 +1133,11 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         opacity: 1,
         yaxis: 'y2',
         legendgroup: bucket.legendGroup,
-        legendgrouptitle: { text: bucket.groupTitle },
+        // Only the current bucket sets the legendgrouptitle. Ancestors share
+        // its legendgroup, so plotly nests their (showlegend:false) traces
+        // under the same title — one legend section, one TL + one VL row,
+        // and one "losses (log)" header in the unified tooltip.
+        ...(bucket.isCurrent ? { legendgrouptitle: { text: bucket.groupTitle } } : {}),
         showlegend: bucket.showLegend,
         customdata: cg,
         hovertemplate: `${bucket.hoverName} %{y:.3f}<br>gstep %{customdata}<extra></extra>`,
