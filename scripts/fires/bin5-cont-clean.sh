@@ -69,8 +69,8 @@ fi
 # 2. Fire the continuation job.
 cd marin
 /Users/ryan/c/oa/marin/.venv/bin/iris --cluster=marin job run \
-  --tpu v6e-16 \
-  --zone us-east5-b \
+  --tpu v5p-16 \
+  --zone us-east5-a \
   --enable-extra-resources \
   --cpu 32 --memory 64GB \
   --max-retries 20 \
