@@ -208,17 +208,32 @@ writes this directory at submission time (before iris fires) so we have the mani
 even if the fire never starts. The trainer appends parquet rows as it goes (no
 overwrites).
 
-### 2.2 Runs: editable canonical thread
+### 2.2 Runs: editable canonical thread (1:N over wandb + iris)
 
-A `runs` row is a *curated view* over an ordered list of fire-ids:
+**Core insight (Ryan 2026-06-23):** a "run" in our model is *not* 1:1 with a wandb
+run or an iris job — it's a composition / concatenation of N wandb runs and M iris
+jobs. The current FE encodes 1:1 (single wandb link + single iris link in the
+run-page header); that assumption is wrong and needs to be migrated out
+aggressively across the code. The `runs` table is what makes the 1:N relation
+explicit:
 
 ```sql
 -- D1 / SQLite schema (dev: SQLite under tmp/runs.db; prod: D1 binding on CFW)
 CREATE TABLE runs (
   run_id              TEXT PRIMARY KEY,     -- "bin5", "bin5-cont-s10", etc.
+                                            -- our canonical name, not wandb's.
   display_name        TEXT,                 -- nicer label for the dashboard
   parent_run_id       TEXT,                 -- editable; backfill-able for old runs
   fire_ids            TEXT NOT NULL,        -- JSON array, ordered chronologically
+  wandb_run_ids       TEXT NOT NULL,        -- JSON array of (entity, project,
+                                            -- wandb_run_id) tuples — N>=1 wandb
+                                            -- runs that contributed to this thread.
+                                            -- Replaces the 1:1 wandb link in
+                                            -- header.
+  iris_job_ids        TEXT NOT NULL,        -- JSON array of /ryan/<label> iris
+                                            -- job paths — M>=0 jobs (some runs
+                                            -- have no iris jobs, e.g. modal-only).
+                                            -- Replaces 1:1 iris link in header.
   blacklisted_fires   TEXT NOT NULL DEFAULT '[]',  -- JSON array of fire-ids whose
                                             -- history rollup the view should skip
                                             -- (bad fires we want hidden, not deleted)
@@ -229,6 +244,20 @@ CREATE TABLE runs (
   created_at, updated_at  TIMESTAMP
 );
 ```
+
+The 1:N migration touches every place the FE assumes one wandb-run-id / one
+iris-job-id:
+- `RunsPage` header chips: render N wandb links + M iris links (dropdown / chip
+  list, not single link).
+- WallclockPlot trajectory union: concatenate metrics from all N wandb runs.
+- iris-state badges: aggregate over M iris jobs (currently picks "the one").
+- Cost computation: sum over M iris jobs.
+- `tomat runs sync`: walk all N wandb runs, all M iris jobs, dedup and merge.
+
+Migration strategy: **add the new columns alongside the existing 1:1 fields,
+populate from inferred lineage during sync, double-render in the FE
+("primary wandb: X · also: [Y, Z]") for a window, then cut over once every
+runs row has its wandb_run_ids / iris_job_ids backfilled.**
 
 Critical: the `runs` row is **editable** — we can set `parent_run_id = 'train-mg-kl-bin5-fs-tpu'`
 on `cont-s10` even though that fire's wandb config doesn't carry it (because cont-s10

@@ -1789,7 +1789,14 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
           muted={isDark ? '#888' : '#666'}
         />
       </div>
-      <div ref={plotWrapperRef} style={{ position: 'relative' }}>
+      {/* CSS-enforced minHeight so the wrapper holds its layout space even if
+          Plotly's auto-resize misfires (e.g. tab background → foreground:
+          Chrome throttles rAF on hidden tabs; Plotly's ResizeObserver
+          callback may not fire on return, collapsing the inner div to 0
+          height. Without minHeight here, RecentEvents below reflows UP into
+          the collapsed plot's space. Matches the plot's `height: 640` in
+          plotLayoutMemo so the visual footprint is unchanged. */}
+      <div ref={plotWrapperRef} style={{ position: 'relative', minHeight: 640 }}>
       <Plot
         onActiveTraceChange={setHoveredTraceName}
         onRelayout={onRelayout as (ev: unknown) => void}
