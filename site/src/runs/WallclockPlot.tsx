@@ -1002,14 +1002,6 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     }
     const SPARSE_THRESHOLD = 30
     const out: SmoothedTrace[] = []
-    // Aggregate every group's (x, y, gstep, groupLabel) for the global
-    // hover proxy. Per-bucket main traces will be `hoverinfo: 'skip'` so
-    // the x-unified tooltip shows ONE entry per metric (closest point
-    // across the entire lineage), not one per group.
-    const allX: number[] = []
-    const allY: number[] = []
-    const allG: (number | string)[] = []
-    const allLabel: string[] = []
     for (const bucket of buckets.values()) {
       // Concatenate this bucket's segments. Insert a `null` y between
       // consecutive segments so plotly breaks the line (the segment boundary
@@ -1057,16 +1049,6 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       // out — VL on long resume chains has a handful of points). Dense
       // buckets stay lines-only (TL would be a wall of red dots otherwise).
       const denseOverall = pointCount >= SPARSE_THRESHOLD
-      // Feed this bucket's points into the global hover-proxy accumulator
-      // (skip null y's — they're segment-break markers).
-      const bucketLabel = bucket.isCurrent ? '' : ` · ${bucket.groupTitle}`
-      for (let i = 0; i < cx.length; i++) {
-        const xv = cx[i]
-        const yv = cy[i]
-        const gv = cg[i]
-        if (yv == null || gv == null || typeof xv !== 'number') continue
-        allX.push(xv); allY.push(yv); allG.push(gv); allLabel.push(bucketLabel)
-      }
       const mainTrace: SmoothedTrace = {
         x: cx, y: cy, name: bucket.legendName,
         type: 'scatter',
@@ -1078,7 +1060,8 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         legendgroup: bucket.legendGroup,
         legendgrouptitle: { text: bucket.groupTitle },
         showlegend: bucket.showLegend,
-        hoverinfo: 'skip',
+        customdata: cg,
+        hovertemplate: `${bucket.hoverName} %{y:.3f}<br>gstep %{customdata}<extra></extra>`,
       }
       // ±σ bands only on the current bucket's last segment (avoids smearing
       // bands across the full lineage).
@@ -1109,31 +1092,6 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         }
       }
       out.push(mainTrace)
-    }
-    // Global hover proxy — invisible (zero-width transparent line), but
-    // contributes ONE entry per metric to the x-unified tooltip. Picks the
-    // closest point across all groups (current + every ancestor). Points
-    // are sorted by x so plotly's nearest-x logic works cleanly across
-    // overlapping group ranges (e.g. a parent and current that both cover
-    // step 0-50k will each contribute their own samples to the proxy).
-    if (allX.length > 0) {
-      const order = Array.from(allX.keys()).sort((a, b) => allX[a] - allX[b])
-      const sx = order.map(i => allX[i])
-      const sy = order.map(i => allY[i])
-      const sg = order.map(i => allG[i])
-      const sl = order.map(i => allLabel[i])
-      const cd = sg.map((g, i) => [g, sl[i]])
-      out.push({
-        x: sx, y: sy, name,
-        type: 'scatter', mode: 'lines',
-        line: { width: 0, color: 'rgba(0,0,0,0)' },
-        opacity: 0,
-        yaxis: 'y2',
-        legendgroup: lg,
-        showlegend: false,
-        customdata: cd,
-        hovertemplate: `${name}%{customdata[1]} %{y:.3f}<br>gstep %{customdata[0]}<extra></extra>`,
-      })
     }
     return out
   }
@@ -1741,11 +1699,13 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     margin: { t: 50, l: 70, r: 210, b: 50 },
     hovermode: 'x unified' as const,
     hoverlabel: { ...themedHoverlabel(isDark), align: 'left' as const },
-    // -1 = every trace contributes its nearest point regardless of pixel
-    // distance. Safe because `smoothedSeriesTraces` now emits ONE trace per
-    // logical group (current + each ancestor), so the unified tooltip has
-    // one TL + one VL row per group at the cursor x.
-    hoverdistance: -1,
+    // 100 px = a trace contributes its nearest point ONLY if the point is
+    // within 100 px of the cursor. Tight enough that out-of-range groups
+    // (e.g. parent's last point 24k steps before cursor) drop out of the
+    // unified tooltip; loose enough to catch sparse VL markers (typically
+    // 4-8k steps apart on long runs ≈ 50-100 px). At any cursor x: one TL
+    // + one VL per group whose data actually reaches the cursor area.
+    hoverdistance: 100,
     legend: {
       x: 1.02, y: 1, bgcolor: 'rgba(0,0,0,0)',
       tracegroupgap: 10,
