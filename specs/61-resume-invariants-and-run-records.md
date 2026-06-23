@@ -191,22 +191,72 @@ authoritative for its concern:
 
 ### 2.1 Fires: immutable provenance
 
-Every iris fire writes:
+Every fire — iris OR Modal — writes:
 
 ```
 R2: openathena/tomat/fires/<fire-id>/
-  manifest.json     # frozen at fire-spawn time; env-vars, --parent, intended deltas,
-                    # git_sha, marin_pin, fire_argv, fire-host, fire-time, iris job_id
+  manifest.json     # frozen at fire-spawn time; substrate-tagged (see schema below).
   raw.parquet       # history this fire emitted, suffix-appended as the fire runs
                     # (immutable once the fire reaches a terminal state)
   eval.json         # m-eval points fired against THIS fire's ckpts (not the run's
                     # other fires); merged at view-time
 ```
 
-`fire-id` is e.g. `<UTC-isoformat>-<8-hex-shasum-of-manifest>`. The `tomat train` CLI
-writes this directory at submission time (before iris fires) so we have the manifest
-even if the fire never starts. The trainer appends parquet rows as it goes (no
-overwrites).
+`fire-id` is e.g. `<UTC-isoformat>-<8-hex-shasum-of-manifest>`. Any fire entry point
+(`tomat train`, `tomat evals fire`, `scripts/fires/*.sh` calling `tomat fires record`
+post-submit) writes this directory at submission time so we have the manifest even
+if the fire never starts. The trainer appends parquet rows as it goes (no overwrites).
+
+**Schema** (the substrate determines which `<X>_id` field is populated; `tomat
+fires record` validates exactly one):
+
+```jsonc
+{
+  "schema_version": 1,
+  "fire_id": "2026-06-23T17:27:07Z-9f3a1c4e",
+  "run_id": "train-mg-kl-bin5-cont-from-80k-v6e",  // canonical run name
+  "parent_run_id": "train-mg-kl-bin5-fs-tpu",      // editable; null for from-scratch
+  "fired_at": "2026-06-23T17:27:07Z",
+  "fired_by": "ryan",                              // getpass.getuser()
+  "fired_host": "ryan-laptop",                     // platform.node()
+  "fire_argv": ["scripts/fires/bin5-cont-from-80k-v6e.sh"],
+  "git_sha": "f51b9ee...",                         // local repo HEAD at fire time
+  "marin_pin": "abc1234...",                       // marin/ submodule SHA
+
+  // Exactly one substrate block:
+  "substrate": "iris",                             // | "modal"
+  "iris": {
+    "job_id": "/ryan/train-mg-kl-bin5-cont-from-80k-v6e",
+    "tpu": "v6e-16", "zone": "us-east5-b", "priority": "interactive"
+  },
+  // OR:
+  "modal": {
+    "app_name": "tomat-train-h200x8",
+    "function_call_id": "fc-...",
+    "fn": "train_bakeoff_h200x8",
+    "region": "us-east-1"
+  },
+
+  // wandb is ALWAYS captured (every fire emits to a wandb run, regardless of
+  // execution substrate):
+  "wandb": {"entity": "open-athena", "project": "tomat-lmq-P19",
+            "run_id": "..."},
+
+  // Intended deltas vs parent at fire time — used by the resume guard + the
+  // dashboard's "what changed" diff. Optional for from-scratch fires.
+  "intended_deltas": {
+    "data.cache_dir": {"from": "train-full-v3", "to": "train-full-v3,...shard3"}
+  },
+
+  // Resume / horizon knobs (per-substrate cared about by the trainer; mirrored
+  // here so the fire record can be read without a separate trainer.json):
+  "horizon": {"resume_from_step": 80000, "target_steps": 82000}
+}
+```
+
+A future Phase 2.x can add `substrate: "hybrid"` for fires that fan out across
+iris + Modal in one logical step, but in practice every concrete fire to date is
+one substrate only. Keep the schema simple until we have a real hybrid case.
 
 ### 2.2 Runs: editable canonical thread (1:N over wandb + iris + Modal)
 

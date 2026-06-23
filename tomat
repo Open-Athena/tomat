@@ -36,8 +36,10 @@ Conventions:
 from __future__ import annotations
 
 import datetime
+import getpass
 import json
 import os
+import platform
 import re
 import socket
 import subprocess
@@ -5525,6 +5527,193 @@ exec {PY} ./tomat train \\
     print(f"  new label: {new_label}")
     print(f"  TPU: {tpu} ({zone}), steps: {steps}, bs: {parent_bs}, lr: {parent_lr}")
     print(f"  fire: {out_path}")
+
+
+FIRES_PREFIX = "tomat/fires"
+_FIRE_SCHEMA_VERSION = 1
+
+
+def _git_sha(cwd: Path | None = None) -> str | None:
+    """`git rev-parse HEAD` for `cwd` (or PROJECT_ROOT). None on any error."""
+    try:
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=cwd or PROJECT_ROOT,
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() or None if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _marin_pin() -> str | None:
+    """Marin pin from tomat's uv.lock (NOT `marin/.git/HEAD`).
+
+    The `marin/` dir in tomat is a working clone, not a submodule — running
+    `git rev-parse HEAD` inside it walks up to tomat's own .git. The
+    authoritative marin pin is the `marin-iris` source revision recorded in
+    `uv.lock`.
+    """
+    lock = PROJECT_ROOT / "uv.lock"
+    if not lock.exists():
+        return None
+    # Cheap regex over the lock file's `[[package]]` blocks. uv writes the
+    # source rev as `source.git = "...git+...?rev=<SHA>"`.
+    try:
+        for chunk in lock.read_text().split("[[package]]"):
+            if "marin-iris" not in chunk:
+                continue
+            m = re.search(r"\?rev=([0-9a-f]{7,40})", chunk)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def _fire_id_from_manifest(manifest: dict) -> str:
+    """`<UTC-isoformat>-<8-hex-shasum>` (deterministic per manifest body)."""
+    import hashlib
+    body = {k: v for k, v in manifest.items() if k != "fire_id"}
+    canon = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    sha = hashlib.sha256(canon).hexdigest()[:8]
+    ts = manifest.get("fired_at") or datetime.datetime.now(datetime.timezone.utc)\
+        .isoformat(timespec="seconds").replace("+00:00", "Z")
+    # Strip `:` from the ts so the fire-id is a valid filename / key.
+    return f"{ts.replace(':', '')}-{sha}"
+
+
+@fires_grp.command("record")
+@click.option("--run-id", "run_id", required=True,
+              help="canonical run name (e.g. 'train-mg-kl-bin5-cont-from-80k-v6e')")
+@click.option("--parent", "parent_run_id", default=None,
+              help="canonical name of the parent run this fire resumes from. "
+                   "Optional for from-scratch fires.")
+@click.option("--substrate", type=click.Choice(["iris", "modal"]), required=True,
+              help="iris (TPU job) or modal (Modal function call).")
+@click.option("--iris-job-id", default=None,
+              help="`/<user>/<label>` iris job path. Required for --substrate iris.")
+@click.option("--iris-tpu", default=None,
+              help="TPU shape (e.g. 'v6e-16'). Recorded for provenance.")
+@click.option("--iris-zone", default=None,
+              help="iris zone (e.g. 'us-east5-b').")
+@click.option("--modal-app", default=None,
+              help="Modal App name. Required for --substrate modal.")
+@click.option("--modal-fc-id", default=None,
+              help="Modal function_call_id. Required for --substrate modal.")
+@click.option("--modal-fn", default=None,
+              help="Modal function name (e.g. 'train_bakeoff_h200x8').")
+@click.option("--wandb-entity", default="open-athena")
+@click.option("--wandb-project", default=None,
+              help="wandb project name (e.g. 'tomat-lmq-P19').")
+@click.option("--wandb-run-id", default=None,
+              help="wandb run id (the short hash, not the display name).")
+@click.option("--resume-from-step", type=int, default=None,
+              help="parent ckpt step we're resuming from (None for from-scratch).")
+@click.option("--target-steps", type=int, default=None,
+              help="trainer's `num_train_steps` for this fire (final horizon).")
+@click.option("--intended-delta", "intended_deltas", multiple=True,
+              help="key=from->to triple, repeatable. Example: "
+                   "--intended-delta 'data.cache_dir=train-full-v3->train-full-v3,...shard3'")
+@click.option("--notes", default=None, help="free-form human context.")
+@click.option("-b", "--bucket", default=R2_BUCKET, help="R2 bucket")
+@click.option("--dry-run", is_flag=True,
+              help="print the manifest JSON instead of PUTing.")
+def fires_record(
+    run_id: str, parent_run_id: str | None, substrate: str,
+    iris_job_id: str | None, iris_tpu: str | None, iris_zone: str | None,
+    modal_app: str | None, modal_fc_id: str | None, modal_fn: str | None,
+    wandb_entity: str, wandb_project: str | None, wandb_run_id: str | None,
+    resume_from_step: int | None, target_steps: int | None,
+    intended_deltas: tuple[str, ...], notes: str | None, bucket: str, dry_run: bool,
+):
+    """Write a fire-manifest record to R2 (spec 61 §2.1).
+
+    A fire is one submission of a training (or eval) job to its execution
+    substrate (iris OR Modal). Each fire's manifest is frozen at submit time
+    and immutable thereafter; the parquet history that fire produces gets
+    appended alongside it as the trainer runs.
+
+    Calling convention: invoke right after `iris job run` / `modal run`
+    succeeds (i.e. the submission landed). The manifest then carries the
+    substrate's job-id, the parent linkage, and enough metadata to
+    reconstruct what we tried to do — independent of whether the fire
+    actually trained anything.
+
+    Wire-in points:
+        - `scripts/fires/*.sh` SHOULD call this post-`iris job run`.
+        - `tomat train` will call this internally (Phase 2 follow-up).
+    """
+    if substrate == "iris" and not iris_job_id:
+        raise click.UsageError("--substrate iris requires --iris-job-id")
+    if substrate == "modal" and not (modal_app and modal_fc_id):
+        raise click.UsageError(
+            "--substrate modal requires both --modal-app and --modal-fc-id")
+    # Parse intended deltas (key=from->to).
+    deltas: dict[str, dict] = {}
+    for entry in intended_deltas:
+        if "=" not in entry or "->" not in entry:
+            raise click.UsageError(
+                f"--intended-delta {entry!r} must be 'key=from->to'")
+        k, rest = entry.split("=", 1)
+        frm, to = rest.split("->", 1)
+        deltas[k.strip()] = {"from": frm, "to": to}
+    fired_at = datetime.datetime.now(datetime.timezone.utc)\
+        .isoformat(timespec="seconds").replace("+00:00", "Z")
+    manifest: dict = {
+        "schema_version": _FIRE_SCHEMA_VERSION,
+        "run_id": run_id,
+        "parent_run_id": parent_run_id,
+        "fired_at": fired_at,
+        "fired_by": getpass.getuser(),
+        "fired_host": platform.node(),
+        "fire_argv": sys.argv,
+        "git_sha": _git_sha(),
+        "marin_pin": _marin_pin(),
+        "substrate": substrate,
+    }
+    if substrate == "iris":
+        manifest["iris"] = {"job_id": iris_job_id}
+        if iris_tpu:
+            manifest["iris"]["tpu"] = iris_tpu
+        if iris_zone:
+            manifest["iris"]["zone"] = iris_zone
+    else:
+        manifest["modal"] = {"app_name": modal_app, "function_call_id": modal_fc_id}
+        if modal_fn:
+            manifest["modal"]["fn"] = modal_fn
+    if wandb_project or wandb_run_id:
+        manifest["wandb"] = {"entity": wandb_entity}
+        if wandb_project:
+            manifest["wandb"]["project"] = wandb_project
+        if wandb_run_id:
+            manifest["wandb"]["run_id"] = wandb_run_id
+    if resume_from_step is not None or target_steps is not None:
+        manifest["horizon"] = {}
+        if resume_from_step is not None:
+            manifest["horizon"]["resume_from_step"] = resume_from_step
+        if target_steps is not None:
+            manifest["horizon"]["target_steps"] = target_steps
+    if deltas:
+        manifest["intended_deltas"] = deltas
+    if notes:
+        manifest["notes"] = notes
+    fire_id = _fire_id_from_manifest(manifest)
+    manifest["fire_id"] = fire_id
+    key = f"{FIRES_PREFIX}/{fire_id}/manifest.json"
+    body = json.dumps(manifest, indent=1).encode("utf-8")
+    if dry_run:
+        print(f"[dry-run] would PUT s3://{bucket}/{key} ({len(body)} bytes)")
+        print(body.decode())
+        return
+    _r2_put_bytes(bucket, key, body, "application/json")
+    print(f"[fires record] wrote s3://{bucket}/{key} ({len(body)} bytes)")
+    print(f"  fire_id: {fire_id}")
+    print(f"  run_id: {run_id}")
+    if parent_run_id:
+        print(f"  parent: {parent_run_id}")
+    print(f"  substrate: {substrate}")
+    if substrate == "iris":
+        print(f"  iris job: {iris_job_id}")
+    else:
+        print(f"  modal: {modal_app}::{modal_fn or '?'} fc={modal_fc_id}")
 
 
 @cli.group("wb")
