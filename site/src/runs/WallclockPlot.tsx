@@ -357,16 +357,21 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   // shows the parent's terminal point even when the cursor is several k
   // steps past it; this filter hides any entry whose trace's actual data
   // x-range doesn't include the cursor.
-  const filterHoverByRange = useCallback((ev: { xvals?: number[]; points?: Array<{ data?: { x?: Array<number | null | string> } }> }) => {
+  const filterHoverByRange = useCallback((ev: { xvals?: number[]; points?: Array<{ data?: { name?: string; x?: Array<number | null | string> } }> }) => {
     const root = plotWrapperRef.current
     const plotDiv = root?.querySelector('.js-plotly-plot') as HTMLElement | null
     if (!plotDiv) return
     const cursorX = ev.xvals?.[0]
     if (cursorX == null || !ev.points || ev.points.length === 0) return
-    const dropDataIdx = new Set<number>()
-    ev.points.forEach((p, i) => {
+    // Build a "drop key" set indexed by `${traceName} gstep ${maxX}` —
+    // robust to ev.points-vs-DOM ordering mismatches. The DOM entry's
+    // text reads e.g. "TL (train loss) (parent) 7.548gstep 40000"; if
+    // that exact (name, gstep) pair is in the drop set, hide the entry.
+    const dropKeys = new Set<string>()
+    ev.points.forEach((p) => {
       const xs = p.data?.x
-      if (!Array.isArray(xs)) return
+      const name = p.data?.name
+      if (!Array.isArray(xs) || !name) return
       let xMin = Infinity
       let xMax = -Infinity
       for (const x of xs) {
@@ -375,26 +380,29 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         if (x > xMax) xMax = x
       }
       if (xMin === Infinity) return
-      if (cursorX < xMin || cursorX > xMax) dropDataIdx.add(i)
+      if (cursorX < xMin || cursorX > xMax) {
+        // Out-of-range. Plotly's nearest-point pick lands on the trace's
+        // closest endpoint to the cursor — xMin if cursor < xMin, else
+        // xMax. Encode both candidates and match either.
+        dropKeys.add(`${name}|${xMax}`)
+        dropKeys.add(`${name}|${xMin}`)
+      }
     })
-    if (dropDataIdx.size === 0) return
+    if (dropKeys.size === 0) return
     const hl = plotDiv.querySelector('.hoverlayer')
     if (!hl) return
-    // Walk g.traces in DOM order; skip legendgrouptitle nodes (they have
-    // no marker line so their first child isn't a path/line), count the
-    // remaining as data entries, hide whichever match dropDataIdx.
     const allTraces = Array.from(hl.querySelectorAll('g.legend g.traces')) as SVGGElement[]
-    let dataIdx = 0
     for (const tr of allTraces) {
-      const firstChild = tr.firstChild as Element | null
-      const isTitle = firstChild?.tagName !== 'g' && firstChild?.tagName !== 'path' && firstChild?.tagName !== 'line'
-      if (isTitle) {
+      const txt = tr.textContent ?? ''
+      if (!txt.includes('gstep')) {
         tr.style.display = ''
         continue
       }
-      if (dropDataIdx.has(dataIdx)) tr.style.display = 'none'
-      else tr.style.display = ''
-      dataIdx++
+      const match = txt.match(/^(.+?)\s+\(?[\d.]+%?\)?\s*gstep\s+(\d+)/)
+      if (!match) { tr.style.display = ''; continue }
+      const tName = match[1].replace(/\s*\(parent\)|\s*\(grandparent\)|\s*\(ancestor #\d+\)/g, '').trim()
+      const tGstep = Number(match[2])
+      tr.style.display = dropKeys.has(`${tName}|${tGstep}`) ? 'none' : ''
     }
   }, [])
   // Attach the hover filter via a poll — the plotDiv is replaced after
