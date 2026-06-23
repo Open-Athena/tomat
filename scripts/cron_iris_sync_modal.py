@@ -305,7 +305,14 @@ def _sync() -> dict:
 @app.function(
     cpu=1,
     memory=1024,
-    timeout=120,
+    # 240s ceiling: at MAX_SYNC_WORKERS=4 and len(PREFIXES)=8 the worst-case
+    # wall-clock is ceil(8/4) × per-prefix_timeout = 2 × 60s = 120s with zero
+    # overhead headroom — equal to the function's own timeout, so a sibling
+    # prefix would always race the cron's own cutoff. 240s gives us a clean
+    # 2× margin and still leaves the safety check (`count == 0` → skip
+    # upload) free to bail if iris is wedged. Bump again if we add more
+    # runners (the worst-case scales with ceil(len(PREFIXES) / 4)).
+    timeout=240,
     secrets=[adc_secret, r2_secret],
     schedule=modal.Cron("* * * * *"),  # every minute UTC
 )
@@ -316,7 +323,14 @@ def cron_sync() -> dict:
 @app.function(
     cpu=1,
     memory=1024,
-    timeout=120,
+    # 240s ceiling: at MAX_SYNC_WORKERS=4 and len(PREFIXES)=8 the worst-case
+    # wall-clock is ceil(8/4) × per-prefix_timeout = 2 × 60s = 120s with zero
+    # overhead headroom — equal to the function's own timeout, so a sibling
+    # prefix would always race the cron's own cutoff. 240s gives us a clean
+    # 2× margin and still leaves the safety check (`count == 0` → skip
+    # upload) free to bail if iris is wedged. Bump again if we add more
+    # runners (the worst-case scales with ceil(len(PREFIXES) / 4)).
+    timeout=240,
     secrets=[adc_secret, r2_secret],
 )
 def sync_once() -> dict:
