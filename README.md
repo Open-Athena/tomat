@@ -11,20 +11,20 @@ DFT-converged electron density for periodic crystals. Inspired by
 
 ## Current state
 
-Best **honest in-distribution NMAE** so far: `train-mg-kl-bin5-fs-tpu`
+Best NMAE so far: `train-mg-kl-bin5-fs-tpu`
 (200M Qwen3, KL-Gauss σ=5, absorbing-prior MaskGIT, 100k steps on v6e-16):
-**val mean 7.46 % / median 5.35 %**, train mean 6.37 % / median 5.26 %
-on 200 mats each at K=1.
+**val mean 7.46% / median 5.35%**, train mean 6.37% / median 5.26%
+(200 mats each).
 
 For reference: ChargE3Net SOTA is **0.196 %**, electrAI ResUNet ~**0.18 %**.
-The 25-40× gap is real and is the thing we're trying to close.
 
 In flight: 10k from-scratch ablations sweeping the bin-width σ ∈ {3, 5, 10, 20}
 and the mask schedule (cos-r vs absorbing); a +10k extension of bin5 to test
 whether it keeps improving past 100k.
 
-For the live per-run table, ckpt list, per-mat ELVis diffs, and m-NMAE /
-m-NEMD trajectories, see [`tomat.oa.dev`](https://tomat.oa.dev).
+For the live per-run table, ckpt list, per-mat [ELVis] diffs, and NMAE trajectories, see [`tomat.oa.dev`](https://tomat.oa.dev).
+
+[ELVis]: https://elvis.oa.dev
 
 ## How it works
 
