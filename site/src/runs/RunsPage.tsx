@@ -15,7 +15,7 @@ import { MEvalTable, type MEvalMetric } from './MEvalTable'
 // user's choice affects both views at once. `?mevm=nmae|nemd` in the URL
 // (defaults to NMAE).
 const M_EVAL_METRICS = ['nmae', 'nemd'] as const
-function useMEvalMetric(): readonly [MEvalMetric, (m: MEvalMetric) => void] {
+function useMEvalMetric() {
   return useUrlState('mevm', enumParam<MEvalMetric>('nmae', M_EVAL_METRICS))
 }
 import { RunsTimelinePlot, colorForIndex, useNameFilter, useTagFilters, useAncestorsToggle, compileMultiTermFilter, runHaystack, shortLabel } from './RunsTimelinePlot'

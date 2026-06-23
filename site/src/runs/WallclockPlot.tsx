@@ -307,7 +307,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     // of the visible x-range so the dedup tracks the rendered pixel
     // resolution rather than absolute step / wallclock units.
     type Range = [number, number]
-    const xRange = (plotDiv._fullLayout?.xaxis?.range as Range | undefined) ?? null
+    const xRange = ((plotDiv._fullLayout as { xaxis?: { range?: Range } } | undefined)?.xaxis?.range) ?? null
     const bucketWidth = xRange ? Math.max(1, (xRange[1] - xRange[0]) / 300) : null
     const tinted: typeof tintedRaw = []
     const seenBucketKey = new Set<string>()
