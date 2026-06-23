@@ -943,227 +943,155 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       if (isCurrent && seriesPerSeg[i].xs.length > 0) lastNonEmptyCurrent = i
     }
     const numCurrentSegs = firstCurrentSeg === -1 ? 0 : N - firstCurrentSeg
-    const out: SmoothedTrace[] = []
-    seriesPerSeg.forEach((s, segIdx) => {
-      if (s.xs.length === 0) return
-      const segMeta = segments[segIdx]
-      const ancestor = ancestorOf(segMeta.partIdx)
-      const isCurrent = !ancestor
-      const isLatest = isCurrent && segIdx === lastNonEmptyCurrent
-      // Color override + opacity / legend strategy:
-      //   - ancestor segments: full opacity, ancestor's color, per-ancestor
-      //     legendgroup so each ancestor has its own legend row;
-      //   - current-run segments: existing ramp anchored on lastNonEmptyCurrent.
-      let traceColor: string
-      let opacity: number
-      let legendGroup: string
-      let groupTitle: string
-      let showLegend: boolean
-      let segName: string
-      // Full descriptive label used in the per-trace hovertemplate (the legend
-      // text itself stays short — `name` or `${name} #k/N`). For ancestor
-      // segments, this surfaces the full ancestor name on hover so the
-      // discoverability cost of the short group title is paid back.
-      let hoverLabel: string
+    void numCurrentSegs
+    void lastNonEmptyCurrent
+    // Group segments into buckets: one "current" bucket + one per ancestor.
+    // Each bucket emits a SINGLE concatenated trace so the x-unified tooltip
+    // shows ONE TL + ONE VL entry per group (current, parent, grandparent),
+    // not one per restart segment. Bucketing in insertion order keeps the
+    // legend order stable (current first, then ancestors as they appear).
+    type Bucket = {
+      key: string
+      segIndices: number[]
+      isCurrent: boolean
+      color: string
+      legendGroup: string
+      groupTitle: string
+      hoverName: string
+      legendName: string
+      showLegend: boolean
+    }
+    const buckets = new Map<string, Bucket>()
+    for (let i = 0; i < N; i++) {
+      const sm = segments[i]
+      const ancestor = ancestorOf(sm.partIdx)
       if (ancestor) {
-        traceColor = ancestor.color
-        opacity = 1
-        // Each ancestor gets its own legend group so hover-fade and
-        // legend-toggle isolate the ancestor's metric stack from the
-        // current run's `losses` group. Group key is unique per ancestor.
-        legendGroup = `lineage:${ancestor.name}`
-        // Short relationship label (parent / grandparent / great-grandparent
-        // / ancestor #N) — the previous full-name group title `ancestor:
-        // <full-name>` dominated the plot width on multi-ancestor runs.
-        // Full name lives on hover (see `hoverLabel`). `lineageInfo` is
-        // non-null here because `ancestor` is.
-        groupTitle = ancestorRelation(segMeta.partIdx, lineageInfo!.length)
-        showLegend = true  // one row per ancestor per metric
-        // Trace name matches the current-run's `name` (e.g. `TL (train/loss)`)
-        // — the legend group title disambiguates which ancestor it is, and
-        // color further distinguishes. Same-name traces still work for the
-        // band-fade logic: ancestor segments don't draw ±σ bands (see
-        // `isLatest` gate below), so the only `name`-matched band edges are
-        // the current run's, which fade together with their parent line.
-        segName = name
-        hoverLabel = `${name} · ${groupTitle} (${ancestor.name})`
-      } else {
-        traceColor = color
-        // Current-run restart segments are sequential in x (step, wallclock,
-        // and epoch all monotonic across resumes), so they never visually
-        // overlap — a recency fade adds no information, only readability cost.
-        // The dashed gap-bridge between segments already shows where restarts
-        // happened.
-        opacity = 1
-        const relIdx = segIdx - firstCurrentSeg
-        legendGroup = lg
-        groupTitle = 'losses (log)'
-        showLegend = isLatest
-        // Label per-segment as `<name> #k/N` (1-based, matches the
-        // restart-segment header count). The hovertemplate uses `segName`
-        // too so the x-unified tooltip shows distinct lines per segment
-        // instead of three identical "TL (train loss)" rows.
-        segName = numCurrentSegs > 1 && !isLatest
-          ? `${name} #${relIdx + 1}/${numCurrentSegs}` : name
-        hoverLabel = segName
-      }
-      // Bypass smoothing for sparse traces — VL on a long run carries ~5-20
-      // points across 10k+ steps, and sample-index rolling with window >
-      // len(ys) collapses every output to the global mean → flat line. Same
-      // rationale as the MT/MV exemption at `evalMedianTrace` below; VL ends
-      // up here because it's logically grouped with TL into one
-      // `smoothedSeriesTraces` call. Threshold 30 is well above typical VL
-      // counts and well below TL's 1000s, so TL still smooths normally.
-      const SPARSE_THRESHOLD = 30
-      const nonNullYs = s.ys.reduce((acc, y) => acc + (y == null ? 0 : 1), 0)
-      const isSparse = nonNullYs < SPARSE_THRESHOLD
-      const { mean: ySmoothed, std: yStd } = isSparse
-        ? { mean: s.ys, std: null as (number | null)[] | null }
-        : computeSmoothedSeries(s.ys, smooth)
-      const segGsteps = customGsteps(s)
-      // Gap-break the main-line arrays so plotly doesn't connect across pauses.
-      // We insert one extra `null` y entry between the gap-start and gap-end
-      // indices (plotly drops the null point but breaks the line on either
-      // side). The bridge trace gets only the (start, end, null) triples for
-      // each gap so consecutive bridges render as discrete dotted spans
-      // rather than fusing into one polyline.
-      const gapEnds = findGapEndIndices(s.xs)
-      const gapSet = new Set(gapEnds)
-      const bridgeX: (string | number | null)[] = []
-      const bridgeY: (number | null)[] = []
-      let lineX: (string | number)[] = s.xs
-      let lineY: (number | null)[] = ySmoothed
-      let lineG: (number | string | null)[] = segGsteps
-      let lineYStd: (number | null)[] | null = yStd
-      if (gapEnds.length > 0) {
-        const newX: (string | number)[] = []
-        const newY: (number | null)[] = []
-        const newG: (number | string | null)[] = []
-        const newYStd: (number | null)[] | null = yStd ? [] : null
-        for (let i = 0; i < s.xs.length; i++) {
-          if (gapSet.has(i)) {
-            // Insert a null-y break-marker BEFORE the post-gap point. Reuse
-            // the gap-start x as the marker's x — plotly drops the null
-            // anyway; its x value never renders.
-            newX.push(s.xs[i - 1])
-            newY.push(null)
-            newG.push(null)
-            newYStd?.push(null)
-            // Bridge: (start, end, null) so consecutive bridges don't fuse.
-            bridgeX.push(s.xs[i - 1], s.xs[i], null)
-            bridgeY.push(ySmoothed[i - 1], ySmoothed[i], null)
-          }
-          newX.push(s.xs[i])
-          newY.push(ySmoothed[i])
-          newG.push(segGsteps[i])
-          newYStd?.push(yStd ? yStd[i] : null)
+        const bk = `ancestor:${ancestor.name}`
+        if (!buckets.has(bk)) {
+          const rel = ancestorRelation(sm.partIdx, lineageInfo!.length)
+          buckets.set(bk, {
+            key: bk,
+            segIndices: [],
+            isCurrent: false,
+            color: ancestor.color,
+            legendGroup: `lineage:${ancestor.name}`,
+            groupTitle: rel,
+            hoverName: `${name} · ${rel} (${ancestor.name})`,
+            legendName: name,
+            showLegend: true,
+          })
         }
-        lineX = newX; lineY = newY; lineG = newG; lineYStd = newYStd
+        buckets.get(bk)!.segIndices.push(i)
+      } else {
+        const bk = 'current'
+        if (!buckets.has(bk)) {
+          buckets.set(bk, {
+            key: bk,
+            segIndices: [],
+            isCurrent: true,
+            color,
+            legendGroup: lg,
+            groupTitle: 'losses (log)',
+            hoverName: name,
+            legendName: name,
+            showLegend: true,
+          })
+        }
+        buckets.get(bk)!.segIndices.push(i)
       }
-      // Sparse segments (≤1 point) can't draw as a line — VL on a 72-restart
-      // run lands at most one VL eval per segment, so every VL datapoint
-      // ends up the lone member of its segment and a `lines`-only render
-      // erases it. Fall back to a marker so the point is visible; multi-
-      // point segments stay as before (TL has thousands per segment, the
-      // line is dense, markers would only add noise).
-      const sparse = lineX.length <= 1
-      const lineTrace: SmoothedTrace = {
-        x: lineX, y: lineY, name: segName,
-        type: 'scatter',
-        mode: sparse ? 'markers' : 'lines',
-        line: { color: traceColor, width: lineWidth },
-        ...(sparse ? { marker: { color: traceColor, size: 5 } } : {}),
-        opacity,
-        yaxis: 'y2',
-        legendgroup: legendGroup,
-        legendgrouptitle: { text: groupTitle },
-        showlegend: showLegend,
-        customdata: lineG,
-        hovertemplate: `${hoverLabel} %{y:.3f}<br>gstep %{customdata}<extra></extra>`,
-      }
-      // Dotted bridge connecting each gap's endpoints. Same color/opacity/
-      // legendgroup as the main line so a legend-toggle hides them with the
-      // rest of the segment; `showlegend: false` so it doesn't add its own
-      // LI. `hoverinfo: 'none'` (NOT 'skip') keeps `applyBandFade` from
-      // sweeping the bridge into its `showlegend:false + hoverinfo:'skip'`
-      // bucket (which force-sets opacity to 1 or 0.3 on every band edge);
-      // 'none' suppresses the bridge's tooltip without joining that bucket.
-      const bridgeTrace: SmoothedTrace | null = bridgeX.length > 0 ? {
-        x: bridgeX, y: bridgeY, name: segName,
-        type: 'scatter', mode: 'lines',
-        line: { color: traceColor, width: lineWidth, dash: 'dot' },
-        opacity,
-        yaxis: 'y2',
-        legendgroup: legendGroup,
-        showlegend: false,
-        hoverinfo: 'none',
-      } : null
-      // Only show ±σ bands on the latest current-run segment — drawing 28
-      // overlapping bands would just be noise, and the older trajectories
-      // already smear visually via opacity. Ancestor segments are skipped
-      // here too: their context is "look at the previous color smoothly
-      // joining ours", not "what was that ancestor's intra-window σ".
-      if (!bandsOn || !lineYStd || !isLatest) {
-        out.push(lineTrace)
-        if (bridgeTrace) out.push(bridgeTrace)
-        return
-      }
-      const yLower: (number | null)[] = []
-      const yUpper: (number | null)[] = []
-      for (let i = 0; i < lineY.length; i++) {
-        const m = lineY[i]
-        const sd = lineYStd[i]
-        if (m == null || sd == null) { yLower.push(null); yUpper.push(null); continue }
-        // y2 is log-scaled — keep band edges strictly positive so plotly doesn't
-        // drop them (`log(<=0) = NaN`). 1e-6 is well below any real loss value.
-        yLower.push(Math.max(1e-6, m - sd))
-        yUpper.push(m + sd)
-      }
-      const edge = (y: (number | null)[], fillKey: string | null): SmoothedTrace => ({
-        x: lineX, y, name: segName,
-        type: 'scatter', mode: 'lines',
-        line: { width: 0, color: 'rgba(0,0,0,0)' },
-        yaxis: 'y2', legendgroup: legendGroup,
-        showlegend: false,
-        hoverinfo: 'skip',
-        ...(fillKey ? { fill: 'tonexty', fillcolor: fillKey } : {}),
-      })
-      const rgb = hexToRgbTuple(traceColor)
-      const fillcolor = `rgba(${rgb}, 0.18)`
-      out.push(edge(yLower, null), edge(yUpper, fillcolor), lineTrace)
-      if (bridgeTrace) out.push(bridgeTrace)
-    })
-    // Cross-segment connector for sparse-overall metrics (VL on long resume
-    // chains). Without this, each per-segment trace has ≤1 point and falls
-    // into markers-only mode (see `sparse` branch above) — the user sees
-    // ~72 disconnected dots with no line. The connector concatenates all
-    // current-run segments' points in order and draws a single thin line
-    // underneath the markers. Ancestor segments are not connected (different
-    // colors, different lineage groups).
-    const currentSparseSegs = seriesPerSeg.filter((s, i) => {
-      if (s.xs.length === 0) return false
-      if (s.xs.length > 1) return false
-      return !ancestorOf(segments[i].partIdx)
-    })
-    if (currentSparseSegs.length > 1) {
+    }
+    const SPARSE_THRESHOLD = 30
+    const out: SmoothedTrace[] = []
+    for (const bucket of buckets.values()) {
+      // Concatenate this bucket's segments. Insert a `null` y between
+      // consecutive segments so plotly breaks the line (the segment boundary
+      // is real — don't draw across restart gaps). Smoothing runs PER segment
+      // so the kernel doesn't reach back across a restart.
       const cx: (string | number)[] = []
       const cy: (number | null)[] = []
-      for (const s of currentSparseSegs) {
+      const cg: (number | string | null)[] = []
+      const cyStd: (number | null)[] = []
+      let lastSegFirstIdx = -1
+      let lastSegLastIdx = -1
+      let pointCount = 0
+      bucket.segIndices.forEach((segIdx, pos) => {
+        const s = seriesPerSeg[segIdx]
+        if (s.xs.length === 0) return
+        const nonNullYs = s.ys.reduce((acc, y) => acc + (y == null ? 0 : 1), 0)
+        const isSparseSeg = nonNullYs < SPARSE_THRESHOLD
+        const { mean: ySm, std: ySt } = isSparseSeg
+          ? { mean: s.ys, std: null as (number | null)[] | null }
+          : computeSmoothedSeries(s.ys, smooth)
+        const segG = customGsteps(s)
+        const isLastBucketSeg = pos === bucket.segIndices.length - 1
+        if (cx.length > 0) {
+          // Inter-segment null break — share the gap-start x so the break
+          // marker doesn't render anywhere visible.
+          cx.push(s.xs[0]); cy.push(null); cg.push(null); cyStd.push(null)
+        }
+        if (isLastBucketSeg) lastSegFirstIdx = cx.length
+        const gapEnds = findGapEndIndices(s.xs)
+        const gapSet = new Set(gapEnds)
         for (let i = 0; i < s.xs.length; i++) {
+          if (gapSet.has(i) && i > 0) {
+            cx.push(s.xs[i - 1]); cy.push(null); cg.push(null); cyStd.push(null)
+          }
           cx.push(s.xs[i])
-          cy.push(s.ys[i])
+          cy.push(ySm[i])
+          cg.push(segG[i])
+          cyStd.push(ySt ? ySt[i] : null)
+          if (ySm[i] != null) pointCount += 1
+        }
+        if (isLastBucketSeg) lastSegLastIdx = cx.length - 1
+      })
+      if (pointCount === 0) continue
+      // Sparse-overall buckets get visible markers (each datapoint stands
+      // out — VL on long resume chains has a handful of points). Dense
+      // buckets stay lines-only (TL would be a wall of red dots otherwise).
+      const denseOverall = pointCount >= SPARSE_THRESHOLD
+      const mainTrace: SmoothedTrace = {
+        x: cx, y: cy, name: bucket.legendName,
+        type: 'scatter',
+        mode: denseOverall ? 'lines' : 'lines+markers',
+        line: { color: bucket.color, width: lineWidth },
+        ...(denseOverall ? {} : { marker: { color: bucket.color, size: 5 } }),
+        opacity: 1,
+        yaxis: 'y2',
+        legendgroup: bucket.legendGroup,
+        legendgrouptitle: { text: bucket.groupTitle },
+        showlegend: bucket.showLegend,
+        customdata: cg,
+        hovertemplate: `${bucket.hoverName} %{y:.3f}<br>gstep %{customdata}<extra></extra>`,
+      }
+      // ±σ bands only on the current bucket's last segment (avoids smearing
+      // bands across the full lineage).
+      if (bandsOn && bucket.isCurrent && lastSegFirstIdx >= 0 && lastSegLastIdx >= 0) {
+        const yLower: (number | null)[] = new Array(cx.length).fill(null)
+        const yUpper: (number | null)[] = new Array(cx.length).fill(null)
+        let hasBand = false
+        for (let i = lastSegFirstIdx; i <= lastSegLastIdx; i++) {
+          const m = cy[i]
+          const sd = cyStd[i]
+          if (m == null || sd == null) continue
+          yLower[i] = Math.max(1e-6, m - sd)
+          yUpper[i] = m + sd
+          hasBand = true
+        }
+        if (hasBand) {
+          const edge = (y: (number | null)[], fillKey: string | null): SmoothedTrace => ({
+            x: cx, y, name: bucket.legendName,
+            type: 'scatter', mode: 'lines',
+            line: { width: 0, color: 'rgba(0,0,0,0)' },
+            yaxis: 'y2', legendgroup: bucket.legendGroup,
+            showlegend: false,
+            hoverinfo: 'skip',
+            ...(fillKey ? { fill: 'tonexty', fillcolor: fillKey } : {}),
+          })
+          const rgb = hexToRgbTuple(bucket.color)
+          out.push(edge(yLower, null), edge(yUpper, `rgba(${rgb}, 0.18)`))
         }
       }
-      out.push({
-        x: cx, y: cy, name,
-        type: 'scatter', mode: 'lines',
-        line: { color, width: lineWidth * 0.7 },
-        opacity: 0.6,
-        yaxis: 'y2',
-        legendgroup: lg,
-        showlegend: false,
-        hoverinfo: 'none',
-      })
+      out.push(mainTrace)
     }
     return out
   }
@@ -1771,12 +1699,11 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     margin: { t: 50, l: 70, r: 210, b: 50 },
     hovermode: 'x unified' as const,
     hoverlabel: { ...themedHoverlabel(isDark), align: 'left' as const },
-    // hoverdistance is the per-trace pixel cutoff for x-unified — `-1` means
-    // every trace contributes its nearest point regardless of distance, which
-    // turned the unified tooltip into one line per segment trace (72 lines
-    // for bin5). Default 20 px keeps only segments with a point near the
-    // cursor → at any x, one TL line + one VL marker show.
-    hoverdistance: 20,
+    // -1 = every trace contributes its nearest point regardless of pixel
+    // distance. Safe because `smoothedSeriesTraces` now emits ONE trace per
+    // logical group (current + each ancestor), so the unified tooltip has
+    // one TL + one VL row per group at the cursor x.
+    hoverdistance: -1,
     legend: {
       x: 1.02, y: 1, bgcolor: 'rgba(0,0,0,0)',
       tracegroupgap: 10,
