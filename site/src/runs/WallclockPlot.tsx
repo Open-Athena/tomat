@@ -391,18 +391,40 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     if (dropKeys.size === 0) return
     const hl = plotDiv.querySelector('.hoverlayer')
     if (!hl) return
+    const legendG = hl.querySelector('g.legend') as SVGGElement | null
     const allTraces = Array.from(hl.querySelectorAll('g.legend g.traces')) as SVGGElement[]
+    let lastVisibleBottom = 0
     for (const tr of allTraces) {
       const txt = tr.textContent ?? ''
-      if (!txt.includes('gstep')) {
-        tr.style.display = ''
-        continue
+      const isTitle = !txt.includes('gstep')
+      let hide = false
+      if (!isTitle) {
+        const match = txt.match(/^(.+?)\s+\(?[\d.]+%?\)?\s*gstep\s+(\d+)/)
+        if (match) {
+          const tName = match[1].replace(/\s*\(parent\)|\s*\(grandparent\)|\s*\(ancestor #\d+\)/g, '').trim()
+          const tGstep = Number(match[2])
+          hide = dropKeys.has(`${tName}|${tGstep}`)
+        }
       }
-      const match = txt.match(/^(.+?)\s+\(?[\d.]+%?\)?\s*gstep\s+(\d+)/)
-      if (!match) { tr.style.display = ''; continue }
-      const tName = match[1].replace(/\s*\(parent\)|\s*\(grandparent\)|\s*\(ancestor #\d+\)/g, '').trim()
-      const tGstep = Number(match[2])
-      tr.style.display = dropKeys.has(`${tName}|${tGstep}`) ? 'none' : ''
+      tr.style.display = hide ? 'none' : ''
+      if (!hide) {
+        try {
+          const bb = tr.getBBox()
+          // The bbox is in the inner coord system; combine with the
+          // entry's translate(y) to find its bottom relative to the
+          // legend's bg rect.
+          const trMatch = (tr.getAttribute('transform') ?? '').match(/translate\([^,]+,\s*([-\d.]+)\)/)
+          const ty = trMatch ? parseFloat(trMatch[1]) : 0
+          const bottom = ty + bb.y + bb.height
+          if (bottom > lastVisibleBottom) lastVisibleBottom = bottom
+        } catch { /* getBBox can throw on detached nodes; ignore */ }
+      }
+    }
+    // Shrink the hover bg rect so there's no big empty area below the
+    // last visible entry. Add a small bottom margin.
+    const bg = legendG?.querySelector('rect.bg') as SVGRectElement | null
+    if (bg && lastVisibleBottom > 0) {
+      bg.setAttribute('height', String(Math.ceil(lastVisibleBottom + 4)))
     }
   }, [])
   // Attach the hover filter via a poll — the plotDiv is replaced after
