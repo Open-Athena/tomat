@@ -352,105 +352,6 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     return () => plotDiv.removeListener?.('plotly_afterplot', applyShapeFade)
   }, [applyShapeFade])
 
-  // x-unified hover post-filter — suppress entries whose trace doesn't
-  // actually have data at the cursor x. Plotly's `nearest non-null` logic
-  // shows the parent's terminal point even when the cursor is several k
-  // steps past it; this filter hides any entry whose trace's actual data
-  // x-range doesn't include the cursor.
-  const filterHoverByRange = useCallback((ev: { xvals?: number[]; points?: Array<{ data?: { name?: string; x?: Array<number | null | string> } }> }) => {
-    const root = plotWrapperRef.current
-    const plotDiv = root?.querySelector('.js-plotly-plot') as HTMLElement | null
-    if (!plotDiv) return
-    const cursorX = ev.xvals?.[0]
-    if (cursorX == null || !ev.points || ev.points.length === 0) return
-    // Build a "drop key" set indexed by `${traceName} gstep ${maxX}` —
-    // robust to ev.points-vs-DOM ordering mismatches. The DOM entry's
-    // text reads e.g. "TL (train loss) (parent) 7.548gstep 40000"; if
-    // that exact (name, gstep) pair is in the drop set, hide the entry.
-    const dropKeys = new Set<string>()
-    ev.points.forEach((p) => {
-      const xs = p.data?.x
-      const name = p.data?.name
-      if (!Array.isArray(xs) || !name) return
-      let xMin = Infinity
-      let xMax = -Infinity
-      for (const x of xs) {
-        if (typeof x !== 'number') continue
-        if (x < xMin) xMin = x
-        if (x > xMax) xMax = x
-      }
-      if (xMin === Infinity) return
-      if (cursorX < xMin || cursorX > xMax) {
-        // Out-of-range. Plotly's nearest-point pick lands on the trace's
-        // closest endpoint to the cursor — xMin if cursor < xMin, else
-        // xMax. Encode both candidates and match either.
-        dropKeys.add(`${name}|${xMax}`)
-        dropKeys.add(`${name}|${xMin}`)
-      }
-    })
-    if (dropKeys.size === 0) return
-    const hl = plotDiv.querySelector('.hoverlayer')
-    if (!hl) return
-    const legendG = hl.querySelector('g.legend') as SVGGElement | null
-    const allTraces = Array.from(hl.querySelectorAll('g.legend g.traces')) as SVGGElement[]
-    let lastVisibleBottom = 0
-    for (const tr of allTraces) {
-      const txt = tr.textContent ?? ''
-      const isTitle = !txt.includes('gstep')
-      let hide = false
-      if (!isTitle) {
-        const match = txt.match(/^(.+?)\s+\(?[\d.]+%?\)?\s*gstep\s+(\d+)/)
-        if (match) {
-          const tName = match[1].replace(/\s*\(parent\)|\s*\(grandparent\)|\s*\(ancestor #\d+\)/g, '').trim()
-          const tGstep = Number(match[2])
-          hide = dropKeys.has(`${tName}|${tGstep}`)
-        }
-      }
-      tr.style.display = hide ? 'none' : ''
-      if (!hide) {
-        try {
-          const bb = tr.getBBox()
-          // The bbox is in the inner coord system; combine with the
-          // entry's translate(y) to find its bottom relative to the
-          // legend's bg rect.
-          const trMatch = (tr.getAttribute('transform') ?? '').match(/translate\([^,]+,\s*([-\d.]+)\)/)
-          const ty = trMatch ? parseFloat(trMatch[1]) : 0
-          const bottom = ty + bb.y + bb.height
-          if (bottom > lastVisibleBottom) lastVisibleBottom = bottom
-        } catch { /* getBBox can throw on detached nodes; ignore */ }
-      }
-    }
-    // Shrink the hover bg rect so there's no big empty area below the
-    // last visible entry. Add a small bottom margin.
-    const bg = legendG?.querySelector('rect.bg') as SVGRectElement | null
-    if (bg && lastVisibleBottom > 0) {
-      bg.setAttribute('height', String(Math.ceil(lastVisibleBottom + 4)))
-    }
-  }, [])
-  // Attach the hover filter via a poll — the plotDiv is replaced after
-  // the first data-driven redraw (~10 s after mount), so a one-shot
-  // attach races with the redraw and ends up bound to a stale node. The
-  // polling effect re-checks every 500 ms and re-attaches via a tagged
-  // attribute (idempotent: only attaches once per new plotDiv).
-  useEffect(() => {
-    const root = plotWrapperRef.current
-    if (!root) return
-    const TAG = 'data-tomat-hover-filter-attached'
-    let stopped = false
-    const tryAttach = () => {
-      if (stopped) return
-      const plotDiv = root.querySelector('.js-plotly-plot') as (HTMLElement & {
-        on?: (evt: string, fn: (ev: unknown) => void) => void
-      }) | null
-      if (plotDiv?.on && plotDiv.getAttribute(TAG) !== '1') {
-        plotDiv.setAttribute(TAG, '1')
-        plotDiv.on('plotly_hover', filterHoverByRange as unknown as (ev: unknown) => void)
-      }
-    }
-    tryAttach()
-    const id = window.setInterval(tryAttach, 500)
-    return () => { stopped = true; window.clearInterval(id) }
-  }, [filterHoverByRange])
 
   // `?x=wallclock|elapsed|step|epoch` — URL-persisted so deep-links carry
   // the view choice. The run-detail page defaults to `'step'` (training
@@ -1807,15 +1708,19 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     // See the Bug 3 fix comment above.
     margin: { t: 50, l: 70, r: 210, b: 50 },
     hovermode: 'x unified' as const,
+    // `hoversubplots: 'axis'` makes the x-unified tooltip span ALL subplots
+    // sharing the x axis — TL/VL panel + MT/MV panel — so a single hover
+    // box surfaces every trace the spikeline intersects. plotly default is
+    // 'single' which restricts hover to the cursor's subplot only.
+    hoversubplots: 'axis' as const,
+    // `hoverdistance: 1` so only traces whose nearest data point is
+    // essentially on the spikeline contribute to the unified tooltip.
+    // The user explicitly asked for "exactly the traces the x-sparkline
+    // intersects, none more none less" — a wider value re-introduces an
+    // "overlap buffer" near restart cutovers where the parent's terminal
+    // point (last x = N) leaks into the tooltip for cursors at N+ε.
+    hoverdistance: 1,
     hoverlabel: { ...themedHoverlabel(isDark), align: 'left' as const },
-    // Tight pixel cutoff so out-of-range groups (e.g. a parent whose last
-    // point is well before the cursor) drop out of the x-unified tooltip.
-    // Sparse VL markers (~5k step spacing) are ~27 px apart at full-100k
-    // zoom in a 540 px plot; 40 px catches the nearest VL marker while
-    // rejecting parents whose terminal point is >5k steps from the cursor.
-    // Caveat: when zoomed in 10×, VL spacing → 270 px and only the closest
-    // half of the inter-marker gap will hover; pre-existing trade-off.
-    hoverdistance: 40,
     legend: {
       x: 1.02, y: 1, bgcolor: 'rgba(0,0,0,0)',
       tracegroupgap: 10,
