@@ -1133,6 +1133,38 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       out.push(edge(yLower, null), edge(yUpper, fillcolor), lineTrace)
       if (bridgeTrace) out.push(bridgeTrace)
     })
+    // Cross-segment connector for sparse-overall metrics (VL on long resume
+    // chains). Without this, each per-segment trace has ≤1 point and falls
+    // into markers-only mode (see `sparse` branch above) — the user sees
+    // ~72 disconnected dots with no line. The connector concatenates all
+    // current-run segments' points in order and draws a single thin line
+    // underneath the markers. Ancestor segments are not connected (different
+    // colors, different lineage groups).
+    const currentSparseSegs = seriesPerSeg.filter((s, i) => {
+      if (s.xs.length === 0) return false
+      if (s.xs.length > 1) return false
+      return !ancestorOf(segments[i].partIdx)
+    })
+    if (currentSparseSegs.length > 1) {
+      const cx: (string | number)[] = []
+      const cy: (number | null)[] = []
+      for (const s of currentSparseSegs) {
+        for (let i = 0; i < s.xs.length; i++) {
+          cx.push(s.xs[i])
+          cy.push(s.ys[i])
+        }
+      }
+      out.push({
+        x: cx, y: cy, name,
+        type: 'scatter', mode: 'lines',
+        line: { color, width: lineWidth * 0.7 },
+        opacity: 0.6,
+        yaxis: 'y2',
+        legendgroup: lg,
+        showlegend: false,
+        hoverinfo: 'none',
+      })
+    }
     return out
   }
 
@@ -1152,11 +1184,16 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
   //
   // Markers are size 6 so the typically-handful (~4) of timepoints are clearly
   // visible. ±p25-p75 / p1-p99 bands were dropped — see header comment.
-  const evalMedianTrace = (
+  const evalMeanTrace = (
     setKey: string, mvmt: 'MT' | 'MV', kLabel: string,
     dash: 'solid' | 'dash',
     metric: 'nmae' | 'nemd',
   ) => {
+    // Use the MEAN of nmae_filled_* / nemd_filled_* to match the MEvalTable
+    // (table reads `${metric}_filled_mean`). Plot was previously using
+    // `_median`, which produced different numbers per step (e.g. bin5 step
+    // 100k: median 5.35% vs mean 7.46%). Median is more outlier-robust but
+    // diverging from the table broke user trust in the dashboard's coherence.
     const pts = evalSeries?.sets[setKey] ?? []
     const xs: (string | number)[] = []
     const ys: (number | null)[] = []
@@ -1165,7 +1202,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       const x = xOfStep(pt.step)
       if (x === null) continue
       const rec = pt as unknown as Record<string, number | null>
-      const v = rec[`${metric}_median`]
+      const v = rec[`${metric}_filled_mean`] ?? rec[`${metric}_mean`]
       const nMats = (pt as unknown as { n_mats?: number }).n_mats
       xs.push(x)
       customdata.push([pt.step, nMats ?? '?'])
@@ -1240,7 +1277,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     }
     for (const setKey of setKeys) {
       const { mvmt, kLabel, dash } = labelFor(setKey)
-      out.push(evalMedianTrace(setKey, mvmt, kLabel, dash, mevalMetric))
+      out.push(evalMeanTrace(setKey, mvmt, kLabel, dash, mevalMetric))
     }
     return out
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1734,7 +1771,12 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     margin: { t: 50, l: 70, r: 210, b: 50 },
     hovermode: 'x unified' as const,
     hoverlabel: { ...themedHoverlabel(isDark), align: 'left' as const },
-    hoverdistance: -1,
+    // hoverdistance is the per-trace pixel cutoff for x-unified — `-1` means
+    // every trace contributes its nearest point regardless of distance, which
+    // turned the unified tooltip into one line per segment trace (72 lines
+    // for bin5). Default 20 px keeps only segments with a point near the
+    // cursor → at any x, one TL line + one VL marker show.
+    hoverdistance: 20,
     legend: {
       x: 1.02, y: 1, bgcolor: 'rgba(0,0,0,0)',
       tracegroupgap: 10,
