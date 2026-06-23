@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Cron-invoked iris-state sync — runs on the `tomat-iris-cron` GCE VM.
 
-Standalone (no `tomat` / `marin/` working-dir requirement) so the VM doesn't
-need the full repo. Mirrors the data-shape that `tomat iris sync` writes to
-`s3://openathena/tomat/iris-state.json`, so the dashboard reads identically.
-
-Deployed by `scripts/setup-iris-cron-vm.sh`. Crontab runs this every minute.
+The script itself doesn't need the full `tomat` checkout — only the canonical
+runner roster — so we co-locate this with `scripts/iris_runners.py` and ship
+both files to the VM. `scripts/setup-iris-cron-vm.sh` rsyncs the `scripts/`
+dir; the cron invokes this file from there, and the sibling `iris_runners`
+import resolves locally. Mirrors the data-shape that `tomat iris sync` writes
+to `s3://openathena/tomat/iris-state.json`, so the dashboard reads identically.
 
 R2 creds: pulled from `~/.aws/credentials [cfo]` (so we don't depend on
 cron's stripped env).
