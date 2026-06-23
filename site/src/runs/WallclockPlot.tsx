@@ -976,7 +976,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
             color: ancestor.color,
             legendGroup: `lineage:${ancestor.name}`,
             groupTitle: rel,
-            hoverName: `${name} · ${rel} (${ancestor.name})`,
+            hoverName: `${name} (${rel})`,
             legendName: name,
             showLegend: true,
           })
@@ -1699,13 +1699,14 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     margin: { t: 50, l: 70, r: 210, b: 50 },
     hovermode: 'x unified' as const,
     hoverlabel: { ...themedHoverlabel(isDark), align: 'left' as const },
-    // 100 px = a trace contributes its nearest point ONLY if the point is
-    // within 100 px of the cursor. Tight enough that out-of-range groups
-    // (e.g. parent's last point 24k steps before cursor) drop out of the
-    // unified tooltip; loose enough to catch sparse VL markers (typically
-    // 4-8k steps apart on long runs ≈ 50-100 px). At any cursor x: one TL
-    // + one VL per group whose data actually reaches the cursor area.
-    hoverdistance: 100,
+    // Tight pixel cutoff so out-of-range groups (e.g. a parent whose last
+    // point is well before the cursor) drop out of the x-unified tooltip.
+    // Sparse VL markers (~5k step spacing) are ~27 px apart at full-100k
+    // zoom in a 540 px plot; 40 px catches the nearest VL marker while
+    // rejecting parents whose terminal point is >5k steps from the cursor.
+    // Caveat: when zoomed in 10×, VL spacing → 270 px and only the closest
+    // half of the inter-marker gap will hover; pre-existing trade-off.
+    hoverdistance: 40,
     legend: {
       x: 1.02, y: 1, bgcolor: 'rgba(0,0,0,0)',
       tracegroupgap: 10,
