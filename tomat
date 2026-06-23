@@ -5301,6 +5301,232 @@ def ckpt_ls(run_label: str, bucket_override: str | None):
     print(f"  size: {du.stdout.strip()}")
 
 
+@cli.group("fires")
+def fires_grp():
+    """Fire-script generators (spec 61, Phase 1.6).
+
+    `tomat fires new --parent P [--name N]` emits a `scripts/fires/<N>.sh`
+    with all knobs pre-filled from parent P's wandb config. The generated
+    script calls `tomat train --resume --parent P …` so the FROZEN_ON_RESUME
+    guard fires at submit time.
+
+    LIMITATION (until Phase 2 lands): wandb config is itself overwritten on
+    each resume, so reading from it may capture a CONTAMINATED state (the
+    bin5 case: `bin5-extend-10k.sh` overwrote bin5's TS0123 mid-life config
+    back to TS0). Generator emits a WARNING when this is suspected. With
+    Phase 2's editable runs DB, the parent's actual prevailing config will
+    be authoritative + uncontaminated."""
+
+
+def _bin_path_for_fire_script() -> str:
+    """Path to the python interpreter that should run `tomat train`."""
+    return "/Users/ryan/c/oa/marin/.venv/bin/python"
+
+
+def _check_parent_contamination(parent_run, parent_cfg: dict) -> list[str]:
+    """Heuristic warnings about parent's wandb config trustworthiness.
+
+    Wandb config is overwritten on each resume, so a run with N writes
+    may have lost its mid-life state. We can't fully detect this, but we
+    can surface signals:
+
+      - Run state is 'crashed' or 'failed' (the last fire may have been
+        an aborted experiment that contaminated config).
+      - lifecycle/trainer_starts summary > 1 (multiple Levanter resumes
+        have overwritten config in sequence).
+    """
+    warnings: list[str] = []
+    state = (parent_run.state or "").lower() if hasattr(parent_run, "state") else ""
+    if state in ("crashed", "failed"):
+        warnings.append(
+            f"parent state is {state!r} — its last fire may have been an "
+            "aborted experiment whose config now reflects only the failed "
+            "fire's settings, not the parent's prevailing state."
+        )
+    try:
+        summary = parent_run.summary
+        starts = summary.get("lifecycle/trainer_starts", 0)
+        if isinstance(starts, (int, float)) and starts > 1:
+            warnings.append(
+                f"parent has {int(starts)} recorded `trainer_started` "
+                "events — wandb config reflects the LAST fire only. "
+                "If any prior fire used different knobs (data label, σ, "
+                "etc.), they will NOT appear in the generated script."
+            )
+    except Exception:
+        pass
+    return warnings
+
+
+@fires_grp.command("new")
+@click.option("--parent", "parent_label", required=True,
+              help="parent run-id this fire resumes from. Generator pulls "
+                   "all FROZEN_ON_RESUME knobs from its wandb config.")
+@click.option("-N", "--name", "fire_name", default=None,
+              help="output script basename (no .sh). Defaults to `<parent>-cont-<utc>`.")
+@click.option("-D", "--data-label", "data_label_override", default=None,
+              help="override parent's data label (will require --allow-config-change "
+                   "in the generated `tomat train` call).")
+@click.option("-s", "--steps", "steps_override", default=None, type=int,
+              help="override parent's num_train_steps. Required for resumes that "
+                   "want to extend (parent.num_train_steps is the *original* horizon, "
+                   "not necessarily the resume target).")
+@click.option("--sigma", "sigma_override", default=None, type=int,
+              help="override parent's TOMAT_MG_KL_SIGMA (will require "
+                   "--allow-config-change=loss.kl_sigma in the train call).")
+@click.option("--tpu", "tpu_override", default=None,
+              help="override TPU shape (e.g. v5p-16). Defaults to parent's last "
+                   "iris fire's TPU if discoverable; else v6e-16.")
+@click.option("--zone", "zone_override", default=None,
+              help="override iris --zone. Defaults to parent's last zone if "
+                   "discoverable; else us-east5-b (v6e) / us-east5-a (v5p).")
+@click.option("--print", "print_only", is_flag=True,
+              help="print the generated script to stdout instead of writing.")
+def fires_new(
+    parent_label: str,
+    fire_name: str | None,
+    data_label_override: str | None,
+    steps_override: int | None,
+    sigma_override: int | None,
+    tpu_override: str | None,
+    zone_override: str | None,
+    print_only: bool,
+):
+    """Generate a fire script that resumes from a parent run.
+
+    Reads parent's wandb config + writes `scripts/fires/<name>.sh` invoking
+    `tomat train --resume --parent <parent> …` with all knobs pre-filled.
+    Drops the copy-paste-fire-script failure mode that caused the 4 bin5
+    bugs this week. See spec 61 §1.6."""
+    import datetime as _dt
+    parent_run, parent_cfg = _fetch_parent_wandb_run(parent_label)
+    if parent_run is None:
+        err(f"--parent {parent_label!r}: no matching wandb run found.")
+        sys.exit(1)
+    # Heuristic contamination check.
+    warnings = _check_parent_contamination(parent_run, parent_cfg)
+    if warnings:
+        err(f"[tomat fires new] WARNING: parent {parent_label!r} may have a "
+            f"contaminated wandb config:")
+        for w in warnings:
+            err(f"  - {w}")
+        err("  the generated script will reflect what's IN wandb config now, "
+            "which may not be the parent's actual prevailing state. Verify "
+            "knobs manually against the parent's earlier fire scripts / "
+            "annotations.ts before firing.")
+        err("")
+
+    # Pull knobs from parent's wandb config. Map to CLI flag values.
+    parent_cache_dir = _dot_get(parent_cfg, "data.cache_dir") or ""
+    import re as _re
+    pm = _re.search(r"/cache/([^/]+)/?$", parent_cache_dir.rstrip("/"))
+    parent_data_label = (pm.group(1) if pm else "train-full-v3").replace("+", ",")
+    parent_lr           = _dot_get(parent_cfg, "optimizer.learning_rate") or 3e-4
+    parent_lr_schedule  = _dot_get(parent_cfg, "optimizer.lr_schedule")   or "constant"
+    parent_warmup       = _dot_get(parent_cfg, "optimizer.warmup")        or 0.0
+    parent_bs           = _dot_get(parent_cfg, "trainer.train_batch_size") or 128
+    parent_steps        = _dot_get(parent_cfg, "trainer.num_train_steps")  or 10000
+    # σ + loss-type are in TOMAT_* env-vars, captured by the trainer's new
+    # wandb config write (task #269). Pre-#269 runs won't have these.
+    parent_sigma = _dot_get(parent_cfg, "tomat.env.mg_kl_sigma")
+    parent_loss  = _dot_get(parent_cfg, "tomat.env.mg_loss_type")
+    parent_mode  = _dot_get(parent_cfg, "tomat.env.mg_mode")
+    parent_prior = _dot_get(parent_cfg, "tomat.env.mg_mask_prior")
+
+    # Resolve overrides + intended-deltas list.
+    data_label = data_label_override or parent_data_label
+    sigma = sigma_override or (int(parent_sigma) if parent_sigma else None)
+    steps = steps_override or parent_steps
+    # Default new-fire steps: parent's last clean step + some headroom.
+    # (We can't easily resolve parent's last clean step here, so default to
+    # parent.steps + 10% if no override.)
+    if not steps_override:
+        steps = int(parent_steps * 1.1)  # +10% extension
+    tpu = tpu_override or "v6e-16"
+    zone = zone_override or ("us-east5-a" if tpu.startswith("v5p") else "us-east5-b")
+    # Auto fire-name if not given.
+    if not fire_name:
+        ts = _dt.datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+        fire_name = f"{parent_label.replace('train-mg-kl-', '').replace('train-mg-', '')}-cont-{ts}"
+    new_label = fire_name if fire_name.startswith("train-") else f"train-mg-{fire_name}"
+    # Identify intentional deltas (drive --allow-config-change).
+    allow_keys: list[str] = []
+    if data_label_override and data_label_override != parent_data_label:
+        allow_keys.append("data.cache_dir")
+    if sigma_override and sigma_override != parent_sigma:
+        # σ isn't in FROZEN_ON_RESUME yet (it's in tomat.env not optimizer.*),
+        # but mark it as intended.
+        pass
+
+    allow_flag = (f" --allow-config-change={','.join(allow_keys)}"
+                  if allow_keys else "")
+    # Build script body. We emit a tomat-train invocation, not raw iris,
+    # so the FROZEN_ON_RESUME guard fires at submit time.
+    PY = _bin_path_for_fire_script()
+    sigma_line = f"    --env TOMAT_MG_KL_SIGMA={sigma} \\\n" if sigma else ""
+    loss_line  = f"    --env TOMAT_MG_LOSS_TYPE={parent_loss} \\\n" if parent_loss else ""
+    mode_line  = f"    --env TOMAT_MG_MODE={parent_mode} \\\n" if parent_mode else ""
+    prior_line = f"    --env TOMAT_MG_MASK_PRIOR={parent_prior} \\\n" if parent_prior else ""
+
+    script = f"""#!/bin/bash
+# Auto-generated by `tomat fires new --parent {parent_label}`.
+# Spec 61, Phase 1.6: parent-aware fire script. The `tomat train --parent`
+# guard verifies parent's wandb config matches this fire's settings before
+# iris-submitting; any drift outside `--allow-config-change` aborts.
+#
+# Parent: {parent_label}
+#   data label:       {parent_data_label}
+#   LR:               {parent_lr} ({parent_lr_schedule})
+#   warmup:           {parent_warmup}
+#   batch size:       {parent_bs}
+#   sigma (if KL):    {parent_sigma}
+#   loss type:        {parent_loss}
+#
+# Intended deltas vs parent: {allow_keys or 'none'}
+#
+# Verify the knobs above match the parent's PREVAILING config (not just
+# its latest wandb-config overwrite) — wandb's config is itself
+# overwritten on each resume, so old multi-fire parents (like bin5) may
+# have a contaminated config. See spec 61 §2 for the eventual Phase 2
+# fix (editable runs DB).
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+
+export WANDB_API_KEY="${{WANDB_API_KEY:-$(grep -E '^password' ~/.netrc 2>/dev/null | head -1 | awk '{{print $2}}')}}"
+
+exec {PY} ./tomat train \\
+    --resume \\
+    --parent {parent_label}{allow_flag} \\
+    -D {data_label} \\
+    -m 200M \\
+    -T {tpu} \\
+    --zone {zone} \\
+    -s {steps} \\
+    -b {parent_bs} \\
+    --lr {parent_lr} \\
+    --lr-schedule {parent_lr_schedule} \\
+    --warmup 0 \\
+{mode_line}{prior_line}{loss_line}{sigma_line}    {new_label}
+"""
+    if print_only:
+        print(script)
+        return
+    # Write to scripts/fires/<name>.sh.
+    out_path = Path("scripts/fires") / f"{fire_name}.sh"
+    if out_path.exists():
+        err(f"[tomat fires new] {out_path} exists; refusing to overwrite. "
+            f"pass `--print` to see the generated script.")
+        sys.exit(1)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(script)
+    out_path.chmod(0o755)
+    print(f"[tomat fires new] wrote {out_path} ({len(script)} bytes)")
+    print(f"  parent: {parent_label}")
+    print(f"  new label: {new_label}")
+    print(f"  TPU: {tpu} ({zone}), steps: {steps}, bs: {parent_bs}, lr: {parent_lr}")
+    print(f"  fire: {out_path}")
+
+
 @cli.group("wb")
 def wb_grp():
     """Wandb GraphQL helpers: introspect, list projects, manipulate access."""

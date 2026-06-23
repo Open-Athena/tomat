@@ -168,50 +168,164 @@ new `scripts/fires/<name>.sh` with all the resume-required flags pre-filled from
 parent's manifest. Removes the hand-authoring step that introduced the TS0 mistake 4
 times.
 
-## Phase 2 — fires-as-immutable-records (sketch)
+## Phase 2 — layered source of truth (sketch)
 
-This phase decouples wandb run-id from the canonical record. Out of scope to implement
-until Phase 1 has shipped and we've used it for ~1 month.
+Phase 1 makes the wandb config the source of truth for the resume guard. **That's a
+weakness.** Wandb config is overwritten by every resume — bin5's current wandb config
+no longer reflects its TS0123 mid-life state because `bin5-extend-10k.sh` overwrote
+it with TS0. The guard catches drift against the *last fire's overwrite*, not the
+parent's prevailing state. We can't backfill the truth either: wandb config isn't
+ours to edit.
 
-### 2.1 Storage layout
+Phase 2's reframe: **separate "what was fired" (immutable, our record) from "what
+the canonical thread should look like" (editable, our curation) from "metrics" (wandb,
+their record).** Three layers, no single one is the source of truth — each is
+authoritative for its concern:
+
+| Layer            | Where                                    | Authority over                                 | Editable? |
+|------------------|------------------------------------------|------------------------------------------------|-----------|
+| **Fire**         | `R2/openathena/tomat/fires/<fire-id>/`   | what was actually fired (env-vars, manifest)   | NO — immutable provenance |
+| **Run**          | D1 (or SQLite during dev) `runs` table   | canonical "thread" for a logical training arc  | YES — we can backfill / correct |
+| **Wandb**        | wandb.ai/open-athena/...                 | metric trajectories (TL, VL, m-evals, …)       | partial — config we don't own |
+| **Manifest**     | `R2/.../runs/<run-id>/manifest.json`     | cached aggregate of the above for FE reads     | regenerated, not edited |
+
+### 2.1 Fires: immutable provenance
+
+Every iris fire writes:
 
 ```
 R2: openathena/tomat/fires/<fire-id>/
-  manifest.json     # frozen at fire-spawn time; never updated
-  raw.parquet       # history written by tomat runs sync; immutable suffix-appendable
-  eval.json         # m-eval points fired against this fire's ckpts
-  ckpts/            # (or pointer to GCS)
+  manifest.json     # frozen at fire-spawn time; env-vars, --parent, intended deltas,
+                    # git_sha, marin_pin, fire_argv, fire-host, fire-time, iris job_id
+  raw.parquet       # history this fire emitted, suffix-appended as the fire runs
+                    # (immutable once the fire reaches a terminal state)
+  eval.json         # m-eval points fired against THIS fire's ckpts (not the run's
+                    # other fires); merged at view-time
 ```
 
-`fire-id` is e.g. `<UTC-isoformat>-<8-hex-shasum-of-manifest>`. Immutable.
+`fire-id` is e.g. `<UTC-isoformat>-<8-hex-shasum-of-manifest>`. The `tomat train` CLI
+writes this directory at submission time (before iris fires) so we have the manifest
+even if the fire never starts. The trainer appends parquet rows as it goes (no
+overwrites).
 
-### 2.2 Run = view
+### 2.2 Runs: editable canonical thread
 
-A "run" becomes a view, not a record:
+A `runs` row is a *curated view* over an ordered list of fire-ids:
 
+```sql
+-- D1 / SQLite schema (dev: SQLite under tmp/runs.db; prod: D1 binding on CFW)
+CREATE TABLE runs (
+  run_id              TEXT PRIMARY KEY,     -- "bin5", "bin5-cont-s10", etc.
+  display_name        TEXT,                 -- nicer label for the dashboard
+  parent_run_id       TEXT,                 -- editable; backfill-able for old runs
+  fire_ids            TEXT NOT NULL,        -- JSON array, ordered chronologically
+  blacklisted_fires   TEXT NOT NULL DEFAULT '[]',  -- JSON array of fire-ids whose
+                                            -- history rollup the view should skip
+                                            -- (bad fires we want hidden, not deleted)
+  segment_overrides   TEXT NOT NULL DEFAULT '{}',  -- JSON; manual annotations like
+                                            -- "step-67000: data label switched to
+                                            -- TS0123" — what annotations.ts holds today
+  notes               TEXT,                 -- free-form for human context
+  created_at, updated_at  TIMESTAMP
+);
 ```
-R2: openathena/tomat/views/<view-name>.json
-  {
-    "view": "bin5",
-    "fires": ["2026-06-15T01:23:00Z-abc12345", "2026-06-22T14:18:50Z-def67890", …],
-    "blacklisted": ["2026-06-22T14:18:50Z-def67890"]  // bad fires we want hidden from rollup
-  }
+
+Critical: the `runs` row is **editable** — we can set `parent_run_id = 'train-mg-kl-bin5-fs-tpu'`
+on `cont-s10` even though that fire's wandb config doesn't carry it (because cont-s10
+was fired before `tomat train --parent` existed). The FE reads from this table, not
+from wandb config.
+
+The `runs` table is also what closes the "memory feels too weak" gap: instead of
+relying on `annotations.ts` comments + bash history to reconstruct "what bin5 actually
+ran at step 67k", that knowledge lives in `runs.segment_overrides` as structured data,
+queryable across the dashboard.
+
+### 2.3 Manifest = cached aggregate
+
+`R2/.../runs/<run-id>/manifest.json` becomes a derived artifact. `tomat runs sync`
+regenerates it by:
+
+1. Reading the `runs` table row for `<run-id>`.
+2. For each `fire_id` in `fire_ids` (excluding `blacklisted_fires`), reading that
+   fire's manifest + parquet.
+3. Merging them (deduping on `_step`, preferring later fires on overlap).
+4. Joining metric trajectories from wandb (the only thing wandb is still authoritative
+   for).
+5. Writing the aggregate to R2.
+
+The FE reads from this aggregated manifest. No FE logic changes — the join just
+happens upstream.
+
+### 2.4 Blacklist mechanism
+
+Bad fires (like the bin5+10k extension) get added to `runs.blacklisted_fires`.
+The view's trajectory rollup skips them. The fire's `R2/fires/<fire-id>/` records
+stay forever (provenance is precious; the bad fire happened and someone might want
+to know why later). The ckpts they produced stay on GCS until GC'd by the standard
+retention rule. Nothing destructive.
+
+### 2.5 Migration path
+
+Phase 2 is delivered in **dev mode first**, prod-second:
+
+1. **SQLite under `tmp/runs.db`** while the schema settles. `tomat runs ls` / `tomat
+   runs edit` / `tomat runs set-parent` subcommands let us populate + correct rows
+   by hand.
+2. **Manual backfill** of the editable rows for the dozen runs we actually care
+   about (bin5 + family). Surfaces schema gaps quickly.
+3. **Worker reads from new layout, falls back to old `runs/<run-id>/` layout** when
+   no `runs` row exists. `tomat runs sync` writes both layouts during the transition.
+4. **Promote to D1** once the schema is stable and we trust the manual backfill.
+   `tomat runs` subcommands speak to D1 instead of SQLite. FE auto-cuts over.
+
+### 2.6 Region-agnostic resumes
+
+Currently each fire pins its `--zone` and its `TOMAT_BUCKET` (ckpt region) at fire
+time. Pre-emption auto-resumes inherit the same spec, so a starving zone wedges
+the run forever. Manual re-fires can pick any zone but pay cross-region ckpt-read
+costs unless we mirror.
+
+Phase 2 surfaces region preferences as **first-class run state**:
+
+```sql
+ALTER TABLE runs ADD COLUMN
+  preferred_tpus    TEXT NOT NULL DEFAULT '[]', -- JSON, e.g.
+                                                -- [{"tpu":"v5p-16","zones":["us-east5-a"]},
+                                                --  {"tpu":"v6e-16","zones":["us-east5-b","eu-west4-a"]}]
+  ckpt_regions      TEXT NOT NULL DEFAULT '[]'; -- JSON, e.g. ["us-east5","eu-west4"]
+                                                -- (used by --zone widening + by the
+                                                -- `tomat ckpt mirror` op when adding
+                                                -- a new fallback region)
 ```
 
-The dashboard's `/runs/bin5` page assembles by reading the view, then reading each fire's
-manifest + parquet, then doing the join client-side (or in the CFW).
+`tomat train --resume <run-id>` reads these and:
+1. Widens its `--zone` to every zone in `preferred_tpus` whose TPU pool has capacity *and*
+   whose region appears in `ckpt_regions`.
+2. Sets `TOMAT_BUCKET` to whichever region the chosen zone is in.
 
-### 2.3 Blacklist mechanism
+Pre-emption auto-resumes inherit the widened `--zone`, so a starving zone hand-off to
+its peer just works. New regions get added to `ckpt_regions` only after `tomat ckpt
+mirror` finishes copying the ckpt there, so we never fire into a region that can't read.
 
-Bad fires (like the bin5+10k extension) get added to `blacklisted`. The view's
-trajectory rollup skips blacklisted fires. The ckpts they produced stay on GCS until
-GC'd. Nothing gets deleted.
+### 2.7 Why this works where Phase 1 alone doesn't
 
-### 2.4 Migration
+The bin5-extend-10k mistake would be **caught** by Phase 1's guard *only if* bin5's
+wandb config still reflected its TS0123 prevailing state at fire time. It didn't.
 
-Worker reads from new layout, falls back to old `runs/<run-id>/` layout when no view
-exists. `tomat runs sync` writes both layouts during the transition (3-6 months) so
-nothing breaks if we revert.
+Under Phase 2:
+- `bin5-extend-10k` would be a `fire-id` in `runs.bin5.fire_ids`, recorded
+  immutably.
+- The drift guard would diff against `runs.bin5.fire_ids[-1]`'s **immutable fire
+  manifest** (which captures the env-vars of bin5's *last clean fire*, before
+  bin5-extend overwrote anything).
+- After we discovered the spike, `bin5-extend-10k` would land in
+  `runs.bin5.blacklisted_fires`, and bin5's trajectory plot would drop it.
+- The `runs.bin5.parent_run_id` for any future `cont-clean`-style fire would point
+  at the *clean* fire, not the contaminated one.
+
+The Phase 1 guard becomes a special case of the Phase 2 architecture: "diff against
+the parent's last non-blacklisted fire-id's manifest" instead of "diff against the
+parent's current wandb config." The CLI signature stays identical.
 
 ## Open questions (deferred)
 
