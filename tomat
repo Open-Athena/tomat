@@ -7926,7 +7926,7 @@ def cost_grp():
 
 @cost_grp.command("summary")
 @click.option("-p", "--prefix", default=None,
-              help="iris job prefix to inspect (default: /<user> per known runner)")
+              help="iris job prefix to inspect (default: DEFAULT_IRIS_PREFIXES — /<user>/<jobname> per known runner)")
 @click.option("-f", "--filter", "filter_re", default="tomat|train-full|train-cont", help="regex on job name")
 def cost_summary(prefix: str | None, filter_re: str):
     """Estimate MSRP-equivalent compute spend across matching iris jobs.
@@ -7934,13 +7934,19 @@ def cost_summary(prefix: str | None, filter_re: str):
     Sums chip-hours (TPU × duration) across visible parent jobs and prints
     preempt-rate and on-demand-rate equivalents. Public-rate, not actual.
     """
-    prefixes = (prefix,) if prefix else tuple(f"/{u}" for u in IRIS_USERS)
+    # iris requires --prefix to be `/<user>/<jobname>` (2+ segments) — single-
+    # segment `/<user>` errors out and silently produces "no matching jobs".
+    # Default to the same fan-out `iris ls` uses; explicit `-p` is honored as-is.
+    prefixes = (prefix,) if prefix else DEFAULT_IRIS_PREFIXES
     pat = re.compile(filter_re)
     rows = []
     seen: set[str] = set()
     for pfx in prefixes:
         # Parent jobs only — children inherit their parent's slice, would double-count.
         res = iris_run("list", "--prefix", pfx)
+        if res.returncode != 0:
+            err(f"iris job list failed for {pfx!r}: rc={res.returncode}\n{res.stderr[-500:]}")
+            continue
         out = strip_iris_log(res.stdout)
         for line in out.split("\n"):
             if not line.strip() or "JOB ID" in line:

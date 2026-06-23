@@ -169,7 +169,17 @@ def _iris_job_list_json(prefix: str, timeout: int = 60) -> list[dict]:
 
     cmd = ["iris", "--cluster=marin", "job", "list", "--prefix", prefix, "--json"]
     t0 = time.monotonic()
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # The function docstring promises a slow call just skips this prefix's
+        # upload — honor that instead of crashing the whole Modal cron run.
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        print(
+            f"[iris-rpc {prefix} {elapsed_ms}ms] TIMEOUT (>{timeout}s, skip)",
+            file=sys.stderr,
+        )
+        return []
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     tag = "SLOW" if elapsed_ms > 10_000 else ""
     print(f"[iris-rpc {prefix} {elapsed_ms}ms] {tag}", file=sys.stderr)

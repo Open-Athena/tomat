@@ -71,7 +71,14 @@ def iris_job_list_json(prefix: str, timeout: int = 240) -> list[dict]:
         "--json",
     ]
     t0 = time.monotonic()
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # The function comment promises a slow call just skips the upload —
+        # honor that by returning [] instead of crashing the sibling prefixes.
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        err(f"[iris-rpc {prefix} {elapsed_ms}ms] TIMEOUT (>{timeout}s, skip)")
+        return []
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     err(
         f"[iris-rpc {prefix} {elapsed_ms}ms]" + (" SLOW" if elapsed_ms > 10_000 else "")
