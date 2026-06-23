@@ -88,3 +88,18 @@ cd marin
 echo
 echo "[fired bin5-cont-from-80k on v6e-16 us-east5-b]"
 echo "Dashboard: https://tomat.oa.dev/#/runs/${DST_LABEL}"
+
+# Self-record this fire to R2 (spec 61 §2.1). Idempotent on the manifest
+# body — re-running this script after iris submit-fail produces the same
+# fire-id (and a no-op overwrite if the prior PUT landed).
+cd "$(dirname "$0")/../.."  # tomat root
+./tomat fires record \
+  --run-id "${DST_LABEL}" \
+  --parent "${SRC_LABEL}" \
+  --substrate iris \
+  --iris-job-id "/ryan/${DST_LABEL}" \
+  --iris-tpu v6e-16 --iris-zone us-east5-b \
+  --wandb-entity open-athena --wandb-project tomat-lmq-P19 \
+  --resume-from-step 80000 --target-steps "${RESUME_STEPS}" \
+  --intended-delta 'hardware.tpu=v5p-16 us-east5-a->v6e-16 us-east5-b' \
+  --notes 'controlled HW test: parent v6e-16 → resume on v6e-16 (vs cont-clean v5p-16). If TL clean → cross-HW v6e->v5p caused the +1 nat spike.'

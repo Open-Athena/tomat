@@ -5716,6 +5716,106 @@ def fires_record(
         print(f"  modal: {modal_app}::{modal_fn or '?'} fc={modal_fc_id}")
 
 
+@fires_grp.command("ls")
+@click.option("--run-id", "run_filter", default=None,
+              help="filter to fires whose run_id matches this substring.")
+@click.option("--parent", "parent_filter", default=None,
+              help="filter to fires whose parent_run_id matches this substring.")
+@click.option("--substrate", default=None,
+              type=click.Choice(["iris", "modal"]),
+              help="filter by execution substrate.")
+@click.option("-n", "--limit", default=20, type=int,
+              help="show last N fires (newest first; 0 = all).")
+@click.option("-b", "--bucket", default=R2_BUCKET, help="R2 bucket")
+@click.option("--json", "as_json", is_flag=True,
+              help="emit one JSON object per fire (manifest body, suitable for jq).")
+def fires_ls(
+    run_filter: str | None, parent_filter: str | None,
+    substrate: str | None, limit: int, bucket: str, as_json: bool,
+):
+    """List recorded fires (spec 61 §2.1).
+
+    Walks `R2/openathena/tomat/fires/<fire-id>/manifest.json` and emits a
+    one-row-per-fire table sorted by `fired_at` (newest first), or one JSON
+    object per fire under `--json`.
+
+    Filters compose with AND. Empty filter = all.
+    """
+    # List manifest.json keys under the fires prefix; each manifest sits at
+    # `fires/<fire-id>/manifest.json`.
+    keys = _r2_list_keys(bucket, FIRES_PREFIX + "/")
+    keys = [k for k in keys if k.endswith("/manifest.json")]
+    if not keys:
+        err("[fires ls] no fires found")
+        return
+    rows: list[dict] = []
+    for k in keys:
+        m = _r2_get_json(bucket, k)
+        if not isinstance(m, dict):
+            err(f"[fires ls] skipping {k}: not a JSON object")
+            continue
+        if run_filter and run_filter not in (m.get("run_id") or ""):
+            continue
+        if parent_filter and parent_filter not in (m.get("parent_run_id") or ""):
+            continue
+        if substrate and m.get("substrate") != substrate:
+            continue
+        rows.append(m)
+    rows.sort(key=lambda r: r.get("fired_at", ""), reverse=True)
+    if limit > 0:
+        rows = rows[:limit]
+    if as_json:
+        for r in rows:
+            print(json.dumps(r))
+        return
+    if not rows:
+        err("[fires ls] no fires match filters")
+        return
+    # Tabular output. Columns: fired_at | substrate | run_id | parent | id-tail
+    w_run = max((len(r.get("run_id") or "") for r in rows), default=20)
+    w_parent = max((len(r.get("parent_run_id") or "") for r in rows), default=10)
+    print(f"{'fired_at':<20} {'sub':<5} {'run_id':<{w_run}} "
+          f"{'parent_run_id':<{w_parent}} fire_id_tail")
+    for r in rows:
+        fid = r.get("fire_id") or ""
+        tail = fid.split("-")[-1] if "-" in fid else fid
+        print(f"{r.get('fired_at',''):<20} "
+              f"{(r.get('substrate') or '?'):<5} "
+              f"{(r.get('run_id') or ''):<{w_run}} "
+              f"{(r.get('parent_run_id') or '-'):<{w_parent}} "
+              f"{tail}")
+
+
+@fires_grp.command("show")
+@click.argument("fire_id")
+@click.option("-b", "--bucket", default=R2_BUCKET, help="R2 bucket")
+def fires_show(fire_id: str, bucket: str):
+    """Print a fire's manifest JSON.
+
+    `FIRE_ID` may be the full id (`<UTC>-<8hex>`) or just the 8-hex tail
+    when unambiguous.
+    """
+    if "-" in fire_id and len(fire_id) > 10:
+        key = f"{FIRES_PREFIX}/{fire_id}/manifest.json"
+    else:
+        # Resolve by tail (rare but handy when reading from logs).
+        keys = _r2_list_keys(bucket, FIRES_PREFIX + "/")
+        matches = [k for k in keys if k.endswith(f"-{fire_id}/manifest.json")]
+        if len(matches) == 0:
+            err(f"[fires show] no fire matches tail {fire_id!r}")
+            sys.exit(1)
+        if len(matches) > 1:
+            err(f"[fires show] multiple fires match tail {fire_id!r}: "
+                f"{[m.split('/')[-2] for m in matches]}")
+            sys.exit(1)
+        key = matches[0]
+    m = _r2_get_json(bucket, key)
+    if m is None:
+        err(f"[fires show] {key} not found")
+        sys.exit(1)
+    print(json.dumps(m, indent=2))
+
+
 @cli.group("wb")
 def wb_grp():
     """Wandb GraphQL helpers: introspect, list projects, manipulate access."""
