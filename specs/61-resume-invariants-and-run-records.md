@@ -208,14 +208,37 @@ writes this directory at submission time (before iris fires) so we have the mani
 even if the fire never starts. The trainer appends parquet rows as it goes (no
 overwrites).
 
-### 2.2 Runs: editable canonical thread (1:N over wandb + iris)
+### 2.2 Runs: editable canonical thread (1:N over wandb + iris + Modal)
 
-**Core insight (Ryan 2026-06-23):** a "run" in our model is *not* 1:1 with a wandb
-run or an iris job — it's a composition / concatenation of N wandb runs and M iris
-jobs. The current FE encodes 1:1 (single wandb link + single iris link in the
-run-page header); that assumption is wrong and needs to be migrated out
-aggressively across the code. The `runs` table is what makes the 1:N relation
-explicit:
+**Core insight (Ryan 2026-06-23, expanded 2026-06-23 PM after Betsy
+discussion):** a "run" in our model is *not* 1:1 with any single execution
+substrate. It's a composition over **three** independent multi-valued
+relations:
+
+| substrate | what counts as "one" | example |
+| --- | --- | --- |
+| **wandb runs** | one `wandb_run_id` (per entity+project) | the original bin5 run-id; a child-resume's separate wandb id |
+| **iris jobs** | one `/<user>/<label>` job path | `/ryan/train-mg-kl-bin5-fs-tpu`; each cont-clean is its own iris job |
+| **Modal function calls** | one `function_call_id` for the long-running training/eval call | each `modal run train_bakeoff_h200x8.py` = one fc; modal-v4-epochwin's H200×8 training was one fc |
+
+A single canonical run can compose any (N, M, P) where each is ≥ 0 and
+their sum is ≥ 1. Examples in our current fleet:
+
+- **bin5-fs-tpu:** N=1 wandb (mid-life flip rejoined the same id), M=1 iris
+  job (~73 preempt-restarts within), P=0 Modal — pure iris track.
+- **modal-v4-epochwin:** N=1 wandb, M=0 iris, P=1 Modal fc — pure Modal
+  track. The dashboard today shows it with a Modal-app chip and *no* iris
+  chip, which is correct in spirit but accidental (we only got one shot
+  right, not N:M:P right).
+- **modal-v4-cont-clean:** N=1 wandb, M=1 iris (v6e-16 us-east5-b
+  continuation), **inherits P=1 Modal fc from its parent** through
+  `parent_run_id`. The chip strip should reflect both substrates as the
+  thread crosses them.
+
+The current FE encodes 1:1:1 (single wandb link + single iris link + single
+Modal link in the run-page header); that assumption is wrong on all three
+axes and needs to be migrated out aggressively across the code. The `runs`
+table is what makes the 1:N:M:P relation explicit:
 
 ```sql
 -- D1 / SQLite schema (dev: SQLite under tmp/runs.db; prod: D1 binding on CFW)
@@ -226,14 +249,22 @@ CREATE TABLE runs (
   parent_run_id       TEXT,                 -- editable; backfill-able for old runs
   fire_ids            TEXT NOT NULL,        -- JSON array, ordered chronologically
   wandb_run_ids       TEXT NOT NULL,        -- JSON array of (entity, project,
-                                            -- wandb_run_id) tuples — N>=1 wandb
-                                            -- runs that contributed to this thread.
-                                            -- Replaces the 1:1 wandb link in
-                                            -- header.
+                                            -- wandb_run_id) tuples — N>=0 wandb
+                                            -- runs that contributed to this
+                                            -- thread (almost always >=1, but
+                                            -- nothing demands it). Replaces the
+                                            -- 1:1 wandb link in header.
   iris_job_ids        TEXT NOT NULL,        -- JSON array of /ryan/<label> iris
-                                            -- job paths — M>=0 jobs (some runs
-                                            -- have no iris jobs, e.g. modal-only).
+                                            -- job paths — M>=0 jobs (Modal-only
+                                            -- runs have M=0).
                                             -- Replaces 1:1 iris link in header.
+  modal_function_calls TEXT NOT NULL DEFAULT '[]',
+                                            -- JSON array of {app_name,
+                                            -- function_call_id, fn, started_at,
+                                            -- finished_at, region} — P>=0 Modal
+                                            -- fcs that contributed (TPU-only
+                                            -- runs have P=0). Replaces 1:1
+                                            -- modal-app heuristic.
   blacklisted_fires   TEXT NOT NULL DEFAULT '[]',  -- JSON array of fire-ids whose
                                             -- history rollup the view should skip
                                             -- (bad fires we want hidden, not deleted)
@@ -245,14 +276,29 @@ CREATE TABLE runs (
 );
 ```
 
-The 1:N migration touches every place the FE assumes one wandb-run-id / one
-iris-job-id:
-- `RunsPage` header chips: render N wandb links + M iris links (dropdown / chip
-  list, not single link).
-- WallclockPlot trajectory union: concatenate metrics from all N wandb runs.
-- iris-state badges: aggregate over M iris jobs (currently picks "the one").
-- Cost computation: sum over M iris jobs.
-- `tomat runs sync`: walk all N wandb runs, all M iris jobs, dedup and merge.
+**Why function_call, not app, for Modal:** a Modal `App` is the deployed
+unit (long-lived, shared across many invocations); a `function_call` is a
+single `.remote()` / `.spawn()` invocation, and that's the granularity we
+care about for "what trained this run". `modal-v4-epochwin` = one
+`train_bakeoff_h200x8` function call; `modal-v4-cont-clean`'s parent
+inheritance points to that same fc. App-level grouping happens at render
+time (dedup on `app_name` if the chip strip needs it).
+
+The 1:N:M:P migration touches every place the FE assumes a single execution
+on any substrate:
+
+| substrate | site | today's assumption | migration |
+| --- | --- | --- | --- |
+| iris | `RunHeaderRich.tsx:1386` (chip) | `\`/ryan/${data.id}\`` | render M chips, one per `iris_job_ids[]` |
+| iris | `RunsPage.tsx` `irisJobIdForRun(id)` lookups | single job per run | take a `runs.iris_job_ids[]` and aggregate state across them |
+| iris | iris-state badges, preempt counts | picks "the one" iris job | aggregate over M |
+| iris | `cost compute` per-run | one job's chip-hours | sum across `iris_job_ids[]` |
+| wandb | header wandb chip | single project/id | render N chips |
+| wandb | WallclockPlot trajectory union | one parquet stream | concat metrics from all N (Phase 2 manifest aggregate handles this upstream) |
+| Modal | `modalAppForRun(modal, id)` | single deployed app | render P chips, one per `modal_function_calls[]` |
+| Modal | Modal "isRunning" badge | per-app | per-fc (already partially done — see memory `feedback_dashboard_modal_isrunning_per_fc`) |
+| Modal | `pendingFcForRun` | single fc | walk `modal_function_calls[]` |
+| sync  | `tomat runs sync` | one wandb run + one iris job per run | walk all N+M+P; dedup; merge into the `runs` row |
 
 Migration strategy: **add the new columns alongside the existing 1:1 fields,
 populate from inferred lineage during sync, double-render in the FE
