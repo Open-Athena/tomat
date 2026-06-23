@@ -4818,6 +4818,20 @@ def train(
         accepted_at=iris_accepted_at,
         mode="resume" if resume_mode else "from-scratch",
     )
+    # Record this fire to R2 (spec 61 §2.1). Failure is non-fatal — the fire
+    # is already submitted; we don't want a flaky R2 PUT to break the
+    # post-submit pipeline. Resume from-step: prefer the parent's `latest`
+    # ckpt step the trainer auto-discovered (we only have it for same-label
+    # resumes; cross-label `--parent` discovery needs a manifest read which
+    # we punt on here).
+    try:
+        _record_train_fire_to_r2(
+            label=label, parent_label=parent_label,
+            tpu=tpu, zone=zone, steps=steps,
+            from_step=latest if resume_mode else None,
+        )
+    except Exception as e:
+        err(f"[tomat train] failed to record fire to R2: {e!r} (continuing)")
     print(f"[launched {label} on {tpu}, {steps} steps"
           f"{f' (resume from step-{latest})' if resume_mode else ''}]")
     print(f"  wandb: https://wandb.ai/{WANDB_PROJECT}/runs/{label}")
@@ -5578,6 +5592,65 @@ def _fire_id_from_manifest(manifest: dict) -> str:
         .isoformat(timespec="seconds").replace("+00:00", "Z")
     # Strip `:` from the ts so the fire-id is a valid filename / key.
     return f"{ts.replace(':', '')}-{sha}"
+
+
+def _record_train_fire_to_r2(
+    *,
+    label: str,
+    parent_label: str | None,
+    tpu: str,
+    zone: str | None,
+    steps: int,
+    from_step: int | None,
+    bucket: str = None,
+) -> str:
+    """In-process equivalent of `tomat fires record` for `tomat train`.
+
+    Same manifest shape as `fires_record` (so `fires ls/show` see both
+    sources identically) — just skips re-spawning `tomat`. Substrate is
+    always `iris` here (Modal train fires record from the Modal-side
+    entrypoint script, not from this CLI path).
+
+    Returns the fire_id on success; raises on R2 failure (caller wraps
+    in try/except so the just-submitted iris job isn't disrupted).
+    """
+    if bucket is None:
+        bucket = R2_BUCKET
+    fired_at = datetime.datetime.now(datetime.timezone.utc)\
+        .isoformat(timespec="seconds").replace("+00:00", "Z")
+    manifest: dict = {
+        "schema_version": _FIRE_SCHEMA_VERSION,
+        "run_id": label,
+        "parent_run_id": parent_label,
+        "fired_at": fired_at,
+        "fired_by": getpass.getuser(),
+        "fired_host": platform.node(),
+        "fire_argv": sys.argv,
+        "git_sha": _git_sha(),
+        "marin_pin": _marin_pin(),
+        "substrate": "iris",
+        "iris": {
+            "job_id": f"/{getpass.getuser()}/{label}",
+            **({"tpu": tpu} if tpu else {}),
+            **({"zone": zone} if zone else {}),
+        },
+        "wandb": {
+            "entity": WANDB_PROJECT.split("/")[0],
+            "project": WANDB_PROJECT.split("/")[-1],
+        },
+        "horizon": {
+            **({"resume_from_step": from_step} if from_step is not None else {}),
+            "target_steps": steps,
+        },
+    }
+    fire_id = _fire_id_from_manifest(manifest)
+    manifest["fire_id"] = fire_id
+    key = f"{FIRES_PREFIX}/{fire_id}/manifest.json"
+    body = json.dumps(manifest, indent=1).encode("utf-8")
+    _r2_put_bytes(bucket, key, body, "application/json")
+    err(f"[tomat train] recorded fire to s3://{bucket}/{key} ({len(body)} bytes)")
+    err(f"  fire_id: {fire_id}")
+    return fire_id
 
 
 @fires_grp.command("record")
