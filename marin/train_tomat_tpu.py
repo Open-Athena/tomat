@@ -278,6 +278,30 @@ def _log_tomat_run_metadata_to_wandb():
                 cfg["tomat"]["intended_resume_deltas"] = [
                     d for d in deltas.split(",") if d
                 ]
+            # Authoritative marin-package versions actually installed on this
+            # worker — supersedes TOMAT_MARIN_PIN (which is the LOCAL clone
+            # SHA at fire-submit time on the laptop, NOT what the worker
+            # actually pulled). Resolves to e.g. "0.2.0" for git-pinned
+            # packages or "0.2.10.dev202606130855" for PyPI dev wheels.
+            # On resume-spike debugging: pin parity between parent run's
+            # and child run's `tomat.installed.*` values tells us whether
+            # the Levanter loader code is the same — relevant when
+            # diagnosing "+1 nat permanent spike from `--from-ckpt` loads
+            # vs clean PE-restarts of the same ckpt".
+            try:
+                import importlib.metadata as ilmd
+                installed = {}
+                for pkg in ("marin-core", "marin-levanter", "marin-iris",
+                            "marin-zephyr", "marin-rigging", "marin-haliax",
+                            "marin-finelog", "jax", "jaxlib"):
+                    try:
+                        installed[pkg.replace("-", "_")] = ilmd.version(pkg)
+                    except ilmd.PackageNotFoundError:
+                        pass
+                if installed:
+                    cfg["tomat"]["installed"] = installed
+            except Exception:
+                pass
             # `allow_val_change=True` because wandb refuses repeat-writes
             # otherwise — we may end up here multiple times on resume.
             wandb.run.config.update(cfg, allow_val_change=True)
