@@ -4,7 +4,7 @@ import { enumParam, useUrlState } from 'use-prms'
 import { Tooltip } from '../Tooltip'
 import { evalJobsByRun, fetchCronHeartbeat, fetchEval, fetchEvalsIndex, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchPendingFires, fetchRunCost, fetchRunsSnapshot, irisJobIdForRun, isModalRun, modalAppForRun, modalFcForPending, pendingFcForRun, pendingFcIdForRun, parquetUrl } from './api'
 import type { EvalPoint, ModalApp, ModalFunctionCall, PendingFire } from './api'
-import { concatHistories, fetchRunHistory, type RunHistory } from './parquet'
+import { concatHistories, fetchRunHistory, truncateHistoryAtStep, type RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
 import { RecentEvents } from './RecentEvents'
 import { EvalsPanel } from './EvalsPanel'
@@ -1365,13 +1365,25 @@ function RunDetail({ runId }: { runId: string }) {
       if (!h) return ownHistory  // hold off on glue until every ancestor lands
       ancestorHistories.push(h)
     }
+    // Truncate each ancestor at the step where its CHILD forked off. Without
+    // this, the child run's page shows the parent's full post-fork training
+    // (e.g. bin5 trained to step-105k after bin5-cont-from-80k-v6e branched
+    // at step-80k — those steps are an alternate timeline, not part of the
+    // child's lineage). `ancestors` is child→root; child-of-ancestors[i] is
+    // either runId (for i==0) or ancestors[i-1] (for i>0). We look up the
+    // child's lineage entry to get the fork step.
+    const truncated: RunHistory[] = ancestorHistories.map((h, i) => {
+      const childId = i === 0 ? runId : ancestors[i - 1]
+      const forkStep = lineageFor(childId)?.parent_step
+      return forkStep != null ? truncateHistoryAtStep(h, forkStep) : h
+    })
     // `ancestors[0]` is the immediate parent; the array is child→root. Reverse
     // to root→…→parent so concat ends in chronological order, then append the
     // current run's segment.
-    const ordered = [...ancestorHistories].reverse()
+    const ordered = truncated.reverse()
     ordered.push(ownHistory)
     return concatHistories(ordered)
-  }, [lineageMode, ownHistory, ancestors, ancestorHistoryQs])
+  }, [lineageMode, ownHistory, runId, ancestors, ancestorHistoryQs])
   const history = lineageHistory
   // Ancestor lineage metadata for the WallclockPlot — root → parent order
   // (matches the prefix of `partRowCounts` on the concatenated history).

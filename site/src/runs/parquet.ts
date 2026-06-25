@@ -102,6 +102,36 @@ export async function fetchRunHistory(url: string): Promise<RunHistory> {
  *  child's first; the child's first row typically sits at parent's last
  *  step + 1 (Levanter increments before logging), so de-dup would be a
  *  no-op in practice. */
+/** Drop history rows whose `_step` is past `maxStep` (the fork point at
+ *  which this history's child diverged). Used by the lineage-glue path to
+ *  truncate ancestors at their fork point — without this, the child run's
+ *  page shows the parent's full post-fork "alternate timeline", which is
+ *  data the child diverged from and isn't part of its lineage.
+ *
+ *  Rows with null `_step` (eval / annotation rows that wandb logs without
+ *  a global_step) are kept iff they come before the first row past
+ *  `maxStep` — they're typically interleaved with surrounding training
+ *  rows and aren't safe to truncate by step alone. Assumes rows are sorted
+ *  ascending by `_step` (the wandb / Levanter convention). */
+export function truncateHistoryAtStep(h: RunHistory, maxStep: number): RunHistory {
+  let cutoff = h.rowCount
+  for (let i = 0; i < h.rowCount; i++) {
+    const s = h.steps[i]
+    if (s != null && s > maxStep) { cutoff = i; break }
+  }
+  if (cutoff === h.rowCount) return h
+  const filter = <T>(arr: readonly T[]): T[] => arr.slice(0, cutoff)
+  const cols = new Map<keyof RunHistoryRow, (number | null)[]>()
+  for (const [k, v] of h.cols) cols.set(k, filter(v) as (number | null)[])
+  return {
+    rowCount: cutoff,
+    timestamps: filter(h.timestamps),
+    steps: filter(h.steps),
+    cols,
+  }
+}
+
+
 export function concatHistories(parts: RunHistory[]): RunHistory {
   if (parts.length === 0) {
     return { rowCount: 0, timestamps: [], steps: [], cols: new Map() }
