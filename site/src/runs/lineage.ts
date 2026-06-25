@@ -100,6 +100,41 @@ export const RUN_LINEAGE: Record<string, RunLineage> = {
     parent: 'train-mg-modal-h200x8-tz-fs-kl-s05-ts1-bs128-seed42',
     parent_step: 20000,
   },
+
+  // bin5 resume-spike diagnostic fires (2026-06-23). All three resume from
+  // train-mg-kl-bin5-fs-tpu at different ckpt steps; all three exhibit the
+  // ~1 nat TL spike (+1.5 → +1.0 nat above parent) regardless of HW. Memory:
+  // [[resume-spike-not-bug-converged-minimum]] was already retracted; this
+  // session falsified the v6e→v5p HW-switch hypothesis too (cont-from-80k-v6e
+  // resumes on parent's own HW and STILL spikes).
+  'train-mg-kl-bin5-cont-from-80k-v6e': {
+    parent: 'train-mg-kl-bin5-fs-tpu',
+    parent_step: 80000,
+  },
+  'train-mg-kl-bin5-cont-from-99k': {
+    parent: 'train-mg-kl-bin5-fs-tpu',
+    parent_step: 99000,
+  },
+  'train-mg-kl-bin5-cont-clean': {
+    parent: 'train-mg-kl-bin5-fs-tpu',
+    parent_step: 100000,
+  },
+
+  // cos-r-cont-clean: +10k continuation of the cos-r-fs-tpu MG cosine-prior
+  // smoke from step-9000 (cos-r-fs-tpu targeted 10k steps; final ckpt is the
+  // Levanter `info.step = state.step − 1` final = step-9000).
+  'train-mg-cos-r-cont-clean': {
+    parent: 'train-mg-cos-r-fs-tpu',
+    parent_step: 9000,
+  },
+
+  // modal-v4-cont-clean: +10k iris continuation of the Modal-trained
+  // modal-v4-epochwin run from step-100000 (its final ckpt). Resume tests
+  // "non-KL absorbing-CE bridge" hypothesis vs bin5's KL-Gauss recipe.
+  'train-mg-modal-v4-cont-clean': {
+    parent: 'train-mg-modal-h200x8-tz-v4-epochwin-bs128-seed42',
+    parent_step: 100000,
+  },
 }
 
 /** Lineage entry for `runName`, or `null` if it has no recorded parent. */
