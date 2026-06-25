@@ -1073,11 +1073,17 @@ export interface RunHeaderRichProps {
    *  totals breakdown (steps / tokens / FLOPs / MSRP / epochs) below the main
    *  chip row. Only meaningful when the run has ≥2 declared segments. */
   showSegmentBreakdown?: boolean
+  /** When true, suppress the inline wandb / modal / iris icon links that
+   *  normally sit next to the run name. Used on the detail page (where
+   *  these links live in the LineageTable below the header instead), so
+   *  the title bar stays compact and the lineage table is the canonical
+   *  place to reach jobs for ancestors AND current. */
+  hideJobLinks?: boolean
 }
 
 export function RunHeaderRich({
   data, parentWandbUrl, parentColor, onScrollToParent, linkRunName = true,
-  showSegmentBreakdown = false,
+  showSegmentBreakdown = false, hideJobLinks = false,
 }: RunHeaderRichProps) {
   const { id, manifest, job, history, evalJobs, err, attempts, modalApp } = data
   const incomplete = isIncomplete(data)
@@ -1279,7 +1285,7 @@ export function RunHeaderRich({
             <span style={{ fontFamily: 'monospace', fontSize: '0.9rem',
                            color: '#ddd' }}>{id}</span>
           )}
-          {wbUrl && (
+          {!hideJobLinks && wbUrl && (
             <Tooltip content="open this run in wandb">
               <a href={wbUrl} target="_blank" rel="noreferrer"
                 style={{ fontSize: '0.75rem', color: '#888',
@@ -1296,7 +1302,7 @@ export function RunHeaderRich({
               </a>
             </Tooltip>
           )}
-          {isModalRun(id) && (() => {
+          {!hideJobLinks && isModalRun(id) && (() => {
             // The modal LINK is independent of whether the run still has
             // a live `modalApp` association. The badge-side `RunsPage` drops
             // `data.modalApp` for stale runs (so the badge stops misclaiming
@@ -1373,7 +1379,7 @@ export function RunHeaderRich({
               </Tooltip>
             )
           })()}
-          {data.job && (() => {
+          {!hideJobLinks && data.job && (() => {
             // iris dashboard URL pattern: `https://iris.oa.dev/#/job/%2Fryan%2F<id>`
             // (per iris-dashboard-share-pattern memory). The iris job-id is
             // the dict key in iris-state.json (`/ryan/<run-label>`); the

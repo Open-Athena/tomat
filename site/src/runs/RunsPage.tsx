@@ -30,6 +30,7 @@ import {
   tokenizerGen,
 } from './runMeta'
 import { DOT, isIncomplete, RunHeaderRich, type RunCardData } from './RunHeaderRich'
+import { LineageTable, type LineageRow } from './LineageTable'
 
 // Auto-refresh cadences (ms) for the react-query polling on the runs
 // dashboard. The `tomat-iris-cron` VM re-syncs R2 roughly every minute;
@@ -1500,8 +1501,50 @@ function RunDetail({ runId }: { runId: string }) {
         marginBottom: '1rem',
         backgroundColor: '#181818',
       }}>
-        <RunHeaderRich data={headerData} linkRunName={false} showSegmentBreakdown />
+        <RunHeaderRich data={headerData} linkRunName={false} showSegmentBreakdown hideJobLinks />
       </div>
+      {(() => {
+        // Lineage table: one row per wandb run in this experiment's chain
+        // (root → … → current). The wandb/iris/modal title-bar icons that
+        // used to live on the header now live here (per-row), so ancestors
+        // get their links surfaced too instead of just the current run.
+        // 1 wandb run ≈ 1 job under our forward-going invariant
+        // (`tomat train --force` guards + new-fire-per-resume convention).
+        // When that holds, this table doubles as the "job rollup" view;
+        // when it doesn't, a v2 driven by fires-as-records will key on
+        // fire-id from R2 instead.
+        //
+        // Step ranges use Levanter's `global_step` column (the training
+        // counter) NOT wandb's `_step` (which restarts at 0 for each new
+        // wandb run, so a resume's row would say `0-Nk` instead of
+        // `parentStep-Nk`).
+        const stepRangeFromHistory = (h: RunHistory | null): { start: number | null; end: number | null } => {
+          if (!h) return { start: null, end: null }
+          const gs = h.cols.get('global_step') ?? []
+          let start: number | null = null
+          let end: number | null = null
+          for (let i = 0; i < gs.length; i++) {
+            const v = gs[i]
+            if (v == null) continue
+            const n = Number(v)
+            if (start == null) start = n
+            end = n
+          }
+          return { start, end }
+        }
+        const rootFirst = [...ancestors].reverse()  // root → parent
+        const ancestorRows: LineageRow[] = rootFirst.map((aid, i) => {
+          const h = ancestorHistoryQs[ancestors.length - 1 - i]?.data ?? null
+          const { start, end } = stepRangeFromHistory(h)
+          return { runId: aid, startStep: start, endStep: end, current: false }
+        })
+        const { start: ownStart, end: ownEnd } = stepRangeFromHistory(ownHistory)
+        const allRows: LineageRow[] = [
+          ...ancestorRows,
+          { runId, startStep: ownStart, endStep: ownEnd, current: true },
+        ]
+        return <LineageTable rows={allRows} />
+      })()}
       {ancestors.length > 0 && (
         <LineageToggle
           mode={lineageMode}
