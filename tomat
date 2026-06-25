@@ -4295,6 +4295,16 @@ def _fetch_parent_wandb_run(parent_label: str):
               help="seconds between iris-avail polls when --queue is set (default 60)")
 @click.option("--region-strategy", "region_strategy", type=click.Choice(["any", "auto", "explicit"]), default=None,
               help="how to pick region(s) for this fire (spec 62). `any` = fire to all regions where cache is fully present, let iris pick (default for from-scratch). `auto` = probe iris-avail, pick highest-READY eligible region, pre-mirror parent ckpt there (default for --resume). `explicit` = use --zone/--region as given, no pre-flight (current behavior; required if you pass --zone). Default per mode: any (from-scratch) / auto (resume).")
+@click.option("--mg-mode/--no-mg-mode", default=False,
+              help="TOMAT_MG_MODE: enable MaskGIT head/training path (iterative mask-prediction). Mutually exclusive with --ss-mode (the trainer enforces). Off by default — most prior runs are causal-AR. All 10 .sh fire scripts set this on.")
+@click.option("--mask-prior", "mask_prior", type=click.Choice(["cosine", "uniform", "high", "absorbing"]), default="cosine",
+              help="TOMAT_MG_MASK_PRIOR: masking-schedule prior for MaskGIT iterative decoding. `absorbing` = train under terminal mask (bin5 family); `cosine` = MaskGIT-original cosine ramp (cos-r family). Only consulted when --mg-mode is on.")
+@click.option("--mg-loss", "mg_loss_type", type=click.Choice(["ce", "kl_gauss", "emd"]), default="ce",
+              help="TOMAT_MG_LOSS_TYPE: loss applied at MaskGIT-head outputs. `kl_gauss` = KL-divergence vs a discretized Gaussian centered on the true bin (σ controls width); `ce` = plain cross-entropy. Only consulted when --mg-mode is on.")
+@click.option("--mg-kl-sigma", "mg_kl_sigma", default=0.5, type=float,
+              help="TOMAT_MG_KL_SIGMA: σ for the KL-Gaussian target (only when --mg-loss=kl_gauss). Default 0.5 matches the trainer default; the bin5 production runs train at σ=5 (interpreted via --mg-kl-sigma-unit=value as raw density units).")
+@click.option("--mg-kl-sigma-unit", "mg_kl_sigma_unit", type=click.Choice(["value", "bin"]), default="value",
+              help="TOMAT_MG_KL_SIGMA_UNIT: interpret σ in raw density units (value) or bins. Default value.")
 @click.argument("label")
 def train(
     label: str,
@@ -4339,6 +4349,11 @@ def train(
     queue: bool,
     queue_poll: int,
     region_strategy: str | None,
+    mg_mode: bool,
+    mask_prior: str,
+    mg_loss_type: str,
+    mg_kl_sigma: float,
+    mg_kl_sigma_unit: str,
 ):
     """Launch (or resume) a tomat training run.
 
@@ -4687,6 +4702,15 @@ def train(
         # Trainer detects its actual GCE region at startup and picks the
         # matching mirror — no submit-time bucket pinning needed.
         env_vars.append(("TOMAT_SHARE_CACHE", "1"))
+    # MaskGIT knobs (only emitted when --mg-mode; otherwise the trainer
+    # defaults via TOMAT_MG_MODE=0 → standard density LM head).
+    if mg_mode:
+        env_vars.append(("TOMAT_MG_MODE", "1"))
+        env_vars.append(("TOMAT_MG_MASK_PRIOR", mask_prior))
+        env_vars.append(("TOMAT_MG_LOSS_TYPE", mg_loss_type))
+        if mg_loss_type == "kl_gauss":
+            env_vars.append(("TOMAT_MG_KL_SIGMA", str(mg_kl_sigma)))
+            env_vars.append(("TOMAT_MG_KL_SIGMA_UNIT", mg_kl_sigma_unit))
     if pyspy:
         env_vars.append(("TOMAT_PYSPY", "1"))
         env_vars.append(("TOMAT_PYSPY_INTERVAL", str(pyspy_interval)))
