@@ -4293,6 +4293,8 @@ def _fetch_parent_wandb_run(parent_label: str):
               help="poll iris-avail every --queue-poll seconds and submit when the target pool has READY≥1. Catches capacity churn between hourly polls. Blocks until iris accepts the job.")
 @click.option("--queue-poll", default=60, type=int,
               help="seconds between iris-avail polls when --queue is set (default 60)")
+@click.option("--region-strategy", "region_strategy", type=click.Choice(["any", "auto", "explicit"]), default=None,
+              help="how to pick region(s) for this fire (spec 62). `any` = fire to all regions where cache is fully present, let iris pick (default for from-scratch). `auto` = probe iris-avail, pick highest-READY eligible region, pre-mirror parent ckpt there (default for --resume). `explicit` = use --zone/--region as given, no pre-flight (current behavior; required if you pass --zone). Default per mode: any (from-scratch) / auto (resume).")
 @click.argument("label")
 def train(
     label: str,
@@ -4336,6 +4338,7 @@ def train(
     bucket_override: str | None,
     queue: bool,
     queue_poll: int,
+    region_strategy: str | None,
 ):
     """Launch (or resume) a tomat training run.
 
@@ -4696,6 +4699,28 @@ def train(
         k, v = kv.split("=", 1)
         env_vars.append((k, v))
 
+    # Resolve region-strategy (spec 62) and pre-flight. May mutate `region`
+    # / `zone` to reflect the picked / eligible regions; populates
+    # `region_info` for the fire manifest. Idempotent w.r.t. existing data
+    # mirrors (pre-flight skips if cache/ckpt already present in the target).
+    region_info = _resolve_region_strategy(
+        region_strategy=region_strategy,
+        resume_mode=resume_mode,
+        data_labels=[s.strip() for s in data_label.split(",") if s.strip()],
+        tpu=tpu,
+        zone=zone, region=region,
+        parent_label=parent_label, label=label,
+    )
+    if region_info["region_picked"] is not None:
+        # `auto` mode: single picked region overrides anything the user passed.
+        region = region_info["region_picked"]
+        zone = None
+    elif region_info["region_eligible"]:
+        # `any` mode: pass all eligible regions.
+        region = ",".join(region_info["region_eligible"])
+        zone = None
+    # `explicit` mode: leave `region` / `zone` as passed in by the caller.
+
     cmd = [
         IRIS_BIN, "--cluster=marin", "job", "run",
         "--tpu", tpu, "--enable-extra-resources", "--priority", "interactive",
@@ -4829,6 +4854,7 @@ def train(
             label=label, parent_label=parent_label,
             tpu=tpu, zone=zone, steps=steps,
             from_step=latest if resume_mode else None,
+            region_info=region_info,
         )
     except Exception as e:
         err(f"[tomat train] failed to record fire to R2: {e!r} (continuing)")
@@ -5017,6 +5043,253 @@ _CACHE_TARGETS = {
     "gs://marin-us-east1/tomat":    ["us-east1-d (v6e)"],
     "gs://marin-us-east5/tomat":    ["us-east5-a (v5p)", "us-east5-b (v6e)"],
 }
+
+# Region → bucket map for spec 62 (region-strategy). Includes canonical
+# eu-west4 source bucket as well, so eligibility check can consider it.
+# Keys MUST match iris's region naming (g.region on ScalingGroup, which
+# uses Google's official region names like `europe-west4`). The bucket
+# names use Google's shorthand `eu-west4` — that's an inconsistency in
+# Google's own naming, not a typo here.
+_REGION_BUCKETS = {
+    "europe-west4": "gs://marin-eu-west4/tomat",
+    "us-east5":     "gs://marin-us-east5/tomat",
+    "us-central1":  "gs://marin-us-central1/tomat",
+    "us-east1":     "gs://marin-us-east1/tomat",
+}
+
+
+def _region_data_eligibility(data_labels: list[str]) -> dict[str, list[str]]:
+    """For each region, return list of `data_labels` whose cache is fully present.
+
+    Spec 62 §3 (`any` mode eligibility). A region is eligible for a fire if it
+    has caches for ALL requested data_labels. We probe by `gsutil ls <bucket>/cache/<label>/`
+    and check for any output.
+    """
+    present: dict[str, list[str]] = {r: [] for r in _REGION_BUCKETS}
+    for region, region_bucket in _REGION_BUCKETS.items():
+        for label in data_labels:
+            cache_path = f"{region_bucket}/cache/{label}/"
+            r = subprocess.run(
+                ["gsutil", "ls", cache_path],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                present[region].append(label)
+    return present
+
+
+def _eligible_regions(data_labels: list[str]) -> list[str]:
+    """Regions where ALL `data_labels` have cache present. Order = `_REGION_BUCKETS` keys."""
+    present = _region_data_eligibility(data_labels)
+    needed = set(data_labels)
+    return [r for r in _REGION_BUCKETS if set(present[r]) >= needed]
+
+
+def _ckpt_mirror_status(parent_label: str, dst_region: str) -> tuple[bool, int | None]:
+    """Check whether `parent_label`'s latest step is already mirrored to `dst_region`.
+
+    Returns (is_present, latest_step). is_present is True iff the dst-bucket has
+    SOME step-N dir matching the latest step in the canonical bucket. Used by `auto`
+    to skip a redundant mirror.
+    """
+    src_bucket = _resolve_run_bucket(parent_label)
+    if src_bucket is None:
+        return False, None
+    src_root = f"{src_bucket}/results/{parent_label}/checkpoints/{parent_label}"
+    listing = subprocess.run(
+        ["gcloud", "storage", "ls", f"{src_root}/"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if listing.returncode != 0:
+        return False, None
+    available = sorted({
+        int(m.group(1)) for m in re.finditer(r"step-(\d+)/?", listing.stdout)
+    })
+    if not available:
+        return False, None
+    latest = available[-1]
+    dst_bucket = _REGION_BUCKETS.get(dst_region)
+    if dst_bucket is None:
+        return False, latest
+    dst_step = f"{dst_bucket}/results/{parent_label}/checkpoints/{parent_label}/step-{latest}"
+    probe = subprocess.run(
+        ["gsutil", "ls", f"{dst_step}/"],
+        capture_output=True, text=True, timeout=15,
+    )
+    return probe.returncode == 0 and bool(probe.stdout.strip()), latest
+
+
+def _resolve_region_strategy(
+    *,
+    region_strategy: str | None,
+    resume_mode: bool,
+    data_labels: list[str],
+    tpu: str,
+    zone: str | None,
+    region: str | None,
+    parent_label: str | None,
+    label: str,
+) -> dict:
+    """Spec 62 — resolve region-strategy + perform pre-flight.
+
+    Returns a dict for `_record_train_fire_to_r2`'s manifest extension:
+        {
+            "region_strategy": "any" | "auto" | "explicit",
+            "region_eligible": [...],          # data-label-eligible regions
+            "region_picked": str | None,       # `auto` only
+            "region_avail_snapshot": {...} | None,
+            "pre_flight_mirrors": {...},
+        }
+    Mutates: nothing — caller reads `region_picked` / `region_eligible` to update
+    the iris `--region`/`--zone` args.
+
+    NOTE: pre-flight ckpt mirror is only run for `auto` mode resumes. From-scratch
+    fires don't have a ckpt to mirror; `any` fires with multi-region eligibility
+    don't mirror ckpts (would be N× ckpt size — opt-in only).
+    """
+    # Default per mode (spec 62 §3 final paragraph).
+    if region_strategy is None:
+        region_strategy = "auto" if resume_mode else "any"
+
+    # Validation.
+    if region_strategy == "any" and zone:
+        raise click.UsageError(
+            "--region-strategy any incompatible with --zone — use "
+            "--region-strategy explicit to pin a single zone")
+    if region_strategy == "explicit" and not (zone or region):
+        raise click.UsageError(
+            "--region-strategy explicit requires --zone or --region")
+
+    info: dict = {
+        "region_strategy": region_strategy,
+        "region_eligible": [],
+        "region_picked": None,
+        "region_avail_snapshot": None,
+        "pre_flight_mirrors": {},
+    }
+
+    if region_strategy == "explicit":
+        # Caller drives everything; we just record the strategy.
+        err(f"[region-strategy explicit] zone={zone!r} region={region!r}")
+        return info
+
+    # Build eligible region set from data-label cache presence.
+    err(f"[region-strategy {region_strategy}] checking cache presence for "
+        f"data_labels={data_labels}")
+    eligible = _eligible_regions(data_labels)
+    if not eligible:
+        raise click.UsageError(
+            f"no region has all caches for data_labels={data_labels}. "
+            f"Run `tomat cache mirror -l '<label>'` to seed a region first, "
+            f"or pass --region-strategy explicit to bypass eligibility check.")
+    # If the caller passed --region as a filter, intersect.
+    user_filter = [r.strip() for r in (region or "").split(",") if r.strip()]
+    if user_filter:
+        eligible = [r for r in eligible if r in user_filter]
+        if not eligible:
+            raise click.UsageError(
+                f"no eligible regions after --region filter "
+                f"{user_filter}; check data-label cache presence")
+    err(f"[region-strategy {region_strategy}] eligible regions: {eligible}")
+    info["region_eligible"] = eligible
+
+    if region_strategy == "any":
+        # Iris picks among eligible; no ckpt mirror (from-scratch).
+        err(f"[region-strategy any] firing with --region {' --region '.join(eligible)}")
+        return info
+
+    # `auto` — probe + pick + pre-mirror.
+    snapshot = _probe_iris_avail_by_region(tpu, eligible_regions=eligible)
+    info["region_avail_snapshot"] = {
+        "ready": snapshot,
+        "tpu": tpu,
+    }
+    if not snapshot:
+        # Fallback: no region has READY capacity right now. Pick the first
+        # eligible region; iris's --queue / autoscaler will handle the wait.
+        picked = eligible[0]
+        err(f"[region-strategy auto] iris-avail returned 0 READY across "
+            f"{eligible}; defaulting to {picked} (eligible[0])")
+    else:
+        # Highest READY; tie-break by eligible-list order.
+        picked = max(eligible, key=lambda r: (snapshot.get(r, 0), -eligible.index(r)))
+        err(f"[region-strategy auto] avail snapshot {snapshot} → picked {picked}")
+    info["region_picked"] = picked
+
+    # Pre-mirror parent ckpt to the picked region if we're resuming.
+    if resume_mode and parent_label:
+        present, latest = _ckpt_mirror_status(parent_label, picked)
+        if present:
+            err(f"[region-strategy auto] parent {parent_label}@step-{latest} "
+                f"already in {picked}; skipping mirror")
+            info["pre_flight_mirrors"]["ckpt"] = {
+                "label": parent_label, "step": latest,
+                "to": picked, "skipped_existing": True,
+            }
+        elif latest is None:
+            err(f"[region-strategy auto] could not find parent {parent_label}'s "
+                f"ckpts in any canonical bucket; skipping mirror")
+        else:
+            dst_bucket = _REGION_BUCKETS[picked]
+            err(f"[region-strategy auto] mirroring {parent_label}@step-{latest} "
+                f"→ {dst_bucket}")
+            r = subprocess.run(
+                [str(Path(__file__).resolve()), "ckpt", "mirror",
+                 parent_label, "--to", dst_bucket, "-s", str(latest)],
+                capture_output=False,
+            )
+            if r.returncode != 0:
+                raise click.UsageError(
+                    f"ckpt mirror failed (rc={r.returncode}); cannot fire in "
+                    f"{picked} with stale parent ckpt — re-run after fixing or "
+                    f"use --region-strategy explicit")
+            info["pre_flight_mirrors"]["ckpt"] = {
+                "label": parent_label, "step": latest,
+                "to": picked, "skipped_existing": False,
+            }
+    return info
+
+
+def _probe_iris_avail_by_region(
+    tpu: str, eligible_regions: list[str] | None = None,
+) -> dict[str, int]:
+    """Probe iris autoscaler for READY counts per region for a given TPU shape.
+
+    Returns: region → max READY count across all pools in that region for this TPU.
+    Filters to `eligible_regions` if provided. Mirrors the regex matching in
+    `tomat train --queue` (pool naming: `tpu_<chip>-<class>_<size>-<zone>`).
+    """
+    try:
+        chip, size = tpu.rsplit("-", 1)
+    except ValueError:
+        chip, size = tpu, ""
+    pool_re = re.compile(rf"^tpu_{re.escape(chip)}-\w+_{re.escape(size)}-(.+)$")
+    probe = subprocess.run(
+        [IRIS_BIN, "--cluster=marin", "rpc", "controller", "get-autoscaler-status"],
+        cwd=str(MARIN_DIR), capture_output=True, text=True, timeout=90,
+    )
+    by_region: dict[str, int] = {}
+    if probe.returncode != 0:
+        err(f"[region-strategy] iris-avail probe failed: rc={probe.returncode}")
+        return by_region
+    try:
+        data = json.loads(strip_iris_log(probe.stdout).strip())
+    except Exception as e:
+        err(f"[region-strategy] iris-avail parse failed: {e}")
+        return by_region
+    for p in _walk_pools(data):
+        if p["status"] != "available" or p["ready"] <= 0:
+            continue
+        m = pool_re.match(p["name"])
+        if not m:
+            continue
+        # Pool zone (e.g. `us-east5-b`). Region = strip trailing -<letter>.
+        pool_zone = m.group(1)
+        region = re.sub(r"-[a-z]$", "", pool_zone)
+        if eligible_regions and region not in eligible_regions:
+            continue
+        by_region[region] = max(by_region.get(region, 0), p["ready"])
+    return by_region
 
 
 @cache_grp.command("mirror")
@@ -5602,6 +5875,7 @@ def _record_train_fire_to_r2(
     zone: str | None,
     steps: int,
     from_step: int | None,
+    region_info: dict | None = None,
     bucket: str = None,
 ) -> str:
     """In-process equivalent of `tomat fires record` for `tomat train`.
@@ -5633,6 +5907,10 @@ def _record_train_fire_to_r2(
             "job_id": f"/{getpass.getuser()}/{label}",
             **({"tpu": tpu} if tpu else {}),
             **({"zone": zone} if zone else {}),
+            # Spec 62 — region-strategy fields. Always present (even if `info`
+            # is None we record `strategy: "explicit"` as the conservative
+            # interpretation, since pre-spec-62 callers behaved that way).
+            **(region_info or {"region_strategy": "explicit"}),
         },
         "wandb": {
             "entity": WANDB_PROJECT.split("/")[0],
