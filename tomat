@@ -4692,6 +4692,14 @@ def train(
         env_vars.append(("TOMAT_PARENT_RUN_ID", parent_label))
     if intended_deltas:
         env_vars.append(("TOMAT_INTENDED_RESUME_DELTAS", ",".join(intended_deltas)))
+    # Marin pin captured at fire time (`git rev-parse HEAD` on the marin clone
+    # the trainer will run with). Surfaces to wandb config via task #269's
+    # TOMAT_* logging — so future fires aren't "floating pins" and we can
+    # answer "what marin SHA did this run train under" from the dashboard.
+    # Memory: [[marin-dev-wheel-rotation]] + task #271. Empty string when
+    # marin isn't a discoverable git clone (e.g. CI).
+    _pin = _marin_pin() or ""
+    env_vars.append(("TOMAT_MARIN_PIN", _pin))
     # Always emit — shuffle is on by default; `--shuffle-window-blocks 0` is
     # the explicit opt-out and `auto` (default) defers epoch-window resolution
     # to the trainer (`marin/train_tomat_tpu.py:_epoch_window_blocks`).
@@ -5855,27 +5863,47 @@ def _git_sha(cwd: Path | None = None) -> str | None:
 
 
 def _marin_pin() -> str | None:
-    """Marin pin from tomat's uv.lock (NOT `marin/.git/HEAD`).
+    """Marin pin captured at fire time.
 
-    The `marin/` dir in tomat is a working clone, not a submodule — running
-    `git rev-parse HEAD` inside it walks up to tomat's own .git. The
-    authoritative marin pin is the `marin-iris` source revision recorded in
-    `uv.lock`.
+    The marin/ subdir of this repo IS the marin repo (working clone — but its
+    own git dir is `marin/.git`, distinct from tomat's). The fire-time pin is
+    whatever HEAD that clone is at, which is what `train_tomat_tpu.py` (which
+    lives at `marin/train_tomat_tpu.py`) will run with on the iris worker.
+
+    Prior implementation looked at `uv.lock`'s `marin-iris ?rev=` field, but
+    marin is installed via editable from the local clone (not pinned in
+    uv.lock), so that always returned None. The fall-through reads
+    `marin/.git/HEAD` directly.
     """
+    # First try uv.lock (some configs DO pin marin via git+...?rev=<SHA>).
     lock = PROJECT_ROOT / "uv.lock"
-    if not lock.exists():
-        return None
-    # Cheap regex over the lock file's `[[package]]` blocks. uv writes the
-    # source rev as `source.git = "...git+...?rev=<SHA>"`.
-    try:
-        for chunk in lock.read_text().split("[[package]]"):
-            if "marin-iris" not in chunk:
-                continue
-            m = re.search(r"\?rev=([0-9a-f]{7,40})", chunk)
-            if m:
-                return m.group(1)
-    except Exception:
-        pass
+    if lock.exists():
+        try:
+            for chunk in lock.read_text().split("[[package]]"):
+                if "marin-iris" not in chunk:
+                    continue
+                m = re.search(r"\?rev=([0-9a-f]{7,40})", chunk)
+                if m:
+                    return m.group(1)
+        except Exception:
+            pass
+    # Fall through: read the sibling marin clone's HEAD. Per `$c/oa` layout:
+    # marin code lives at `$c/oa/marin/` (sibling of `$c/oa/tomat/`), not at
+    # `tomat/marin/` (which is just per-project training scripts).
+    for candidate in (
+        Path.home() / "c" / "oa" / "marin",
+        PROJECT_ROOT.parent / "marin",
+    ):
+        if (candidate / ".git").exists():
+            try:
+                r = subprocess.run(
+                    ["git", "-C", str(candidate), "rev-parse", "HEAD"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    return r.stdout.strip()
+            except Exception:
+                pass
     return None
 
 
