@@ -6191,6 +6191,54 @@ def fires_show(fire_id: str, bucket: str):
     print(json.dumps(m, indent=2))
 
 
+@cli.group("lineage")
+def lineage_grp():
+    """Lineage (parent → child) management for runs.
+
+    Lineage drives the dashboard's "experiment" view (parent overlay + lineage
+    table on /runs/<id>). The source of truth is `TOMAT_PARENT_RUN_ID` +
+    `TOMAT_PARENT_STEP` on each run's wandb config. New fires populate these
+    via `tomat train --parent X` (spec 61 P1 / task #331). For older runs
+    that predate that wiring, `tomat lineage backfill` writes the keys
+    post-hoc; the cron's next `runs sync` picks them up and the dashboard
+    renders the lineage automatically.
+    """
+
+
+@lineage_grp.command("backfill")
+@click.option("-r", "--run-id", required=True, help="canonical run name to backfill")
+@click.option("-p", "--parent", required=True, help="parent run name")
+@click.option("-s", "--parent-step", "parent_step", required=True, type=int,
+              help="step in parent's trajectory the child resumed from")
+@click.option("--project", default=WANDB_PROJECT, show_default=True,
+              help="wandb project (entity/project)")
+@click.option("-d", "--dry-run", is_flag=True)
+def lineage_backfill(
+    run_id: str, parent: str, parent_step: int, project: str, dry_run: bool,
+):
+    """Set `TOMAT_PARENT_RUN_ID`/`TOMAT_PARENT_STEP` on a wandb run's config.
+
+    Used for runs fired before --parent wiring landed. Going forward, every
+    `tomat train --parent X` writes these automatically — no backfill needed.
+
+    Example:
+        tomat lineage backfill -r train-mg-kl-bin5-cont-clean \\
+            -p train-mg-kl-bin5-fs-tpu -s 100000
+    """
+    import wandb
+    if dry_run:
+        print(f"[dry-run] would set on {project}/{run_id}:")
+        print(f"  TOMAT_PARENT_RUN_ID = {parent!r}")
+        print(f"  TOMAT_PARENT_STEP = {parent_step}")
+        return
+    api = wandb.Api()
+    r = api.run(f"{project}/{run_id}")
+    r.config["TOMAT_PARENT_RUN_ID"] = parent
+    r.config["TOMAT_PARENT_STEP"] = parent_step
+    r.update()
+    print(f"[lineage backfill] {run_id}: parent={parent}, parent_step={parent_step}")
+
+
 @cli.group("wb")
 def wb_grp():
     """Wandb GraphQL helpers: introspect, list projects, manipulate access."""

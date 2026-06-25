@@ -20,7 +20,7 @@ function useMEvalMetric() {
 }
 import { RunsTimelinePlot, colorForIndex, useNameFilter, useTagFilters, useAncestorsToggle, compileMultiTermFilter, runHaystack, shortLabel } from './RunsTimelinePlot'
 import { runPassesTagFilters, tagsFor } from './tags'
-import { ancestorsOf, lineageFor } from './lineage'
+import { ancestorsOf, lineageFor, registerLineageFromManifest } from './lineage'
 import type { RunTimelineSeries } from './RunsTimelinePlot'
 import { useTraceHighlight } from 'pltly/react'
 import {
@@ -582,6 +582,18 @@ function RunsIndex() {
 
   // m-eval jobs grouped by the run they evaluate (parsed from iris job names).
   const evalByRun = useMemo(() => evalJobsByRun(iris ?? undefined), [iris])
+
+  // Register wandb-config-driven lineage from every run in the snapshot.
+  // Future fires populated by `tomat train --parent` (spec 61 P1) appear in
+  // the dashboard without any RUN_LINEAGE registry edit.
+  useEffect(() => {
+    const runs = snapshotQ.data?.runs
+    if (!runs) return
+    for (const [id, m] of Object.entries(runs)) {
+      const cfg = (m as { run?: { config?: Record<string, unknown> } })?.run?.config
+      if (cfg) registerLineageFromManifest(id, cfg)
+    }
+  }, [snapshotQ.data])
   const err = snapshotQ.error ? String(snapshotQ.error) : null
   // One card per visible run; manifests come straight from the snapshot,
   // histories from their per-run parquet queries. Failed history fetch is
@@ -1351,6 +1363,15 @@ function RunDetail({ runId }: { runId: string }) {
     retry: 1,
   })
   const manifest = manifestQ.data ?? null
+  // Data-driven lineage (spec 63): register parent from wandb config so
+  // `lineageFor()` picks it up without a RUN_LINEAGE registry edit. Fires
+  // populated by `tomat train --parent` (spec 61 P1) thus appear in the
+  // dashboard automatically.
+  useEffect(() => {
+    if (manifest?.run?.config) {
+      registerLineageFromManifest(runId, manifest.run.config as Record<string, unknown>)
+    }
+  }, [runId, manifest])
   const ownHistory = historyQ.data ?? null
   // Lineage-aware concatenated history: ancestor-first → … → this run.
   // Available when every ancestor history has loaded (`every(d != null)`).

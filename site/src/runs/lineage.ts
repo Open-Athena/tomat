@@ -135,11 +135,58 @@ export const RUN_LINEAGE: Record<string, RunLineage> = {
     parent: 'train-mg-modal-h200x8-tz-v4-epochwin-bs128-seed42',
     parent_step: 100000,
   },
+
+  // bin5 σ-ablation continuations (s∈{3,10,20}) — all resume from
+  // bin5-fs-tpu@step-100000 with the σ value swapped. Spec 61 P1 / the
+  // intentional --allow-config-change=optimizer.density_kl_sigma exception
+  // applies. All 3 fired in sequence on v5p-16 us-east5-a; per memory
+  // [[resume-spike-not-bug-converged-minimum]] (retracted), the resume
+  // spike here is HW-or-resume-mechanism, not σ-specific.
+  'train-mg-kl-bin5-cont-s3': {
+    parent: 'train-mg-kl-bin5-fs-tpu',
+    parent_step: 100000,
+  },
+  'train-mg-kl-bin5-cont-s10': {
+    parent: 'train-mg-kl-bin5-fs-tpu',
+    parent_step: 100000,
+  },
+  'train-mg-kl-bin5-cont-s20': {
+    parent: 'train-mg-kl-bin5-fs-tpu',
+    parent_step: 100000,
+  },
 }
 
-/** Lineage entry for `runName`, or `null` if it has no recorded parent. */
+/** Data-driven overlay populated from wandb config at manifest load time.
+ *  When a run's `manifest.run.config.TOMAT_PARENT_RUN_ID` is set, the parent
+ *  is registered here and `lineageFor()` prefers it over the hand-curated
+ *  `RUN_LINEAGE` fallback. Future fires populated by `tomat train --parent`
+ *  (spec 61 P1 / task #331) thus appear in the dashboard without any code
+ *  edit; the registry is now the legacy fallback for older runs that
+ *  predate the wandb-config logging. */
+const LINEAGE_FROM_MANIFEST = new Map<string, RunLineage>()
+
+/** Called from RunsPage when a manifest loads. Reads
+ *  `config.TOMAT_PARENT_RUN_ID` + `config.TOMAT_PARENT_STEP` and updates
+ *  the dynamic lineage map. Safe to call repeatedly with the same data. */
+export function registerLineageFromManifest(
+  runId: string,
+  config: Record<string, unknown> | null | undefined,
+): void {
+  if (!config) return
+  const parent = config['TOMAT_PARENT_RUN_ID']
+  if (typeof parent !== 'string' || !parent) return
+  const stepRaw = config['TOMAT_PARENT_STEP']
+  const parent_step = typeof stepRaw === 'number' ? stepRaw
+    : (typeof stepRaw === 'string' && /^\d+$/.test(stepRaw)) ? Number(stepRaw)
+    : undefined
+  LINEAGE_FROM_MANIFEST.set(runId, { parent, parent_step })
+}
+
+/** Lineage entry for `runName`, or `null` if it has no recorded parent.
+ *  Prefers the data-driven `LINEAGE_FROM_MANIFEST` overlay (sourced from
+ *  wandb config) over the hand-curated `RUN_LINEAGE` registry. */
 export function lineageFor(runName: string): RunLineage | null {
-  return RUN_LINEAGE[runName] ?? null
+  return LINEAGE_FROM_MANIFEST.get(runName) ?? RUN_LINEAGE[runName] ?? null
 }
 
 /** Short relationship label for an ancestor at `partIdx` in a `lineageInfo`
