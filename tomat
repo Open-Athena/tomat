@@ -7532,7 +7532,10 @@ def marin_grp():
 
 
 _MARIN_PIN_RE = re.compile(
-    r'^(marin-\S+\s*=\s*\{\s*git\s*=\s*"https://github\.com/marin-community/marin",\s*rev\s*=\s*")[0-9a-f]{40}(",\s*subdirectory\s*=\s*"lib/\S+"\s*\})\s*$',
+    # Matches both `marin-community/marin` (upstream) and `Open-Athena/marin`
+    # (our fork) URLs — pyproject.toml uses the fork today, but the upstream
+    # pattern is kept for forward compatibility / future un-fork.
+    r'^(marin-\S+\s*=\s*\{\s*git\s*=\s*"https://github\.com/(?:marin-community|Open-Athena)/marin",\s*rev\s*=\s*")[0-9a-f]{40}(",\s*subdirectory\s*=\s*"lib/\S+"\s*\})\s*$',
     re.MULTILINE,
 )
 
@@ -7562,18 +7565,19 @@ def _rewrite_marin_pin(new_sha: str) -> int:
 
 def _resolve_marin_sha(sha: str) -> str:
     """Resolve 'latest', a branch name, or a short SHA to a full 40-char SHA
-    via `gh api`. Raises if the ref doesn't exist."""
+    via `gh api`. Tries our fork (Open-Athena/marin) first since that's
+    where our SHAs live; falls back to upstream (marin-community/marin)
+    so `tomat marin bump latest` continues to pick up upstream main."""
     ref = "main" if sha == "latest" else sha
-    r = subprocess.run(
-        ["gh", "api", f"repos/marin-community/marin/commits/{ref}", "--jq", ".sha"],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        raise click.ClickException(f"gh api failed to resolve marin-community/marin@{ref}: {r.stderr.strip()}")
-    full = r.stdout.strip()
-    if not re.fullmatch(r"[0-9a-f]{40}", full):
-        raise click.ClickException(f"unexpected gh api response for {ref}: {full!r}")
-    return full
+    for repo in ("Open-Athena/marin", "marin-community/marin"):
+        r = subprocess.run(
+            ["gh", "api", f"repos/{repo}/commits/{ref}", "--jq", ".sha"],
+            capture_output=True, text=True,
+        )
+        full = r.stdout.strip()
+        if r.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", full):
+            return full
+    raise click.ClickException(f"gh api failed to resolve marin@{ref} in Open-Athena/marin or marin-community/marin")
 
 
 @marin_grp.command("status")
