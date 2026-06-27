@@ -24,6 +24,10 @@ export interface LineageRow {
   endStep: number | null
   /** True for the row corresponding to the page's current run. */
   current: boolean
+  /** Optional kind marker — drives the row's relationship label. Defaults:
+   *  `current` if `current === true`, else `ancestor`. Pass `'child'` for
+   *  rows that are direct children of the current run. */
+  kind?: 'ancestor' | 'current' | 'child'
 }
 
 function fmtStep(s: number | null): string {
@@ -130,6 +134,11 @@ export function LineageTable({ rows }: { rows: LineageRow[] }) {
                   {row.current && (
                     <span style={{ marginLeft: 6, fontSize: '0.7rem', color: '#7aa3ff' }}>
                       ◀ current
+                    </span>
+                  )}
+                  {row.kind === 'child' && (
+                    <span style={{ marginLeft: 6, fontSize: '0.7rem', color: '#7aa37a' }}>
+                      ↳ child
                     </span>
                   )}
                 </td>

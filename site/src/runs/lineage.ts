@@ -270,18 +270,41 @@ export function segmentsFor(runName: string): RunSegment[] | null {
 
 /** Walk the lineage map upward from `runName`, collecting every ancestor
  *  (parent, grandparent, …). Stops at the root or a cycle (defensive — there
- *  shouldn't be any). The starting `runName` itself is NOT included. */
+ *  shouldn't be any). The starting `runName` itself is NOT included.
+ *  Honors the dynamic LINEAGE_FROM_MANIFEST overlay via `lineageFor`. */
 export function ancestorsOf(runName: string): string[] {
   const out: string[] = []
   const seen = new Set<string>([runName])
   let cur: string | undefined = runName
   while (cur !== undefined) {
-    const lin: RunLineage | undefined = RUN_LINEAGE[cur]
+    const lin = lineageFor(cur)
     if (!lin) break
     if (seen.has(lin.parent)) break  // cycle guard
     seen.add(lin.parent)
     out.push(lin.parent)
     cur = lin.parent
+  }
+  return out
+}
+
+/** Direct children of `runName`: all runs whose recorded parent equals
+ *  `runName`. Scans both the dynamic LINEAGE_FROM_MANIFEST overlay and the
+ *  hand-curated RUN_LINEAGE fallback, de-duped by run id. */
+export function childrenOf(runName: string): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const [child, lin] of LINEAGE_FROM_MANIFEST.entries()) {
+    if (lin.parent === runName && !seen.has(child)) {
+      out.push(child)
+      seen.add(child)
+    }
+  }
+  for (const child of Object.keys(RUN_LINEAGE)) {
+    const lin = RUN_LINEAGE[child]
+    if (lin.parent === runName && !seen.has(child)) {
+      out.push(child)
+      seen.add(child)
+    }
   }
   return out
 }

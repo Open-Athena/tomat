@@ -20,7 +20,7 @@ function useMEvalMetric() {
 }
 import { RunsTimelinePlot, colorForIndex, useNameFilter, useTagFilters, useAncestorsToggle, compileMultiTermFilter, runHaystack, shortLabel } from './RunsTimelinePlot'
 import { runPassesTagFilters, tagsFor } from './tags'
-import { ancestorsOf, lineageFor, registerLineageFromManifest } from './lineage'
+import { ancestorsOf, childrenOf, lineageFor, registerLineageFromManifest } from './lineage'
 import type { RunTimelineSeries } from './RunsTimelinePlot'
 import { useTraceHighlight } from 'pltly/react'
 import {
@@ -1273,12 +1273,33 @@ function RunDetail({ runId }: { runId: string }) {
   // (no need to gate on iris state — the user is staring at this one).
   const errBackoff = (q: { state: { error: unknown | null } }) =>
     q.state.error ? REFETCH_MS.errorBackoff : null
+  // Shared-key snapshot poll so we can discover children of this run via
+  // their wandb config's `TOMAT_PARENT_RUN_ID`. tanstack-query dedupes
+  // with RunsIndex's identical queryKey, so this is free when navigating
+  // from the index, and one extra fetch on direct-URL loads.
+  const snapshotQ = useQuery({
+    queryKey: ['runs-snapshot'],
+    queryFn: fetchRunsSnapshot,
+    refetchInterval: REFETCH_MS.snapshot,
+  })
   const manifestQ = useQuery({
     queryKey: ['manifest', runId],
     queryFn: () => fetchManifest(runId),
     refetchInterval: (q) => errBackoff(q) ?? REFETCH_MS.manifest,
     retry: 1,
   })
+  // Mirror RunsIndex's lineage-registration effect — needed so direct
+  // URL loads of /runs/<id> populate LINEAGE_FROM_MANIFEST and thus see
+  // children. Effect is a no-op when the snapshot was pre-registered by
+  // RunsIndex.
+  useEffect(() => {
+    const runs = snapshotQ.data?.runs
+    if (!runs) return
+    for (const [id, m] of Object.entries(runs)) {
+      const cfg = (m as { run?: { config?: Record<string, unknown> } })?.run?.config
+      if (cfg) registerLineageFromManifest(id, cfg)
+    }
+  }, [snapshotQ.data])
   const historyQ = useQuery({
     queryKey: ['history', runId],
     queryFn: () => fetchRunHistory(parquetUrl(runId)),
@@ -1294,7 +1315,11 @@ function RunDetail({ runId }: { runId: string }) {
   // NMAE / NEMD toggle shared between MEvalTable (table cells) and
   // WallclockPlot (MT/MV panel). URL-persisted via `?mevm=`.
   const [mevalMetric, setMevalMetric] = useMEvalMetric()
-  const ancestors = useMemo(() => ancestorsOf(runId), [runId])
+  const ancestors = useMemo(() => ancestorsOf(runId), [runId, snapshotQ.data])
+  // Children — direct descendants whose `TOMAT_PARENT_RUN_ID === runId`. We
+  // recompute when snapshotQ.data refreshes so newly-registered manifests
+  // surface here without waiting for a route change.
+  const children = useMemo(() => childrenOf(runId), [runId, snapshotQ.data])
   // `useQueries` returns a stable array indexed by ancestor; ancestors-first
   // (parent, grandparent, …) so concat below reverses to chronological order.
   const ancestorHistoryQs = useQueries({
@@ -1560,9 +1585,17 @@ function RunDetail({ runId }: { runId: string }) {
           return { runId: aid, startStep: start, endStep: end, current: false }
         })
         const { start: ownStart, end: ownEnd } = stepRangeFromHistory(ownHistory)
+        // Children: any registered run whose parent === this run. Step ranges
+        // are not fetched here (would 2× the history requests); the row shows
+        // the run name + links and leaves step range null. Drill into the
+        // child's own page for its full timeline.
+        const childRows: LineageRow[] = children.map((cid) => ({
+          runId: cid, startStep: null, endStep: null, current: false, kind: 'child',
+        }))
         const allRows: LineageRow[] = [
           ...ancestorRows,
           { runId, startStep: ownStart, endStep: ownEnd, current: true },
+          ...childRows,
         ]
         return <LineageTable rows={allRows} />
       })()}
