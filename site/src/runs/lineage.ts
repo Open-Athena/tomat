@@ -173,9 +173,23 @@ export function registerLineageFromManifest(
   config: Record<string, unknown> | null | undefined,
 ): void {
   if (!config) return
-  const parent = config['TOMAT_PARENT_RUN_ID']
+  // Read parent from any of the locations the trainer writes it:
+  // - `cfg.tomat.parent_run_id` (canonical — written by
+  //   `_log_tomat_run_metadata_to_wandb` in marin/train_tomat_tpu.py)
+  // - `cfg.tomat.env.parent_run_id` (same value via env-vars dict)
+  // - `cfg.TOMAT_PARENT_RUN_ID` (top-level — legacy/never actually written
+  //   by the trainer, but kept here in case a future code path does)
+  const tomat = config['tomat'] as Record<string, unknown> | undefined
+  const tomatEnv = tomat?.['env'] as Record<string, unknown> | undefined
+  let parent: unknown =
+    tomat?.['parent_run_id']
+    ?? tomatEnv?.['parent_run_id']
+    ?? config['TOMAT_PARENT_RUN_ID']
   if (typeof parent !== 'string' || !parent) return
-  const stepRaw = config['TOMAT_PARENT_STEP']
+  const stepRaw =
+    tomat?.['parent_step']
+    ?? tomatEnv?.['parent_step']
+    ?? config['TOMAT_PARENT_STEP']
   const parent_step = typeof stepRaw === 'number' ? stepRaw
     : (typeof stepRaw === 'string' && /^\d+$/.test(stepRaw)) ? Number(stepRaw)
     : undefined
