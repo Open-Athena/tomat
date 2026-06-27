@@ -31,9 +31,15 @@ from utz.cli import flag
 
 err = partial(print, file=sys.stderr)
 
+_VENV_ROOTS = [Path('/Users/ryan/c/oa/tomat/.venv'), Path('/Users/ryan/c/oa/tomat/marin/.venv')]
+# Glob `python3.*` instead of hardcoding 3.12: tomat's venv has switched
+# back and forth between 3.11 and 3.12 over recent syncs and a hardcoded
+# minor version silently misses the active install (script reports
+# "done (0 files)" while leaving the stale BUILD_DATE in place → iris
+# launch fails with "client too old").
 CANDIDATES = [
-    Path('/Users/ryan/c/oa/tomat/.venv/lib/python3.12/site-packages/iris/_build_info.py'),
-    Path('/Users/ryan/c/oa/tomat/marin/.venv/lib/python3.12/site-packages/iris/_build_info.py'),
+    p for root in _VENV_ROOTS
+    for p in root.glob('lib/python3.*/site-packages/iris/_build_info.py')
 ]
 
 
