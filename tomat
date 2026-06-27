@@ -4419,10 +4419,13 @@ def train(
             print(f"[tomat train] --from-ckpt: [dry-run] would copy {src}/ → {target}/")
         else:
             print(f"[tomat train] --from-ckpt: copying {src}/ → {target}/ …")
-            cp = subprocess.run(["gsutil", "-m", "cp", "-r", src, target.rsplit("/", 1)[0] + "/"],
+            # `gcloud storage cp -r` mirrors the `evals fire --mirror-to`
+            # path (tomat:2467); avoids `gsutil -m`'s macOS multiprocessing
+            # deadlock (observed hanging 45 min at 0 bytes copied).
+            cp = subprocess.run(["gcloud", "storage", "cp", "-r", src, target.rsplit("/", 1)[0] + "/"],
                                 capture_output=False, text=True)
             if cp.returncode != 0:
-                err(f"--from-ckpt: gsutil cp failed (rc={cp.returncode})")
+                err(f"--from-ckpt: gcloud storage cp failed (rc={cp.returncode})")
                 sys.exit(cp.returncode)
             print(f"[tomat train] --from-ckpt: copy complete")
 
@@ -5355,7 +5358,11 @@ def cache_mirror(data_label: str, source: str, targets: str | None, splits: str,
         for split in split_list:
             src = f"{source}/cache/{label_for_path}/{split}/"
             dst = f"{tgt}/cache/{data_label}/{split}/"
-            cmd = ["gsutil", "-m", "rsync", "-r", src, dst]
+            # `gcloud storage rsync` avoids `gsutil -m`'s macOS
+            # multiprocessing deadlock; same fix as the `--from-ckpt` cp
+            # path (tomat:4422) and the `evals fire --mirror-to` path
+            # (tomat:2467).
+            cmd = ["gcloud", "storage", "rsync", "-r", src, dst]
             print()
             print(f"# {src} → {dst}")
             print(" ", " ".join(cmd))
