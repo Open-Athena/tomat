@@ -9,7 +9,13 @@
 # RT should be clean and TL should continue smoothly past 110k with no spike.
 # Spike → falsifies pin-drift hypothesis. See tmp/pin-drift-hypothesis.md.
 #
-# Recipe mirrors v4-cont-clean exactly: same TPU/zone/bucket/loss/data/HPs.
+# Recipe mirrors v4-cont-clean exactly for loss/data/HPs/seed/BS/LR.
+# HW deviation: SWITCHED v6e-16 us-east5-b → v5p-16 us-east5-a after the
+# original target sat pending iris capacity for 30+ min. bin5 evidence
+# (bin5-cont-clean v5p-16 vs bin5-cont-from-80k-v6e v6e-16 both spiked
+# identically) shows HW doesn't affect resume-mechanism behavior, so v5p
+# is a free swap for this diagnostic. Bonus: v5p ~3× v6e MFU → faster.
+#
 # Includes the pre-existing 78125 shuffle_window_blocks (inherited from
 # v4-modal-epochwin's TS1-epochwin) even though we're on TS0123 — fidelity
 # to the parent is what isolates the resume mechanism.
@@ -32,8 +38,8 @@ fi
   --resume --parent "${PARENT_LABEL}" \
   --from-ckpt "${FROM_CKPT}" \
   --bucket "${SRC_BUCKET}" \
-  --region-strategy explicit --zone us-east5-b \
-  -T v6e-16 \
+  --region-strategy explicit --zone us-east5-a \
+  -T v5p-16 \
   -D train-full-v3,train-full-v3-shard1,train-full-v3-shard2,train-full-v3-shard3 \
   -m 200M -b 128 --seed 42 \
   --lr 4e-5 --lr-schedule constant --warmup 0 \
