@@ -3819,19 +3819,21 @@ def evals_auto_fire(
     # results pool to one canonical bucket so the dashboard's `evals
     # sync` only walks one tree.)
     eval_results_bucket = "marin-eu-west4"
-    # Cadence filter: only consider /10k-aligned ckpts (+ the run's
-    # final ckpt). Levanter writes a ckpt every 1k steps but m-eval
-    # sample-NMAE is expensive — we only want /10k points on the
-    # dashboard's MT/MV trace. See memory
-    # `feedback_mt_mv_only_10k_cadence`.
+    # Cadence filter: only /10k-aligned ckpts. Levanter writes a ckpt
+    # every 1k steps but m-eval sample-NMAE is expensive — we only want
+    # /10k points on the dashboard's MT/MV trace. Per-lineage step
+    # counters are preserved across resume so /10k applies cleanly even
+    # across cont segments. See memory `feedback_mt_mv_only_10k_cadence`.
+    #
+    # No "final step" exception: a continuation that ends mid-decamillage
+    # (e.g. parent 100k → child +5k = step 105k) yields no new /10k
+    # boundary and should not fire anything, which matches the dashboard's
+    # /10k MT/MV trace cadence.
     CADENCE = 10_000
     for run, ckpt_bucket, steps in active:
         if not steps:
             continue
-        final_step = max(steps)
-        steps_at_cadence = sorted(
-            {s for s in steps if s % CADENCE == 0} | {final_step}
-        )
+        steps_at_cadence = sorted(s for s in steps if s % CADENCE == 0)
         do_k12 = any(run.startswith(p) for p in K12_RUN_PREFIXES)
         # (variant_suffix, mg_k_steps_for_fire, gcs_variant_key)
         modes = [("-K1", 1, "K1")]
