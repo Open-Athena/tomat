@@ -3580,6 +3580,302 @@ def evals_process_fire_requests(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# tomat evals auto-fire — walk active runs and fire missing m-eval cells.
+# Lives downstream of `tomat evals process-fire-requests` (Phase D, the
+# FE-driven single-cell drainer) — Phase C drives the systemic case:
+# every training run gets its (ckpt × set × mode) grid filled in
+# automatically. See task #351 + memory `autosync-cron-stall-pattern`.
+# ──────────────────────────────────────────────────────────────────────
+
+
+# Hardcoded list of run-name prefixes whose MG training included
+# partial-mask exposure (cos-r lineage and friends); for these K=12
+# evals are meaningful as well as K=1. All other MG-trained runs are
+# "absorbing-only" (always masked at training time) — K=1 is the honest
+# in-distribution number; K>1 is degenerate-OOD per memory
+# `k1-oneshot-on-mg-is-gigo`. Add lineages here as needed.
+K12_RUN_PREFIXES = (
+    "train-mg-cos-r",
+)
+
+
+def _ckpts_for_run_with_max_mtime(
+    run: str, gcs_bucket: str = "marin-eu-west4", fs=None,
+) -> tuple[list[int], "datetime | None"]:
+    """Return (sorted-step-list, latest-ckpt-mtime) for a run on GCS.
+
+    The mtime drives the lookback-days filter (run is "active" iff its
+    newest ckpt was written within the lookback window). Two fsspec
+    calls per run: one `fs.ls` for the step-N directory listing
+    (cheap, no per-subdir mtime), one `fs.info` on the latest step's
+    metadata.json (gives a real mtime).
+    """
+    import fsspec
+    if fs is None:
+        fs = fsspec.filesystem("gcs")
+    base = f"{gcs_bucket}/tomat/results/{run}/checkpoints/{run}"
+    try:
+        children = fs.ls(base)
+    except Exception:
+        return ([], None)
+    steps = sorted({
+        int(m.group(1)) for c in children
+        if (m := re.search(r"/step-(\d+)/?$", c))
+    })
+    if not steps:
+        return ([], None)
+    # Latest step's metadata.json mtime ≈ "when this run last wrote a ckpt".
+    # We pay 1 GCS object-stat per run for an honest mtime.
+    metadata_path = f"{base}/step-{steps[-1]}/metadata.json"
+    try:
+        info = fs.info(metadata_path)
+    except Exception:
+        return (steps, None)
+    latest = info.get("mtime") or info.get("updated")
+    if isinstance(latest, str):
+        from datetime import datetime, timezone as _tz
+        try:
+            latest = datetime.fromisoformat(latest.replace("Z", "+00:00"))
+        except ValueError:
+            latest = None
+    return (steps, latest)
+
+
+def _existing_eval_steps(
+    fs, gcs_bucket: str, run: str, mat_set: str, mode: str,
+) -> set[tuple[int, str]]:
+    """Return {(step, variant)} for every step-N(-<variant>)?.json file
+    under `<mat_set>(-<mode>)/` on GCS. `variant=""` = unsuffixed (K=12 maskgit
+    or vanilla oneshot); `variant="K1"` = K=1 maskgit; etc.
+    """
+    sub = mat_set if mode in ("teacher", "oneshot") else f"{mat_set}-{mode}"
+    path = f"{gcs_bucket}/tomat/eval/results/{run}/{sub}"
+    if not fs.exists(path):
+        return set()
+    out: set[tuple[int, str]] = set()
+    for p in fs.ls(path):
+        name = p.rsplit("/", 1)[-1]
+        if not name.startswith("step-") or not name.endswith(".json"):
+            continue
+        stem = name[len("step-"):-len(".json")]
+        # Strip trailing `-task<i>` first (fanout suffix).
+        core, _, _task = stem.rpartition("-task")
+        if not core:
+            core = stem
+        if "-" in core:
+            step_str, variant = core.split("-", 1)
+        else:
+            step_str, variant = core, ""
+        try:
+            out.add((int(step_str), variant))
+        except ValueError:
+            continue
+    return out
+
+
+def _count_in_flight_evals(timeout: int = 60) -> int:
+    """Count iris jobs with prefix `tomat-eval-` in a non-terminal state.
+
+    Used by `evals auto-fire` to respect the global iris-in-flight cap.
+    Falls back to 0 on RPC failure (better to over-fire than skip a pass
+    entirely — iris's de-dup is the final backstop).
+    """
+    try:
+        jobs = _iris_job_list_json("tomat-eval-", timeout=timeout)
+    except Exception as e:
+        err(f"[auto-fire] WARN: iris job list failed ({type(e).__name__}: {e}); "
+            f"assuming 0 in-flight (de-dup will catch double-fires)")
+        return 0
+    # Per iris's JSON: each job has a `state` field; non-terminal states
+    # are anything other than SUCCEEDED/FAILED/CANCELLED. iris currently
+    # reports lowercase (`running`, `queued`, etc.) — match defensively.
+    terminal = {"succeeded", "failed", "cancelled", "canceled", "completed"}
+    n = 0
+    for j in jobs:
+        state = (j.get("state") or j.get("status") or "").lower()
+        if state and state not in terminal:
+            n += 1
+    return n
+
+
+@evals.command("auto-fire")
+@click.option("-l", "--lookback-days", default=7, type=int, show_default=True,
+              help="Active = run with a ckpt mtime within the last N days. Old runs are skipped; --include adds an explicit run regardless.")
+@click.option("-w", "--max-in-flight", default=12, type=int, show_default=True,
+              help="Global cap on concurrent iris `tomat-eval-*` jobs. Each fire decrements local capacity by 1 task. Default 12 ≈ 4-6 ckpts × 2 sets at a time.")
+@click.option("-T", "--tpu", default="v6e-8", show_default=True,
+              help="--tpu for the spawned `evals fire` calls. See also `tomat evals fire --help`.")
+@click.option("-n", "--dry-run", is_flag=True,
+              help="Print the fire plan (active runs, missing cells, capacity decisions) without invoking iris.")
+@click.option("--include", multiple=True,
+              help="Extra runs to consider active regardless of mtime. Repeatable.")
+@click.option("--exclude", multiple=True,
+              help="Runs to never auto-fire (overrides --include + active heuristic). Repeatable.")
+@click.option("--buckets", default="marin-eu-west4,marin-us-east5,marin-us-central2", show_default=True,
+              help="Comma-separated list of GCS buckets to scan for ckpts (no `gs://` prefix). Per memory `cross-region-codec-mirror`, runs land in whichever region the trainer worker was assigned to. Each pass unions over these regions.")
+def evals_auto_fire(
+    lookback_days: int, max_in_flight: int, tpu: str, dry_run: bool,
+    include: tuple[str, ...], exclude: tuple[str, ...], buckets: str,
+):
+    """Walk active runs × ckpts × (set, mode) cells; fire missing evals.
+
+    "Active" run = ckpt mtime within `--lookback-days` (default 7d), or
+    explicitly in `--include`. Per active run, the eval grid is:
+
+        sets   ∈ {val_200, train_200}
+        modes  = K=1 maskgit (always)
+               + K=12 maskgit (only if run name starts with one of
+                 `K12_RUN_PREFIXES` — currently `train-mg-cos-r`)
+
+    Existing cells (any `step-N(-K1)?.json` on GCS under
+    `tomat/eval/results/<run>/<set>-maskgit/`) are skipped. Missing
+    cells are fired via `tomat evals fire` subject to the global iris
+    in-flight cap (`-w`, default 12). When capacity is exhausted, the
+    remaining plan is logged but skipped — the next 15-min autosync
+    pass will pick up where this one left off.
+
+    Failures (iris submit error, GCS check failure) don't abort the
+    sweep — they're logged and the next run is tried. iris's own
+    duplicate-job de-dup is the final backstop against repeated fires.
+
+    See task #351, memory `cont33k-is-gigo` (why K=1 default for MG runs),
+    and `k1-oneshot-on-mg-is-gigo` (why K=12 is degenerate for
+    absorbing-only MG).
+    """
+    import fsspec
+    from datetime import datetime, timedelta, timezone as _tz
+
+    fs = fsspec.filesystem("gcs")
+    bucket_list = [b.strip() for b in buckets.split(",") if b.strip()]
+
+    # 1. Enumerate runs by listing the ckpts root in each region. We track
+    #    bucket per run so the spawned `evals fire` knows where to look
+    #    (a run lives in exactly one region; if the same run name appears
+    #    in two buckets that's a misconfig and we go with the first one
+    #    found).
+    run_bucket: dict[str, str] = {}
+    for b in bucket_list:
+        try:
+            for p in fs.ls(f"{b}/tomat/results"):
+                if not fs.isdir(p):
+                    continue
+                name = p.rsplit("/", 1)[-1]
+                run_bucket.setdefault(name, b)
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            err(f"[auto-fire] WARN: failed to list gs://{b}/tomat/results: {e}")
+            continue
+    all_runs = sorted(run_bucket)
+    exclude_set = set(exclude)
+    include_set = set(include)
+    err(f"[auto-fire] {len(all_runs)} candidate runs across "
+        f"{len(bucket_list)} regions ({', '.join(bucket_list)})")
+
+    # 2. Per-run mtime filter (cheap-ish: one `gcloud storage ls -L` each).
+    cutoff = datetime.now(_tz.utc) - timedelta(days=lookback_days)
+    active: list[tuple[str, str, list[int]]] = []  # (run, bucket, steps)
+    for run in all_runs:
+        if run in exclude_set:
+            continue
+        b = run_bucket[run]
+        steps, latest = _ckpts_for_run_with_max_mtime(run, gcs_bucket=b, fs=fs)
+        if not steps:
+            continue
+        # Normalize mtime to tz-aware UTC for comparison.
+        if latest is not None and latest.tzinfo is None:
+            latest = latest.replace(tzinfo=_tz.utc)
+        if run in include_set or (latest is not None and latest >= cutoff):
+            active.append((run, b, steps))
+    err(f"[auto-fire] {len(active)} active (mtime > now-{lookback_days}d, "
+        f"or --include): {[(r, b) for r, b, _ in active]}")
+
+    if not active:
+        err("[auto-fire] nothing to do")
+        return
+
+    # 3. Capacity check.
+    in_flight = _count_in_flight_evals()
+    capacity = max(0, max_in_flight - in_flight)
+    err(f"[auto-fire] iris in-flight tomat-eval-* jobs: {in_flight} "
+        f"(cap={max_in_flight}; capacity={capacity})")
+    if capacity == 0 and not dry_run:
+        err("[auto-fire] at iris-cap; deferring to next pass")
+        return
+
+    # 4. Plan + fire.
+    n_fired = n_skipped_exists = n_skipped_cap = n_failed = 0
+    # Eval result JSONs are written under eu-west4 regardless of which
+    # region holds the ckpts. (See `eval_mat_nmae.py` + memory
+    # `cross-region-eval-egress` — eval workers can run in any region but
+    # results pool to one canonical bucket so the dashboard's `evals
+    # sync` only walks one tree.)
+    eval_results_bucket = "marin-eu-west4"
+    for run, ckpt_bucket, steps in active:
+        do_k12 = any(run.startswith(p) for p in K12_RUN_PREFIXES)
+        # (variant_suffix, mg_k_steps_for_fire, gcs_variant_key)
+        modes = [("-K1", 1, "K1")]
+        if do_k12:
+            modes.append(("", 12, ""))
+        for mat_set in ("val_200", "train_200"):
+            existing = _existing_eval_steps(fs, eval_results_bucket, run, mat_set, "maskgit")
+            for suffix, k_steps, variant_key in modes:
+                # Only step-N (or step-N-task<i>) cells count as "exists".
+                step_done = {s for (s, v) in existing if v == variant_key}
+                missing = [s for s in steps if s not in step_done]
+                if not missing:
+                    continue
+                for step in missing:
+                    desc = f"{run} step-{step} {mat_set} maskgit-k{k_steps}"
+                    if capacity <= 0 and not dry_run:
+                        err(f"[plan-skip] {desc}: NO CAPACITY")
+                        n_skipped_cap += 1
+                        continue
+                    eval_label = _eval_label_for_run(run)
+                    cmd = [
+                        sys.argv[0], "evals", "fire",
+                        "-s", str(step),
+                        "-S", mat_set,
+                        "-l", eval_label,
+                        "-t", tpu,  # `evals fire` uses -t for TPU shape;
+                                    # -T is --num-tasks (a different knob).
+                        "--mode", "maskgit",
+                        "--mg-k-steps", str(k_steps),
+                        "--bucket", f"gs://{ckpt_bucket}/tomat",
+                    ]
+                    if suffix:
+                        cmd += ["--output-suffix", suffix]
+                    cmd.append(run)
+                    if dry_run:
+                        err(f"[dry-run] {desc}: would fire `{' '.join(cmd)}`")
+                        n_fired += 1
+                        capacity -= 1
+                        continue
+                    err(f"[fire] {desc}")
+                    # Capacity is a per-pass attempt budget — decrement on
+                    # every try (success OR failure). Otherwise a CLI-arg
+                    # bug or auth issue can spam thousands of failed
+                    # attempts in one pass.
+                    capacity -= 1
+                    try:
+                        r = subprocess.run(
+                            cmd, capture_output=True, text=True, timeout=300,
+                        )
+                    except Exception as e:
+                        err(f"[fire-fail] {desc}: {type(e).__name__}: {e}")
+                        n_failed += 1
+                        continue
+                    if r.returncode != 0:
+                        err(f"[fire-fail] {desc}: rc={r.returncode}")
+                        err(r.stderr[-500:])
+                        n_failed += 1
+                        continue
+                    n_fired += 1
+    err(f"[auto-fire] done: {n_fired} fired, {n_skipped_cap} skipped (cap), "
+        f"{n_failed} failed")
+
+
+# ──────────────────────────────────────────────────────────────────────
 # tomat evals backfill — reconstruct eval records from historical GCS results.
 # See specs/43-run-eval-relation.md §"Backfill" + §"Data model".
 # ──────────────────────────────────────────────────────────────────────

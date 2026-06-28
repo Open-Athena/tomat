@@ -68,11 +68,15 @@ trap 'rm -f "$LOCK"' EXIT
   #   $TOMAT runs build-segments --all
   #   $TOMAT runs build-annotations --all
 
-  # Phase C: m-eval auto-fire. Stub. Would walk each running/finished
-  # run's ckpts and fire missing (val_200|train_200) × (K=1|K=12) evals.
-  # TODO:
-  #   $TOMAT evals auto-fire --all --modes oneshot,maskgit \
-  #            --sets val_200,train_200
+  # Phase C: m-eval auto-fire. Walk active runs × ckpts × (set, mode)
+  # cells; fire missing maskgit evals. Bounded by --max-in-flight (default
+  # 12 concurrent iris jobs) so a fresh run with many missing ckpts
+  # backfills over multiple passes instead of bursting. Active = ckpt
+  # within last 7 days; K=12 only for `train-mg-cos-r*` lineage (per
+  # memory `k1-oneshot-on-mg-is-gigo` — K>1 is OOD for absorbing-only MG).
+  # See task #351, `tomat evals auto-fire --help`.
+  echo "[$(date -u +%FT%TZ)] tomat evals auto-fire"
+  $TOMAT evals auto-fire 2>&1 || echo "  evals auto-fire exit=$?"
 
   # Phase D: process pending eval-fire requests posted from the dashboard.
   # FE → CFW (`POST /api/eval/fire`) writes a small JSON request to R2 at
