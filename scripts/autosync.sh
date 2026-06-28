@@ -49,11 +49,15 @@ trap 'rm -f "$LOCK"' EXIT
   # shows stale rows: the iris jobs finish, the JSONs land on GCS, but
   # `eval.json` on R2 doesn't auto-rebuild. Bin5's "13 done · 1 dot
   # rendered" symptom on 2026-06-14 traced to this.
-  echo "[$(date -u +%FT%TZ)] tomat evals sync (all recently-synced runs)"
-  # `evals sync` takes a SUBSTR. Empty string = match all → walk every
-  # run that has a parquet sidecar. Each run takes ~1s of GCS scans;
-  # the dominant cost is the eu-west4 bucket walk.
-  $TOMAT evals sync 2>&1 || echo "  evals sync exit=$?"
+  echo "[$(date -u +%FT%TZ)] tomat evals sync -X (per-run subprocess fanout)"
+  # `-X / --per-run-subprocess`: each run gets its own `tomat evals sync
+  # <run>` subprocess (with `--per-run-timeout`). Required because the
+  # in-process whole-fleet walk has a cross-run gcsfs/gRPC
+  # fork-after-init deadlock that wedged this cron for 31h on 2026-06-27
+  # (see memory `autosync-cron-stall-pattern`). Per-run subprocesses get
+  # fresh interpreters with no cross-run gRPC state to corrupt, and the
+  # timeout localizes any single-run wedge.
+  $TOMAT evals sync -X 2>&1 || echo "  evals sync exit=$?"
 
   # Phase B: segments + annotations from submissions.jsonl. Stub until
   # next pass. The CLI would read ~/.tomat/submissions.jsonl, group by

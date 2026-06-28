@@ -3026,8 +3026,10 @@ def evals_harvest(run_label: str, sets: str, interval: int, eval_label: str | No
 @click.option("-b", "--bucket", default=R2_BUCKET, help="R2 bucket")
 @click.option("-n", "--dry-run", is_flag=True, help="assemble + report, but skip the R2 upload")
 @click.option("-p", "--prefix", default=R2_RUNS_PREFIX, help="R2 key prefix (run id appended)")
+@click.option("-X", "--per-run-subprocess", is_flag=True, help="Fan each run out to its own `tomat evals sync <run>` subprocess (with --per-run-timeout). Use for the no-arg whole-fleet pass: keeps gcsfs/gRPC state per-run-isolated, so a cross-run fork-after-init deadlock can't wedge the whole sweep. See memory `autosync-cron-stall-pattern`.")
+@click.option("-t", "--per-run-timeout", default=120, type=int, show_default=True, help="Per-run timeout (seconds) under -X. A hang in one run is logged + skipped; the sweep continues.")
 @click.argument("substr", required=False)
-def evals_sync(substr: str | None, bucket: str, dry_run: bool, prefix: str):
+def evals_sync(substr: str | None, bucket: str, dry_run: bool, prefix: str, per_run_subprocess: bool, per_run_timeout: int):
     """Aggregate per-step GCS eval-result JSONs → `eval.json` → OA's R2.
 
     `eval_mat_nmae.py` writes one JSON per (checkpoint, mat-set) under
@@ -3056,6 +3058,41 @@ def evals_sync(substr: str | None, bucket: str, dry_run: bool, prefix: str):
     if not run_dirs:
         err(f"[evals sync] no eval-result run dirs match {substr!r}")
         sys.exit(1)
+
+    if per_run_subprocess:
+        # Per-run subprocess fanout. Avoids the cross-run gcsfs/gRPC fork
+        # deadlock that wedged autosync on 2026-06-27 (see memory
+        # `autosync-cron-stall-pattern`).
+        n_ok = n_fail = n_timeout = 0
+        for run in run_dirs:
+            cmd = [
+                sys.argv[0], "evals", "sync",
+                "-b", bucket,
+                "-p", prefix,
+                run,
+            ]
+            if dry_run:
+                cmd.insert(-1, "-n")
+            try:
+                r = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=per_run_timeout,
+                )
+            except subprocess.TimeoutExpired:
+                err(f"[evals sync -X] {run}: TIMEOUT after {per_run_timeout}s — skipping")
+                n_timeout += 1
+                continue
+            if r.returncode != 0:
+                err(f"[evals sync -X] {run}: rc={r.returncode}")
+                err(r.stderr[-800:])
+                n_fail += 1
+                continue
+            # Forward the child's stderr (its single `[evals sync] <run>: N pts → ...` line).
+            sys.stderr.write(r.stderr)
+            n_ok += 1
+        err(f"[evals sync -X] done: {n_ok} ok, {n_fail} failed, {n_timeout} timed out "
+            f"(of {len(run_dirs)})")
+        return
 
     stat_keys = ("nmae_mean", "nmae_median", "nmae_p99",
                  "nemd_mean", "nemd_median", "nemd_p99")
