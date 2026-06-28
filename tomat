@@ -3065,8 +3065,13 @@ def evals_sync(substr: str | None, bucket: str, dry_run: bool, prefix: str, per_
         # `autosync-cron-stall-pattern`).
         n_ok = n_fail = n_timeout = 0
         for run in run_dirs:
+            # Use `sys.executable` (the venv interpreter we're already
+            # running in), not the bare script path — the shebang
+            # `#!/usr/bin/env python3` resolves to the system Python under
+            # launchd's PATH, which has no `click`/`gcsfs`/etc. and dies
+            # with ModuleNotFoundError on every spawn.
             cmd = [
-                sys.argv[0], "evals", "sync",
+                sys.executable, str(PROJECT_ROOT / "tomat"), "evals", "sync",
                 "-b", bucket,
                 "-p", prefix,
                 run,
@@ -3545,12 +3550,15 @@ def evals_process_fire_requests(
         # Dispatch `tomat evals fire`. We invoke the running CLI as a
         # subprocess so we don't have to refactor `evals_fire` to be
         # importable; that also gives us a clean stdout/stderr separation.
+        # `sys.executable` (not bare script path) so shebang doesn't pick
+        # system Python under launchd. `-t` (not `-T`) — `evals fire`'s
+        # `-T` is `--num-tasks` (memory `evals-fire-flag-pitfall`).
         cmd = [
-            sys.argv[0], "evals", "fire",
+            sys.executable, str(PROJECT_ROOT / "tomat"), "evals", "fire",
             "-s", str(step),
             "-S", mat_set,
             "-l", eval_label,
-            "-T", tpu,
+            "-t", tpu,
             "--mode", mode,
             run_id,
         ]
@@ -3832,8 +3840,12 @@ def evals_auto_fire(
                         n_skipped_cap += 1
                         continue
                     eval_label = _eval_label_for_run(run)
+                    # Use sys.executable (not bare script path) — shebang
+                    # `#!/usr/bin/env python3` picks system Python under
+                    # launchd, which has no `click` etc.
                     cmd = [
-                        sys.argv[0], "evals", "fire",
+                        sys.executable, str(PROJECT_ROOT / "tomat"),
+                        "evals", "fire",
                         "-s", str(step),
                         "-S", mat_set,
                         "-l", eval_label,
