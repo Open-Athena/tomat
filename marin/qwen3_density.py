@@ -71,6 +71,44 @@ from levanter.layers.attention import AttentionMask
 from levanter.models.lm_model import LmConfig, LmExample
 from levanter.models.qwen import Qwen3Config, Qwen3LMHeadModel
 
+from .atom_encoder import (
+    AtomEncoder, F0AtomEncoder, F1AtomEncoder, F1Args, build_atom_encoder,
+)
+
+
+# Module-level atom-encoder configuration. Set once at training-script
+# startup via `configure_atom_encoder(...)`. Read by each model's `init()`
+# to build the right `AtomEncoder` instance and store it as a field. The
+# field then drives `activations()` for that model.
+#
+# When unset (None), models default to `F0AtomEncoder()` — no-op,
+# preserves all pre-F1 behavior including byte-for-byte ckpt load
+# compatibility for runs that never carried an atom_encoder field.
+_ATOM_ENCODER_ARGS: Optional[tuple[str, Optional[F1Args]]] = None
+
+
+def configure_atom_encoder(
+    atom_encoding: str = "f0",
+    *,
+    f1_args: F1Args | None = None,
+) -> None:
+    """Set the module-level atom-encoder config used by model `init()`s.
+
+    `atom_encoding`: "f0" | "f1" (and "f2"/"f3" once implemented).
+    `f1_args`: F1-specific knobs (num_freqs, atom_token_lo/hi, coord_frame).
+              Ignored when `atom_encoding != "f1"`.
+    """
+    global _ATOM_ENCODER_ARGS
+    _ATOM_ENCODER_ARGS = (atom_encoding, f1_args)
+
+
+def _build_active_atom_encoder(Embed: Axis, *, key) -> AtomEncoder:
+    """Build the encoder per the active `_ATOM_ENCODER_ARGS`, or F0 if unset."""
+    if _ATOM_ENCODER_ARGS is None:
+        return F0AtomEncoder()
+    encoding, f1_args = _ATOM_ENCODER_ARGS
+    return build_atom_encoder(encoding, Embed, key=key, f1_args=f1_args)
+
 
 @dataclass(frozen=True)
 class DensityLossArgs:
@@ -257,12 +295,38 @@ class Qwen3DensityLMHeadModel(Qwen3LMHeadModel):
     base, never to this override. Every "density EMD"-mode run prior to this
     fix was actually trained with standard CE. Re-wrap via parent's tuple to
     restore the subclass.
+
+    Atom-encoding axis (2026-06-27): `atom_encoder` is an `AtomEncoder`
+    instance (F0 by default, F1 when configured via
+    `configure_atom_encoder("f1", ...)`) that gets applied to the token
+    embeddings between embed-lookup and the transformer. Routes the
+    spec-34 F0/F1/F2/F3 axis through composition rather than a separate
+    subclass per (training-objective × atom-encoding) cell.
     """
+
+    atom_encoder: AtomEncoder
 
     @classmethod
     def init(cls, Vocab, config, *, key):
-        base = Qwen3LMHeadModel.init(Vocab, config, key=key)
-        return cls(base.transformer, base.embeddings, base.lm_head)
+        key_base, key_enc = jrandom.split(key, 2)
+        base = Qwen3LMHeadModel.init(Vocab, config, key=key_base)
+        atom_encoder = _build_active_atom_encoder(config.Embed, key=key_enc)
+        return cls(base.transformer, base.embeddings, base.lm_head, atom_encoder)
+
+    def activations(
+        self,
+        input_ids: NamedArray,
+        attn_mask: AttentionMask | NamedArray | None = None,
+        *,
+        key=None,
+        pos_ids: NamedArray | None = None,
+        atom_xyz: NamedArray | None = None,
+    ) -> NamedArray:
+        """Forward: embed → atom_encoder.apply → transformer."""
+        x = self.embeddings.embed(input_ids)
+        x = self.atom_encoder.apply(x, input_ids, atom_xyz)
+        x = self.transformer(x, attn_mask=attn_mask, key=key, pos_ids=pos_ids)
+        return x
 
     def compute_next_token_loss(
         self,
@@ -276,20 +340,32 @@ class Qwen3DensityLMHeadModel(Qwen3LMHeadModel):
         logit_soft_cap=None,
     ) -> NamedArray:
         args = _DENSITY_LOSS_ARGS
+        atom_xyz = getattr(example, "atom_xyz", None)
         if args is None or args.weight == 0.0:
-            # Fall through to default Qwen3 CE loss.
-            return super().compute_next_token_loss(
-                example,
-                key=key,
-                reduction=reduction,
-                reduction_axis=reduction_axis,
-                logsumexp_weight=logsumexp_weight,
-                loss_dtype=loss_dtype,
+            # Fall through to default Qwen3 CE loss. We can't call super()
+            # because the base doesn't know about atom_encoder/atom_xyz, so
+            # replicate Levanter's CE loss inline against our activations.
+            activations = self.activations(
+                example.tokens, example.attn_mask, key=key, atom_xyz=atom_xyz,
+            )
+            aux_loss = 0
+            if isinstance(activations, tuple):
+                activations, aux_loss = activations
+            from levanter.models.loss import maybe_fused_next_token_loss
+            head = self.get_lm_head()
+            loss = maybe_fused_next_token_loss(
+                self.Pos, self.Embed, self.Vocab, activations, head,
+                example.tokens, loss_weight=example.loss_weight,
+                reduction=reduction, reduction_axis=reduction_axis,
+                logsumexp_weight=logsumexp_weight, dtype=loss_dtype,
                 logit_soft_cap=logit_soft_cap,
             )
+            return loss + aux_loss
 
         # Custom path: compute logits explicitly → density-aware loss.
-        activations = self.activations(example.tokens, example.attn_mask, key=key)
+        activations = self.activations(
+            example.tokens, example.attn_mask, key=key, atom_xyz=atom_xyz,
+        )
         aux_loss = 0
         if isinstance(activations, tuple):
             activations, aux_loss = activations
@@ -581,12 +657,32 @@ class Qwen3MaskGITLMHeadModel(Qwen3LMHeadModel):
 
     See `Qwen3DensityLMHeadModel.init` for why we need to override `init`
     (Levanter's parent `Qwen3LMHeadModel.init` hard-codes the return class).
+    Same atom-encoding axis as Density (see its docstring).
     """
+
+    atom_encoder: AtomEncoder
 
     @classmethod
     def init(cls, Vocab, config, *, key):
-        base = Qwen3LMHeadModel.init(Vocab, config, key=key)
-        return cls(base.transformer, base.embeddings, base.lm_head)
+        key_base, key_enc = jrandom.split(key, 2)
+        base = Qwen3LMHeadModel.init(Vocab, config, key=key_base)
+        atom_encoder = _build_active_atom_encoder(config.Embed, key=key_enc)
+        return cls(base.transformer, base.embeddings, base.lm_head, atom_encoder)
+
+    def activations(
+        self,
+        input_ids: NamedArray,
+        attn_mask: AttentionMask | NamedArray | None = None,
+        *,
+        key=None,
+        pos_ids: NamedArray | None = None,
+        atom_xyz: NamedArray | None = None,
+    ) -> NamedArray:
+        """Forward: embed → atom_encoder.apply → transformer."""
+        x = self.embeddings.embed(input_ids)
+        x = self.atom_encoder.apply(x, input_ids, atom_xyz)
+        x = self.transformer(x, attn_mask=attn_mask, key=key, pos_ids=pos_ids)
+        return x
 
     def compute_next_token_loss(
         self,
@@ -661,7 +757,11 @@ class Qwen3MaskGITLMHeadModel(Qwen3LMHeadModel):
             attn_mask=bidir_mask,
         )
 
-        activations = self.activations(masked_example.tokens, masked_example.attn_mask, key=None)
+        atom_xyz = getattr(example, "atom_xyz", None)
+        activations = self.activations(
+            masked_example.tokens, masked_example.attn_mask, key=None,
+            atom_xyz=atom_xyz,
+        )
         aux_loss = 0
         if isinstance(activations, tuple):
             activations, aux_loss = activations
@@ -1064,13 +1164,16 @@ class Qwen3SSLMHeadModel(Qwen3DensityLMHeadModel):
 
     See `Qwen3DensityLMHeadModel.init` for the `init` re-wrap necessitated by
     Levanter's parent `Qwen3LMHeadModel.init` hard-coding the return class
-    (specs/done/30-levanter-init-cls-postmortem.md).
+    (specs/done/30-levanter-init-cls-postmortem.md). Atom-encoding axis
+    inherits from `Qwen3DensityLMHeadModel`; `activations()` is inherited.
     """
 
     @classmethod
     def init(cls, Vocab, config, *, key):
-        base = Qwen3LMHeadModel.init(Vocab, config, key=key)
-        return cls(base.transformer, base.embeddings, base.lm_head)
+        key_base, key_enc = jrandom.split(key, 2)
+        base = Qwen3LMHeadModel.init(Vocab, config, key=key_base)
+        atom_encoder = _build_active_atom_encoder(config.Embed, key=key_enc)
+        return cls(base.transformer, base.embeddings, base.lm_head, atom_encoder)
 
     def compute_next_token_loss(
         self,
@@ -1138,7 +1241,10 @@ class Qwen3SSLMHeadModel(Qwen3DensityLMHeadModel):
         # Get the model's own one-step-ahead predictions on the GT inputs.
         # stop_gradient on the logits ensures the pre-forward contributes
         # NO gradients — its sole purpose is to sample replacement tokens.
-        pre_act = self.activations(example.tokens, example.attn_mask, key=key_pre)
+        atom_xyz = getattr(example, "atom_xyz", None)
+        pre_act = self.activations(
+            example.tokens, example.attn_mask, key=key_pre, atom_xyz=atom_xyz,
+        )
         if isinstance(pre_act, tuple):
             pre_act, _ = pre_act
         pre_head = self.get_lm_head()
@@ -1186,7 +1292,10 @@ class Qwen3SSLMHeadModel(Qwen3DensityLMHeadModel):
                 "inline CE that takes mixed input + original targets."
             )
 
-        activations = self.activations(mixed_example.tokens, mixed_example.attn_mask, key=key)
+        activations = self.activations(
+            mixed_example.tokens, mixed_example.attn_mask, key=key,
+            atom_xyz=atom_xyz,
+        )
         aux_loss = 0
         if isinstance(activations, tuple):
             activations, aux_loss = activations
@@ -1215,308 +1324,23 @@ def configure_ss(args: "SSArgs | None") -> None:
 
 
 # ---------------------------------------------------------------------------
-# Spec 34 F1 — sinusoidal continuous-xyz atom embedding
+# Spec 34 F1 — atom-encoding sidecar (see `marin/atom_encoder.py`)
 # ---------------------------------------------------------------------------
 #
-# F1 layout (see `tomat.tokenizers.patch_v3` module docstring):
-#   - Each atom contributes ONE preamble token (the atom-type id).
-#   - Per-atom continuous (x, y, z) coords are carried as a side array
-#     `atom_xyz: float32[Pos, 3]` (NaN at non-atom positions).
+# The model-side F1 machinery (Qwen3F1LMHeadModel + Qwen3F1Config + the
+# sinusoidal embed helper) was refactored into the `AtomEncoder` interface
+# at `marin/atom_encoder.py` on 2026-06-27. New code routes the
+# F0/F1/F2/F3 axis through composition: each training-objective model
+# (Density / MaskGIT / SS) holds an `atom_encoder: AtomEncoder` field
+# that is applied between embed-lookup and the transformer, regardless
+# of which training objective is in use.
 #
-# Model side: we add a learned linear projection of a NeRF-style sinusoidal
-# encoding of (x, y, z) to the token embedding at atom-token positions. The
-# rest of the Qwen3 stack is unchanged.
-#
-# Atom-token detection uses the [ATOM_OFFSET, ATOM_END) id range from
-# `tomat.tokenizers.patch.SPECIAL_TOKENS`. The model receives that range as
-# a config field (no import of tomat from inside the model module, so the
-# levanter/JIT path doesn't depend on tomat).
-#
-# JIT-traceability: `atom_xyz` enters `activations` as an explicit kwarg
-# alongside `input_ids`/`attn_mask`. Callers that don't have it (e.g. eval
-# paths that haven't been F1-plumbed yet) can omit it — `activations` falls
-# back to the standard embedding lookup.
-#
-# Loader plumbing: threading `atom_xyz` from a parquet column through the
-# Levanter `LmExample` (whose fields are frozen at the library layer) to
-# `compute_next_token_loss` requires subclassing `LmExample` (or replacing
-# the `PrebuiltLmDataset` adapter). That work is deferred — this module
-# provides only the model-side machinery; see spec 34 for the broader
-# integration plan.
+# `configure_atom_encoder("f1", f1_args=...)` at training-script
+# startup selects F1 for the next `init()`. `F1LmExample` below carries
+# the `atom_xyz` sidecar from data through to `compute_next_token_loss`,
+# which extracts it via `getattr(example, "atom_xyz", None)` and threads
+# it into `self.activations(..., atom_xyz=...)`.
 
-
-@dataclass(frozen=True)
-class F1Args:
-    """Spec-34 F1 configuration.
-
-    `num_freqs` (K): number of log-spaced frequencies in the sinusoidal
-    encoding `γ`. Output dim of γ is 6K (cos+sin per axis).
-    `atom_token_lo` / `atom_token_hi`: half-open [lo, hi) id range that
-    identifies atom-type tokens. Defaults match `tomat.tokenizers.patch`
-    (ATOM_OFFSET=20, ATOM_END=138).
-    `coord_frame`: "fractional" (default — matches v3 tokenizer's
-    translated-frac convention) or "cartesian" (caller pre-multiplies
-    fractional coords by the lattice).
-    """
-
-    num_freqs: int = 10
-    atom_token_lo: int = 20   # ATOM_OFFSET in tomat.tokenizers.patch
-    atom_token_hi: int = 138  # ATOM_END
-    coord_frame: str = "fractional"
-
-
-def f1_sinusoidal_embed(xyz: jax.Array, num_freqs: int) -> jax.Array:
-    """NeRF-style sinusoidal positional encoding.
-
-    Input: `xyz` of shape (..., 3) — coords in [0, 1) (fractional) or any
-    Cartesian range (works as long as it's consistent within a run).
-    Output: array of shape (..., 6 * num_freqs).
-
-    For each axis a ∈ {x, y, z} and frequency k ∈ {0, …, K-1}:
-        γ_{a, k}(p) = [sin(2^k · π · p_a), cos(2^k · π · p_a)]
-    Concatenated across (a, k, {sin, cos}).
-    """
-    # `freqs` shape (K,)
-    freqs = jnp.pi * (2.0 ** jnp.arange(num_freqs, dtype=xyz.dtype))
-    # `scaled` shape (..., 3, K)
-    scaled = xyz[..., None] * freqs
-    sin = jnp.sin(scaled)
-    cos = jnp.cos(scaled)
-    # Concatenate sin/cos along the freq axis → (..., 3, 2K),
-    # then flatten the last two dims into 6K.
-    combined = jnp.concatenate([sin, cos], axis=-1)
-    out_shape = xyz.shape[:-1] + (3 * 2 * num_freqs,)
-    return combined.reshape(out_shape)
-
-
-@dataclass(frozen=True)
-class Qwen3F1Config(Qwen3Config):
-    """Qwen3Config whose `model_type` is `Qwen3F1LMHeadModel`.
-
-    Spec 34 F1: 1 token/atom + sinusoidal continuous-xyz at the embed layer.
-
-    Adds F1-specific knobs as config fields so `config.build(Vocab, key)`
-    (which Levanter calls via `LmConfig.build → model_type.init(Vocab,
-    config, key=...)`) can thread them into `Qwen3F1LMHeadModel.init`.
-    The `build` override below is what wires these through.
-    """
-
-    f1_num_freqs: int = 10
-    f1_atom_token_lo: int = 20   # ATOM_OFFSET in tomat.tokenizers.patch
-    f1_atom_token_hi: int = 138  # ATOM_END
-    f1_coord_frame: str = "fractional"
-
-    @property  # type: ignore[override]
-    def model_type(self):
-        return Qwen3F1LMHeadModel
-
-    def build(self, Vocab, *, key):
-        # Translate config-time F1 settings → runtime `F1Args` for `init`.
-        f1_args = F1Args(
-            num_freqs=self.f1_num_freqs,
-            atom_token_lo=self.f1_atom_token_lo,
-            atom_token_hi=self.f1_atom_token_hi,
-            coord_frame=self.f1_coord_frame,
-        )
-        return Qwen3F1LMHeadModel.init(Vocab, self, key=key, f1_args=f1_args)
-
-
-class Qwen3F1LMHeadModel(Qwen3DensityLMHeadModel):
-    """Spec-34 F1 model: standard Qwen3 + learned linear projection of a
-    sinusoidal encoding of per-atom (x, y, z), added to the atom-token
-    embedding at the embed layer.
-
-    Extra field (vs `Qwen3DensityLMHeadModel`):
-        `f1_atom_proj`: `hnn.Linear(In=PosFeat=6K, Out=Embed, use_bias=False)`
-
-    Forward path (override of `activations`):
-        1. Look up token embeddings the usual way (`self.embeddings.embed`).
-        2. If `atom_xyz` is None: return as-is (F1-OFF fallback — model
-           weights are still well-defined, just unused).
-        3. Compute γ(atom_xyz) on the *whole* `Pos` axis (NaN at non-atom
-           positions → finite output via `jnp.where(is_atom, xyz, 0.0)`
-           before γ is evaluated; γ(0)=cos(0)=1 leaks a constant but is
-           masked out by `is_atom` below).
-        4. Project to `Embed` and add at atom-token positions only.
-
-    Inherits `compute_next_token_loss` from `Qwen3DensityLMHeadModel`. The
-    density-loss path already calls `self.activations(...)` explicitly; F1
-    plumbing for *that* path requires passing `atom_xyz` through the
-    `LmExample`-adjacent kwargs chain (deferred — see module-docstring note).
-
-    See `Qwen3DensityLMHeadModel.init` for the `init` re-wrap necessitated by
-    Levanter's parent `Qwen3LMHeadModel.init` hard-coding the return class.
-    """
-
-    f1_atom_proj: hnn.Linear
-    f1_args: F1Args = eqx.field(static=True)
-
-    @classmethod
-    def init(cls, Vocab, config, *, key, f1_args: F1Args | None = None):
-        # Allow callers to pass F1Args; default to a fresh F1Args() for
-        # backward-compat with config-only call sites.
-        f1_args = f1_args if f1_args is not None else F1Args()
-        k_base, k_proj = jrandom.split(key, 2)
-        base = Qwen3LMHeadModel.init(Vocab, config, key=k_base)
-        PosFeat = Axis("pos_feat", 6 * f1_args.num_freqs)
-        # Standard small-variance init; Linear.init in haliax handles fan-in
-        # scaling. `use_bias=False` matches Llama/Qwen embed-projection style.
-        f1_atom_proj = hnn.Linear.init(
-            In=PosFeat,
-            Out=config.Embed,
-            key=k_proj,
-            use_bias=False,
-            out_first=True,
-        )
-        return cls(
-            base.transformer,
-            base.embeddings,
-            base.lm_head,
-            f1_atom_proj,
-            f1_args,
-        )
-
-    def activations(
-        self,
-        input_ids: NamedArray,
-        attn_mask: AttentionMask | NamedArray | None = None,
-        *,
-        key=None,
-        pos_ids: NamedArray | None = None,
-        atom_xyz: NamedArray | None = None,
-    ) -> NamedArray:
-        """F1 forward: standard embed + sinusoidal-xyz addition at atom positions.
-
-        `atom_xyz` is expected to have axes (Pos, XYZ) where XYZ has size 3.
-        NaN at non-atom positions is OK — we mask before the linear projection.
-        If `atom_xyz` is None (e.g. eval paths not yet F1-plumbed), this
-        reduces to standard Qwen3 forward.
-        """
-        x = self.embeddings.embed(input_ids)
-        if atom_xyz is not None:
-            x = x + self._f1_pos_addend(input_ids, atom_xyz)
-        x = self.transformer(x, attn_mask=attn_mask, key=key, pos_ids=pos_ids)
-        return x
-
-    def _f1_pos_addend(
-        self,
-        input_ids: NamedArray,
-        atom_xyz: NamedArray,
-    ) -> NamedArray:
-        """Compute the additive sinusoidal-xyz embedding contribution.
-
-        Returns a `NamedArray` shaped like `self.embeddings.embed(input_ids)`
-        (i.e. {..., Pos, Embed}), zero at non-atom positions, equal to
-        `f1_atom_proj(γ(xyz))` at atom positions.
-        """
-        f1 = self.f1_args
-        # Atom-mask: True where token id ∈ [lo, hi).
-        is_atom = hax.logical_and(
-            input_ids >= f1.atom_token_lo,
-            input_ids < f1.atom_token_hi,
-        )  # axes: same as input_ids → {..., Pos}
-
-        # Sanitize NaN at non-atom positions before applying γ (γ(NaN)=NaN
-        # would taint the masked-zero contribution via fp arithmetic).
-        # Bypass haliax for the elementwise jnp ops on the underlying array,
-        # then rewrap.
-        xyz_arr = atom_xyz.array  # shape (..., Pos, 3)
-        xyz_safe = jnp.where(jnp.isnan(xyz_arr), 0.0, xyz_arr)
-        gamma_arr = f1_sinusoidal_embed(xyz_safe, f1.num_freqs)
-        # Wrap γ as a NamedArray with axes (..., Pos, PosFeat).
-        pos_feat_axis = self.f1_atom_proj.In  # AxisSpec — could be tuple, but our init uses a single Axis
-        # `self.f1_atom_proj.In` may be a single Axis or a tuple; project
-        # safely by constructing a NamedArray with the right axes.
-        new_axes = atom_xyz.axes[:-1] + (pos_feat_axis,)
-        gamma = hax.named(gamma_arr, new_axes)
-        # Project to Embed.
-        proj = self.f1_atom_proj(gamma)  # axes (..., Pos, Embed)
-        # Mask to atom positions only.
-        mask = is_atom.astype(proj.dtype)
-        return proj * mask
-
-    def compute_next_token_loss(
-        self,
-        example,
-        *,
-        key=None,
-        reduction=hax.mean,
-        reduction_axis=None,
-        logsumexp_weight=None,
-        loss_dtype=jnp.float32,
-        logit_soft_cap=None,
-    ) -> NamedArray:
-        """F1-aware loss dispatch.
-
-        If `example` is an `F1LmExample` carrying a non-None `atom_xyz`,
-        compute activations with the F1 path (sinusoidal-xyz addend at
-        atom positions) and then re-use the standard CE/density loss tail.
-        Otherwise fall through to the parent `Qwen3DensityLMHeadModel`
-        path (which itself falls through to plain Qwen3 CE when no density
-        loss args are configured).
-
-        This override only kicks in when there's actual F1 data to thread;
-        it preserves byte-for-byte parity with the parent loss when
-        `atom_xyz` is None (the TOMAT_F1_MODE=0 back-compat guarantee at
-        the loss layer).
-        """
-        # Late-import to avoid a forward-reference loop with the class
-        # definition above (F1LmExample lives in this module).
-        atom_xyz = getattr(example, "atom_xyz", None)
-        if atom_xyz is None:
-            return super().compute_next_token_loss(
-                example,
-                key=key,
-                reduction=reduction,
-                reduction_axis=reduction_axis,
-                logsumexp_weight=logsumexp_weight,
-                loss_dtype=loss_dtype,
-                logit_soft_cap=logit_soft_cap,
-            )
-
-        # Forward with atom_xyz, then re-use the parent's logit→loss tail.
-        activations = self.activations(
-            example.tokens, example.attn_mask, key=key, atom_xyz=atom_xyz,
-        )
-        aux_loss = 0
-        if isinstance(activations, tuple):
-            activations, aux_loss = activations
-        head = self.get_lm_head()
-        logits = hax.dot(activations, head, axis=self.Embed)
-
-        # Decide loss flavor based on whether a density-loss config is set.
-        args = _DENSITY_LOSS_ARGS
-        if args is not None and args.weight != 0.0:
-            loss = density_aware_loss(
-                Pos=self.Pos,
-                Vocab=self.Vocab,
-                logits=logits,
-                input_tokens=example.tokens,
-                loss_weight=example.loss_weight,
-                args=args,
-                reduction=reduction,
-            )
-            return loss + aux_loss
-
-        # Plain CE tail (mirrors `LmHeadModel.compute_next_token_loss`
-        # internals — we already paid for activations so we can't call
-        # super() to recompute them; we also bypass `head` recomputation).
-        from levanter.models.loss import maybe_fused_next_token_loss
-        loss = maybe_fused_next_token_loss(
-            self.Pos,
-            self.Embed,
-            self.Vocab,
-            activations,
-            head,
-            example.tokens,
-            loss_weight=example.loss_weight,
-            reduction=reduction,
-            reduction_axis=reduction_axis,
-            logsumexp_weight=logsumexp_weight,
-            dtype=loss_dtype,
-            logit_soft_cap=logit_soft_cap,
-        )
-        return loss + aux_loss
 
 
 class F1LmExample(LmExample):

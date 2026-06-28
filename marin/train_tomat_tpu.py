@@ -872,22 +872,37 @@ def main():
 
     # F1 mode (spec 34): 1 token/atom + continuous (x,y,z) sidecar.
     # Requires parquet built with `--atom-encoding f1` (carries an `atom_xyz`
-    # column alongside `input_ids`). Mutually exclusive with MG/SS for now —
-    # the F1 model is a subclass of Qwen3DensityLMHeadModel without MG/SS
-    # forward overrides; combinations would need a richer subclass tree.
+    # column alongside `input_ids`).
+    #
+    # 2026-06-27 refactor: F1 now composes with ANY training objective
+    # (Density / MaskGIT / SS) via the `AtomEncoder` interface — the
+    # per-objective model class holds an `atom_encoder` field selected by
+    # `configure_atom_encoder("f1", ...)` at startup. No more F1 ⊥ MG/SS
+    # restriction.
     f1_mode = os.environ.get("TOMAT_F1_MODE", "0") == "1"
     f1_num_freqs = int(os.environ.get("TOMAT_F1_NUM_FREQS", "10"))
-    if f1_mode and (mg_mode or ss_mode):
-        raise ValueError(
-            "TOMAT_F1_MODE=1 cannot combine with TOMAT_MG_MODE / TOMAT_SS_MODE "
-            "(F1 currently only composes with the base AR / density-only paths)."
-        )
     if f1_mode and meta.get("atom_encoding") != "f1":
         raise ValueError(
             "TOMAT_F1_MODE=1 requires parquet built with --atom-encoding f1; "
             f"got meta.atom_encoding={meta.get('atom_encoding')!r}. "
             f"Re-tokenize with `tokenize_patches.py -F f1`."
         )
+    # Wire the atom-encoder selection into qwen3_density's module-level
+    # state so each model class's `init()` picks up the right encoder.
+    from qwen3_density import configure_atom_encoder
+    from atom_encoder import F1Args as _F1Args
+    if f1_mode:
+        configure_atom_encoder(
+            "f1",
+            f1_args=_F1Args(
+                num_freqs=f1_num_freqs,
+                # atom_token_lo/hi default to ATOM_OFFSET/ATOM_END;
+                # tomat.tokenizers.patch can be probed for current values
+                # if they ever drift.
+            ),
+        )
+    else:
+        configure_atom_encoder("f0")
 
     # Bump vocab_size by 1 for [MASK] token in MaskGIT mode.
     # MASK_ID = old total_size (new token appended at the end of vocab).
@@ -1100,49 +1115,13 @@ def main():
         _pos_sv = tuple((2 if i == 0 else 1) << b for i, b in enumerate(_p_mag))
         return _n_spec + _n_atoms + _n_ints + sum(_pos_sv)
 
-    if f1_mode:
-        # F1 (spec 34): 1 token/atom + sinusoidal-xyz addend at the embed layer.
-        # Composes with the standard density loss if TOMAT_LMQ_PATH is set
-        # (Qwen3F1LMHeadModel inherits the density-aware loss from
-        # Qwen3DensityLMHeadModel). With no density loss configured, F1
-        # behaves as plain Qwen3 + xyz addend + CE loss.
-        from qwen3_density import Qwen3F1Config
-        if lmq_path_env:
-            from qwen3_density import (
-                build_density_loss_args,
-                configure_density_loss,
-            )
-            import numpy as np
-            lmq_codec = _load_lmq(lmq_path_env)
-            DENSITY_OFFSET = _compute_density_offset(meta)
-            print(f"[tomat-tpu] F1+density: density_offset={DENSITY_OFFSET}, "
-                  f"density_range=[{DENSITY_OFFSET}, {DENSITY_OFFSET + lmq_codec.n_bins})")
-            import haliax as hax
-            Vocab_f1 = hax.Axis("vocab", vocab_size)
-            penalty_val = (
-                float(density_l1_penalty_env)
-                if density_l1_penalty_env is not None
-                else 10.0 * float(lmq_codec.recon_points.max())
-            )
-            density_loss_args = build_density_loss_args(
-                Vocab=Vocab_f1,
-                density_offset=DENSITY_OFFSET,
-                n_density_bins=lmq_codec.n_bins,
-                codec_recon=lmq_codec.recon_points,
-                penalty=penalty_val,
-                weight=density_l1_weight,
-                mode=density_l1_mode,
-                loss_type=density_loss_type,
-                density_only=density_only_loss,
-                pad_id=PAD_ID if packed else None,
-            )
-            configure_density_loss(density_loss_args)
-            print(f"[tomat-tpu] F1+density-L_1 configured with PENALTY={penalty_val:.4f}")
-        else:
-            print(f"[tomat-tpu] F1 mode with plain CE loss (no TOMAT_LMQ_PATH)")
-        model_config_cls = Qwen3F1Config
-        model_extra_kwargs = {"f1_num_freqs": f1_num_freqs}
-    elif mg_mode and lmq_path_env:
+    # F1's "which model class" branch is gone — F1 is now selected via
+    # `configure_atom_encoder("f1", ...)` above, and any of the three
+    # standard configs (Density / MaskGIT / SS) picks it up automatically
+    # at `init()` time. So F1 + MG → Qwen3MaskGITConfig with an F1
+    # atom_encoder; F1 alone → Qwen3DensityConfig with an F1 atom_encoder;
+    # etc. (Refactor 2026-06-27, spec 34 → AtomEncoder interface.)
+    if mg_mode and lmq_path_env:
         # MaskGIT path: configure loss args (masking itself is applied inside
         # Qwen3MaskGITLMHeadModel.compute_next_token_loss via JAX random ops,
         # so no host-side collator is needed — everything stays JIT-traceable).
