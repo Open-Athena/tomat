@@ -25,6 +25,16 @@ TOMAT="$TOMAT_PY $TOMAT_SCRIPT"
 LOG="/tmp/tomat-autosync.log"
 LOCK="/tmp/tomat-autosync.lock"
 
+# launchd doesn't run `direnv`, so `WANDB_API_KEY` (in `~/c/oa/.envrc`)
+# isn't in our env. Phase C's `tomat evals auto-fire` → `evals fire`
+# bails with "WANDB_API_KEY not set in env" because it can't pass the
+# key through to spawned iris jobs. Source the parent project .envrc to
+# pick it up. The file only exports vars; no side effects.
+if [ -f /Users/ryan/c/oa/.envrc ]; then
+  # shellcheck disable=SC1091
+  source /Users/ryan/c/oa/.envrc
+fi
+
 # Single-instance lock (so a launchd over-fire doesn't pile up jobs).
 # macOS doesn't ship `flock` — use a flag file. Race window is tiny vs
 # the 15-minute cadence so simple-is-fine.
