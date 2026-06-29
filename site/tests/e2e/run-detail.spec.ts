@@ -147,15 +147,25 @@ test.describe('run detail — lineage glue', () => {
     await expect(page.getByText(/lineage glued|\+lineage/).first()).toBeVisible({
       timeout: 30_000,
     })
-    // Per-trace inspection: there must be a trace whose legendgroup or
-    // name references the parent run id (`train-mg-modal-h200x8-tz-fs-kl-…`).
-    // The ancestor parquet fetches lazily after first paint, so poll
-    // instead of single-shot reading the trace data.
+    // Per-trace inspection: post-`f259da8` bucket consolidation, ancestor
+    // traces share `name: 'train loss'` / `'eval loss'` with the current
+    // run — they're distinguished only by `color` (per-ancestor) and an
+    // internal bucket key. So instead of looking for the parent's run-id
+    // in the trace name, assert there are ≥2 distinct-color train-loss
+    // traces with data (current + ≥1 ancestor). The ancestor parquet
+    // fetches lazily after first paint, so poll. Pre-`f259da8` runs had
+    // explicit `name.includes(parentId)`, kept as a back-compat OR.
     const parentId = 'train-mg-modal-h200x8-tz-fs-kl-s05-ts1-bs128-seed42'
     await expect.poll(
       async () => {
         const traces = await readPlot(page, 0)
-        return traces.filter(
+        const trainLossColors = new Set(
+          traces
+            .filter((t) => t.n > 0 && /train\s*loss/i.test(t.name))
+            .map((t) => t.color)
+            .filter((c): c is string => c != null),
+        )
+        const explicit = traces.filter(
           (t) =>
             t.n > 0 &&
             (t.name.includes(parentId) ||
@@ -163,6 +173,9 @@ test.describe('run detail — lineage glue', () => {
               /\bparent\b|\bancestor\b/i.test(t.name) ||
               /\bparent\b|\bancestor\b/i.test(t.lg)),
         ).length
+        // ≥2 distinct colors → at least one ancestor bucket alongside the
+        // current run.
+        return Math.max(trainLossColors.size - 1, explicit)
       },
       { timeout: 30_000, message: 'ancestor trace never appeared' },
     ).toBeGreaterThan(0)
