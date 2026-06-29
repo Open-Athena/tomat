@@ -37,10 +37,11 @@ if _MARIN not in sys.path:
 
 from qwen3_density import (  # noqa: E402
     F1Args,
-    Qwen3F1Config,
-    Qwen3F1LMHeadModel,
-    f1_sinusoidal_embed,
+    Qwen3DensityConfig,
+    Qwen3DensityLMHeadModel,
+    configure_atom_encoder,
 )
+from atom_encoder import f1_sinusoidal_embed  # noqa: E402
 from tomat.tokenizers.patch import (  # noqa: E402
     ATOM_END,
     ATOM_OFFSET,
@@ -226,7 +227,7 @@ def test_sinusoidal_periodicity():
 
 def _tiny_f1_model(num_freqs: int = 8, max_seq_len: int = 32):
     Vocab = Axis("vocab", 5000)
-    config = Qwen3F1Config(
+    config = Qwen3DensityConfig(
         max_seq_len=max_seq_len,
         hidden_dim=32,
         intermediate_dim=64,
@@ -234,8 +235,9 @@ def _tiny_f1_model(num_freqs: int = 8, max_seq_len: int = 32):
         num_heads=4,
         num_kv_heads=4,
     )
-    return config, Qwen3F1LMHeadModel.init(
-        Vocab, config, key=jrandom.PRNGKey(0), f1_args=F1Args(num_freqs=num_freqs),
+    configure_atom_encoder("f1", f1_args=F1Args(num_freqs=num_freqs))
+    return config, Qwen3DensityLMHeadModel.init(
+        Vocab, config, key=jrandom.PRNGKey(0),
     )
 
 

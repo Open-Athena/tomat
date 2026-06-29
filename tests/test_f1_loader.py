@@ -48,8 +48,9 @@ if _MARIN not in sys.path:
 from qwen3_density import (  # noqa: E402
     F1Args,
     F1LmExample,
-    Qwen3F1Config,
-    Qwen3F1LMHeadModel,
+    Qwen3DensityConfig,
+    Qwen3DensityLMHeadModel,
+    configure_atom_encoder,
 )
 from f1_data import (  # noqa: E402
     F1LmDataConfig,
@@ -237,7 +238,7 @@ def test_f1_dataset_end_to_end(tmp_path: Path):
 
 def _tiny_f1_model(num_freqs: int = 4, max_seq_len: int = SEQ_LEN):
     Vocab = Axis("vocab", 1024)
-    config = Qwen3F1Config(
+    config = Qwen3DensityConfig(
         max_seq_len=max_seq_len,
         hidden_dim=16,
         intermediate_dim=32,
@@ -245,8 +246,9 @@ def _tiny_f1_model(num_freqs: int = 4, max_seq_len: int = SEQ_LEN):
         num_heads=2,
         num_kv_heads=2,
     )
-    return config, Qwen3F1LMHeadModel.init(
-        Vocab, config, key=jrandom.PRNGKey(0), f1_args=F1Args(num_freqs=num_freqs),
+    configure_atom_encoder("f1", f1_args=F1Args(num_freqs=num_freqs))
+    return config, Qwen3DensityLMHeadModel.init(
+        Vocab, config, key=jrandom.PRNGKey(0),
     )
 
 
