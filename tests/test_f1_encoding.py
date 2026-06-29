@@ -259,7 +259,8 @@ def test_pos_addend_zero_at_non_atom():
     tokens = hax.named(jnp.asarray(tokens_np), (Pos,))
     atom_xyz = hax.named(jnp.asarray(xyz_np), (Pos, XYZ))
 
-    addend = model._f1_pos_addend(tokens, atom_xyz)
+    # The addend lives on the F1AtomEncoder now (spec-34 F-axis refactor).
+    addend = model.atom_encoder._addend(tokens, atom_xyz)
     addend_np = np.asarray(addend.array)
 
     non_atom_idx = [i for i in range(seq_len) if i not in atom_positions]
