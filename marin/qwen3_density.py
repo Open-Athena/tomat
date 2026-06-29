@@ -71,7 +71,7 @@ from levanter.layers.attention import AttentionMask
 from levanter.models.lm_model import LmConfig, LmExample
 from levanter.models.qwen import Qwen3Config, Qwen3LMHeadModel
 
-from .atom_encoder import (
+from atom_encoder import (
     AtomEncoder, F0AtomEncoder, F1AtomEncoder, F1Args, build_atom_encoder,
 )
 
