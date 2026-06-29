@@ -3,7 +3,7 @@ import { useQueries, useQuery } from '@tanstack/react-query'
 import { enumParam, useUrlState } from 'use-prms'
 import { Tooltip } from '../Tooltip'
 import { evalJobsByRun, fetchCronHeartbeat, fetchEval, fetchEvalsIndex, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchPendingFires, fetchRunCost, fetchRunsSnapshot, irisJobIdForRun, isModalRun, modalAppForRun, modalFcForPending, pendingFcForRun, pendingFcIdForRun, parquetUrl } from './api'
-import type { EvalPoint, ModalApp, ModalFunctionCall, PendingFire } from './api'
+import type { EvalPoint, ModalApp, ModalFunctionCall, PendingFire, RunEval } from './api'
 import { concatHistories, fetchRunHistory, truncateHistoryAtStep, type RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
 import { RecentEvents } from './RecentEvents'
@@ -1368,6 +1368,18 @@ function RunDetail({ runId }: { runId: string }) {
     refetchInterval: (q) => errBackoff(q) ?? REFETCH_MS.history.active,
     retry: 1,
   })
+  // Same query for each ancestor — spec 61 P1 #334. Without this the
+  // MEvalTable + WallclockPlot MT/MV panel on a child's page render empty
+  // (or only the child's own /10k segment), because eval.json is per-run.
+  // We merge ancestor `sets[*]` into the current run's evalSeries below.
+  const ancestorEvalQs = useQueries({
+    queries: ancestors.map((aid) => ({
+      queryKey: ['eval', aid],
+      queryFn: () => fetchEval(aid),
+      refetchInterval: REFETCH_MS.history.idle,
+      retry: 1,
+    })),
+  })
   // Eval-records index (spec 43): per-(step, set, mode[, task]) lifecycle
   // records. Drives the EvalsPanel matrix view between WallclockPlot and
   // RecentEvents. Phase A is read-only + backfill; Phase B/C wire live
@@ -1461,10 +1473,60 @@ function RunDetail({ runId }: { runId: string }) {
     () => evalJobsByRun(irisQ.data ?? undefined).get(runId) ?? [],
     [irisQ.data, runId],
   )
-  // step → { val_200, train_200 } eval point, from the synced eval.json.
+  // Lineage-aware eval series: concatenate ancestor eval.json points
+  // (truncated at each fork step, matching the lineageHistory pattern) onto
+  // the current run's series. Without this, child run pages show no MT/MV
+  // history because the autosync writes eval results under the run they
+  // were fired from. spec 61 P1 #334.
+  const evalSeries = useMemo<RunEval | null>(() => {
+    const own = evalQ.data
+    if (lineageMode === 'seg') return own ?? null
+    if (ancestors.length === 0) return own ?? null
+    // Hold off on glue while any ancestor eval.json is still loading. 404 is
+    // a valid resolved state (`data === null` from fetchEval) — we just skip
+    // those ancestors. We only block on still-pending fetches.
+    if (ancestorEvalQs.some((q) => q.isLoading)) return own ?? null
+    const merged: Record<string, EvalPoint[]> = {}
+    // ancestors[i] is child→root; ancestors[i]'s child is runId (i==0) or
+    // ancestors[i-1] (i>0). Truncate that ancestor's series at the fork step
+    // so the child doesn't show its parent's post-fork eval points.
+    ancestors.forEach((aid, i) => {
+      const data = ancestorEvalQs[i]?.data
+      if (!data?.sets) return
+      const childId = i === 0 ? runId : ancestors[i - 1]
+      const forkStep = lineageFor(childId)?.parent_step
+      for (const [set, pts] of Object.entries(data.sets)) {
+        const kept = forkStep == null
+          ? pts
+          : pts.filter((p) => p.step <= forkStep)
+        if (!kept.length) continue
+        const arr = merged[set] ?? []
+        arr.push(...kept)
+        merged[set] = arr
+      }
+    })
+    if (own?.sets) {
+      for (const [set, pts] of Object.entries(own.sets)) {
+        const arr = merged[set] ?? []
+        arr.push(...pts)
+        merged[set] = arr
+      }
+    }
+    for (const set of Object.keys(merged)) {
+      merged[set].sort((a, b) => a.step - b.step)
+    }
+    if (!Object.keys(merged).length) return own ?? null
+    return {
+      schema_version: own?.schema_version ?? 1,
+      synced_at: own?.synced_at ?? new Date().toISOString(),
+      run: runId,
+      sets: merged,
+    }
+  }, [evalQ.data, ancestorEvalQs, ancestors, lineageMode, runId])
+  // step → { val_200, train_200 } eval point, from the lineage-merged series.
   const evalByStep = useMemo(() => {
     const m = new Map<number, Record<string, EvalPoint>>()
-    const sets = evalQ.data?.sets
+    const sets = evalSeries?.sets
     if (!sets) return m
     for (const [set, pts] of Object.entries(sets)) {
       for (const pt of pts) {
@@ -1474,7 +1536,7 @@ function RunDetail({ runId }: { runId: string }) {
       }
     }
     return m
-  }, [evalQ.data])
+  }, [evalSeries])
   const errObj = manifestQ.error || historyQ.error
   const err = errObj ? String(errObj) : null
 
@@ -1616,7 +1678,7 @@ function RunDetail({ runId }: { runId: string }) {
           `eval.json` returned nothing. */}
       <MEvalTable
         runId={runId}
-        evalSeries={evalQ.data ?? null}
+        evalSeries={evalSeries}
         evalJobs={evalJobs}
         metric={mevalMetric}
         setMetric={setMevalMetric}
@@ -1625,7 +1687,7 @@ function RunDetail({ runId }: { runId: string }) {
       {history && (
         <WallclockPlot
           history={history}
-          evalSeries={evalQ.data ?? null}
+          evalSeries={evalSeries}
           runId={runId}
           attempts={attemptsQ.data ?? null}
           manifest={manifest}

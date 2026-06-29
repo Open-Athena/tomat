@@ -1249,6 +1249,13 @@ def main():
                 "label": label,
                 "model": model_preset,
                 "mode": eval_mode,
+                # mg_k_steps + output_suffix recorded so downstream
+                # consumers can disambiguate "K=1 maskgit" (-K1 fire)
+                # from "K=12 maskgit" (bare fire) without having to
+                # guess from the filename. Without this, the dashboard
+                # mislabels OOD oneshot fires as K=12 iterative decode.
+                "mg_k_steps": mg_k_steps if eval_mode == "maskgit" else None,
+                "output_suffix": _out_suffix or None,
                 "mat_set": eval_mat_set,
                 "n_mats": n,
                 "nmae_mean": float(nmaes.mean()) if n else None,

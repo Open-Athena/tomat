@@ -3717,13 +3717,16 @@ def _count_in_flight_evals(timeout: int = 60) -> int:
               help="Print the fire plan (active runs, missing cells, capacity decisions) without invoking iris.")
 @click.option("--include", multiple=True,
               help="Extra runs to consider active regardless of mtime. Repeatable.")
+@click.option("-a", "--include-ancestors", is_flag=True,
+              help="After resolving active runs, also include every ancestor (parent, grandparent, ...) from `wandb.config.TOMAT_PARENT_RUN_ID` chains. Closes the gap where a child run is fresh but its parent's older /10k ckpts were never K=1-eval'd (e.g. v4-cont-clean, cos-r-cont-clean). See task #334 + memory `k1-oneshot-on-mg-is-gigo`.")
 @click.option("--exclude", multiple=True,
               help="Runs to never auto-fire (overrides --include + active heuristic). Repeatable.")
 @click.option("--buckets", default="marin-eu-west4,marin-us-east5,marin-us-central2", show_default=True,
               help="Comma-separated list of GCS buckets to scan for ckpts (no `gs://` prefix). Per memory `cross-region-codec-mirror`, runs land in whichever region the trainer worker was assigned to. Each pass unions over these regions.")
 def evals_auto_fire(
     lookback_days: int, max_in_flight: int, tpu: str, dry_run: bool,
-    include: tuple[str, ...], exclude: tuple[str, ...], buckets: str,
+    include: tuple[str, ...], include_ancestors: bool,
+    exclude: tuple[str, ...], buckets: str,
 ):
     """Walk active runs × ckpts × (set, mode) cells; fire missing evals.
 
@@ -3797,6 +3800,58 @@ def evals_auto_fire(
             active.append((run, b, steps))
     err(f"[auto-fire] {len(active)} active (mtime > now-{lookback_days}d, "
         f"or --include): {[(r, b) for r, b, _ in active]}")
+
+    # 2.5. Optional: walk lineage upward from each active run via
+    # `wandb.config.TOMAT_PARENT_RUN_ID` and add each ancestor to the
+    # active set. Closes the gap where a child is fresh but its
+    # ancestors' /10k ckpts were never K=1-eval'd.
+    if include_ancestors and active:
+        import wandb as _wb
+        api = _wb.Api()
+        active_names = {r for r, _b, _s in active}
+        added: list[tuple[str, str, list[int]]] = []
+        # Walk via cached config reads, breadth-first, capped at a small
+        # depth so a misregistered parent chain can't loop forever.
+        # 10 levels is well past any real lineage tomat has trained.
+        MAX_DEPTH = 10
+        frontier = list(active_names)
+        for _ in range(MAX_DEPTH):
+            next_frontier: list[str] = []
+            for child in frontier:
+                parent = None
+                for proj in ("open-athena/tomat-lmq-P19",):
+                    try:
+                        runs = list(api.runs(proj, filters={"displayName": child}))
+                    except Exception:
+                        continue
+                    if not runs:
+                        continue
+                    p = (runs[0].config or {}).get("TOMAT_PARENT_RUN_ID")
+                    if p:
+                        parent = p
+                        break
+                if not parent or parent in active_names:
+                    continue
+                # Resolve bucket + ckpts. Skip when not present in any
+                # scanned region (e.g. parent's bucket is outside
+                # `--buckets`); not an error.
+                b = run_bucket.get(parent)
+                if not b:
+                    err(f"[auto-fire] ancestor {parent} of {child}: not in scanned buckets, skipping")
+                    continue
+                steps, _ = _ckpts_for_run_with_max_mtime(parent, gcs_bucket=b, fs=fs)
+                if not steps:
+                    continue
+                added.append((parent, b, steps))
+                active_names.add(parent)
+                next_frontier.append(parent)
+            if not next_frontier:
+                break
+            frontier = next_frontier
+        if added:
+            err(f"[auto-fire] +{len(added)} ancestor runs added via "
+                f"--include-ancestors: {[r for r, _, _ in added]}")
+            active.extend(added)
 
     if not active:
         err("[auto-fire] nothing to do")

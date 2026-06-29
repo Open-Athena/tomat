@@ -1168,7 +1168,7 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       legendgroup: 'mtmv',
       legendgrouptitle: { text: `MT/MV (mat-${metric.toUpperCase()} %)` },
       customdata,
-      hovertemplate: `${name} %{y:.3f}%%<br>step %{customdata[0]} · n_mats %{customdata[1]}<extra></extra>`,
+      hovertemplate: `${name} %{y:.3f}%<br>step %{customdata[0]} · n_mats %{customdata[1]}<extra></extra>`,
     }
   }
   const evalTraces = useMemo(() => {
