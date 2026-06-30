@@ -2698,11 +2698,89 @@ def evals_fire(
 # ──────────────────────────────────────────────────────────────────────
 
 
+def _vl_backfill_loss_from_wandb(run_label: str) -> dict | None:
+    """Pull the MG loss config (loss_type, kl_sigma, kl_sigma_unit, mask_prior)
+    from the run's wandb config. Returns a dict with those keys (or None entries
+    when the run isn't MG-mode / config is missing), or None if no wandb run
+    matches the label at all.
+
+    Why: `_vl_backfill_autodetect_loss` only recognised the `bin<N>` name
+    pattern and silently defaulted to `ce/None/bin` for everything else,
+    producing meaningless eval_loss numbers for cos-r / v4 / non-bin runs.
+    Reading wandb config is authoritative — the trainer writes
+    `tomat.env.TOMAT_MG_*` at startup (`_log_tomat_run_metadata_to_wandb`).
+    See memory `vl-silent-failure-pattern`.
+    """
+    import wandb
+    try:
+        api = wandb.Api()
+        runs = match_runs(api, run_label)
+        # Filter to exact label match (substring search is too permissive —
+        # `bin5` substring matches bin5-fs-tpu AND bin5-cont-clean AND
+        # bin5-cont-from-80k-v6e).
+        exact = [r for r in runs if r.name == run_label]
+        if not exact:
+            return None
+        r = exact[0]
+        cfg = dict(r.config)
+        # Loss config sits under `tomat.env.TOMAT_MG_*` (the canonical path
+        # written by `_log_tomat_run_metadata_to_wandb`). Top-level
+        # `TOMAT_MG_*` fallback is here in case a future code path logs it
+        # there instead.
+        tomat_blob = cfg.get("tomat") or {}
+        env_blob = tomat_blob.get("env") or {}
+        # The trainer normalizes env-var names when writing to wandb config:
+        # `TOMAT_MG_MODE` → `mg_mode` (strip `TOMAT_` prefix, lowercase).
+        # Check both forms so this helper works regardless of which path the
+        # writer used.
+        def get(key: str):
+            short = key.removeprefix("TOMAT_").lower()
+            return (
+                env_blob.get(short)
+                or env_blob.get(key)
+                or tomat_blob.get(short)
+                or tomat_blob.get(key)
+                or cfg.get(key)
+            )
+        mg_mode = get("TOMAT_MG_MODE")
+        # Distinguish "not logged" (pre-#269 runs that predate the env-var
+        # wandb-config logging — fall through to caller's name-detect) from
+        # "explicitly 0" (genuine AR run — caller should refuse). `None`
+        # means we don't know; `"0"`/`0`/`False` means we know it's not MG.
+        if mg_mode is None:
+            return None
+        if str(mg_mode) == "0" or mg_mode is False:
+            return {"mg_mode": False}
+        loss_type = get("TOMAT_MG_LOSS_TYPE")
+        kl_sigma_raw = get("TOMAT_MG_KL_SIGMA")
+        kl_sigma_unit = get("TOMAT_MG_KL_SIGMA_UNIT") or "value"
+        mask_prior = get("TOMAT_MG_MASK_PRIOR") or "absorbing"
+        kl_sigma: float | None
+        try:
+            kl_sigma = float(kl_sigma_raw) if kl_sigma_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            kl_sigma = None
+        return {
+            "mg_mode": True,
+            "loss_type": loss_type,
+            "kl_sigma": kl_sigma,
+            "kl_sigma_unit": kl_sigma_unit,
+            "mask_prior": mask_prior,
+        }
+    except Exception as e:
+        err(f"[vl-backfill] WARN: wandb config lookup for {run_label!r} failed "
+            f"({type(e).__name__}: {e})")
+        return None
+
+
 def _vl_backfill_autodetect_loss(run_label: str) -> tuple[str, float | None, str]:
     """Heuristic mapping from run-label substrings to (loss_type, kl_sigma, kl_sigma_unit).
 
     Conservative: defaults to ce/None. Recognised tags:
       `kl-bin<N>` / `bin<N>` → kl_gauss, sigma=N, unit=bin
+
+    Prefer `_vl_backfill_loss_from_wandb` over this — the name-based heuristic
+    only matches the bin5 family and silently mis-configures everything else.
     """
     m = re.search(r"(?:^|-)(?:kl-)?bin(\d+)(?:-|$)", run_label)
     if m:
@@ -2817,14 +2895,51 @@ def evals_vl_backfill(
     leaf = ckpt_leaf or run_label
     err(f"[vl-backfill] bucket={bucket} run={run_label} leaf={leaf}")
 
-    # Autodetect loss + parquet from run label.
+    # Loss config: prefer wandb config (authoritative — the trainer wrote it),
+    # fall back to name-regex heuristic (only bin5 family), refuse to fire if
+    # neither resolves and the user didn't override. This stops the silent
+    # ce-default that produced meaningless eval_loss for cos-r / v4 / non-bin
+    # runs (memory `vl-silent-failure-pattern`).
     if loss_type is None:
-        loss_type, sigma_auto, unit_auto = _vl_backfill_autodetect_loss(run_label)
-        if kl_sigma is None:
-            kl_sigma = sigma_auto
-        kl_sigma_unit = unit_auto if loss_type == "kl_gauss" else kl_sigma_unit
-        err(f"[vl-backfill] loss autodetect: type={loss_type} "
-            f"sigma={kl_sigma} unit={kl_sigma_unit}")
+        wb = _vl_backfill_loss_from_wandb(run_label)
+        if wb is not None and wb.get("mg_mode") is False:
+            raise click.UsageError(
+                f"{run_label!r} was NOT trained in MG mode (wandb config "
+                f"TOMAT_MG_MODE=0). vl-backfill currently only supports MG "
+                f"runs (it forces TOMAT_MG_MODE=1 on the eval-only fire). "
+                f"AR/CE VL backfill is not implemented; refusing to fire "
+                f"meaningless numbers."
+            )
+        if wb is not None and wb.get("loss_type"):
+            loss_type = wb["loss_type"]
+            if kl_sigma is None and wb.get("kl_sigma") is not None:
+                kl_sigma = wb["kl_sigma"]
+            if wb.get("kl_sigma_unit"):
+                kl_sigma_unit = wb["kl_sigma_unit"]
+            if wb.get("mask_prior"):
+                mask_prior = wb["mask_prior"]
+            err(f"[vl-backfill] loss from wandb config: type={loss_type} "
+                f"sigma={kl_sigma} unit={kl_sigma_unit} mask_prior={mask_prior}")
+        else:
+            loss_type, sigma_auto, unit_auto = _vl_backfill_autodetect_loss(run_label)
+            if kl_sigma is None:
+                kl_sigma = sigma_auto
+            kl_sigma_unit = unit_auto if loss_type == "kl_gauss" else kl_sigma_unit
+            # Refuse the silent ce-default for runs whose wandb lookup didn't
+            # resolve a real MG loss_type. If the user really wants
+            # `--loss-type ce` they can pass it explicitly.
+            if loss_type == "ce" and re.search(r"(?:^|-)(?:kl-)?bin(\d+)(?:-|$)", run_label) is None:
+                raise click.UsageError(
+                    f"could not determine MG loss config for {run_label!r} "
+                    f"from either wandb config or name heuristic; refusing "
+                    f"to fire with a silent `ce` default that would produce "
+                    f"meaningless eval_loss. Pass --loss-type / --kl-sigma "
+                    f"/ --kl-sigma-unit / --mask-prior explicitly if you "
+                    f"actually want a non-MG loss. See memory "
+                    f"`vl-silent-failure-pattern`."
+                )
+            err(f"[vl-backfill] loss name-heuristic: type={loss_type} "
+                f"sigma={kl_sigma} unit={kl_sigma_unit}")
     if loss_type == "kl_gauss" and kl_sigma is None:
         raise click.UsageError("--kl-sigma required when --loss-type=kl_gauss (autodetect failed)")
 
