@@ -5170,6 +5170,22 @@ def train(
         zone = None
     # `explicit` mode: leave `region` / `zone` as passed in by the caller.
 
+    # Build the fire manifest + derive fire_id BEFORE iris launch so we can
+    # plumb TOMAT_FIRE_ID into the iris env-vars. The trainer reads it to
+    # derive a per-fire wandb run_id (spec 61 §2.2 — 1 wandb : 1 fire).
+    # `_pending_fire_manifest` is held until after iris-launch then PUT to
+    # R2 (we don't want to leave an orphan fire-record if the iris submit
+    # fails outright — the existing code recorded post-launch for the same
+    # reason; this just splits the build/record steps).
+    _pending_fire_manifest = _build_train_fire_manifest(
+        label=label, parent_label=parent_label,
+        tpu=tpu, zone=zone, steps=steps,
+        from_step=latest if resume_mode else None,
+        region_info=region_info,
+    )
+    _pending_fire_id = _fire_id_from_manifest(_pending_fire_manifest)
+    env_vars.append(("TOMAT_FIRE_ID", _pending_fire_id))
+
     cmd = [
         IRIS_BIN, "--cluster=marin", "job", "run",
         "--tpu", tpu, "--enable-extra-resources", "--priority", "interactive",
@@ -5292,19 +5308,13 @@ def train(
         accepted_at=iris_accepted_at,
         mode="resume" if resume_mode else "from-scratch",
     )
-    # Record this fire to R2 (spec 61 §2.1). Failure is non-fatal — the fire
-    # is already submitted; we don't want a flaky R2 PUT to break the
-    # post-submit pipeline. Resume from-step: prefer the parent's `latest`
-    # ckpt step the trainer auto-discovered (we only have it for same-label
-    # resumes; cross-label `--parent` discovery needs a manifest read which
-    # we punt on here).
+    # Record this fire to R2 (spec 61 §2.1). Manifest + fire_id were
+    # derived above (before iris-launch) so we could plumb TOMAT_FIRE_ID
+    # into the iris env-vars. Failure is non-fatal — the fire is already
+    # submitted; we don't want a flaky R2 PUT to break the post-submit
+    # pipeline.
     try:
-        _record_train_fire_to_r2(
-            label=label, parent_label=parent_label,
-            tpu=tpu, zone=zone, steps=steps,
-            from_step=latest if resume_mode else None,
-            region_info=region_info,
-        )
+        _record_fire_manifest_to_r2(_pending_fire_manifest, fire_id=_pending_fire_id)
     except Exception as e:
         err(f"[tomat train] failed to record fire to R2: {e!r} (continuing)")
     print(f"[launched {label} on {tpu}, {steps} steps"
@@ -6340,7 +6350,7 @@ def _fire_id_from_manifest(manifest: dict) -> str:
     return f"{ts.replace(':', '')}-{sha}"
 
 
-def _record_train_fire_to_r2(
+def _build_train_fire_manifest(
     *,
     label: str,
     parent_label: str | None,
@@ -6349,23 +6359,20 @@ def _record_train_fire_to_r2(
     steps: int,
     from_step: int | None,
     region_info: dict | None = None,
-    bucket: str = None,
-) -> str:
-    """In-process equivalent of `tomat fires record` for `tomat train`.
+    fired_at: str | None = None,
+) -> dict:
+    """Build a `tomat train` fire manifest (no fire_id stamped yet).
 
-    Same manifest shape as `fires_record` (so `fires ls/show` see both
-    sources identically) — just skips re-spawning `tomat`. Substrate is
-    always `iris` here (Modal train fires record from the Modal-side
-    entrypoint script, not from this CLI path).
-
-    Returns the fire_id on success; raises on R2 failure (caller wraps
-    in try/except so the just-submitted iris job isn't disrupted).
+    Pure function — no IO. Split out from `_record_train_fire_to_r2` so
+    the caller can derive `fire_id = _fire_id_from_manifest(manifest)`
+    BEFORE submitting to iris and pass it as `TOMAT_FIRE_ID` env-var.
+    The trainer then uses `TOMAT_FIRE_ID` to derive a per-fire wandb
+    run_id (spec 61 §2.2 — 1 wandb : 1 fire).
     """
-    if bucket is None:
-        bucket = R2_BUCKET
-    fired_at = datetime.datetime.now(datetime.timezone.utc)\
-        .isoformat(timespec="seconds").replace("+00:00", "Z")
-    manifest: dict = {
+    if fired_at is None:
+        fired_at = datetime.datetime.now(datetime.timezone.utc)\
+            .isoformat(timespec="seconds").replace("+00:00", "Z")
+    return {
         "schema_version": _FIRE_SCHEMA_VERSION,
         "run_id": label,
         "parent_run_id": parent_label,
@@ -6394,7 +6401,23 @@ def _record_train_fire_to_r2(
             "target_steps": steps,
         },
     }
-    fire_id = _fire_id_from_manifest(manifest)
+
+
+def _record_fire_manifest_to_r2(
+    manifest: dict, fire_id: str | None = None, bucket: str | None = None,
+) -> str:
+    """PUT a pre-built fire manifest to R2 at `fires/<fire-id>/manifest.json`.
+
+    `fire_id` may be passed in (when the caller already derived it ahead
+    of iris submit so it could plumb `TOMAT_FIRE_ID` into env-vars), or
+    derived here from the manifest body. Either way the stored manifest
+    includes `fire_id`.
+    """
+    if bucket is None:
+        bucket = R2_BUCKET
+    if fire_id is None:
+        fire_id = _fire_id_from_manifest(manifest)
+    manifest = dict(manifest)
     manifest["fire_id"] = fire_id
     key = f"{FIRES_PREFIX}/{fire_id}/manifest.json"
     body = json.dumps(manifest, indent=1).encode("utf-8")
@@ -6402,6 +6425,28 @@ def _record_train_fire_to_r2(
     err(f"[tomat train] recorded fire to s3://{bucket}/{key} ({len(body)} bytes)")
     err(f"  fire_id: {fire_id}")
     return fire_id
+
+
+def _record_train_fire_to_r2(
+    *,
+    label: str,
+    parent_label: str | None,
+    tpu: str,
+    zone: str | None,
+    steps: int,
+    from_step: int | None,
+    region_info: dict | None = None,
+    bucket: str = None,
+) -> str:
+    """Legacy single-call: build + record. Used by the old code path
+    that records AFTER iris launch (without plumbing TOMAT_FIRE_ID into
+    env-vars). Prefer the split build-then-record flow for new code so
+    the wandb-per-fire wiring lands."""
+    manifest = _build_train_fire_manifest(
+        label=label, parent_label=parent_label, tpu=tpu, zone=zone,
+        steps=steps, from_step=from_step, region_info=region_info,
+    )
+    return _record_fire_manifest_to_r2(manifest, bucket=bucket)
 
 
 @fires_grp.command("record")
