@@ -179,6 +179,13 @@ export interface EvalPoint {
   nemd_median: number | null
   nemd_p75: number | null
   nemd_p99: number | null
+  /** ISO timestamp proxy for "when was this point's ckpt written" — used by
+   *  `formatStepDetail` to decide whether to apply the legacy info.step-OBO
+   *  asterisk. Stamped at merge time in `RunsPage.tsx`'s evalSeries from
+   *  the source run's `manifest.run.created_at` (lineage-aware: ancestor
+   *  rows get their ancestor's timestamp, own rows get the current run's).
+   *  Not present on the wire — only on in-memory merged points. */
+  _writtenAt?: string
 }
 
 /**

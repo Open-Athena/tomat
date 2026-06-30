@@ -117,9 +117,16 @@ function resultBlurb(rec: EvalRecord | null | undefined): { primary: string | nu
   }
 }
 
-export function EvalsPanel({ runId, evalsIndex }: {
+export function EvalsPanel({ runId, evalsIndex, runCreatedAt }: {
   runId: string
   evalsIndex: EvalIndexEntry[] | null
+  /** Current run's `manifest.run.created_at`. Drives the legacy
+   *  info.step-OBO `*` marker on the step cell — runs past
+   *  `LEGACY_STEP_NAMING_CUTOFF` use exact step-N naming and render
+   *  without `*`. EvalsPanel only shows the current run's evals (no
+   *  ancestor merge), so a single `runCreatedAt` is sufficient here
+   *  (unlike `MEvalTable` which is lineage-aware). */
+  runCreatedAt?: string | null
 }) {
   const idx = evalsIndex ?? []
 
@@ -217,7 +224,7 @@ export function EvalsPanel({ runId, evalsIndex }: {
                   // `*` flags legacy info.step-OBO interpretation (pre-fix
                   // Levanter; see `formatStepDetail` for the full semantics).
                   // The tooltip narrates raw vs completed steps.
-                  const d = formatStepDetail(step)
+                  const d = formatStepDetail(step, { writtenAt: runCreatedAt ?? undefined })
                   return d.isLegacy ? (
                     <Tooltip content={d.tooltip}>
                       <span>{d.display}</span>

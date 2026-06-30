@@ -66,6 +66,11 @@ interface Props {
   evalJobs: EvalJob[]
   metric: MEvalMetric
   setMetric: (m: MEvalMetric) => void
+  /** ISO timestamp for the current run's `manifest.run.created_at`. Used as
+   *  the `writtenAt` fallback for steps whose eval points haven't been
+   *  stamped yet (e.g. in-flight rows where eval.json hasn't landed) so a
+   *  fresh post-cutoff run's first row doesn't render as legacy. */
+  runCreatedAt?: string | null
 }
 
 /** Column-key → display label. The four eval-set/mode combinations we
@@ -357,7 +362,7 @@ function representativeJob(jobs: EvalJob[]): EvalJob {
 }
 
 export function MEvalTable({
-  runId, evalSeries, evalJobs, metric, setMetric,
+  runId, evalSeries, evalJobs, metric, setMetric, runCreatedAt,
 }: Props): ReactElement | null {
   const { isDark } = useTheme()
   injectStyles()
@@ -371,6 +376,25 @@ export function MEvalTable({
   const evalSteps = stepsDescOf(evalSeries)
   const lookup = pointsByStepSet(evalSeries)
   const jobsByCol = jobsByStepCol(evalJobs)
+  // step → latest `_writtenAt` across that step's points (any column / any
+  // ancestor in the merged series). Drives the legacy info.step-OBO `*`
+  // marker on the step cell — runs whose `manifest.run.created_at` is past
+  // `LEGACY_STEP_NAMING_CUTOFF` produce exact step-N ckpts and render
+  // without `*`. When no points carry `_writtenAt` (in-flight only steps),
+  // we fall back to the prop `runCreatedAt` so a fresh run's first eval
+  // step still renders right while its eval.json catches up.
+  const writtenAtByStep = new Map<number, string>()
+  if (evalSeries?.sets) {
+    for (const pts of Object.values(evalSeries.sets)) {
+      for (const pt of pts) {
+        if (pt._writtenAt === undefined) continue
+        const prev = writtenAtByStep.get(pt.step)
+        if (prev === undefined || pt._writtenAt > prev) {
+          writtenAtByStep.set(pt.step, pt._writtenAt)
+        }
+      }
+    }
+  }
 
   // Steps come from both eval.json (completed rows) and in-flight iris jobs
   // — but only jobs whose `(matSet, mode, variant)` actually maps to one of
@@ -485,7 +509,15 @@ export function MEvalTable({
                   // = 50,000 completed steps (exact after +1). `*` is the
                   // periodic / off-by-one case; the force-save snap renders
                   // as round Nk with no asterisk (tooltip explains).
-                  const d = formatStepDetail(step)
+                  //
+                  // Per-row `writtenAt` is picked from `writtenAtByStep`
+                  // (preferred — stamped from the SOURCE run's created_at at
+                  // merge time, lineage-aware) with `runCreatedAt` as a
+                  // fallback for steps whose source we don't have yet
+                  // (in-flight only). Both produce honest no-`*` for runs
+                  // started after `LEGACY_STEP_NAMING_CUTOFF`.
+                  const writtenAt = writtenAtByStep.get(step) ?? runCreatedAt ?? undefined
+                  const d = formatStepDetail(step, { writtenAt })
                   return d.isLegacy ? (
                     <Tooltip content={d.tooltip}>
                       <span>{d.display}</span>

@@ -1480,8 +1480,26 @@ function RunDetail({ runId }: { runId: string }) {
   // were fired from. spec 61 P1 #334.
   const evalSeries = useMemo<RunEval | null>(() => {
     const own = evalQ.data
-    if (lineageMode === 'seg') return own ?? null
-    if (ancestors.length === 0) return own ?? null
+    // Per-row `_writtenAt` proxy = the SOURCE run's `manifest.run.created_at`.
+    // `formatStepDetail` reads this to decide whether to apply the legacy
+    // info.step-OBO asterisk. Runs created after `LEGACY_STEP_NAMING_CUTOFF`
+    // use exact step-N naming; their rows render without `*`.
+    const snapRuns = (snapshotQ.data?.runs ?? {}) as Record<string, { run?: { created_at?: string } } | null>
+    const writtenAtForRun = (rid: string): string | undefined =>
+      snapRuns[rid]?.run?.created_at ?? (rid === runId ? manifest?.run?.created_at : undefined)
+    const stamp = (pts: EvalPoint[], rid: string): EvalPoint[] => {
+      const wa = writtenAtForRun(rid)
+      if (wa === undefined) return pts
+      return pts.map((p) => p._writtenAt === undefined ? { ...p, _writtenAt: wa } : p)
+    }
+    if (lineageMode === 'seg' || ancestors.length === 0) {
+      if (!own?.sets) return own ?? null
+      const stamped: Record<string, EvalPoint[]> = {}
+      for (const [set, pts] of Object.entries(own.sets)) {
+        stamped[set] = stamp(pts, runId)
+      }
+      return { ...own, sets: stamped }
+    }
     // Hold off on glue while any ancestor eval.json is still loading. 404 is
     // a valid resolved state (`data === null` from fetchEval) — we just skip
     // those ancestors. We only block on still-pending fetches.
@@ -1501,14 +1519,14 @@ function RunDetail({ runId }: { runId: string }) {
           : pts.filter((p) => p.step <= forkStep)
         if (!kept.length) continue
         const arr = merged[set] ?? []
-        arr.push(...kept)
+        arr.push(...stamp(kept, aid))
         merged[set] = arr
       }
     })
     if (own?.sets) {
       for (const [set, pts] of Object.entries(own.sets)) {
         const arr = merged[set] ?? []
-        arr.push(...pts)
+        arr.push(...stamp(pts, runId))
         merged[set] = arr
       }
     }
@@ -1522,7 +1540,7 @@ function RunDetail({ runId }: { runId: string }) {
       run: runId,
       sets: merged,
     }
-  }, [evalQ.data, ancestorEvalQs, ancestors, lineageMode, runId])
+  }, [evalQ.data, ancestorEvalQs, ancestors, lineageMode, runId, snapshotQ.data, manifest])
   // step → { val_200, train_200 } eval point, from the lineage-merged series.
   const evalByStep = useMemo(() => {
     const m = new Map<number, Record<string, EvalPoint>>()
@@ -1682,6 +1700,7 @@ function RunDetail({ runId }: { runId: string }) {
         evalJobs={evalJobs}
         metric={mevalMetric}
         setMetric={setMevalMetric}
+        runCreatedAt={manifest?.run?.created_at ?? null}
       />
       {!history && !err && <p>loading parquet…</p>}
       {history && (
@@ -1698,6 +1717,7 @@ function RunDetail({ runId }: { runId: string }) {
       <EvalsPanel
         runId={runId}
         evalsIndex={evalsIndexQ.data ?? null}
+        runCreatedAt={manifest?.run?.created_at ?? null}
       />
       <RecentEvents
         attempts={attemptsQ.data ?? null}
