@@ -1123,6 +1123,18 @@ def runs_sync(substr: str, bucket: str, prefix: str, project: str | None, dry_ru
                 if v is not None:
                     summary[col_name] = v
                     break
+    # Spec 61 §2.2 — 1 run : N wandb runs. Today (pre-trainer-change) every
+    # logical run has exactly 1 wandb run, so `wandb_run_ids` is a 1-element
+    # array. After the trainer's per-fire wandb_run_id change lands (commit
+    # 61f5853), subsequent `tomat train --resume` fires of the same segment
+    # create distinct wandb runs (each with id `<results_label>-<fire-tail>`),
+    # all matched by the substring-search above. We list them ordered by
+    # created_at so the FE can render the chip strip chronologically.
+    sorted_copies = sorted(copies, key=lambda c: c.created_at or "")
+    wandb_run_ids = [
+        {"entity": c.entity, "project": c.project, "run_id": c.id, "name": c.name}
+        for c in sorted_copies
+    ]
     manifest = {
         "schema_version": _RUN_PARQUET_SCHEMA_VERSION,
         "synced_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1133,6 +1145,7 @@ def runs_sync(substr: str, bucket: str, prefix: str, project: str | None, dry_ru
             "tags": list(r.tags or []), "group": r.group,
             "config": dict(r.config),
         },
+        "wandb_run_ids": wandb_run_ids,
         "summary": {k: v for k, v in summary.items()
                     if isinstance(v, (int, float, bool, str)) or v is None},
         "history": {

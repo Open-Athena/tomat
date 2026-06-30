@@ -33,6 +33,20 @@ export interface RunsList {
   count: number
 }
 
+/** One wandb run that contributed to a logical run (spec 61 §2.2 — 1 run :
+ *  N wandb runs). Today most runs have N=1 (1 wandb : 1 segment / fire);
+ *  post-trainer-change (commit 61f5853) `tomat train --resume` fires get
+ *  their own wandb run with id `<results_label>-<fire-tail>` so a single
+ *  segment can accumulate N>1 wandb runs over its lineage of resumes. */
+export interface WandbRunRef {
+  entity: string
+  project: string
+  /** wandb's internal `r.id` (used for URL construction). */
+  run_id: string
+  /** wandb display name. Typically `<results_label>(-<fire-tail>)?`. */
+  name: string
+}
+
 export interface RunManifest {
   schema_version: number
   synced_at: string
@@ -48,6 +62,11 @@ export interface RunManifest {
     group: string | null
     config: Record<string, unknown>
   }
+  /** Spec 61 §2.2 — all wandb runs that contributed to this logical run,
+   *  ordered by `created_at` ascending. Optional (older manifests + Modal
+   *  runs may omit). Length-1 array is the common case today; >1 once
+   *  per-fire wandb-id derivation has run for ≥2 fires of the same segment. */
+  wandb_run_ids?: WandbRunRef[]
   summary: Record<string, number | string | boolean | null>
   history: {
     rows: number

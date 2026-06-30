@@ -1298,23 +1298,53 @@ export function RunHeaderRich({
             <span style={{ fontFamily: 'monospace', fontSize: '0.9rem',
                            color: '#ddd' }}>{id}</span>
           )}
-          {!hideJobLinks && wbUrl && (
-            <Tooltip content="open this run in wandb">
-              <a href={wbUrl} target="_blank" rel="noreferrer"
-                style={{ fontSize: '0.75rem', color: '#888',
-                  display: 'inline-flex', alignItems: 'center', gap: 2 }}>
-                {/* wandb.svg ships as the full horizontal lockup
-                    (icon + text + tagline); crop to just the leftmost
-                    icon square via overflow:hidden + width constraint. */}
-                <span style={{ display: 'inline-block', width: 18, height: 18,
-                  overflow: 'hidden', verticalAlign: 'middle' }}>
-                  <img src="/wandb.svg" alt="wandb"
-                    style={{ height: 18, width: 'auto', display: 'block' }} />
-                </span>
-                ↗
-              </a>
-            </Tooltip>
-          )}
+          {!hideJobLinks && (() => {
+            // Spec 61 §2.2 — render N wandb chips when manifest carries
+            // `wandb_run_ids[]` (the post-trainer-change 1 run : N wandb
+            // shape). When only a single chip would render OR when sync
+            // hasn't populated the array yet, fall back to the legacy
+            // single chip via `run.url` so existing manifests keep
+            // working unchanged.
+            const refs = manifest?.wandb_run_ids ?? []
+            if (refs.length > 1) {
+              return refs.map((ref, i) => {
+                const href = `https://wandb.ai/${ref.entity}/${ref.project}/runs/${encodeURIComponent(ref.run_id)}`
+                return (
+                  <Tooltip key={`${ref.entity}/${ref.project}/${ref.run_id}`}
+                    content={`open fire #${i + 1} (${ref.name}) in wandb`}>
+                    <a href={href} target="_blank" rel="noreferrer"
+                      style={{ fontSize: '0.75rem', color: '#888',
+                        display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+                      <span style={{ display: 'inline-block', width: 18, height: 18,
+                        overflow: 'hidden', verticalAlign: 'middle' }}>
+                        <img src="/wandb.svg" alt="wandb"
+                          style={{ height: 18, width: 'auto', display: 'block' }} />
+                      </span>
+                      ↗{i + 1}
+                    </a>
+                  </Tooltip>
+                )
+              })
+            }
+            // Single chip: identical render to pre-spec-61-§2.2 dashboard.
+            return wbUrl ? (
+              <Tooltip content="open this run in wandb">
+                <a href={wbUrl} target="_blank" rel="noreferrer"
+                  style={{ fontSize: '0.75rem', color: '#888',
+                    display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+                  {/* wandb.svg ships as the full horizontal lockup
+                      (icon + text + tagline); crop to just the leftmost
+                      icon square via overflow:hidden + width constraint. */}
+                  <span style={{ display: 'inline-block', width: 18, height: 18,
+                    overflow: 'hidden', verticalAlign: 'middle' }}>
+                    <img src="/wandb.svg" alt="wandb"
+                      style={{ height: 18, width: 'auto', display: 'block' }} />
+                  </span>
+                  ↗
+                </a>
+              </Tooltip>
+            ) : null
+          })()}
           {!hideJobLinks && isModalRun(id) && (() => {
             // The modal LINK is independent of whether the run still has
             // a live `modalApp` association. The badge-side `RunsPage` drops
