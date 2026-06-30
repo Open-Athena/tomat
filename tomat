@@ -7154,6 +7154,84 @@ def wb_gql(query: str, var: tuple[str, ...]):
     print(json.dumps(out, indent=2))
 
 
+@wb_grp.command("set-loss-config")
+@click.option("--loss-type", "loss_type", required=True, type=click.Choice(["ce", "kl_gauss", "emd"]),
+              help="MG loss type")
+@click.option("-k", "--kl-sigma", type=float, default=None,
+              help="kl_gauss σ (required when --loss-type=kl_gauss)")
+@click.option("--kl-sigma-unit", type=click.Choice(["bin", "value"]), default=None,
+              help="kl_gauss σ unit (required when --loss-type=kl_gauss)")
+@click.option("--mask-prior", type=click.Choice(["absorbing", "cosine", "uniform", "high"]), default=None,
+              help="MG mask prior")
+@click.option("-n", "--dry-run", is_flag=True, help="print the planned merge, don't write")
+@click.argument("run_label")
+def wb_set_loss_config(
+    run_label: str, loss_type: str, kl_sigma: float | None,
+    kl_sigma_unit: str | None, mask_prior: str | None, dry_run: bool,
+):
+    """Backfill MG loss config onto a wandb run's `tomat.env` config.
+
+    Older runs (pre-#269) didn't auto-log TOMAT_MG_* env vars at trainer
+    startup, so `tomat evals vl-backfill` can't pull their loss config
+    from wandb and refuses to fire (silent ce-default → meaningless
+    eval_loss; see memory `vl-silent-failure-pattern`). This command
+    writes the config retroactively under `tomat.env.{mg_mode=1,
+    mg_loss_type, mg_kl_sigma, mg_kl_sigma_unit, mg_mask_prior}` so
+    subsequent VL-backfill / auto-fire passes resolve correctly.
+
+    The merge preserves any other keys already under `tomat.env`. Pass
+    `--dry-run` to inspect the planned write first.
+    """
+    if loss_type == "kl_gauss":
+        if kl_sigma is None or kl_sigma_unit is None:
+            raise click.UsageError("--kl-sigma and --kl-sigma-unit are required when --loss-type=kl_gauss")
+    import wandb
+    api = wandb.Api()
+    runs = match_runs(api, run_label)
+    exact = [r for r in runs if r.name == run_label]
+    if not exact:
+        err(f"no wandb run named {run_label!r} across configured projects")
+        sys.exit(1)
+    if len(exact) > 1:
+        err(f"{len(exact)} wandb runs named {run_label!r}; refusing ambiguous write")
+        for r in exact:
+            err(f"  {r.entity}/{r.project}/{r.id}")
+        sys.exit(1)
+    r = exact[0]
+    cfg = dict(r.config)
+    tomat_blob = dict(cfg.get("tomat") or {})
+    env_blob = dict(tomat_blob.get("env") or {})
+    new_env = {
+        "mg_mode": "1",
+        "mg_loss_type": loss_type,
+    }
+    if kl_sigma is not None:
+        new_env["mg_kl_sigma"] = str(kl_sigma)
+    if kl_sigma_unit is not None:
+        new_env["mg_kl_sigma_unit"] = kl_sigma_unit
+    if mask_prior is not None:
+        new_env["mg_mask_prior"] = mask_prior
+    diff: list[tuple[str, object, object]] = []
+    for k, v in new_env.items():
+        before = env_blob.get(k)
+        if before != v:
+            diff.append((k, before, v))
+    if not diff:
+        err(f"[{r.entity}/{r.project}/{r.name}] tomat.env already has all requested keys; no-op")
+        return
+    err(f"[{r.entity}/{r.project}/{r.name}] planned updates under `tomat.env`:")
+    for k, b, a in diff:
+        err(f"  {k}: {b!r} → {a!r}")
+    if dry_run:
+        err("[dry-run] not writing")
+        return
+    env_blob.update(new_env)
+    tomat_blob["env"] = env_blob
+    r.config["tomat"] = tomat_blob
+    r.update()
+    err(f"[{r.entity}/{r.project}/{r.name}] wrote {len(diff)} key(s)")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # tomat viz
 # ──────────────────────────────────────────────────────────────────────
