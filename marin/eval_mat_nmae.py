@@ -741,6 +741,20 @@ def main():
         os.environ.get("TOMAT_EVAL_FORCE_MG_VOCAB") == "1"
         or any(tok in _name_blob for tok in ("mg-", "kl-", "crps-", "emd-", "tz-"))
     )
+    # Guard: `mode=teacher` (a.k.a. `oneshot`) on an MG-trained model is GIGO.
+    # The model was trained with bidir attn + (mostly-)masked density tokens;
+    # feeding it GT density tokens with a causal mask is double-OOD and
+    # produces ~hundreds-of-percent NMAE. Use `mode=maskgit --mg-k-steps 1`
+    # instead for the honest single-pass eval. Memories `k1-oneshot-on-mg-is-gigo`
+    # and `cont33k-is-gigo` document the historical evidence.
+    if eval_mode == "teacher" and _mg_trained and os.environ.get("TOMAT_EVAL_ALLOW_TEACHER_ON_MG") != "1":
+        raise ValueError(
+            f"refusing teacher-mode eval on MG-trained model (label={label}, "
+            f"ckpt={checkpoint_path}). Use TOMAT_EVAL_MODE=maskgit with "
+            f"TOMAT_EVAL_MG_K_STEPS=1 for the honest K=1 baseline. "
+            f"Override via TOMAT_EVAL_ALLOW_TEACHER_ON_MG=1 if you really "
+            f"want a (known-garbage) historical repro."
+        )
     if eval_mode == "maskgit" or _mg_trained:
         MASK_ID = vocab_size
         vocab_size = vocab_size + 1
