@@ -37,6 +37,7 @@ import {
   numTrainStepsOf,
   parseRunName,
   parseTargetSteps,
+  perLabelEpochsAtStep,
   recentStepPoints,
   secsAgo,
   segmentBreakdownAtStep,
@@ -1148,6 +1149,16 @@ export function RunHeaderRich({
   const epochBreakdown = stepsDoneRaw != null
     ? epochBreakdownAtStep(stepsDoneRaw, manifest)
     : null
+  // Lineage-aware per-data-label epoch breakdown — walks the parent chain via
+  // `lineageFor` (spec 61 §1.5). For cross-resume children whose `global_step`
+  // includes parent-era training under a different data label, this attributes
+  // tokens to the correct label rather than rolling all of them under the
+  // child's own label. Returns `null` for runs without a meaningful resolution
+  // (step ≤ 0, missing manifest); callers fall back to the older single-scalar
+  // `nEpochs` path in that case.
+  const perLabelEpochs = stepsDoneRaw != null
+    ? perLabelEpochsAtStep(stepsDoneRaw, manifest)
+    : null
   // Prefer `epochOfStep(step, manifest)` whenever stepsDoneRaw is known,
   // independent of whether the run has SEGMENTS declared in `lineage.ts`.
   // `epochOfStep` falls back internally to the manifest's single-segment math
@@ -1158,7 +1169,9 @@ export function RunHeaderRich({
   const epochSegmented = stepsDoneRaw != null
     ? epochOfStep(stepsDoneRaw, manifest)
     : null
-  const nEpochs = epochSegmented ?? nEpochsOf(manifest)
+  // Prefer the lineage-aware total when available (it includes parent-era
+  // training under the correct labels); fall back to the within-run scalar.
+  const nEpochs = perLabelEpochs?.total ?? epochSegmented ?? nEpochsOf(manifest)
   // Segment-aware totals: prefer per-segment summation over wandb's single
   // summary scalars when the run is declared in `SEGMENTS` (lineage.ts).
   // Otherwise fall back to the summary values so undeclared runs render
@@ -1478,21 +1491,50 @@ export function RunHeaderRich({
                 in lineage.ts SEGMENTS) get a tooltip showing the per-
                 segment breakdown so the discrepancy with single-(BS,label)
                 math is auditable from the chip itself. */}
-            {nEpochs != null && (
+            {nEpochs != null && (() => {
+              const labelEntries = perLabelEpochs
+                ? Object.entries(perLabelEpochs.byLabel)
+                : []
+              const labelCount = labelEntries.length
+              const hasMultiLabel = labelCount > 1
+              const hasOwnSegments = epochBreakdown != null && epochBreakdown.length > 0
+              return (
               <Tooltip content={
-                epochBreakdown && epochBreakdown.length > 0
+                hasOwnSegments || hasMultiLabel
                   ? (
                     <div style={{ fontFamily: 'monospace', fontSize: '0.72rem' }}>
-                      <div style={{ marginBottom: 4 }}>
-                        epochs at step {stepsDoneRaw != null ? formatStep(stepsDoneRaw) : '?'}, by segment:
-                      </div>
-                      {epochBreakdown.map(({ segment, endStep, epochs }, i) => (
-                        <div key={i}>
-                          {`#${i + 1} ${segment.dataLabel}, BS=${segment.batchSize}, `}
-                          {`${segment.startStep.toLocaleString()} → ${endStep.toLocaleString()}: `}
-                          <b>{Number.isFinite(epochs) ? epochs.toFixed(2) : '—'}</b>
-                        </div>
-                      ))}
+                      {hasOwnSegments && (
+                        <>
+                          <div style={{ marginBottom: 4 }}>
+                            epochs at step {stepsDoneRaw != null ? formatStep(stepsDoneRaw) : '?'}, by own segment:
+                          </div>
+                          {epochBreakdown!.map(({ segment, endStep, epochs }, i) => (
+                            <div key={i}>
+                              {`#${i + 1} ${segment.dataLabel}, BS=${segment.batchSize}, `}
+                              {`${segment.startStep.toLocaleString()} → ${endStep.toLocaleString()}: `}
+                              <b>{Number.isFinite(epochs) ? epochs.toFixed(2) : '—'}</b>
+                            </div>
+                          ))}
+                        </>
+                      )}
+                      {hasMultiLabel && (
+                        <>
+                          <div style={{ marginTop: hasOwnSegments ? 6 : 0, marginBottom: 4 }}>
+                            across lineage, by data label:
+                          </div>
+                          {labelEntries.map(([label, eps]) => (
+                            <div key={label}>
+                              {`${label}: `}
+                              <b>{Number.isFinite(eps) ? eps.toFixed(2) : '—'}</b>
+                            </div>
+                          ))}
+                          {perLabelEpochs!.unresolved.length > 0 && (
+                            <div style={{ marginTop: 2, opacity: 0.7 }}>
+                              {`unresolved: ${perLabelEpochs!.unresolved.join(', ')}`}
+                            </div>
+                          )}
+                        </>
+                      )}
                       <div style={{ marginTop: 4 }}>
                         total: <b>{nEpochs.toFixed(2)}</b>
                       </div>
@@ -1501,23 +1543,26 @@ export function RunHeaderRich({
                   : 'fractional passes over the training set, computed from total_tokens / (epoch_sequences × train_seq_len)'
               }>
                 <div style={{ marginTop: 3, fontSize: '0.78rem' }}>
-                  {/* For segmented runs (different data label / BS across
-                      segments), display each segment's epochs as a `+`-joined
-                      expression rather than the numeric sum — the operands are
-                      over different training distributions, so the sum is a
-                      misleading single-number summary. The tooltip above
-                      still shows the per-segment breakdown + a `total:` row
-                      for callers who want the scalar. */}
+                  {/* Chip text: prefer per-data-label join when lineage walked
+                      across multiple labels (cross-resume children pick up
+                      parent-era contributions here). Else fall back to the
+                      within-run per-segment join (v4-epochwin, bin5 fs-tpu).
+                      Else single scalar. */}
                   epoch <b>{
-                    epochBreakdown && epochBreakdown.length > 1
-                      ? epochBreakdown
-                          .map(({ epochs }) => Number.isFinite(epochs) ? epochs.toFixed(2) : '?')
+                    hasMultiLabel
+                      ? labelEntries
+                          .map(([, eps]) => Number.isFinite(eps) ? eps.toFixed(2) : '?')
                           .join(' + ')
-                      : nEpochs.toFixed(2)
+                      : epochBreakdown && epochBreakdown.length > 1
+                        ? epochBreakdown
+                            .map(({ epochs }) => Number.isFinite(epochs) ? epochs.toFixed(2) : '?')
+                            .join(' + ')
+                        : nEpochs.toFixed(2)
                   }</b>
                 </div>
               </Tooltip>
-            )}
+              )
+            })()}
           </div>
         )}
         {/* Sparkline: step vs wallclock over last 6h. Flat = preempt/restart. */}

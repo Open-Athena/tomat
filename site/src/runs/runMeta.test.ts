@@ -12,12 +12,13 @@
 import { strict as assert } from 'node:assert'
 import { afterEach, describe, it } from 'node:test'
 import type { RunManifest } from './api.ts'
-import { SEGMENTS } from './lineage.ts'
+import { RUN_LINEAGE, SEGMENTS } from './lineage.ts'
 import {
   costBreakdownAtStep,
   epochBreakdownAtStep,
   epochOfStep,
   EPOCH_SEQUENCES,
+  perLabelEpochsAtStep,
   segmentBreakdownAtStep,
   totalFlopsAtStep,
   totalTokensAtStep,
@@ -57,11 +58,18 @@ const TEST_SINGLE_SEG = 'test:epoch:single-seg'
 const TEST_TWO_SEG = 'test:epoch:two-seg'
 const TEST_UNKNOWN_LABEL = 'test:epoch:unknown-label'
 const TEST_FALLBACK_NAME = 'test:epoch:fallback'
+const TEST_PARENT = 'test:lineage:parent'
+const TEST_CHILD = 'test:lineage:child'
+const TEST_GRANDPARENT = 'test:lineage:grandparent'
 
 afterEach(() => {
   // Strip every test-only entry so tests stay isolated.
-  for (const k of [TEST_SINGLE_SEG, TEST_TWO_SEG, TEST_UNKNOWN_LABEL]) {
+  for (const k of [
+    TEST_SINGLE_SEG, TEST_TWO_SEG, TEST_UNKNOWN_LABEL,
+    TEST_PARENT, TEST_CHILD, TEST_GRANDPARENT,
+  ]) {
     delete SEGMENTS[k]
+    delete RUN_LINEAGE[k]
   }
 })
 
@@ -292,6 +300,159 @@ describe('segmentBreakdownAtStep', () => {
       seqLen: 8192,
     })
     assert.equal(segmentBreakdownAtStep(1000, m), null)
+  })
+})
+
+describe('perLabelEpochsAtStep', () => {
+  it('returns null when step ≤ 0', () => {
+    const m = mkManifest({
+      name: TEST_FALLBACK_NAME, batchSize: 128, dataLabel: 'train-full-v3',
+    })
+    assert.equal(perLabelEpochsAtStep(0, m), null)
+    assert.equal(perLabelEpochsAtStep(-1, m), null)
+  })
+
+  it('no lineage, no SEGMENTS → single-label fallback from manifest', () => {
+    const m = mkManifest({
+      name: TEST_FALLBACK_NAME, batchSize: 128, dataLabel: 'train-full-v3',
+    })
+    const out = perLabelEpochsAtStep(1000, m)
+    assert.ok(out != null)
+    const expected = (1000 * 128) / EPOCH_SEQUENCES['train-full-v3']
+    assert.deepEqual(out.byLabel, { 'train-full-v3': expected })
+    assert.equal(out.total, expected)
+    assert.deepEqual(out.unresolved, [])
+  })
+
+  it('child of a SEGMENTS-declared parent: integrates parent up to parent_step, child from parent_step', () => {
+    // Parent has two segments (TS1 then TS0123 union), cuts over at step 100.
+    SEGMENTS[TEST_PARENT] = [
+      { startStep: 0,   endStep: 100,      dataLabel: 'train-full-v3-shard1', batchSize: 128 },
+      { startStep: 100, endStep: Infinity, dataLabel: 'train-full-v3+train-full-v3-shard1+train-full-v3-shard2+train-full-v3-shard3', batchSize: 128 },
+    ]
+    // Child resumed from parent at step 200, continues on the TS0123 union.
+    RUN_LINEAGE[TEST_CHILD] = { parent: TEST_PARENT, parent_step: 200 }
+    const childManifest = mkManifest({
+      name: TEST_CHILD, batchSize: 128,
+      dataLabel: 'train-full-v3+train-full-v3-shard1+train-full-v3-shard2+train-full-v3-shard3',
+    })
+    // step=250 → parent integrated [0,200], child integrated [200,250].
+    const out = perLabelEpochsAtStep(250, childManifest)
+    assert.ok(out != null)
+    const shard1Eps = (100 * 128) / EPOCH_SEQUENCES['train-full-v3-shard1']
+    const unionLabel = 'train-full-v3+train-full-v3-shard1+train-full-v3-shard2+train-full-v3-shard3'
+    // Two separate contributions: parent [100,200] and child [200,250], same label.
+    // Match the impl's summation order to avoid spurious floating-point drift.
+    const unionEps =
+      (100 * 128) / EPOCH_SEQUENCES[unionLabel]
+      + (50 * 128) / EPOCH_SEQUENCES[unionLabel]
+    assert.equal(out.byLabel['train-full-v3-shard1'], shard1Eps)
+    assert.equal(out.byLabel[unionLabel], unionEps)
+    assert.equal(out.total, shard1Eps + unionEps)
+    assert.deepEqual(out.unresolved, [])
+  })
+
+  it('child without SEGMENTS but with parent: own contribution starts at parent_step', () => {
+    // Parent has SEGMENTS (single seg). Child uses manifest fallback.
+    SEGMENTS[TEST_PARENT] = [
+      { startStep: 0, endStep: Infinity, dataLabel: 'train-full-v3', batchSize: 128 },
+    ]
+    RUN_LINEAGE[TEST_CHILD] = { parent: TEST_PARENT, parent_step: 1000 }
+    const childManifest = mkManifest({
+      name: TEST_CHILD, batchSize: 128, dataLabel: 'train-full-v3',
+    })
+    // step=1500 → parent integrated [0,1000], child integrated [1000,1500].
+    const out = perLabelEpochsAtStep(1500, childManifest)
+    assert.ok(out != null)
+    // Both contribute to the same label → single key in byLabel.
+    const expected = (1500 * 128) / EPOCH_SEQUENCES['train-full-v3']
+    assert.deepEqual(out.byLabel, { 'train-full-v3': expected })
+  })
+
+  it('walks multi-level lineage chains (grandparent → parent → child)', () => {
+    SEGMENTS[TEST_GRANDPARENT] = [
+      { startStep: 0, endStep: Infinity, dataLabel: 'train-full-v3', batchSize: 128 },
+    ]
+    SEGMENTS[TEST_PARENT] = [
+      { startStep: 0, endStep: Infinity, dataLabel: 'train-full-v3-shard1', batchSize: 128 },
+    ]
+    RUN_LINEAGE[TEST_PARENT] = { parent: TEST_GRANDPARENT, parent_step: 100 }
+    RUN_LINEAGE[TEST_CHILD] = { parent: TEST_PARENT, parent_step: 200 }
+    const childManifest = mkManifest({
+      name: TEST_CHILD, batchSize: 128, dataLabel: 'train-full-v3-shard2',
+    })
+    // grandparent contributes [0,100] @ train-full-v3,
+    // parent contributes [100,200] @ shard1,
+    // child contributes [200,300] @ shard2.
+    const out = perLabelEpochsAtStep(300, childManifest)
+    assert.ok(out != null)
+    assert.equal(out.byLabel['train-full-v3'],         (100 * 128) / EPOCH_SEQUENCES['train-full-v3'])
+    assert.equal(out.byLabel['train-full-v3-shard1'],  (100 * 128) / EPOCH_SEQUENCES['train-full-v3-shard1'])
+    assert.equal(out.byLabel['train-full-v3-shard2'],  (100 * 128) / EPOCH_SEQUENCES['train-full-v3-shard2'])
+    assert.equal(Object.keys(out.byLabel).length, 3)
+  })
+
+  it('records unresolved ancestor when parent_step is missing', () => {
+    SEGMENTS[TEST_PARENT] = [
+      { startStep: 0, endStep: Infinity, dataLabel: 'train-full-v3', batchSize: 128 },
+    ]
+    // No parent_step recorded — we don't know how much of parent ran.
+    RUN_LINEAGE[TEST_CHILD] = { parent: TEST_PARENT }
+    const childManifest = mkManifest({
+      name: TEST_CHILD, batchSize: 128, dataLabel: 'train-full-v3',
+    })
+    const out = perLabelEpochsAtStep(500, childManifest)
+    assert.ok(out != null)
+    assert.deepEqual(out.unresolved, [TEST_PARENT])
+    // Child's own contribution still counted (parent_step=undefined → 0,
+    // so child contributes [0, step]).
+    assert.equal(out.byLabel['train-full-v3'], (500 * 128) / EPOCH_SEQUENCES['train-full-v3'])
+  })
+
+  it('records unresolved ancestor when ancestor has no SEGMENTS entry', () => {
+    RUN_LINEAGE[TEST_CHILD] = { parent: TEST_PARENT, parent_step: 100 }
+    const childManifest = mkManifest({
+      name: TEST_CHILD, batchSize: 128, dataLabel: 'train-full-v3',
+    })
+    const out = perLabelEpochsAtStep(150, childManifest)
+    assert.ok(out != null)
+    assert.deepEqual(out.unresolved, [TEST_PARENT])
+    // Child's own [100,150] contribution counted on its declared label.
+    assert.equal(out.byLabel['train-full-v3'], (50 * 128) / EPOCH_SEQUENCES['train-full-v3'])
+  })
+
+  it('reproduces the v4-epochwin spec example (1.97 + 0.76 ≈ 2.73 by label)', () => {
+    SEGMENTS[TEST_TWO_SEG] = [
+      { startStep: 0,     endStep: 76186,    dataLabel: 'train-full-v3',        batchSize: 128 },
+      { startStep: 76186, endStep: Infinity, dataLabel: 'train-full-v3-shard1', batchSize: 256 },
+    ]
+    const m = mkManifest({ name: TEST_TWO_SEG })
+    const out = perLabelEpochsAtStep(90982, m)
+    assert.ok(out != null)
+    assert.equal(out.byLabel['train-full-v3'].toFixed(2),        '1.97')
+    assert.equal(out.byLabel['train-full-v3-shard1'].toFixed(2), '0.76')
+    assert.equal(out.total.toFixed(2), '2.73')
+  })
+
+  it('legacy own-SEGMENTS encodes parent+child (v4-epochwin pattern): doesn\'t clamp to parent_step', () => {
+    // v4-epochwin's SEGMENTS predate the lineage walk and encode the FULL
+    // parent+child trajectory (seg #1 starts at 0, covers parent-era TS0).
+    // Even when a parent is declared via RUN_LINEAGE, we must NOT clamp
+    // the own-SEGMENTS to parent_step (would drop the parent-era slice).
+    SEGMENTS[TEST_TWO_SEG] = [
+      { startStep: 0,     endStep: 76186,    dataLabel: 'train-full-v3',        batchSize: 128 },
+      { startStep: 76186, endStep: Infinity, dataLabel: 'train-full-v3-shard1', batchSize: 256 },
+    ]
+    // Parent has no SEGMENTS — its contribution is conceptually inside seg #1.
+    RUN_LINEAGE[TEST_TWO_SEG] = { parent: TEST_PARENT, parent_step: 40000 }
+    const m = mkManifest({ name: TEST_TWO_SEG })
+    const out = perLabelEpochsAtStep(90982, m)
+    assert.ok(out != null)
+    // Same numbers as without the lineage entry — seg #1 still integrates [0, 76186].
+    assert.equal(out.byLabel['train-full-v3'].toFixed(2),        '1.97')
+    assert.equal(out.byLabel['train-full-v3-shard1'].toFixed(2), '0.76')
+    // Parent ancestor flagged as unresolved (no SEGMENTS, no manifest).
+    assert.deepEqual(out.unresolved, [TEST_PARENT])
   })
 })
 

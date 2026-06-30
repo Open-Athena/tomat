@@ -9,7 +9,7 @@ import type { RunManifest } from './api'
 import type { RunHistory } from './parquet'
 // `.ts` extension keeps the node-test runner (`--experimental-strip-types`)
 // happy while remaining compatible with Vite + `moduleResolution: bundler`.
-import { segmentsFor, type RunSegment } from './lineage.ts'
+import { ancestorsOf, lineageFor, segmentsFor, type RunSegment } from './lineage.ts'
 
 export const LOOKBACK_HOURS = 6
 export const LOOKBACK_SEC = LOOKBACK_HOURS * 3600
@@ -362,6 +362,133 @@ export function epochBreakdownAtStep(
     out.push({ segment: seg, endStep: segEnd, epochs })
   }
   return out
+}
+
+// ── lineage-aware per-data-label epochs ───────────────────────────────────
+//
+// `epochBreakdownAtStep` above answers "how many epochs did THIS run train",
+// integrating only the current run's own `SEGMENTS` entries. That's wrong for
+// resume children: a child run's `global_step` includes the parent's training,
+// but the current run's data label (and possibly batch size) was set at fire
+// time and may differ from the parent's. Naively dividing
+// `child.tokens / child.label.epoch_seqs` mis-attributes the parent-era tokens
+// to the child's label.
+//
+// Spec 61 §1.5: walk the parent chain via `lineageFor`, accumulate tokens per
+// data label across the chain, render as a per-label tuple
+// (e.g. `epoch: TS0=1.97, TS0123=0.76`).
+//
+// Each ancestor is integrated up to the step at which the next-down child
+// resumed from it (`lineageFor(child).parent_step`). The current run is
+// integrated from its OWN parent_step (or 0 if it has no parent) up to `step`.
+// SEGMENTS entries are preferred when available; otherwise the manifest's
+// single `(batchSize, dataLabel)` pair drives the integration for the current
+// run, and ancestors with no SEGMENTS entry are marked `unresolved` (we don't
+// have their manifests in this client view).
+
+export interface PerLabelEpochs {
+  /** dataLabel → epochs contributed. Includes ancestors. */
+  byLabel: Record<string, number>
+  /** Sum of `byLabel` values. Useful for chip display. */
+  total: number
+  /** Ancestor run names (or `name:label` pairs) we couldn't integrate:
+   *  - ancestor has no `SEGMENTS` entry AND we don't have its manifest;
+   *  - a segment's `dataLabel` isn't in `EPOCH_SEQUENCES`;
+   *  - the immediate parent has no recorded `parent_step` (so we can't
+   *    cap the ancestor's contribution).
+   *  `total` excludes these — display as "+ ?" alongside resolved labels. */
+  unresolved: string[]
+}
+
+export function perLabelEpochsAtStep(
+  step: number, manifest: RunManifest | null,
+): PerLabelEpochs | null {
+  const runName = manifest?.run?.name
+  if (!runName || step <= 0) return null
+
+  const byLabel: Record<string, number> = {}
+  const unresolved: string[] = []
+  const addContribution = (
+    label: string, startStep: number, endStep: number, bs: number,
+  ): void => {
+    if (endStep <= startStep) return
+    const rows = EPOCH_SEQUENCES[label]
+    if (rows == null) {
+      unresolved.push(label)
+      return
+    }
+    byLabel[label] = (byLabel[label] ?? 0) + ((endStep - startStep) * bs) / rows
+  }
+
+  // Walk ancestors (direct parent first). For each ancestor, the integration
+  // range is `[ancestor's own parent_step ?? 0, next-down child's parent_step]`
+  // — i.e. the steps during which THIS ancestor was the active trainer. The
+  // upper bound is `lineageFor(directChild).parent_step`; the lower bound is
+  // `lineageFor(ancestor).parent_step` (where the ancestor itself resumed
+  // from its parent), or 0 for from-scratch.
+  const ancestors = ancestorsOf(runName)
+  for (let i = 0; i < ancestors.length; i++) {
+    const ancestor = ancestors[i]
+    const directChild = i === 0 ? runName : ancestors[i - 1]
+    const cutoff = lineageFor(directChild)?.parent_step
+    if (cutoff == null) {
+      unresolved.push(ancestor)
+      continue
+    }
+    const ancestorStart = lineageFor(ancestor)?.parent_step ?? 0
+    const segs = segmentsFor(ancestor)
+    if (segs && segs.length > 0) {
+      for (const seg of segs) {
+        const segStart = Math.max(seg.startStep, ancestorStart)
+        if (cutoff <= segStart) break
+        const segEnd = Math.min(cutoff, seg.endStep)
+        addContribution(seg.dataLabel, segStart, segEnd, seg.batchSize)
+      }
+    } else {
+      unresolved.push(ancestor)
+    }
+  }
+
+  // Current run's own contribution.
+  //
+  // - SEGMENTS path: integrate own SEGMENTS as-authored, WITHOUT clamping to
+  //   `lineageFor(runName).parent_step`. Two conventions in production:
+  //   (a) legacy SEGMENTS predate lineage and encode the full parent+child
+  //       trajectory in one table (v4-epochwin-bs128-seed42's seg #1 starts
+  //       at 0 and covers parent-era TS0 training);
+  //   (b) new SEGMENTS author segments starting at the actual `parent_step`,
+  //       leaving parent-era contributions to the ancestor walk.
+  //   Either way, "trust the SEGMENTS entry" gives the right answer for the
+  //   own-segments slice; in (a) the parent ancestor will additionally be
+  //   marked `unresolved` (its contribution is already in own SEGMENTS), in
+  //   (b) the parent ancestor's SEGMENTS resolves cleanly and there's no
+  //   overlap.
+  //
+  // - manifest-fallback path: the manifest only describes the CURRENT data
+  //   label, NOT the parent's. So we MUST clamp the integration window to
+  //   `[parent_step, step]` — otherwise we attribute parent-era tokens
+  //   (under whatever label the parent trained on) to the child's label.
+  //   This is the cont-clean / bin5 cross-resume case.
+  const ownParentStep = lineageFor(runName)?.parent_step ?? 0
+  const ownSegs = segmentsFor(runName)
+  if (ownSegs && ownSegs.length > 0) {
+    for (const seg of ownSegs) {
+      if (step <= seg.startStep) break
+      const segEnd = Math.min(step, seg.endStep)
+      addContribution(seg.dataLabel, seg.startStep, segEnd, seg.batchSize)
+    }
+  } else {
+    const bs = batchSizeOf(manifest)
+    const label = dataLabelOf(manifest)
+    if (bs != null && label != null) {
+      addContribution(label, ownParentStep, step, bs)
+    } else {
+      unresolved.push(runName)
+    }
+  }
+
+  const total = Object.values(byLabel).reduce((a, b) => a + b, 0)
+  return { byLabel, total, unresolved }
 }
 
 // ── segment-aware totals: tokens / FLOPs / MSRP ────────────────────────────
