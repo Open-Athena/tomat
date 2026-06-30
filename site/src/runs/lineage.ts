@@ -255,13 +255,25 @@ export interface RunSegment {
 }
 
 export const SEGMENTS: Record<string, RunSegment[]> = {
-  // v4-epochwin: TS0 trained on `train-full-v3` at BS=128 through step 76186,
-  // then TS1 cut over to the re-seeded `train-full-v3-shard1` at BS=256.
-  // Without this entry the manifest's sync-time (BS, label) drove epoch
-  // math for the whole run, over-reporting by ~1.7× at the current step.
-  // Per-segment numbers at step 90,982 (spec 54): 1.97 + 0.76 = 2.73.
+  // v4: the from-scratch base run that v4-epochwin resumed from. Trained on
+  // `train-full-v3` BS=128 from step 0 to step 40000 on Modal H200×8. SEGMENTS
+  // is needed so the cross-run lineage walk in `perLabelEpochsAtStep`
+  // (runMeta.ts) can attribute the [0, 40000] TS0 contribution to the v4
+  // ancestor rather than dropping it as `unresolved`. Without this, both
+  // v4-epochwin and v4-cont-clean under-attributed by ~1 epoch of TS0.
+  'train-mg-modal-h200x8-tz-v4-bs128-seed42': [
+    { startStep: 0, endStep: 40000, dataLabel: 'train-full-v3', batchSize: 128 },
+  ],
+  // v4-epochwin: resumed from v4 at step 40000, continued on TS0 at BS=128
+  // through step 76186, then TS1 cut over to the re-seeded
+  // `train-full-v3-shard1` at BS=256. Per-segment numbers at step 90,982
+  // (spec 54): TS0 own [40000, 76186) = 0.93 + TS0 from v4 ancestor
+  // [0, 40000] = 1.03 → 1.97, plus shard1 [76186, 90982] = 0.76, total 2.73.
+  // First segment starts at parent_step=40000 (new convention, post-#354);
+  // the parent's [0, 40000] training is attributed via the v4 entry above
+  // through `perLabelEpochsAtStep`'s ancestor walk.
   'train-mg-modal-h200x8-tz-v4-epochwin-bs128-seed42': [
-    { startStep: 0,     endStep: 76186,    dataLabel: 'train-full-v3',        batchSize: 128 },
+    { startStep: 40000, endStep: 76186,    dataLabel: 'train-full-v3',        batchSize: 128 },
     { startStep: 76186, endStep: Infinity, dataLabel: 'train-full-v3-shard1', batchSize: 256 },
   ],
   // bin5 (r=1 absorbing-prior MaskGIT). Started on shard1 only through

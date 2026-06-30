@@ -454,6 +454,63 @@ describe('perLabelEpochsAtStep', () => {
     // Parent ancestor flagged as unresolved (no SEGMENTS, no manifest).
     assert.deepEqual(out.unresolved, [TEST_PARENT])
   })
+
+  it('new convention: parent SEGMENTS + child SEGMENTS at parent_step → same totals (post-#354)', () => {
+    // Post-migration v4-epochwin pattern: parent v4 has its OWN SEGMENTS for
+    // [0, 40000] TS0; v4-epochwin's seg #1 starts at parent_step=40000. The
+    // ancestor walk picks up the [0, 40000] slice from the parent. Totals
+    // must match the legacy pattern: 1.97 + 0.76 = 2.73 at step 90982.
+    SEGMENTS[TEST_PARENT] = [
+      { startStep: 0, endStep: 40000, dataLabel: 'train-full-v3', batchSize: 128 },
+    ]
+    SEGMENTS[TEST_TWO_SEG] = [
+      { startStep: 40000, endStep: 76186,    dataLabel: 'train-full-v3',        batchSize: 128 },
+      { startStep: 76186, endStep: Infinity, dataLabel: 'train-full-v3-shard1', batchSize: 256 },
+    ]
+    RUN_LINEAGE[TEST_TWO_SEG] = { parent: TEST_PARENT, parent_step: 40000 }
+    const m = mkManifest({ name: TEST_TWO_SEG })
+    const out = perLabelEpochsAtStep(90982, m)
+    assert.ok(out != null)
+    // 40000*128/4954176 (v4) + 36186*128/4954176 (v4-epochwin own) = 1.97 TS0.
+    assert.equal(out.byLabel['train-full-v3'].toFixed(2),        '1.97')
+    assert.equal(out.byLabel['train-full-v3-shard1'].toFixed(2), '0.76')
+    assert.equal(out.total.toFixed(2), '2.73')
+    // Parent now resolves cleanly — no unresolved entries.
+    assert.deepEqual(out.unresolved, [])
+  })
+
+  it('new convention: grandchild lineage cleanly attributes parent + grandparent (v4-cont-clean pattern)', () => {
+    // v4-cont-clean resumed v4-epochwin at step-100000. With v4's SEGMENTS in
+    // place (post-#354), the chain v4-cont-clean → v4-epochwin → v4 resolves
+    // every slice without `unresolved`. At grandchild step=120000:
+    //   - v4 [0, 40000] TS0 BS=128 → 40000*128 / 4954176 = 1.034
+    //   - v4-epochwin [40000, 76186) TS0 BS=128 → 36186*128 / 4954176 = 0.935
+    //   - v4-epochwin [76186, 100000) shard1 BS=256 → 23814*256 / 4964352 = 1.228
+    //   - v4-cont-clean own [100000, 120000] (manifest fallback) shard1 BS=256
+    //     → 20000*256 / 4964352 = 1.032
+    SEGMENTS[TEST_GRANDPARENT] = [
+      { startStep: 0, endStep: 40000, dataLabel: 'train-full-v3', batchSize: 128 },
+    ]
+    SEGMENTS[TEST_PARENT] = [
+      { startStep: 40000, endStep: 76186,    dataLabel: 'train-full-v3',        batchSize: 128 },
+      { startStep: 76186, endStep: Infinity, dataLabel: 'train-full-v3-shard1', batchSize: 256 },
+    ]
+    RUN_LINEAGE[TEST_PARENT] = { parent: TEST_GRANDPARENT, parent_step: 40000 }
+    RUN_LINEAGE[TEST_CHILD] = { parent: TEST_PARENT, parent_step: 100000 }
+    // No SEGMENTS for the child → manifest-fallback path.
+    const m = mkManifest({
+      name: TEST_CHILD, batchSize: 256, dataLabel: 'train-full-v3-shard1',
+    })
+    const out = perLabelEpochsAtStep(120000, m)
+    assert.ok(out != null)
+    const ts0 = (40000 * 128) / EPOCH_SEQUENCES['train-full-v3']
+              + (36186 * 128) / EPOCH_SEQUENCES['train-full-v3']
+    const shard1 = (23814 * 256) / EPOCH_SEQUENCES['train-full-v3-shard1']
+                 + (20000 * 256) / EPOCH_SEQUENCES['train-full-v3-shard1']
+    assert.equal(out.byLabel['train-full-v3'], ts0)
+    assert.equal(out.byLabel['train-full-v3-shard1'], shard1)
+    assert.deepEqual(out.unresolved, [])
+  })
 })
 
 describe('costBreakdownAtStep', () => {
