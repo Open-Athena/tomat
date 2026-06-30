@@ -922,7 +922,21 @@ def main():
     # literal commas. Single-label labels are unchanged.
     label_for_path = label.replace(",", "+")
     results_label = results_label_env or f"{label_for_path}-tpu-{model_preset}-bs{batch_size}-seed{seed}"
+    # `run_id` = Levanter `TrainerConfig.id` = ckpt-dir name. Stays at
+    # `results_label` so resume's auto-discovery
+    # (`<output>/checkpoints/<run_id>/step-N`) keeps working.
     run_id = results_label
+    # wandb run_id: spec 61 §2.2 wants 1 wandb : 1 fire (not 1 wandb :
+    # 1 results_label). When the fire submitter (`tomat train`) sets
+    # `TOMAT_FIRE_ID`, derive a fire-specific wandb id so each iris
+    # submission gets its own wandb run (preempt restarts within a fire
+    # keep TOMAT_FIRE_ID constant + WandbConfig.resume='allow' makes
+    # them rejoin the same wandb run). When `TOMAT_FIRE_ID` is absent
+    # (legacy fire scripts), fall back to `results_label` — current
+    # 1 wandb : 1 segment behavior, back-compat.
+    fire_id_env = os.environ.get("TOMAT_FIRE_ID", "").strip()
+    fire_id_tail = fire_id_env.rsplit("-", 1)[-1][:8] if fire_id_env else ""
+    wandb_run_id = f"{results_label}-{fire_id_tail}" if fire_id_tail else results_label
 
     # cache_dir resolution. Three modes, in priority order:
     #   1. TOMAT_CACHE_DIR — explicit full path, used as-is.
@@ -1262,7 +1276,7 @@ def main():
             # the run's original entity if `id` already exists). Override via
             # TOMAT_WANDB_ENTITY env if needed (e.g. local-only smokes).
             entity=os.environ.get("TOMAT_WANDB_ENTITY", "open-athena"),
-            id=run_id,
+            id=wandb_run_id,
             resume="allow",
             project=f"tomat-{meta['density_codec_name']}-P{meta['patch_size']}",
             group=f"M32-Ntpu-{model_preset}",
