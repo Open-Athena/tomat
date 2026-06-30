@@ -3777,6 +3777,32 @@ def _ckpts_for_run_with_max_mtime(
     return (steps, latest)
 
 
+def _existing_vl_steps(fs, ckpt_bucket: str, run_leaf: str) -> set[int]:
+    """Return {step} for every `step-N.json` under either VL location on
+    GCS — the newer `eval/vl/<leaf>/` (from `preamble_vl_modal.py --label
+    val-full-v3`) or the legacy `eval/vl-backfill/<leaf>/` (from
+    `tomat evals vl-backfill`). `tomat runs sync` reads both via
+    `_vl_backfill_rows`; auto-fire treats either as "already covered".
+    """
+    out: set[int] = set()
+    for sub in ("vl", "vl-backfill"):
+        path = f"{ckpt_bucket}/tomat/eval/{sub}/{run_leaf}"
+        try:
+            if not fs.exists(path):
+                continue
+            for p in fs.ls(path):
+                name = p.rsplit("/", 1)[-1]
+                if not (name.startswith("step-") and name.endswith(".json")):
+                    continue
+                try:
+                    out.add(int(name[len("step-"):-len(".json")]))
+                except ValueError:
+                    continue
+        except Exception:
+            continue
+    return out
+
+
 def _existing_eval_steps(
     fs, gcs_bucket: str, run: str, mat_set: str, mode: str,
 ) -> set[tuple[int, str]]:
@@ -3851,10 +3877,17 @@ def _count_in_flight_evals(timeout: int = 60) -> int:
               help="Runs to never auto-fire (overrides --include + active heuristic). Repeatable.")
 @click.option("--buckets", default="marin-eu-west4,marin-us-east5,marin-us-central2", show_default=True,
               help="Comma-separated list of GCS buckets to scan for ckpts (no `gs://` prefix). Per memory `cross-region-codec-mirror`, runs land in whichever region the trainer worker was assigned to. Each pass unions over these regions.")
+@click.option("--vl/--no-vl", "do_vl", default=True, show_default=True,
+              help="Also auto-fire VL backfill (`tomat evals vl-backfill`) for /10k ckpts whose `eval/vl(-backfill)/<run>/step-N.json` is missing. Loss config is pulled from the run's wandb config (or run is skipped with a loud message). Memory `vl-silent-failure-pattern`.")
+@click.option("--vl-tpu", default="v6e-8", show_default=True,
+              help="--tpu for spawned VL-backfill iris jobs. v6e-8 boots in ~30s + ~10s eval per ckpt; default cost ~$1.50/fire.")
+@click.option("--vl-zone", default="us-east5-b", show_default=True,
+              help="--zone for spawned VL-backfill iris jobs. Default us-east5-b is the cheapest interactive v6e-8 pool. Cross-region GCS reads from eu-west4 buckets work but penalize egress; acceptable for small VL fires.")
 def evals_auto_fire(
     lookback_days: int, max_in_flight: int, tpu: str, dry_run: bool,
     include: tuple[str, ...], include_ancestors: bool,
     exclude: tuple[str, ...], buckets: str,
+    do_vl: bool, vl_tpu: str, vl_zone: str,
 ):
     """Walk active runs × ckpts × (set, mode) cells; fire missing evals.
 
@@ -4080,8 +4113,71 @@ def evals_auto_fire(
                         n_failed += 1
                         continue
                     n_fired += 1
-    err(f"[auto-fire] done: {n_fired} fired, {n_skipped_cap} skipped (cap), "
-        f"{n_failed} failed")
+
+    # 5. VL plan + fire. Walks the same active-run set at the same /10k
+    # cadence. For each missing cell, invokes `tomat evals vl-backfill -s N`
+    # which pulls loss config from wandb (refusing to fire on a silent
+    # ce-default) — see memory `vl-silent-failure-pattern`. Capacity is
+    # SHARED with the m-eval loop above so a single autosync pass can't
+    # exceed the global iris cap.
+    n_vl_fired = n_vl_skipped_exists = n_vl_skipped_cap = n_vl_failed = 0
+    if do_vl:
+        for run, ckpt_bucket, steps in active:
+            if not steps:
+                continue
+            steps_at_cadence = sorted(s for s in steps if s % CADENCE == 0)
+            if not steps_at_cadence:
+                continue
+            existing = _existing_vl_steps(fs, ckpt_bucket, run)
+            missing = [s for s in steps_at_cadence if s not in existing]
+            if not missing:
+                continue
+            for step in missing:
+                desc = f"{run} step-{step} VL"
+                if capacity <= 0 and not dry_run:
+                    err(f"[vl-plan-skip] {desc}: NO CAPACITY")
+                    n_vl_skipped_cap += 1
+                    continue
+                cmd = [
+                    sys.executable, str(PROJECT_ROOT / "tomat"),
+                    "evals", "vl-backfill",
+                    "-s", str(step),
+                    "--mode", "iris",
+                    "-T", vl_tpu,
+                    "--zone", vl_zone,
+                    "--bucket", f"gs://{ckpt_bucket}/tomat",
+                    run,
+                ]
+                if dry_run:
+                    err(f"[dry-run] {desc}: would fire `{' '.join(cmd)}`")
+                    n_vl_fired += 1
+                    capacity -= 1
+                    continue
+                err(f"[vl-fire] {desc}")
+                capacity -= 1
+                try:
+                    r = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=300,
+                    )
+                except Exception as e:
+                    err(f"[vl-fire-fail] {desc}: {type(e).__name__}: {e}")
+                    n_vl_failed += 1
+                    continue
+                if r.returncode != 0:
+                    # The most common failure mode is the vl-backfill loss-
+                    # config refusal (pre-#269 runs, non-bin runs without
+                    # wandb config). Surface a one-line stderr tail so the
+                    # cron log shows which runs need manual override —
+                    # silent failure here is exactly what memory
+                    # `vl-silent-failure-pattern` calls out.
+                    err(f"[vl-fire-fail] {desc}: rc={r.returncode}")
+                    err(r.stderr[-500:])
+                    n_vl_failed += 1
+                    continue
+                n_vl_fired += 1
+    err(f"[auto-fire] done: m-eval {n_fired} fired, {n_skipped_cap} skipped (cap), "
+        f"{n_failed} failed · VL {n_vl_fired} fired, {n_vl_skipped_cap} skipped (cap), "
+        f"{n_vl_failed} failed")
 
 
 # ──────────────────────────────────────────────────────────────────────
