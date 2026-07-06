@@ -1696,7 +1696,12 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     },
     yaxis3: {
       title: { text: `mat-${mevalMetric.toUpperCase()} %` },
-      type: 'linear' as const,
+      // Log scale: MT/MV data can span parent-lineage NMAE (early-checkpoint
+      // parents at 200-500%) alongside a current fire's converged values
+      // (a trained model at 3-7%) on the same panel. Under linear, the child
+      // trace flattens to the axis floor when the parent dominates. Log keeps
+      // both regimes legible without a manual clip.
+      type: 'log' as const,
       domain: evalDomain ?? [0.0, 0.01],
       gridcolor, zerolinecolor, linecolor: gridcolor,
       visible: showEvalPanel,
