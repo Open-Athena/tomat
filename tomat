@@ -2715,13 +2715,23 @@ def _vl_backfill_loss_from_wandb(run_label: str) -> dict | None:
     try:
         api = wandb.Api()
         runs = match_runs(api, run_label)
-        # Filter to exact label match (substring search is too permissive —
-        # `bin5` substring matches bin5-fs-tpu AND bin5-cont-clean AND
-        # bin5-cont-from-80k-v6e).
-        exact = [r for r in runs if r.name == run_label]
-        if not exact:
+        # Match strategies (in priority order):
+        #   1. Exact `r.name == run_label` — pre-spec-61 runs where wandb name = label.
+        #   2. `r.name == f"{run_label}-<fire-id>"` — spec-61 fire-id-suffixed names.
+        # Substring/prefix search is deliberately narrow: `bin5-` would also
+        # match `bin5-fs-tpu`; we require an 8-char hex `-<fire-id>` suffix
+        # so only true spec-61 fires match. Multiple fires may exist for one
+        # label (crashed r3-418a93c4 + successful r3-0a3ff994); prefer the
+        # most-recent by created_at (its config is what a step-30000 eval
+        # would use, since it's the one whose ckpt actually landed).
+        import re
+        fire_id_re = re.compile(rf"^{re.escape(run_label)}-[0-9a-f]{{8}}$")
+        candidates = [r for r in runs if r.name == run_label or fire_id_re.match(r.name)]
+        if not candidates:
             return None
-        r = exact[0]
+        # Sort by created_at descending; the newest fire's config is authoritative.
+        candidates.sort(key=lambda r: getattr(r, "created_at", "") or "", reverse=True)
+        r = candidates[0]
         cfg = dict(r.config)
         # Loss config sits under `tomat.env.TOMAT_MG_*` (the canonical path
         # written by `_log_tomat_run_metadata_to_wandb`). Top-level
@@ -3321,13 +3331,33 @@ def evals_sync(substr: str | None, bucket: str, dry_run: bool, prefix: str, per_
         }
         data = json.dumps(doc, separators=(",", ":")).encode()
         n_pts = sum(len(v) for v in sets.values())
-        key = f"{prefix}/{run}/eval.json"
+        # spec 61: wandb run ids are `<label>-<fire-id>` for post-spec-61 fires
+        # while the eval GCS layout is still keyed by bare label. FE fetches
+        # by wandb run id → 404s on the bare-label eval.json. Mirror eval.json
+        # under each matching wandb run's fire-id path so the dashboard
+        # renders every fire without a client-side fallback. Bare-label path
+        # stays too (pre-spec-61 back-compat + `results_label` lookup).
+        keys = [f"{prefix}/{run}/eval.json"]
+        try:
+            import wandb, re
+            api = wandb.Api()
+            fire_id_re = re.compile(rf"^{re.escape(run)}-[0-9a-f]{{8}}$")
+            for wr in match_runs(api, run):
+                if fire_id_re.match(wr.name):
+                    keys.append(f"{prefix}/{wr.name}/eval.json")
+        except Exception as e:
+            err(f"[evals sync] WARN: wandb enum for {run!r} failed "
+                f"({type(e).__name__}: {e}); bare-label path only")
         if dry_run:
             err(f"[evals sync] {run}: {n_pts} pts, {len(data)} B → "
-                f"s3://{bucket}/{key} (dry-run)")
+                f"{len(keys)} R2 key(s) (dry-run)")
         else:
-            _r2_put_bytes(bucket, key, data, "application/json")
-            err(f"[evals sync] {run}: {n_pts} pts → {R2_ENDPOINT}/{bucket}/{key}")
+            for key in keys:
+                _r2_put_bytes(bucket, key, data, "application/json")
+            err(f"[evals sync] {run}: {n_pts} pts → "
+                f"{R2_ENDPOINT}/{bucket}/{keys[0]}"
+                + (f" (+ {len(keys) - 1} fire-id mirror{'s' if len(keys) > 2 else ''})"
+                   if len(keys) > 1 else ""))
 
 
 # ──────────────────────────────────────────────────────────────────────
