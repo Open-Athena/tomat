@@ -8116,22 +8116,38 @@ def _compute_one_cost(
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     notes: list[str] = []
 
-    # Attempts sidecar (TPU runs only). 404 is fine — we'll fall back to
-    # iris-state for the full window.
-    attempts = _r2_get_json(bucket, f"{attempts_prefix}/{run_label}.json")
-    # Iris job (parent) entry from the snapshot — the run may have been
-    # fired by any known runner, so scan each user namespace.
-    job: dict | None = None
-    if iris_state is not None:
-        for u in IRIS_USERS:
-            job = iris_state.get("jobs", {}).get(f"/{u}/{run_label}")
-            if job is not None:
-                break
     # Manifest — lazily fetched. Required for Modal runs (we read
     # `history.ts_min/max` for wallclock). Caller may pass it in to avoid
     # a redundant R2 round-trip when we just wrote it (see `runs_sync`).
     if manifest is None:
         manifest = _r2_get_json(bucket, f"{runs_prefix}/{run_label}/manifest.json")
+
+    # spec 61: wandb run ids are `<label>-<fire-id>` for post-spec-61 fires
+    # while iris-attempts sidecars + iris-state entries stay keyed by bare
+    # LABEL (multiple fires share one label). Resolve the bare label from
+    # the manifest's `results_label` so cost lookups find the right entries;
+    # `_lookup_label` falls back to the run_label itself for pre-61 runs.
+    _results_label: str | None = None
+    if manifest is not None:
+        _env = (((manifest.get("run") or {}).get("config") or {}).get("tomat") or {}).get("env") or {}
+        _results_label = _env.get("results_label") or None
+    lookup_label = _results_label or run_label
+
+    # Attempts sidecar (TPU runs only). 404 is fine — we'll fall back to
+    # iris-state for the full window.
+    attempts = _r2_get_json(bucket, f"{attempts_prefix}/{lookup_label}.json")
+    if attempts is None and lookup_label != run_label:
+        # Belt-and-suspenders: try the fire-id path too in case a future
+        # sidecar writer keys by wandb-run-id.
+        attempts = _r2_get_json(bucket, f"{attempts_prefix}/{run_label}.json")
+    # Iris job (parent) entry from the snapshot — the run may have been
+    # fired by any known runner, so scan each user namespace.
+    job: dict | None = None
+    if iris_state is not None:
+        for u in IRIS_USERS:
+            job = iris_state.get("jobs", {}).get(f"/{u}/{lookup_label}")
+            if job is not None:
+                break
 
     # Try to parse TPU hardware from the label. Modal runs (h100x8, h200x8,
     # b200x8) won't match — they get the Phase-B placeholder.
