@@ -3501,11 +3501,13 @@ def _mirror_gcs_dir_to_r2(
 @click.option("--gcs-bucket", default="marin-eu-west4", show_default=True, help="source GCS bucket (no gs:// prefix)")
 @click.option("-b", "--bucket", default=R2_BUCKET, show_default=True, help="dest R2 bucket")
 @click.option("--split", default=None, help="zarr split (validation|train); auto-detects from set name if unset")
+@click.option("--output-suffix", default="", help="String appended to the pred zarr basename before .zarr — mirror of `evals fire --output-suffix`. Use to fetch ablation-variant zarrs (e.g. `--output-suffix -V` for zarrs from `evals fire -V --output-suffix -V`). GT zarr never carries the suffix.")
 @click.option("-n", "--dry-run", is_flag=True)
 def evals_mirror_mat(
     run_label: str, mp_id: str, set_name: str, mode: str,
     step: int | None, gt: bool, pred: bool,
-    gcs_bucket: str, bucket: str, split: str | None, dry_run: bool,
+    gcs_bucket: str, bucket: str, split: str | None,
+    output_suffix: str, dry_run: bool,
 ):
     """Mirror one mat's GT and/or prediction zarr from GCS → R2 for elvis viz.
 
@@ -3540,9 +3542,9 @@ def evals_mirror_mat(
         out.append(f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com/{bucket}/{r2_key}")
     if pred:
         gcs = (f"{gcs_bucket}/tomat/eval/predictions/{run_label}/"
-               f"{setmode}/step-{step}/{mp_id}.zarr")
+               f"{setmode}/step-{step}/{mp_id}{output_suffix}.zarr")
         r2_key = (f"tomat/eval/{run_label}/predictions/"
-                  f"{setmode}/step-{step}/{mp_id}.zarr")
+                  f"{setmode}/step-{step}/{mp_id}{output_suffix}.zarr")
         if dry_run:
             err(f"[mirror-mat] PRED: gs://{gcs} → s3://{bucket}/{r2_key} (dry-run)")
         else:
