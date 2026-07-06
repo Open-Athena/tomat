@@ -31,8 +31,14 @@ LOCK="/tmp/tomat-autosync.lock"
 # key through to spawned iris jobs. Source the parent project .envrc to
 # pick it up. The file only exports vars; no side effects.
 if [ -f /Users/ryan/c/oa/.envrc ]; then
+  # `.envrc` references vars like `$oa` that direnv sets from a parent
+  # `.envrc` chain that launchd doesn't walk. `set -u` (above) aborts
+  # the whole autosync on the first such unbound-var expansion. Suspend
+  # -u across the source so missing parent vars don't kill the cron.
+  set +u
   # shellcheck disable=SC1091
   source /Users/ryan/c/oa/.envrc
+  set -u
 fi
 
 # Single-instance lock (so a launchd over-fire doesn't pile up jobs).
