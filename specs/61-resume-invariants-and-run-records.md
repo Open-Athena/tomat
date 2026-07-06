@@ -452,6 +452,139 @@ The Phase 1 guard becomes a special case of the Phase 2 architecture: "diff agai
 the parent's last non-blacklisted fire-id's manifest" instead of "diff against the
 parent's current wandb config." The CLI signature stays identical.
 
+### 2.8 Temp-ckpt inheritance (crashed fires are load-bearing ancestors)
+
+**Motivating case**: cos-r-r3 (2026-06-30). First fire `r3-418a93c4` started at
+step-29000, ran 43 min, crashed at step 29399. Wrote a temp ckpt at ~step 29385
+(per its `save_interval: 0:10:00`). Re-fire `r3-0a3ff994` loaded from Levanter's
+auto-discovered *latest* checkpoint — which was that temp ckpt, not the base
+step-29000. Consequence: `r3-0a3ff994`'s wandb history starts at step 29386, not
+step 29001; 385 steps of training between them were done by `r3-418a93c4` and are
+baked into the state that `r3-0a3ff994` picked up. Verified by three independent
+signals in `r3-0a3ff994`'s trailing iris logs:
+
+- `throughput/mfu_sample_count: 466` at `global_step: 29851` → trainer executed
+  466 steps this process; 29851 − 466 = 29385 (start step).
+- wandb history has exactly 29999 − 29386 + 1 = 614 rows with `train/loss`.
+- Wall-clock 63.6 min ÷ 6.1 s/step ≈ 625 steps ≈ 614 rows.
+
+**Implication**: a fire that dies mid-run (and leaves a temp ckpt that a
+subsequent fire loads) is a *linear ancestor* of its successor, not a
+sibling. The dashboard's lineage chain must include it. Its wandb history for
+its lived steps is not throwaway data — it's the only record of what happened
+for those steps of the eventual composite run.
+
+Two capabilities are required to model this cleanly:
+
+1. **Trainer logs the actual load step + source** on startup:
+   `wandb.config.tomat.initial_step` = the state.step immediately after ckpt
+   load; `wandb.config.tomat.initial_ckpt_source` = the ckpt path the trainer
+   chose (base or temp). Currently `trainer.load_checkpoint_path: None`
+   because Levanter auto-discovers; the actual load step ends up implicit in
+   the first history row (which is fragile — as we just saw, that inference
+   took an archaeology dig into throughput counters).
+
+2. **Fire manifests reference the prior fire when a temp ckpt was inherited.**
+   At fire time, if the trainer's chosen ckpt path lives under the
+   `checkpointer.temporary_base_path` prefix, look up which fire wrote it
+   (the temp path already embeds the run label and, if we make it embed the
+   fire_id, we can resolve deterministically) and record
+   `fires/<new-fire-id>/manifest.json.temp_ckpt_source: <prior-fire-id>`.
+   `runs.<label>.parent_chain` then walks this linkage — the prior fire is a
+   real linear ancestor.
+
+This also fixes the sibling-fire-visibility gap surfaced in §2.2: for the
+common case where the *same label* has multiple wandb runs (fire retries
+after crash), we now have a principled distinction: linear ancestors (temp
+ckpt inherited → its data is materially in this run's state), vs. abandoned
+siblings (temp ckpt not inherited → separate branch, blacklisted or hidden).
+
+### 2.9 Manifest carries downsampled history + resolved lineage
+
+Currently the run-detail page renders in two waterfalls:
+
+1. Manifest fetch (small, fast).
+2. *Then* — after `ancestorsOf(runId)` resolves from newly-registered
+   manifests — one parquet fetch per ancestor (~2 MB each, hyparquet range
+   fetches). 3-ancestor pages block on ~6 MB and 3 parallel waterfalls before
+   the plot renders. 5+-ancestor lineages (e.g. cos-r → r2 → r3 chains,
+   or the eventual bin5 continuation family) are visibly slow.
+
+The right long-term shape: fold both the lineage resolution and a
+per-segment downsampled trajectory *into the manifest* at
+`tomat runs sync` time.
+
+New manifest schema addendum:
+
+```jsonc
+{
+  "run": { ... },
+  "config": { ... },
+  "history": { "rows": 29999, "step_min": 0, "step_max": 29999, ... },
+  // NEW: resolved lineage as a flat list, ancestors-first → child.
+  //      Each entry has the fire_id, step range, and a downsampled trace.
+  //      FE reads this instead of walking ancestorsOf + fetching parquets.
+  "lineage_segments": [
+    {
+      "fire_id": "…-fs-tpu",
+      "run_id": "train-mg-cos-r-fs-tpu",
+      "step_range": [2, 9999],
+      "data_label": "train-full-v3",
+      "history_downsampled": {
+        "global_step": [2, 22, 42, ..., 9999],  // ~500-1000 points
+        "train/loss": [9.83, 8.74, ..., 7.31],
+        "_timestamp": [...],
+      }
+    },
+    { "fire_id": "…-cont-clean", ... },
+    { "fire_id": "…-r2",         ... },
+    { "fire_id": "…-r3-418a93c4", "temp_ckpt_source_of": "…-r3-0a3ff994", ... },
+    { "fire_id": "…-r3-0a3ff994", "current": true, ... }
+  ]
+}
+```
+
+Rules:
+- **Downsampling**: LTTB (Largest-Triangle-Three-Buckets) or equal-step,
+  targeting 500-1000 points per segment. Preserves visual shape without
+  shipping 30k raw points. `tomat runs sync` computes this once.
+- **Full parquet stays available** for the *current run* (raw.parquet URL
+  is still in the manifest). WallclockPlot uses the downsampled data at
+  default zoom; if the user zooms in and the downsampled points get sparse
+  (<200 pts visible in the zoomed x-range), the FE issues a range-limited
+  hyparquet fetch against the current run's parquet only. Ancestors past
+  the current zoom window never re-fetch.
+- **Byte budget**: 500 points × 3 fields × 8 bytes ≈ 12 KB per segment.
+  10 ancestors × 12 KB = 120 KB manifest, well within reasonable size
+  (current cos-r-r3-0a3ff994 manifest is ~35 KB; adding lineage brings it
+  to ~85 KB — still a single 10-100 ms fetch vs the current ~6 MB parallel
+  parquet waterfall).
+- **Lineage resolution moves server-side**: `tomat runs sync` walks the
+  `TOMAT_PARENT_RUN_ID` chain (Phase 1) + `temp_ckpt_source` links (§2.8)
+  and inlines the result. Client-side `ancestorsOf` becomes a passthrough
+  read of `manifest.lineage_segments`; the registry-plus-effect pattern
+  (`registerLineageFromManifest` populating a global map that hooks re-read
+  from) goes away.
+
+FE consequences:
+- `ancestorHistoryQs = useQueries(...)` at `RunsPage.tsx:1325-1334` is
+  deleted (5 lines gone plus its consumers), replaced by a direct read of
+  `manifest.lineage_segments[*].history_downsampled` in the WallclockPlot
+  input.
+- One less round-trip; ancestor traces render on manifest-load.
+
+Interim caching win (lands separately, before this): mark
+`ancestorHistoryQs` with `staleTime: Infinity` + long `gcTime` +
+no `refetchInterval` — ancestor parquets on finished runs are immutable, so
+after the first fetch they should live in the react-query cache until the
+tab closes. Reduces repeat-visit cost to zero without any schema change.
+
+Delivery order: (1) trainer-side `initial_step`/`initial_ckpt_source`
+logging (§2.8) — no FE dependency, unblocks temp-ckpt inheritance modeling.
+(2) `runs sync` emits `lineage_segments` in manifest (§2.9). (3) FE
+switches from parquet-fetch fanout to manifest read. (4) Delete the
+`ancestorHistoryQs` code path.
+
 ## Open questions (deferred)
 
 - **Root cause of the bin5 resume spike.** The σ-monotonic gap is KL-Gauss target entropy

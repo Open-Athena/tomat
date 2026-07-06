@@ -1322,13 +1322,18 @@ function RunDetail({ runId }: { runId: string }) {
   const children = useMemo(() => childrenOf(runId), [runId, snapshotQ.data])
   // `useQueries` returns a stable array indexed by ancestor; ancestors-first
   // (parent, grandparent, …) so concat below reverses to chronological order.
+  //
+  // Ancestor parquets are immutable once written (finished segment, `runs sync`
+  // won't rewrite it). Mark the queries as never-stale + long-cached so
+  // navigating away and back doesn't re-fetch ~2 MB per ancestor. Interim win
+  // before spec 61 §2.9 folds downsampled ancestor history into the manifest
+  // itself (at which point this whole fanout goes away).
   const ancestorHistoryQs = useQueries({
     queries: ancestors.map((aid) => ({
       queryKey: ['history', aid],
       queryFn: () => fetchRunHistory(parquetUrl(aid)),
-      // Ancestors are by-definition finished segments; their parquet doesn't
-      // change. Idle cadence keeps polling cheap (single 2 MB fetch).
-      refetchInterval: REFETCH_MS.history.idle,
+      staleTime: Infinity,
+      gcTime: 60 * 60 * 1000,
       retry: 1,
     })),
   })
