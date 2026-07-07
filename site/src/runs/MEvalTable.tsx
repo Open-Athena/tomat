@@ -408,7 +408,14 @@ export function MEvalTable({
     const setKey = evalSetKey(j.matSet, j.mode, j.variant)
     if (colKeys.has(setKey)) allStepsSet.add(j.step)
   }
-  const steps = [...allStepsSet].sort((a, b) => b - a)
+  // Drop steps that would render as an all-dash row: some steps only carry
+  // K=12 (or oneshot) data from an ancestor lineage segment (e.g. the
+  // end-of-segment eval fired only in K=12 mode), and now that the table
+  // only shows K=1 columns those steps land as visual noise. Keep steps
+  // with at least one displayable cell OR an in-flight iris job.
+  const stepHasData = (s: number) =>
+    COLUMNS.some((c) => lookup.has(`${s}|${c.key}`) || jobsByCol.has(`${s}|${c.key}`))
+  const steps = [...allStepsSet].filter(stepHasData).sort((a, b) => b - a)
   if (steps.length === 0) return null
   // Only render columns that have at least one data point OR an iris job
   // across all steps. Keeps the table narrow on teacher-only runs (no
@@ -480,9 +487,11 @@ export function MEvalTable({
                     flexWrap: 'wrap' }}>
         <h2 style={{ fontSize: '0.95rem', margin: 0 }}>
           Per-step m-eval ({steps.length} step{steps.length === 1 ? '' : 's'}) ·{' '}
-          <span style={{ color: '#888', fontWeight: 'normal' }}>{metric.toUpperCase()}</span>
+          <span style={{ color: '#888', fontWeight: 'normal' }}>NMAE</span>
         </h2>
-        <MetricChips metric={metric} setMetric={setMetric} isDark={isDark} />
+        {/* NEMD toggle intentionally removed — always show NMAE. `metric`
+            state is kept because a future drilldown page may still want
+            NEMD numbers, but the on-page toggle was clutter. */}
         {/* Bulk-fire K=12 button removed — K>1 evals deprecated;
             per-cell `[fire]` button is still available for missing cells. */}
       </div>
