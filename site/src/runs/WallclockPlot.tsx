@@ -1056,17 +1056,22 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         // hasn't crossed the first boundary). We still need the legend
         // row so the user can tell which metric is on the plot AND toggle
         // the ancestor traces (they share `bucket.legendGroup`). Emit a
-        // zero-length stub trace with `showlegend: true` if this bucket
-        // was going to carry the legend entry, otherwise skip.
+        // legend-only stub trace if this bucket was going to carry the
+        // legend entry. `visible: 'legendonly'` is plotly's idiom for
+        // "this trace shows in the legend but draws nothing on the plot"
+        // — an empty x/y array with `showlegend: true` gets silently
+        // dropped from the legend, so the stub has to carry at least one
+        // point (null y so it doesn't render).
         if (bucket.showLegend) {
           out.push({
-            x: [], y: [], name: bucket.legendName,
+            x: [null], y: [null], name: bucket.legendName,
             type: 'scatter', mode: 'lines',
             line: { color: bucket.color, width: lineWidth },
             yaxis: 'y2',
             legendgroup: bucket.legendGroup,
             legendgrouptitle: { text: bucket.groupTitle },
             showlegend: true,
+            visible: 'legendonly',
             hoverinfo: 'skip',
           })
         }

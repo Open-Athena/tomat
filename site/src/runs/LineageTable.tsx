@@ -121,7 +121,23 @@ function ModalLink({ runId }: { runId: string }) {
   )
 }
 
-export function LineageTable({ rows }: { rows: LineageRow[] }) {
+export function LineageTable({
+  rows, ancestorsLoading = false, snapshotLoading = false,
+}: {
+  rows: LineageRow[]
+  /** Any ancestor's history parquet is still loading (step range shows `?`
+   *  until it lands). Shown as a subtle caption in the table header. */
+  ancestorsLoading?: boolean
+  /** Snapshot itself is still loading, so ancestors haven't been registered
+   *  yet — the table might be showing only the current row when it should
+   *  show more. Visible caption so the user knows the row list isn't final. */
+  snapshotLoading?: boolean
+}) {
+  const loadingText = snapshotLoading
+    ? 'discovering ancestors…'
+    : ancestorsLoading
+      ? 'loading ancestor history…'
+      : null
   return (
     <div style={{
       margin: '0.25rem 0 0.5rem 0',
@@ -130,6 +146,19 @@ export function LineageTable({ rows }: { rows: LineageRow[] }) {
       overflow: 'hidden',
       fontSize: '0.8rem',
     }}>
+      {loadingText && (
+        <div style={{
+          padding: '3px 8px',
+          background: '#1a1f2b',
+          color: '#8fa4c8',
+          fontSize: '0.7rem',
+          borderBottom: '1px solid #232323',
+          fontStyle: 'italic',
+        }}>
+          <span style={{ opacity: 0.8 }}>◐</span>{' '}
+          {loadingText}
+        </div>
+      )}
       <table style={{ width: '100%', borderCollapse: 'collapse' }}>
         <thead>
           <tr style={{ background: '#1d1d1d', color: '#888', fontSize: '0.7rem' }}>

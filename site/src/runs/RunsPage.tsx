@@ -1696,7 +1696,9 @@ function RunDetail({ runId }: { runId: string }) {
             wandbRefs: wandbRefsFor(runId) },
           ...childRows,
         ]
-        return <LineageTable rows={allRows} />
+        return <LineageTable rows={allRows}
+          snapshotLoading={snapshotQ.isLoading}
+          ancestorsLoading={ancestorHistoryQs.some((q) => q.isLoading)} />
       })()}
       {ancestors.length > 0 && (
         <LineageToggle
