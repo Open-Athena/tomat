@@ -1050,7 +1050,28 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         }
         if (isLastBucketSeg) lastSegLastIdx = cx.length - 1
       })
-      if (pointCount === 0) continue
+      if (pointCount === 0) {
+        // Empty current bucket (fresh resume that hasn't logged any of
+        // this metric yet — e.g. VL only fires every 1k steps, and a run
+        // hasn't crossed the first boundary). We still need the legend
+        // row so the user can tell which metric is on the plot AND toggle
+        // the ancestor traces (they share `bucket.legendGroup`). Emit a
+        // zero-length stub trace with `showlegend: true` if this bucket
+        // was going to carry the legend entry, otherwise skip.
+        if (bucket.showLegend) {
+          out.push({
+            x: [], y: [], name: bucket.legendName,
+            type: 'scatter', mode: 'lines',
+            line: { color: bucket.color, width: lineWidth },
+            yaxis: 'y2',
+            legendgroup: bucket.legendGroup,
+            legendgrouptitle: { text: bucket.groupTitle },
+            showlegend: true,
+            hoverinfo: 'skip',
+          })
+        }
+        continue
+      }
       // Sparse-overall buckets get visible markers (each datapoint stands
       // out — VL on long resume chains has a handful of points). Dense
       // buckets stay lines-only (TL would be a wall of red dots otherwise).
