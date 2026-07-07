@@ -6,6 +6,7 @@ import { KbdShell } from './KbdSetup'
 import { MpPage } from './mp/MpPage'
 import { PostsPage } from './posts/PostsPage'
 import { RunsPage } from './runs/RunsPage'
+import { MEvalDrilldownPage } from './runs/MEvalDrilldownPage'
 import { VoxelCorrPage } from './voxel-corr/VoxelCorrPage'
 import { JointHistPage } from './viz/JointHistPage'
 import { parseHash, useHash } from './useHash'
@@ -55,6 +56,18 @@ export function App() {
           <JointHistPage />
         ) : route === 'mp' && parts[1] ? (
           <MpPage mpId={parts[1]} />
+        ) : (route === 'run' || route === 'runs')
+              && parts[1] && parts[2] === 'm-eval'
+              && parts[3] && parts[4] ? (
+          // Spec 60: `#/run/<runId>/m-eval/<step>/<setKey>`. Accepts both
+          // `run` and `runs` for the top segment — the rest of the app
+          // routes runs under `#/runs/<label>`, and having the drilldown
+          // reachable under the same prefix keeps back-navigation clean.
+          <MEvalDrilldownPage
+            runId={decodeURIComponent(parts[1])}
+            step={parseInt(parts[3], 10)}
+            setKey={decodeURIComponent(parts[4])}
+          />
         ) : (
           <HomePage />
         )}

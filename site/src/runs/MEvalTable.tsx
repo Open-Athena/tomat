@@ -543,7 +543,17 @@ export function MEvalTable({
                 const fireError = fireErrors.get(key) ?? null
                 let inner: ReactElement
                 if (pt) {
-                  inner = <SetCell pt={pt} isDark={isDark} metric={metric} />
+                  // Spec 60: cell with data → link to `#/run/<runId>/
+                  // m-eval/<step>/<setKey>` for per-mat drilldown.
+                  const drillHref = `#/run/${encodeURIComponent(runId)}`
+                    + `/m-eval/${step}/${encodeURIComponent(c.key)}`
+                  inner = (
+                    <a href={drillHref}
+                      style={{ textDecoration: 'none', color: 'inherit' }}
+                      title={`per-mat drilldown for ${c.matSet} · step ${step}`}>
+                      <SetCell pt={pt} isDark={isDark} metric={metric} />
+                    </a>
+                  )
                 } else if (jobs && jobs.length > 0) {
                   // Pick the representative job (in-flight > done > failed,
                   // tiebreak by most-recent-touched).
