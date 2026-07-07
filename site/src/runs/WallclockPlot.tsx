@@ -1225,9 +1225,6 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       const mvmt: 'MT' | 'MV' = parts[0] === 'val_200' ? 'MV' : 'MT'
       const mode: string | undefined = parts[1]
       const variant: string = parts.slice(2).join('-')
-      // Elvis-viz variant: mini n=5 sample fired for drilldown, not a
-      // scientific series. Drop it from the plot to avoid duplicate labels.
-      if (variant === 'V') return null
       const kMatch = variant.match(/^K(\d+)/)
       let kLabel: string
       let dash: 'solid' | 'dash'
@@ -1236,6 +1233,17 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
         const k = kMatch[1]
         kLabel = `K=${k}`
         dash = k === '1' ? 'dash' : 'solid'
+      } else if (mode === 'maskgit' && variant) {
+        // Bare `-maskgit` + arbitrary `--output-suffix` (e.g.
+        // `--output-suffix V` when we fired a small drilldown alongside
+        // `--voxel-zarrs`). K is inherited from the mode default (K=12);
+        // the suffix is just a filename tag with no fixed semantics, but
+        // it usually implies a distinct sample size or ablation config
+        // whose mean isn't comparable to the bare-suffix series.
+        // Preserve the suffix in the label so it doesn't collide with
+        // bare-K=12 in the legend. n_mats is already in the point tooltip.
+        kLabel = `K=12·${variant}`
+        dash = 'solid'
       } else if (mode === 'maskgit') {
         // Bare `-maskgit` is the legacy K=12 iterative-decode bucket.
         kLabel = 'K=12'
