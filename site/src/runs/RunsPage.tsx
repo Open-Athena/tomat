@@ -1288,10 +1288,14 @@ function RunDetail({ runId }: { runId: string }) {
     refetchInterval: (q) => errBackoff(q) ?? REFETCH_MS.manifest,
     retry: 1,
   })
-  // Mirror RunsIndex's lineage-registration effect — needed so direct
-  // URL loads of /runs/<id> populate LINEAGE_FROM_MANIFEST and thus see
-  // children. Effect is a no-op when the snapshot was pre-registered by
-  // RunsIndex.
+  // Mirror RunsIndex's lineage-registration effect — needed so
+  // `childrenOf(runId)` on direct URL loads sees the just-fetched snapshot's
+  // manifests. The `ancestors` useMemo below ALSO registers synchronously
+  // during render (which is required for its OWN correctness — a useEffect
+  // would race behind the useMemo's first evaluation and leave `ancestors`
+  // memoized to `[]` until the next snapshot poll ~30s later). This effect
+  // still exists for the child-side of the graph, which `useMemo`s ordered
+  // after this file's TDZ can pick up.
   useEffect(() => {
     const runs = snapshotQ.data?.runs
     if (!runs) return
@@ -1315,7 +1319,99 @@ function RunDetail({ runId }: { runId: string }) {
   // NMAE / NEMD toggle shared between MEvalTable (table cells) and
   // WallclockPlot (MT/MV panel). URL-persisted via `?mevm=`.
   const [mevalMetric, setMevalMetric] = useMEvalMetric()
-  const ancestors = useMemo(() => ancestorsOf(runId), [runId, snapshotQ.data])
+  // Hoisted above `ancestors` so its useMemo can read this run's manifest
+  // (needed for `manifest.summary._step` = current final step, which bounds
+  // the crashed-sibling gap-filler search).
+  const manifest = manifestQ.data ?? null
+  // Ancestor discovery: two responsibilities in ONE useMemo (not a useEffect)
+  // so that the walk sees a populated LINEAGE_FROM_MANIFEST on the very first
+  // render after data arrives — else the memoized empty result sticks until
+  // the next snapshot poll (react-query with structural sharing can keep the
+  // data ref stable forever if the snapshot hasn't changed, so "wait 30s" was
+  // routinely "wait forever").
+  //
+  //  (1) Register every manifest's parent from the snapshot + this run's own
+  //      manifest into LINEAGE_FROM_MANIFEST, THEN call `ancestorsOf(runId)`.
+  //  (2) Insert crashed siblings between the current run and its logical
+  //      parent: when the current run's `--parent` is r2 but the physical
+  //      resume ckpt came from a crashed sibling that ran between r2 and now,
+  //      the sibling's parquet holds the missing steps in the middle. We
+  //      infer it as "child-of-parent with state=crashed and _step in the gap
+  //      (parentFinal, currentFinal)". Spec 61 §2.2 treats these as physical
+  //      predecessors distinct from the LOGICAL parent recorded by `--parent`.
+  const ancestors = useMemo(() => {
+    const runs = snapshotQ.data?.runs
+    if (runs) {
+      for (const [id, m] of Object.entries(runs)) {
+        const cfg = (m as { run?: { config?: Record<string, unknown> } })?.run?.config
+        if (cfg) registerLineageFromManifest(id, cfg)
+      }
+    }
+    if (manifest?.run?.config) {
+      registerLineageFromManifest(runId, manifest.run.config as Record<string, unknown>)
+    }
+    const logical = ancestorsOf(runId)
+    if (logical.length === 0 || !runs) return logical
+    // Gap-filler pass. Read the logical parent's + current's final step from
+    // the snapshot (falls back to this run's manifest for the current, which
+    // is fresher than the snapshot's cron TTL).
+    const parentId = logical[0]
+    const finalStepOf = (id: string): number | null => {
+      const s = (runs[id] as { summary?: { _step?: number } })?.summary?._step
+      return typeof s === 'number' ? s : null
+    }
+    const parentFinal = finalStepOf(parentId) ?? -Infinity
+    const currentFinal = (manifest?.summary?._step as number | undefined)
+      ?? finalStepOf(runId)
+      ?? Infinity
+    const siblings: Array<{ id: string; finalStep: number }> = []
+    for (const [siblingId, sm] of Object.entries(runs)) {
+      if (siblingId === runId) continue
+      const m = sm as {
+        run?: {
+          state?: string
+          config?: {
+            tomat?: {
+              parent_run_id?: string
+              env?: { parent_run_id?: string }
+            }
+            TOMAT_PARENT_RUN_ID?: string
+          }
+        }
+      }
+      const cfg = m?.run?.config
+      const siblingParent =
+        cfg?.tomat?.parent_run_id
+        ?? cfg?.tomat?.env?.parent_run_id
+        ?? cfg?.TOMAT_PARENT_RUN_ID
+      if (siblingParent !== parentId) continue
+      const state = m?.run?.state
+      if (state !== 'crashed' && state !== 'failed') continue
+      const finalStep = finalStepOf(siblingId)
+      if (finalStep == null || finalStep <= parentFinal || finalStep >= currentFinal) continue
+      siblings.push({ id: siblingId, finalStep })
+    }
+    if (siblings.length === 0) return logical
+    // Sort desc by finalStep so the newest crash (closest to current) lands
+    // at index 0 (the "immediate physical parent" slot of the child→root
+    // ancestor chain). Multiple crashed siblings are assumed to form a linear
+    // resume chain (a→b→c→current), which matches how Levanter's on-disk
+    // ckpt state actually flows.
+    siblings.sort((a, b) => b.finalStep - a.finalStep)
+    return [...siblings.map((s) => s.id), ...logical]
+  }, [runId, snapshotQ.data, manifest])
+  // Set of sibling gap-filler IDs — used to label the LineageTable row.
+  // Anything in `ancestors` that ISN'T in the pure logical chain must have
+  // come from the sibling-gap-fill pass. We recompute `ancestorsOf(runId)`
+  // here (registry is already populated by the useMemo above) and diff.
+  const gapFillerSiblingIds = useMemo(() => {
+    const logicalSet = new Set(ancestorsOf(runId))
+    const s = new Set<string>()
+    for (const aid of ancestors) {
+      if (!logicalSet.has(aid)) s.add(aid)
+    }
+    return s
+  }, [ancestors, runId])
   // Children — direct descendants whose `TOMAT_PARENT_RUN_ID === runId`. We
   // recompute when snapshotQ.data refreshes so newly-registered manifests
   // surface here without waiting for a route change.
@@ -1404,16 +1500,9 @@ function RunDetail({ runId }: { runId: string }) {
     refetchInterval: (q) => errBackoff(q) ?? REFETCH_MS.manifest,
     retry: 1,
   })
-  const manifest = manifestQ.data ?? null
-  // Data-driven lineage (spec 63): register parent from wandb config so
-  // `lineageFor()` picks it up without a RUN_LINEAGE registry edit. Fires
-  // populated by `tomat train --parent` (spec 61 P1) thus appear in the
-  // dashboard automatically.
-  useEffect(() => {
-    if (manifest?.run?.config) {
-      registerLineageFromManifest(runId, manifest.run.config as Record<string, unknown>)
-    }
-  }, [runId, manifest])
+  // `manifest` hoisted above; lineage registration for this run happens
+  // synchronously inside the `ancestors` useMemo above (spec 63 —
+  // manifest.config.tomat.parent_run_id feeds LINEAGE_FROM_MANIFEST).
   const ownHistory = historyQ.data ?? null
   // Lineage-aware concatenated history: ancestor-first → … → this run.
   // Available when every ancestor history has loaded (`every(d != null)`).
@@ -1678,7 +1767,9 @@ function RunDetail({ runId }: { runId: string }) {
         const ancestorRows: LineageRow[] = rootFirst.map((aid, i) => {
           const h = ancestorHistoryQs[ancestors.length - 1 - i]?.data ?? null
           const { start, end } = stepRangeFromHistory(h)
-          return { runId: aid, startStep: start, endStep: end, current: false,
+          const kind: LineageRow['kind'] =
+            gapFillerSiblingIds.has(aid) ? 'sibling' : undefined
+          return { runId: aid, startStep: start, endStep: end, current: false, kind,
             wandbRefs: wandbRefsFor(aid) }
         })
         const { start: ownStart, end: ownEnd } = stepRangeFromHistory(ownHistory)

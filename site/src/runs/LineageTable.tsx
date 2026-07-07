@@ -27,8 +27,12 @@ export interface LineageRow {
   current: boolean
   /** Optional kind marker — drives the row's relationship label. Defaults:
    *  `current` if `current === true`, else `ancestor`. Pass `'child'` for
-   *  rows that are direct children of the current run. */
-  kind?: 'ancestor' | 'current' | 'child'
+   *  rows that are direct children of the current run. `'sibling'` marks a
+   *  crashed sibling gap-filler surfaced by RunsPage's ancestor discovery
+   *  when the physical resume ckpt came from a crashed run that shares this
+   *  run's logical parent (spec 61 §2.2 — the crashed run's parquet holds
+   *  the intermediate steps between logical-parent and current). */
+  kind?: 'ancestor' | 'current' | 'child' | 'sibling'
   /** Spec 61 §2.2: all wandb runs that contributed to this logical run,
    *  in `created_at` ascending order. Optional — when omitted or empty,
    *  the row falls back to a single icon linked by the plain runId. */
@@ -195,6 +199,12 @@ export function LineageTable({
                   {row.kind === 'child' && (
                     <span style={{ marginLeft: 6, fontSize: '0.7rem', color: '#7aa37a' }}>
                       ↳ child
+                    </span>
+                  )}
+                  {row.kind === 'sibling' && (
+                    <span style={{ marginLeft: 6, fontSize: '0.7rem', color: '#d4a374' }}
+                      title="Crashed sibling fire — its parquet fills the gap between the logical parent and this run.">
+                      ⚠ crashed sibling
                     </span>
                   )}
                 </td>
