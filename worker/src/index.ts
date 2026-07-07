@@ -957,11 +957,17 @@ export default {
 		}
 
 		// /api/runs/:id/<file>
+		// eval.json + cost.json get the nullOn404 treatment: they're routinely
+		// missing for fresh runs / ancestor runs that never had evals synced,
+		// and the run-detail page polls them every ~15-30s. 404s spam the
+		// browser console; returning `200 null` keeps the client's null
+		// handling intact without the noise.
 		const runFileMatch = path.match(/^\/api\/runs\/([^/]+)\/(raw\.parquet|manifest\.json|eval\.json|cost\.json)$/);
 		if (runFileMatch) {
 			const [, runId, file] = runFileMatch;
 			const key = `${env.R2_RUNS_PREFIX}/${runId}/${file}`;
-			return serveR2Object(req, env, key);
+			const nullable = file === 'eval.json' || file === 'cost.json';
+			return serveR2Object(req, env, key, undefined, nullable);
 		}
 
 		// /api/runs/:id/evals — eval-records index (spec 43). Returns the
