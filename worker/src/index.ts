@@ -208,6 +208,11 @@ async function serveR2Object(
 	env: Env,
 	key: string,
 	cacheControl: string = 'public, max-age=60',
+	/** When true, respond `200 null` instead of 404 when the object is
+	 *  absent. Use for endpoints whose "not present yet" state is normal
+	 *  and expected (fresh-run sidecars) — a 404 storm from a JSON poller
+	 *  spams the browser console; a 200-with-null resolves cleanly. */
+	nullOn404: boolean = false,
 ): Promise<Response> {
 	// Honor Range requests — required for hyparquet, which fetches the
 	// parquet footer first before issuing typed-column reads.
@@ -217,6 +222,16 @@ async function serveR2Object(
 		? await env.R2.get(key, { range: r2Range })
 		: await env.R2.get(key);
 	if (!obj) {
+		if (nullOn404) {
+			return new Response('null', {
+				status: 200,
+				headers: {
+					...corsHeaders(env),
+					'Content-Type': 'application/json',
+					'Cache-Control': cacheControl,
+				},
+			});
+		}
 		return new Response(`Not found: ${key}`, {
 			status: 404,
 			headers: corsHeaders(env),
@@ -916,10 +931,16 @@ export default {
 		// /api/iris-attempts/<label>.json — per-task attempt history sidecar,
 		// emitted alongside iris-state.json by the same `tomat iris sync` pass.
 		// Drives the death-cause vlines + % training chip on /runs/<label>.
+		// Missing = normal for fresh runs / non-iris runs (Modal, older TZ runs).
+		// Serve 200 { null } instead of 404 so the detail-page poller
+		// (30s cadence) doesn't spam the browser console.
 		const attemptsMatch = path.match(/^\/api\/iris-attempts\/([^/]+)\.json$/);
 		if (attemptsMatch) {
 			const [, label] = attemptsMatch;
-			return serveR2Object(req, env, `tomat/iris-attempts/${label}.json`);
+			return serveR2Object(
+				req, env, `tomat/iris-attempts/${label}.json`,
+				undefined, true,  // nullOn404 = true
+			);
 		}
 
 		// /api/voxel-corr/<label>.{json,bin.gzip} — per-run voxel-position

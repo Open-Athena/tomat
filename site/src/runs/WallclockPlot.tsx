@@ -1207,19 +1207,27 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
     //   val_200-maskgit-K1  → MV · K=1   (`--output-suffix K1` ablation —
     //                          honest single-MG-step decode; the dashboard's
     //                          primary number post-reforward-removal)
+    //   val_200-maskgit-K<N>→ MV · K=N   (K-sweep m-eval fires — see
+    //                          `evals fire --mg-k-steps N --output-suffix K<N>`)
+    //   val_200-maskgit-V   → SKIP       (elvis-viz mini-sample: n_mats=5,
+    //                          fired to power the elvis 3D-diff drilldown,
+    //                          NOT for scientific tracking. Ignoring it here
+    //                          keeps the plot from double-labelling MV·K=12
+    //                          — the n=5 mean is not comparable to the n=200
+    //                          series.)
     //   …-<other-mode>      → MV/MT · <mode>  (e.g. `-free`; falls through
     //                          as a dashed trace to keep the legend coherent)
-    //
-    // `-K<N>` variants get K=N labelling and override the mode's default K
-    // (so e.g. `-maskgit-K1` renders dashed K=1, not solid K=12).
     const setKeys = Object.keys(evalSeries?.sets ?? {})
     const labelFor = (setKey: string): {
       mvmt: 'MT' | 'MV'; kLabel: string; dash: 'solid' | 'dash'
-    } => {
+    } | null => {
       const parts = setKey.split('-')
       const mvmt: 'MT' | 'MV' = parts[0] === 'val_200' ? 'MV' : 'MT'
       const mode: string | undefined = parts[1]
       const variant: string = parts.slice(2).join('-')
+      // Elvis-viz variant: mini n=5 sample fired for drilldown, not a
+      // scientific series. Drop it from the plot to avoid duplicate labels.
+      if (variant === 'V') return null
       const kMatch = variant.match(/^K(\d+)/)
       let kLabel: string
       let dash: 'solid' | 'dash'
@@ -1240,7 +1248,9 @@ export function WallclockPlot({ history, evalSeries, runId, defaultXMode = 'step
       return { mvmt, kLabel, dash }
     }
     for (const setKey of setKeys) {
-      const { mvmt, kLabel, dash } = labelFor(setKey)
+      const label = labelFor(setKey)
+      if (label === null) continue
+      const { mvmt, kLabel, dash } = label
       out.push(evalMeanTrace(setKey, mvmt, kLabel, dash, mevalMetric))
     }
     return out
