@@ -50,6 +50,7 @@ import {
 import { formatFlops, useFlopUnit } from './flops'
 import type { FlopUnit } from './flops.format'
 import { tagsFor, type RunTag } from './tags'
+import { WandbIcon } from './WandbIcon'
 import { formatStep, formatStepDetail, snapStep } from '../lib/runNames'
 
 // ── small SVG sparkline (no plotly) ─────────────────────────────────────────
@@ -1315,11 +1316,7 @@ export function RunHeaderRich({
                     <a href={href} target="_blank" rel="noreferrer"
                       style={{ fontSize: '0.75rem', color: '#888',
                         display: 'inline-flex', alignItems: 'center', gap: 2 }}>
-                      <span style={{ display: 'inline-block', width: 18, height: 18,
-                        overflow: 'hidden', verticalAlign: 'middle' }}>
-                        <img src="/wandb.svg" alt="wandb"
-                          style={{ height: 18, width: 'auto', display: 'block' }} />
-                      </span>
+                      <WandbIcon />
                       ↗{i + 1}
                     </a>
                   </Tooltip>
@@ -1332,14 +1329,7 @@ export function RunHeaderRich({
                 <a href={wbUrl} target="_blank" rel="noreferrer"
                   style={{ fontSize: '0.75rem', color: '#888',
                     display: 'inline-flex', alignItems: 'center', gap: 2 }}>
-                  {/* wandb.svg ships as the full horizontal lockup
-                      (icon + text + tagline); crop to just the leftmost
-                      icon square via overflow:hidden + width constraint. */}
-                  <span style={{ display: 'inline-block', width: 18, height: 18,
-                    overflow: 'hidden', verticalAlign: 'middle' }}>
-                    <img src="/wandb.svg" alt="wandb"
-                      style={{ height: 18, width: 'auto', display: 'block' }} />
-                  </span>
+                  <WandbIcon />
                   ↗
                 </a>
               </Tooltip>

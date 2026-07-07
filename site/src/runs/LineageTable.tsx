@@ -12,7 +12,8 @@
 // fires-as-records manifests into the FE.
 
 import { Tooltip } from '../Tooltip'
-import { isModalRun } from './api'
+import { isModalRun, type WandbRunRef } from './api'
+import { WandbIcon } from './WandbIcon'
 
 const WANDB_PROJECT = 'open-athena/tomat-lmq-P19'
 
@@ -28,6 +29,10 @@ export interface LineageRow {
    *  `current` if `current === true`, else `ancestor`. Pass `'child'` for
    *  rows that are direct children of the current run. */
   kind?: 'ancestor' | 'current' | 'child'
+  /** Spec 61 §2.2: all wandb runs that contributed to this logical run,
+   *  in `created_at` ascending order. Optional — when omitted or empty,
+   *  the row falls back to a single icon linked by the plain runId. */
+  wandbRefs?: WandbRunRef[]
 }
 
 function fmtStep(s: number | null): string {
@@ -44,17 +49,39 @@ function StepRange({ start, end }: { start: number | null; end: number | null })
   )
 }
 
-function WandbLink({ runId }: { runId: string }) {
-  const url = `https://wandb.ai/${WANDB_PROJECT}/runs/${runId}`
+function WandbLink({ runId, refs }: { runId: string; refs?: WandbRunRef[] }) {
+  // Spec 61 §2.2: when a manifest carries `wandb_run_ids[]` with 2+
+  // entries (one per fire), render one chip per fire, mirroring
+  // `RunHeaderRich`'s multi-chip pattern. When 0 or 1 entry, fall back
+  // to the single legacy chip so older/single-fire runs still render.
+  if (refs && refs.length > 1) {
+    return (
+      <span style={{ display: 'inline-flex', gap: 4 }}>
+        {refs.map((ref, i) => {
+          const href = `https://wandb.ai/${ref.entity}/${ref.project}/runs/${encodeURIComponent(ref.run_id)}`
+          return (
+            <Tooltip key={`${ref.entity}/${ref.project}/${ref.run_id}`}
+              content={`open fire #${i + 1} (${ref.name}) in wandb`}>
+              <a href={href} target="_blank" rel="noreferrer"
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 1, color: '#888' }}>
+                <WandbIcon />
+                <span style={{ fontSize: '0.65rem' }}>↗{i + 1}</span>
+              </a>
+            </Tooltip>
+          )
+        })}
+      </span>
+    )
+  }
+  const ref = refs?.[0]
+  const url = ref
+    ? `https://wandb.ai/${ref.entity}/${ref.project}/runs/${encodeURIComponent(ref.run_id)}`
+    : `https://wandb.ai/${WANDB_PROJECT}/runs/${runId}`
   return (
     <Tooltip content={`open ${runId} in wandb`}>
       <a href={url} target="_blank" rel="noreferrer"
         style={{ display: 'inline-flex', alignItems: 'center', gap: 2, color: '#888' }}>
-        <span style={{ display: 'inline-block', width: 18, height: 18,
-          overflow: 'hidden', verticalAlign: 'middle' }}>
-          <img src="/wandb.svg" alt="wandb"
-            style={{ height: 18, width: 'auto', display: 'block' }} />
-        </span>
+        <WandbIcon />
         <span style={{ fontSize: '0.7rem' }}>↗</span>
       </a>
     </Tooltip>
@@ -146,7 +173,7 @@ export function LineageTable({ rows }: { rows: LineageRow[] }) {
                   <StepRange start={row.startStep} end={row.endStep} />
                 </td>
                 <td style={{ padding: '4px 8px', textAlign: 'center' }}>
-                  <WandbLink runId={row.runId} />
+                  <WandbLink runId={row.runId} refs={row.wandbRefs} />
                 </td>
                 <td style={{ padding: '4px 8px', textAlign: 'center' }}>
                   {isModal ? <ModalLink runId={row.runId} /> : <IrisLink runId={row.runId} />}

@@ -16,6 +16,7 @@ import type { IrisAttempt, IrisAttempts, ModalApp } from './api'
 import { classifyDeath } from './deathEvents'
 import { classifyErrorMessage, errorFirstLine } from './errorClassification'
 import type { RunHistory } from './parquet'
+import { WandbIcon } from './WandbIcon'
 
 interface Event {
   ts_ms: number
@@ -40,30 +41,9 @@ const SRC_COLOR: Record<Event['source'], string> = {
 
 // Source-column rendering: brand icons for wandb / modal, text for iris
 // (no first-party logo, and the colored-text reads cleanly anyway).
-//
-// The wandb.svg ships as the full horizontal lockup ("icon + Weights &
-// Biases + tagline", 1360×269). We crop to just the leftmost ~14×14 square
-// via a width-constrained overflow:hidden wrapper, so only the W-mark
-// shows.
 function SourceCell({ source }: { source: Event['source'] }) {
   if (source === 'wandb') {
-    return (
-      <span
-        title="wandb"
-        style={{
-          display: 'inline-block',
-          width: 18, height: 18,
-          overflow: 'hidden',
-          verticalAlign: 'middle',
-        }}
-      >
-        <img
-          src="/wandb.svg"
-          alt="wandb"
-          style={{ height: 18, width: 'auto', display: 'block' }}
-        />
-      </span>
-    )
+    return <WandbIcon title="wandb" />
   }
   if (source === 'modal') {
     return (

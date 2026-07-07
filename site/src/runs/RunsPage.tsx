@@ -3,7 +3,7 @@ import { useQueries, useQuery } from '@tanstack/react-query'
 import { enumParam, useUrlState } from 'use-prms'
 import { Tooltip } from '../Tooltip'
 import { evalJobsByRun, fetchCronHeartbeat, fetchEval, fetchEvalsIndex, fetchIrisAttempts, fetchIrisState, fetchManifest, fetchModalState, fetchPendingFires, fetchRunCost, fetchRunsSnapshot, irisJobIdForRun, isModalRun, modalAppForRun, modalFcForPending, pendingFcForRun, pendingFcIdForRun, parquetUrl } from './api'
-import type { EvalPoint, ModalApp, ModalFunctionCall, PendingFire, RunEval } from './api'
+import type { EvalPoint, ModalApp, ModalFunctionCall, PendingFire, RunEval, WandbRunRef } from './api'
 import { concatHistories, fetchRunHistory, truncateHistoryAtStep, type RunHistory } from './parquet'
 import { WallclockPlot } from './WallclockPlot'
 import { RecentEvents } from './RecentEvents'
@@ -1663,11 +1663,23 @@ function RunDetail({ runId }: { runId: string }) {
           }
           return { start, end }
         }
+        // Spec 61 §2.2: each row's per-fire wandb chip list is pulled from
+        // the aggregated snapshot's manifest for that runId. Falls back to
+        // the current-page `manifest` for the live row (freshest data, in
+        // case snapshot is behind by up to the cron TTL).
+        const snapRuns = (snapshotQ.data?.runs ?? {}) as Record<string, { wandb_run_ids?: WandbRunRef[] } | null>
+        const wandbRefsFor = (rid: string): WandbRunRef[] | undefined => {
+          if (rid === runId) {
+            return manifest?.wandb_run_ids ?? snapRuns[rid]?.wandb_run_ids
+          }
+          return snapRuns[rid]?.wandb_run_ids
+        }
         const rootFirst = [...ancestors].reverse()  // root → parent
         const ancestorRows: LineageRow[] = rootFirst.map((aid, i) => {
           const h = ancestorHistoryQs[ancestors.length - 1 - i]?.data ?? null
           const { start, end } = stepRangeFromHistory(h)
-          return { runId: aid, startStep: start, endStep: end, current: false }
+          return { runId: aid, startStep: start, endStep: end, current: false,
+            wandbRefs: wandbRefsFor(aid) }
         })
         const { start: ownStart, end: ownEnd } = stepRangeFromHistory(ownHistory)
         // Children: any registered run whose parent === this run. Step ranges
@@ -1676,10 +1688,12 @@ function RunDetail({ runId }: { runId: string }) {
         // child's own page for its full timeline.
         const childRows: LineageRow[] = children.map((cid) => ({
           runId: cid, startStep: null, endStep: null, current: false, kind: 'child',
+          wandbRefs: wandbRefsFor(cid),
         }))
         const allRows: LineageRow[] = [
           ...ancestorRows,
-          { runId, startStep: ownStart, endStep: ownEnd, current: true },
+          { runId, startStep: ownStart, endStep: ownEnd, current: true,
+            wandbRefs: wandbRefsFor(runId) },
           ...childRows,
         ]
         return <LineageTable rows={allRows} />
