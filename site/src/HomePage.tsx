@@ -39,14 +39,21 @@ export function HomePage() {
   return (
     <>
       <header>
-        <h1>tomat 🍅 — tokenized materials</h1>
+        <h1>MarinMat 🍅 — tokenized materials</h1>
+        <p className="meta" style={{ fontSize: '0.85rem', marginTop: '-0.3rem' }}>
+          f.k.a. <code>tomat</code> (still the CLI/package/URL name).
+          Sibling to{' '}
+          <ExtLink href="https://github.com/Open-Athena/MarinFold">MarinFold</ExtLink>
+          {' + '}
+          <ExtLink href="https://github.com/Open-Athena/marin-dna">MarinDNA</ExtLink>.
+        </p>
       </header>
 
       <p className="meta">
         LLM-based electron-density prediction for periodic crystals. We
         tokenize ρ(r) directly and train a transformer over the resulting
         token stream — a sequence-model alternative to 3D-ResUNet approaches.{' '}
-        <ExtLink href="https://github.com/Open-Athena/tomat">Open-Athena/tomat</ExtLink>.
+        <ExtLink href="https://github.com/Open-Athena/MarinMat">Open-Athena/MarinMat</ExtLink>.
       </p>
 
       <h2><a href="#/runs">→ Live runs dashboard</a></h2>
@@ -93,10 +100,10 @@ export function HomePage() {
       </p>
 
       <div className="footer">
-        <ExtLink href="https://github.com/Open-Athena/tomat/blob/main/OVERVIEW.md">
+        <ExtLink href="https://github.com/Open-Athena/MarinMat/blob/main/OVERVIEW.md">
           <code>OVERVIEW.md</code>
         </ExtLink>{' · '}
-        <ExtLink href="https://github.com/Open-Athena/tomat/tree/main/specs">
+        <ExtLink href="https://github.com/Open-Athena/MarinMat/tree/main/specs">
           <code>specs/</code>
         </ExtLink>{' · '}
         <ExtLink href="https://wandb.ai/open-athena/tomat-lmq-P19">W&amp;B project</ExtLink>

@@ -226,7 +226,7 @@ function ExtraOmnibarHotkeys() {
 }
 
 // ── top-level wrapper ───────────────────────────────────────────────────────
-const GITHUB_URL = 'https://github.com/Open-Athena/tomat'
+const GITHUB_URL = 'https://github.com/Open-Athena/MarinMat'
 
 export function KbdShell({ children }: { children: React.ReactNode }) {
   return (

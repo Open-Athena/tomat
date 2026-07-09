@@ -1,11 +1,18 @@
-# tomat 🍅
+# MarinMat 🍅
 
-**to**kenized **mat**erials — an LLM/transformer approach to predicting
-DFT-converged electron density for periodic crystals. Inspired by
-[tomol] (tokenized molecules), [electrAI] (the 3D ResUNet over voxel grids).
+<sub>Inspired by [Marin]; f.k.a. `tomat` (**to**kenized **mat**erials — the
+package/CLI/dashboard URL still use that name).</sub>
+
+An LLM/transformer approach to predicting DFT-converged electron density for
+periodic crystals. Sibling to [MarinFold] (protein structure) and [MarinDNA]
+(genomic LMs); also inspired by [tomol] (tokenized molecules) and [electrAI]
+(the 3D ResUNet over voxel grids).
 
 **Interactive dashboard**: [tomat.oa.dev](https://tomat.oa.dev) ([source](./site/)).
 
+[Marin]: https://github.com/marin-community/marin
+[MarinFold]: https://github.com/Open-Athena/MarinFold
+[MarinDNA]: https://github.com/Open-Athena/marin-dna
 [electrAI]: https://github.com/Quantum-Accelerators/electrai
 [tomol]: https://huggingface.co/ihxds/ToMol-marin-1B
 
